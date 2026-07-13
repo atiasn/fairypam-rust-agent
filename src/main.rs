@@ -394,7 +394,12 @@ fn validate_safe_smoke_config(config: &config::AppConfig) -> Result<()> {
     let Some(port) = endpoint.strip_suffix("/ws") else {
         anyhow::bail!("--safe-smoke requires a ws://127.0.0.1:<port>/ws Hub URL");
     };
-    if port.parse::<u16>().ok().filter(|value| *value > 0).is_none() {
+    if port
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value > 0)
+        .is_none()
+    {
         anyhow::bail!("--safe-smoke requires a ws://127.0.0.1:<port>/ws Hub URL");
     }
     if config.capture.fps != 0 {
