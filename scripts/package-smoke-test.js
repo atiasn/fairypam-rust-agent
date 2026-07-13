@@ -119,7 +119,12 @@ async function finish(server, ok, message) {
     message,
   };
   writeEvidence(evidence);
-  fs.rmSync(workdir, { recursive: true, force: true });
+  fs.rmSync(workdir, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 100,
+  });
   if (passed) {
     process.stdout.write(`${JSON.stringify(evidence)}\n`);
     process.exit(0);
