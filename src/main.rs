@@ -1084,6 +1084,42 @@ mod tests {
         assert_eq!(Mode::Automation.flag(), "automation");
     }
 
+    #[test]
+    fn safe_smoke_mode_has_an_explicit_flag() {
+        assert_eq!(Mode::SafeSmoke.flag(), "--safe-smoke");
+    }
+
+    #[test]
+    fn safe_smoke_accepts_only_loopback_without_capture() {
+        let mut config = config::AppConfig::default();
+        config.hub.ws_url = "ws://127.0.0.1:8765/ws".into();
+        config.capture.fps = 0;
+
+        validate_safe_smoke_config(&config).unwrap();
+    }
+
+    #[test]
+    fn safe_smoke_rejects_non_loopback_hub() {
+        let mut config = config::AppConfig::default();
+        config.hub.ws_url = "ws://192.168.2.15:8765/ws".into();
+        config.capture.fps = 0;
+
+        let error = validate_safe_smoke_config(&config).unwrap_err().to_string();
+
+        assert!(error.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn safe_smoke_rejects_capture() {
+        let mut config = config::AppConfig::default();
+        config.hub.ws_url = "ws://127.0.0.1:8765/ws".into();
+        config.capture.fps = 1;
+
+        let error = validate_safe_smoke_config(&config).unwrap_err().to_string();
+
+        assert!(error.contains("capture.fps=0"));
+    }
+
     #[cfg(feature = "automation-cli")]
     #[test]
     fn automation_requires_test_only_for_self_test() {
