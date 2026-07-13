@@ -29,6 +29,7 @@ jobs:
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           $toolchain = (Get-Content rust-toolchain.toml | Select-String 'channel = "([^"]+)"').Matches.Groups[1].Value
           rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy
           rustup override set $toolchain
@@ -38,6 +39,7 @@ jobs:
       - name: Test and build Rust core
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo fmt --all -- --check
           bash scripts/tests/test-package-smoke.sh
           bash scripts/tests/test-safe-smoke-mode.sh
@@ -48,6 +50,7 @@ jobs:
       - name: Test and build Tauri UI
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           Set-Location tauri-ui
           npm ci
           Set-Location src-tauri
@@ -61,6 +64,7 @@ jobs:
         id: package
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           $sourceCommit = (Get-Content SOURCE_COMMIT -Raw).Trim()
           $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
             Where-Object name -eq 'fairypam-agent' |
