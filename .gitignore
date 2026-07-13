@@ -1,0 +1,7 @@
+/target/
+/tauri-ui/dist/
+/tauri-ui/node_modules/
+/tauri-ui/src-tauri/target/
+/dist/
+/config.yaml
+/.env*

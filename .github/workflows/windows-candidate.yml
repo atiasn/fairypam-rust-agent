@@ -1,0 +1,91 @@
+name: Windows candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Build unsigned Windows candidate
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout mirror snapshot
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tauri-ui/package-lock.json
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          $toolchain = (Get-Content rust-toolchain.toml | Select-String 'channel = "([^"]+)"').Matches.Groups[1].Value
+          rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy
+          rustup override set $toolchain
+          rustc --version
+          cargo --version
+
+      - name: Test and build Rust core
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo build --locked --release
+
+      - name: Test and build Tauri UI
+        shell: pwsh
+        run: |
+          Set-Location tauri-ui
+          npm ci
+          Set-Location src-tauri
+          cargo fmt --all -- --check
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          Set-Location ..
+          npm run tauri build -- --no-bundle --ci
+
+      - name: Package unsigned candidate
+        id: package
+        shell: pwsh
+        run: |
+          $sourceCommit = (Get-Content SOURCE_COMMIT -Raw).Trim()
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+            Where-Object name -eq 'fairypam-agent' |
+            Select-Object -ExpandProperty version
+          $sourceShort = $sourceCommit.Substring(0, 8)
+          $buildId = "$version-dev.$sourceShort.run${{ github.run_id }}"
+          ./scripts/package-windows-candidate.ps1 `
+            -BuildId $buildId `
+            -SourceCommit $sourceCommit `
+            -PublicCommit '${{ github.sha }}' `
+            -RunId '${{ github.run_id }}' `
+            -RunAttempt '${{ github.run_attempt }}' `
+            -OutputDirectory dist
+          "artifact_name=fairypam-agent-candidate-${{ github.run_id }}-${{ github.run_attempt }}" >> $env:GITHUB_OUTPUT
+          "package=$(Get-ChildItem dist/*-portable.zip | Select-Object -ExpandProperty FullName)" >> $env:GITHUB_OUTPUT
+          "manifest=$(Resolve-Path dist/candidate-manifest.json)" >> $env:GITHUB_OUTPUT
+
+      - name: Attest candidate provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            ${{ steps.package.outputs.package }}
+            ${{ steps.package.outputs.manifest }}
+
+      - name: Upload candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
