@@ -26,6 +26,7 @@ const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "fairypam-package-smoke-")
 const logPath = path.join(workdir, "logs", "agent.log");
 const configPath = path.join(workdir, "config.yaml");
 let child = null;
+let childClosed = false;
 let finishing = false;
 let sawHello = false;
 let sawHeartbeat = false;
@@ -70,11 +71,11 @@ function parseFrames(buffer, onFrame) {
   return buffer.subarray(offset);
 }
 
-function waitForExit(timeoutMs) {
-  if (!child || child.exitCode !== null) return Promise.resolve(true);
+function waitForClose(timeoutMs) {
+  if (!child || childClosed) return Promise.resolve(true);
   return new Promise((resolve) => {
     const timeout = setTimeout(() => resolve(false), timeoutMs);
-    child.once("exit", () => {
+    child.once("close", () => {
       clearTimeout(timeout);
       resolve(true);
     });
@@ -82,11 +83,11 @@ function waitForExit(timeoutMs) {
 }
 
 async function stopChild() {
-  if (!child || child.exitCode !== null) return true;
-  child.kill();
-  if (await waitForExit(3000)) return true;
-  child.kill("SIGKILL");
-  return waitForExit(3000);
+  if (!child || childClosed) return true;
+  if (child.exitCode === null) child.kill();
+  if (await waitForClose(3000)) return true;
+  if (child.exitCode === null) child.kill("SIGKILL");
+  return waitForClose(3000);
 }
 
 function writeEvidence(evidence) {
@@ -231,6 +232,9 @@ server.listen(0, "127.0.0.1", () => {
   let stderr = "";
   child.stderr.on("data", (chunk) => {
     stderr = `${stderr}${chunk}`.slice(-2000);
+  });
+  child.on("close", () => {
+    childClosed = true;
   });
   child.on("error", (error) => void finish(server, false, error.message));
   child.on("exit", (code) => {
