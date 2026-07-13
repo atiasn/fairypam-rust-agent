@@ -41,8 +41,8 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           cargo fmt --all -- --check
-          bash scripts/tests/test-package-smoke.sh
           bash scripts/tests/test-safe-smoke-mode.sh
+          bash scripts/tests/test-package-smoke.sh
           cargo test --locked --all-targets
           cargo clippy --locked --all-targets -- -D warnings
           cargo build --locked --release
