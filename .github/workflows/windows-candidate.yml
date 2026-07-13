@@ -1,4 +1,5 @@
 name: Windows candidate
+run-name: "Windows candidate ${{ github.sha }} #${{ github.run_number }}"
 
 on:
   workflow_dispatch:
