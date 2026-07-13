@@ -165,7 +165,9 @@ async fn main() -> Result<()> {
             anyhow::bail!("another FairyPam Agent is already running");
         }
 
-        if current_process_privilege_level() != PrivilegeLevel::Elevated {
+        if args.mode != Mode::SafeSmoke
+            && current_process_privilege_level() != PrivilegeLevel::Elevated
+        {
             let executable =
                 std::env::current_exe().context("failed to locate current executable")?;
             let current_dir = std::env::current_dir().ok();
@@ -183,12 +185,16 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Mode::Run => {}
+        Mode::SafeSmoke => {}
         Mode::Automation => unreachable!("automation mode returns before runtime startup"),
     }
 
     let runtime_context = agent_runtime::build_runtime_context(&args.config_path, &args.log_path)?;
 
     let app_config = config::load_config(&runtime_context.config_path)?;
+    if args.mode == Mode::SafeSmoke {
+        validate_safe_smoke_config(&app_config)?;
+    }
     compact_log_file(&runtime_context.log_path)?;
     init_logging(&app_config.agent.log_level, &runtime_context.log_path)?;
     agent_runtime::append_log_line(&runtime_context.log_path, "logging initialized")?;
@@ -312,6 +318,7 @@ struct Args {
 enum Mode {
     Gui,
     Run,
+    SafeSmoke,
     Automation,
 }
 
@@ -329,6 +336,7 @@ impl Args {
             match arg.as_str() {
                 "--gui" => parsed.mode = Mode::Gui,
                 "--run" => parsed.mode = Mode::Run,
+                "--safe-smoke" => parsed.mode = Mode::SafeSmoke,
                 "automation" => {
                     parsed.mode = Mode::Automation;
                     parsed.automation_args = args.collect();
@@ -373,9 +381,26 @@ impl Mode {
         match self {
             Mode::Gui => "--gui",
             Mode::Run => "--run",
+            Mode::SafeSmoke => "--safe-smoke",
             Mode::Automation => "automation",
         }
     }
+}
+
+fn validate_safe_smoke_config(config: &config::AppConfig) -> Result<()> {
+    let Some(endpoint) = config.hub.ws_url.strip_prefix("ws://127.0.0.1:") else {
+        anyhow::bail!("--safe-smoke requires a ws://127.0.0.1:<port>/ws Hub URL");
+    };
+    let Some(port) = endpoint.strip_suffix("/ws") else {
+        anyhow::bail!("--safe-smoke requires a ws://127.0.0.1:<port>/ws Hub URL");
+    };
+    if port.parse::<u16>().ok().filter(|value| *value > 0).is_none() {
+        anyhow::bail!("--safe-smoke requires a ws://127.0.0.1:<port>/ws Hub URL");
+    }
+    if config.capture.fps != 0 {
+        anyhow::bail!("--safe-smoke requires capture.fps=0");
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "automation-cli"))]

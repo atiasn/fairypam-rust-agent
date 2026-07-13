@@ -218,7 +218,7 @@ server.listen(0, "127.0.0.1", () => {
     ].join("\n"),
     "utf8",
   );
-  child = spawn(executable, ["--run", "--config", configPath, "--log-file", logPath], {
+  child = spawn(executable, ["--safe-smoke", "--config", configPath, "--log-file", logPath], {
     cwd: workdir,
     windowsHide: true,
     stdio: ["ignore", "ignore", "pipe"],
