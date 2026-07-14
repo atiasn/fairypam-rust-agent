@@ -4,30 +4,34 @@ param(
     [string]$CandidateMetadataUrl = '',
     [string]$ExpectedSha256 = '',
     [string]$ExpectedBuildId = '',
-    [int]$TimeoutSeconds = 90
+    # 60s metadata + 60s ZIP + 15s CLI + 75s cleanup/receipt.
+    [int]$TimeoutSeconds = 210
 )
 
 $ErrorActionPreference = 'Stop'
 $TaskName = 'FairyPamAgentCandidateSafeSmoke'
 $RunMutexName = 'Local\FairyPamAgentCandidateSafeSmokeRun'
-$RequestPath = Join-Path $PSScriptRoot '..\target\candidate-smoke-request.json'
-$ResultPath = Join-Path $PSScriptRoot '..\target\candidate-smoke-result.json'
-$LeasePath = Join-Path $PSScriptRoot '..\target\candidate-smoke-lease.json'
+$TargetDirectory = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\target'))
+$RequestPath = Join-Path $TargetDirectory 'candidate-smoke-request.json'
+$ResultPath = Join-Path $TargetDirectory 'candidate-smoke-result.json'
+$LeasePath = Join-Path $TargetDirectory 'candidate-smoke-lease.json'
+$DeadlinePath = Join-Path $TargetDirectory 'candidate-smoke-deadline.json'
 $HarnessPath = Join-Path $PSScriptRoot 'package-smoke-test.js'
+$NetworkTimeoutSeconds = 60
 
 function Write-AtomicJsonFile([string]$Path, $Payload) {
-    $parent = Split-Path -Parent $Path
-    if ($parent) {
-        New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    }
-    $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    $targetPath = [IO.Path]::GetFullPath($Path)
+    $parent = [IO.Path]::GetDirectoryName($targetPath)
+    if ([string]::IsNullOrWhiteSpace($parent)) { throw 'candidate JSON target directory is invalid' }
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    $temporary = Join-Path $parent ".$([IO.Path]::GetFileName($targetPath)).$([guid]::NewGuid().ToString('N')).tmp"
     $encoding = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($temporary, (($Payload | ConvertTo-Json -Depth 12) + [Environment]::NewLine), $encoding)
     try {
-        if ([IO.File]::Exists($Path)) {
-            [IO.File]::Replace($temporary, $Path, $null)
+        if ([IO.File]::Exists($targetPath)) {
+            [IO.File]::Replace($temporary, $targetPath, $null)
         } else {
-            [IO.File]::Move($temporary, $Path)
+            [IO.File]::Move($temporary, $targetPath)
         }
     } finally {
         if (Test-Path -LiteralPath $temporary) {
@@ -57,6 +61,15 @@ function Assert-RequestId([string]$RequestId) {
     }
 }
 
+function Assert-CandidateSmokeSchemaVersion($SchemaVersion) {
+    if ($SchemaVersion -isnot [int] -and $SchemaVersion -isnot [long]) {
+        throw 'candidate smoke lease schema is invalid'
+    }
+    if ([long]$SchemaVersion -ne [long]1) {
+        throw 'candidate smoke lease schema is invalid'
+    }
+}
+
 function Assert-ResultMatchesRequest($Result, [string]$RequestId, [string]$LeaseId, [string]$ExpectedSha256, [string]$ExpectedBuildId) {
     if ($Result.completion_receipt -ne $true -or
         [string]$Result.request_id -cne $RequestId -or
@@ -77,13 +90,11 @@ function Get-CandidateSmokeLease($Request) {
         throw 'candidate smoke lease is missing for request'
     }
     try {
-        $lease = Get-Content -Raw -LiteralPath $LeasePath | ConvertFrom-Json
+        $lease = Get-Content -Encoding UTF8 -Raw -LiteralPath $LeasePath | ConvertFrom-Json
     } catch {
         throw 'candidate smoke lease is unreadable; manual diagnosis required'
     }
-    if ($lease.schema_version -isnot [long] -or $lease.schema_version -ne [long]1) {
-        throw 'candidate smoke lease schema is invalid'
-    }
+    Assert-CandidateSmokeSchemaVersion $lease.schema_version
     if ([string]$lease.request_id -cne [string]$Request.request_id -or
         [string]$lease.lease_id -cne [string]$Request.lease_id -or
         [string]$lease.candidate_metadata_url -cne [string]$Request.candidate_metadata_url -or
@@ -132,6 +143,24 @@ function Clear-CandidateSmokeLease($Request) {
     }
 }
 
+function Test-CandidateSmokeDeadline($Request) {
+    if (-not (Test-Path -LiteralPath $DeadlinePath)) {
+        return $false
+    }
+    try {
+        $deadline = Get-Content -Encoding UTF8 -Raw -LiteralPath $DeadlinePath | ConvertFrom-Json
+    } catch {
+        throw 'candidate smoke deadline marker is unreadable; manual diagnosis required'
+    }
+    if ([string]$deadline.request_id -cne [string]$Request.request_id -or
+        [string]$deadline.lease_id -cne [string]$Request.lease_id -or
+        [string]$deadline.expected_sha256 -cne [string]$Request.expected_sha256 -or
+        [string]$deadline.expected_build_id -cne [string]$Request.expected_build_id) {
+        throw 'candidate smoke deadline marker does not match request'
+    }
+    return $true
+}
+
 function Assert-CandidateTransportUri([Uri]$Uri) {
     if ($Uri.Scheme -eq 'https') {
         return
@@ -158,59 +187,6 @@ function Assert-ExactCandidateZip([string]$ZipPath) {
         }
     } finally {
         $archive.Dispose()
-    }
-}
-
-function Test-CandidateGuiWindowVisible([System.Diagnostics.Process]$Process) {
-    if (-not ('FairyPamCandidateGuiWindow' -as [type])) {
-        Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class FairyPamCandidateGuiWindow {
-    [DllImport("user32.dll")]
-    public static extern bool IsWindowVisible(IntPtr hWnd);
-}
-'@
-    }
-    $Process.Refresh()
-    $handle = [IntPtr]$Process.MainWindowHandle
-    return $handle -ne [IntPtr]::Zero -and [FairyPamCandidateGuiWindow]::IsWindowVisible($handle)
-}
-
-function Invoke-CandidateGuiSmoke([string]$GuiExecutable, [string]$WorkingDirectory) {
-    if (-not (Test-Path -LiteralPath $GuiExecutable -PathType Leaf)) {
-        throw 'candidate GUI executable is missing'
-    }
-    $process = $null
-    $visible = $false
-    try {
-        $process = Start-Process -FilePath $GuiExecutable -WorkingDirectory $WorkingDirectory -PassThru
-        $deadline = (Get-Date).AddSeconds([Math]::Min($TimeoutSeconds, 30))
-        while ((Get-Date) -lt $deadline -and -not $process.HasExited) {
-            if (Test-CandidateGuiWindowVisible $process) {
-                $visible = $true
-                break
-            }
-            Start-Sleep -Milliseconds 250
-            $process.Refresh()
-        }
-        if (-not $visible) {
-            throw 'candidate GUI did not expose a visible window'
-        }
-    } finally {
-        if ($process -and -not $process.HasExited) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-            Wait-Process -Id $process.Id -Timeout 5 -ErrorAction SilentlyContinue
-        }
-    }
-    $processCleaned = -not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)
-    if (-not $processCleaned) {
-        throw 'candidate GUI process cleanup failed'
-    }
-    return [ordered]@{
-        gui_smoke_passed = $true
-        gui_window_visible = $visible
-        gui_process_cleaned = $processCleaned
     }
 }
 
@@ -255,6 +231,9 @@ if ($Mode -eq 'Run') {
         if (Test-Path -LiteralPath $LeasePath) {
             throw 'candidate smoke lease already exists; manual diagnosis required'
         }
+        if (Test-Path -LiteralPath $DeadlinePath) {
+            throw 'candidate smoke deadline marker exists; manual diagnosis required'
+        }
         $requestId = [guid]::NewGuid().ToString('N')
         $leaseId = [guid]::NewGuid().ToString('N')
         $request = [ordered]@{
@@ -264,15 +243,17 @@ if ($Mode -eq 'Run') {
             expected_sha256 = $ExpectedSha256
             expected_build_id = $ExpectedBuildId
         }
+        if (Test-Path -LiteralPath $ResultPath) {
+            Remove-Item -Force -ErrorAction Stop -LiteralPath $ResultPath
+        }
         New-CandidateSmokeLease $request
         Write-AtomicJsonFile $RequestPath $request
-        Remove-Item -ErrorAction SilentlyContinue -Path $ResultPath
         Start-ScheduledTask -TaskName $TaskName
         $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
         $result = $null
         while ((Get-Date) -lt $deadline) {
             if (Test-Path $ResultPath) {
-                $raw = Get-Content -Raw -Path $ResultPath
+                $raw = Get-Content -Encoding UTF8 -Raw -Path $ResultPath
                 $result = $raw | ConvertFrom-Json
                 Assert-ResultMatchesRequest $result $requestId $leaseId $ExpectedSha256 $ExpectedBuildId
                 if (Test-Path -LiteralPath $LeasePath) {
@@ -283,10 +264,19 @@ if ($Mode -eq 'Run') {
                 $raw
                 break
             }
+            $scheduledTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            if (-not $scheduledTask -or $scheduledTask.State -ne 'Running') {
+                throw 'candidate smoke task stopped without matching result'
+            }
             Start-Sleep -Milliseconds 500
         }
         if ($null -eq $result) {
-            throw "timed out waiting for candidate smoke result: $ResultPath"
+            $scheduledTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            if ($scheduledTask -and $scheduledTask.State -eq 'Running') {
+                Write-AtomicJsonFile $DeadlinePath $request
+                throw 'candidate smoke deadline expired while task remains running; lease preserved for manual diagnosis'
+            }
+            throw 'candidate smoke deadline expired without matching result'
         }
         if ($result.ok -ne $true) {
             throw 'candidate smoke result reported failure'
@@ -306,10 +296,14 @@ if ($Mode -eq 'Execute') {
     $buildId = ''
     $resultPayload = $null
     $failureMessage = $null
+    $networkPhase = $null
+    $executionPhase = $null
     $leaseVerified = $false
     $cleanupComplete = $true
+    $cliEvidence = $null
+    $requiresGuiSmoke = $null
     try {
-        $request = Get-Content -Raw -Path $RequestPath | ConvertFrom-Json
+        $request = Get-Content -Encoding UTF8 -Raw -Path $RequestPath | ConvertFrom-Json
         $requestId = [string]$request.request_id
         Assert-RequestId $requestId
         $leaseId = [string]$request.lease_id
@@ -322,7 +316,9 @@ if ($Mode -eq 'Execute') {
         $expectedBuildId = [string]$request.expected_build_id
         Get-CandidateSmokeLease $request | Out-Null
         $leaseVerified = $true
-        $metadata = Invoke-RestMethod -Uri $metadataUrl -Method Get -MaximumRedirection 0
+        $networkPhase = 'metadata_get'
+        $metadata = Invoke-RestMethod -Uri $metadataUrl -Method Get -MaximumRedirection 0 -TimeoutSec $NetworkTimeoutSeconds
+        $networkPhase = $null
         foreach ($field in @('build_id', 'source_commit', 'sha256', 'size_bytes', 'download_url', 'requires_gui_smoke')) {
             if ($null -eq $metadata.$field -or [string]::IsNullOrWhiteSpace([string]$metadata.$field)) {
                 throw "candidate metadata field is missing: $field"
@@ -342,6 +338,7 @@ if ($Mode -eq 'Execute') {
         if (-not [string]::IsNullOrWhiteSpace($expectedBuildId) -and $buildId -cne $expectedBuildId) {
             throw 'metadata build_id does not match expected build identity'
         }
+        $requiresGuiSmoke = [bool]$metadata.requires_gui_smoke
 
         $temp = Join-Path ([IO.Path]::GetTempPath()) "fairypam-candidate-smoke-$([guid]::NewGuid())"
         $extract = Join-Path $temp 'package'
@@ -349,7 +346,9 @@ if ($Mode -eq 'Execute') {
         New-Item -ItemType Directory -Force -Path $extract | Out-Null
         $downloadUri = [Uri]::new($metadataUri, [string]$metadata.download_url)
         Assert-CandidateTransportUri $downloadUri
-        Invoke-WebRequest -UseBasicParsing -Uri $downloadUri -OutFile $zip -MaximumRedirection 0
+        $networkPhase = 'zip_get'
+        Invoke-WebRequest -UseBasicParsing -Uri $downloadUri -OutFile $zip -MaximumRedirection 0 -TimeoutSec $NetworkTimeoutSeconds
+        $networkPhase = $null
         if ((Get-Item -LiteralPath $zip).Length -ne [long]$metadata.size_bytes) {
             throw 'downloaded candidate size does not match metadata'
         }
@@ -358,6 +357,7 @@ if ($Mode -eq 'Execute') {
             throw 'downloaded candidate SHA256 does not match expected pin'
         }
 
+        $executionPhase = 'extract_manifest'
         Assert-ExactCandidateZip $zip
         Expand-Archive -LiteralPath $zip -DestinationPath $extract
         $expected = @('BUILD-MANIFEST.json', 'README.txt', 'fairypam-agent-tauri-ui.exe', 'fairypam-agent.exe')
@@ -365,10 +365,11 @@ if ($Mode -eq 'Execute') {
         if ((Get-ChildItem -Directory -LiteralPath $extract) -or (Compare-Object $expected $actual)) {
             throw "candidate ZIP members are not exact: $($actual -join ', ')"
         }
-        $inner = Get-Content -Raw -Path (Join-Path $extract 'BUILD-MANIFEST.json') | ConvertFrom-Json
+        $inner = Get-Content -Encoding UTF8 -Raw -Path (Join-Path $extract 'BUILD-MANIFEST.json') | ConvertFrom-Json
         if ($inner.build_id -ne $metadata.build_id -or $inner.source_commit -ne $metadata.source_commit -or $inner.signed -ne $false -or $inner.requires_gui_smoke -ne $metadata.requires_gui_smoke) {
             throw 'inner build manifest does not match candidate metadata'
         }
+        $executionPhase = $null
 
         $env:FAIRYPAM_CANDIDATE_EXE = Join-Path $extract 'fairypam-agent.exe'
         $env:FAIRYPAM_CANDIDATE_BUILD_ID = [string]$metadata.build_id
@@ -376,29 +377,20 @@ if ($Mode -eq 'Execute') {
         $env:FAIRYPAM_CANDIDATE_SHA256 = $hash
         $cliEvidencePath = Join-Path $temp 'cli-smoke-result.json'
         $env:FAIRYPAM_CANDIDATE_EVIDENCE_PATH = $cliEvidencePath
+        $executionPhase = 'cli_harness'
         & node $HarnessPath
         if ($LASTEXITCODE -ne 0) {
             throw "packaged candidate smoke failed with exit code $LASTEXITCODE"
         }
-        $cliEvidence = Get-Content -Raw -Path $cliEvidencePath | ConvertFrom-Json
+        $cliEvidence = Get-Content -Encoding UTF8 -Raw -Path $cliEvidencePath | ConvertFrom-Json
         if ($cliEvidence.ok -ne $true) {
             throw 'CLI safe smoke evidence is not successful'
         }
-        $requiresGuiSmoke = [bool]$metadata.requires_gui_smoke
-        $guiEvidence = [ordered]@{
-            gui_smoke_executed = $false
-            gui_smoke_passed = $true
-            gui_window_visible = $null
-            gui_process_cleaned = $null
-        }
-        if ($requiresGuiSmoke) {
-            $guiEvidence = Invoke-CandidateGuiSmoke (Join-Path $extract 'fairypam-agent-tauri-ui.exe') $extract
-            $guiEvidence['gui_smoke_executed'] = $true
-        }
+        $executionPhase = $null
         $resultPayload = [ordered]@{
             schema_version = 1
             gate = 'RUST-CLI-SAFE'
-            ok = $cliEvidence.ok -eq $true -and $guiEvidence.gui_smoke_passed -eq $true
+            ok = $cliEvidence.ok -eq $true
             completion_receipt = $true
             request_id = $requestId
             lease_id = $leaseId
@@ -412,10 +404,13 @@ if ($Mode -eq 'Execute') {
             log_initialized = $cliEvidence.log_initialized -eq $true
             process_cleaned = $cliEvidence.process_cleaned -eq $true
             gui_smoke_required = $requiresGuiSmoke
-            gui_smoke_executed = $guiEvidence.gui_smoke_executed -eq $true
-            gui_smoke_passed = $guiEvidence.gui_smoke_passed -eq $true
-            gui_window_visible = $guiEvidence.gui_window_visible
-            gui_process_cleaned = $guiEvidence.gui_process_cleaned
+            gui_smoke_executed = $false
+            gui_smoke_passed = $null
+            gui_window_visible = $null
+            gui_process_cleaned = $null
+            gui_gate = if ($requiresGuiSmoke) { 'TAURI-GUI-HUMAN:pending' } else { 'not-required' }
+            network_phase = $networkPhase
+            execution_phase = $executionPhase
             completed_at = (Get-Date).ToUniversalTime().ToString('o')
             message = [string]$cliEvidence.message
         }
@@ -447,14 +442,23 @@ if ($Mode -eq 'Execute') {
             expected_build_id = $expectedBuildId
             build_id = $buildId
             sha256 = $expectedSha256
+            network_phase = $networkPhase
+            execution_phase = $executionPhase
             error = if ($failureMessage) { $failureMessage } else { 'candidate smoke execution failed' }
             completed_at = (Get-Date).ToUniversalTime().ToString('o')
+        }
+        if ($null -ne $cliEvidence -and $cliEvidence.ok -eq $true) {
+            $resultPayload.saw_hello = $cliEvidence.saw_hello -eq $true
+            $resultPayload.saw_heartbeat = $cliEvidence.saw_heartbeat -eq $true
+            $resultPayload.log_initialized = $cliEvidence.log_initialized -eq $true
+            $resultPayload.process_cleaned = $cliEvidence.process_cleaned -eq $true
         }
     }
     if (-not $leaseVerified) {
         exit 1
     }
     if (-not $cleanupComplete) { exit 1 }
+    if (Test-CandidateSmokeDeadline $request) { exit 1 }
     Clear-CandidateSmokeLease $request
     Write-AtomicJsonFile $ResultPath $resultPayload
     if ($resultPayload.ok -eq $true) { exit 0 }
