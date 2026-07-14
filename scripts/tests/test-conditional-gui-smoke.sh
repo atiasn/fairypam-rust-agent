@@ -94,7 +94,12 @@ grep -Fq '$base..HEAD' "$WORKFLOW"
 grep -Fq "else { 'null' }" "$WORKFLOW"
 ! grep -Fq "else { 'none' }" "$WORKFLOW"
 grep -Fq -- '-ValidatedBasePublicCommit $base' "$WORKFLOW"
-grep -Fq 'validated_base_public_commit = $ValidatedBasePublicCommit' "$PACKAGER"
+grep -Fq '$NormalizedValidatedBasePublicCommit = if' "$PACKAGER"
+grep -Fq 'IsNullOrWhiteSpace($ValidatedBasePublicCommit)) { $null } else { $ValidatedBasePublicCommit.ToLowerInvariant() }' "$PACKAGER"
+grep -Fq '$null -ne $NormalizedValidatedBasePublicCommit -and $NormalizedValidatedBasePublicCommit -notmatch' "$PACKAGER"
+grep -Fq 'ValidatedBasePublicCommit must be null or a full hexadecimal commit' "$PACKAGER"
+test "$(grep -Fc 'validated_base_public_commit = $NormalizedValidatedBasePublicCommit' "$PACKAGER")" -eq 2
+! grep -Fq '$ValidatedBasePublicCommit = if' "$PACKAGER"
 grep -Fq 'must be null or a full hexadecimal commit' "$PACKAGER"
 ! grep -Fq 'git rev-parse HEAD^' "$WORKFLOW"
 

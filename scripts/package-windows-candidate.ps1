@@ -19,8 +19,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ValidatedBasePublicCommit = if ([string]::IsNullOrWhiteSpace($ValidatedBasePublicCommit)) { $null } else { $ValidatedBasePublicCommit.ToLowerInvariant() }
-if ($null -ne $ValidatedBasePublicCommit -and $ValidatedBasePublicCommit -notmatch '^[0-9a-f]{40,64}$') {
+$NormalizedValidatedBasePublicCommit = if ([string]::IsNullOrWhiteSpace($ValidatedBasePublicCommit)) { $null } else { $ValidatedBasePublicCommit.ToLowerInvariant() }
+if ($null -ne $NormalizedValidatedBasePublicCommit -and $NormalizedValidatedBasePublicCommit -notmatch '^[0-9a-f]{40,64}$') {
     throw 'ValidatedBasePublicCommit must be null or a full hexadecimal commit'
 }
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -52,7 +52,7 @@ try {
         build_id = $BuildId
         source_commit = $SourceCommit.ToLowerInvariant()
         public_commit = $PublicCommit.ToLowerInvariant()
-        validated_base_public_commit = $ValidatedBasePublicCommit
+        validated_base_public_commit = $NormalizedValidatedBasePublicCommit
         workflow_run_id = $RunId
         workflow_run_attempt = $RunAttempt
         built_at = $BuiltAt
@@ -113,7 +113,7 @@ Only promote it in FairyPam Hub after required candidate smoke gates pass.
         platform = 'windows-x64'
         source_commit = $SourceCommit.ToLowerInvariant()
         public_commit = $PublicCommit.ToLowerInvariant()
-        validated_base_public_commit = $ValidatedBasePublicCommit
+        validated_base_public_commit = $NormalizedValidatedBasePublicCommit
         workflow_run_id = $RunId
         workflow_run_attempt = $RunAttempt
         built_at = $BuiltAt
