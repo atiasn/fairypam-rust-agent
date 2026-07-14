@@ -15,9 +15,18 @@ grep -Fq 'Cargo\.toml' "$WORKFLOW"
 grep -Fq 'Cargo\.lock' "$WORKFLOW"
 grep -Fq 'rust-toolchain\.toml' "$WORKFLOW"
 grep -Fq 'build\.rs' "$WORKFLOW"
-grep -Fq 'scripts/package-windows-candidate.ps1' "$WORKFLOW"
-if grep -Fq 'scripts/candidate-smoke-runner\.ps1' "$WORKFLOW"; then
-  printf '[FAIL] runner-only smoke infrastructure must not require GUI smoke\n' >&2
+impact_rule="$(grep -F '$_ -match' "$WORKFLOW")"
+for control_plane_path in 'scripts/package-windows-candidate\.ps1' 'scripts/candidate-smoke-runner\.ps1' '.github/workflows/windows-candidate\.yml'; do
+  if [[ "$impact_rule" == *"$control_plane_path"* ]]; then
+    printf '[FAIL] control-plane input must not require GUI smoke: %s\n' "$control_plane_path" >&2
+    exit 1
+  fi
+done
+grep -Fq '$resolveExit = $LASTEXITCODE' "$WORKFLOW"
+grep -Fq '$ancestorExit = $LASTEXITCODE' "$WORKFLOW"
+grep -Fq '$resolved = ([string]$resolvedLines[0]).Trim()' "$WORKFLOW"
+if grep -Fq 'git rev-parse --verify "$previous^{commit}" 2>$null | Select-Object -First 1' "$WORKFLOW"; then
+  printf '[FAIL] rev-parse exit must be captured before pipeline processing\n' >&2
   exit 1
 fi
 grep -Fq 'requires_gui_smoke' "$PACKAGER"
@@ -210,7 +219,7 @@ requires_gui_smoke() {
     return 0
   fi
   git -C "$repo" diff --name-only "$resolved..HEAD" |
-    grep -Eq '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$|scripts/package-windows-candidate\.ps1$|\.github/workflows/windows-candidate\.yml$)'
+    grep -Eq '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$)'
 }
 
 validated_base_json() {
@@ -223,17 +232,19 @@ validated_base_json() {
   fi
 }
 
-for shared_path in src/lib.rs Cargo.toml Cargo.lock rust-toolchain.toml build.rs scripts/package-windows-candidate.ps1 .github/workflows/windows-candidate.yml; do
+for shared_path in src/lib.rs Cargo.toml Cargo.lock rust-toolchain.toml build.rs; do
   printf '%s\n' "$shared_path" |
-    grep -Eq '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$|scripts/package-windows-candidate\.ps1$|\.github/workflows/windows-candidate\.yml$)'
+    grep -Eq '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$)'
 done
 
-git -C "$repo" checkout -qb runner-only "$base"
-commit_path 'scripts/candidate-smoke-runner.ps1' runner 'runner-only change'
-if requires_gui_smoke "$base"; then
-  printf '[FAIL] runner-only change unexpectedly requires GUI smoke\n' >&2
-  exit 1
-fi
+git -C "$repo" checkout -qb control-plane "$base"
+for control_plane_path in scripts/candidate-smoke-runner.ps1 scripts/package-windows-candidate.ps1 .github/workflows/windows-candidate.yml; do
+  commit_path "$control_plane_path" control "control-plane change"
+  if requires_gui_smoke "$base"; then
+    printf '[FAIL] control-plane change unexpectedly requires GUI smoke: %s\n' "$control_plane_path" >&2
+    exit 1
+  fi
+done
 git -C "$repo" checkout -q -
 
 commit_path 'tauri-ui/src/App.tsx' gui 'earlier GUI change'

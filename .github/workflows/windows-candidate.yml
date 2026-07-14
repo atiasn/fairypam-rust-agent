@@ -78,15 +78,20 @@ jobs:
           $requiresGuiSmoke = $true
           $previous = $env:PREVIOUS_VALIDATED_CANDIDATE_PUBLIC_COMMIT
           if (-not [string]::IsNullOrWhiteSpace($previous)) {
-            $resolved = (git rev-parse --verify "$previous^{commit}" 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -eq 0 -and $resolved -match '^[0-9a-f]{40}$') {
-              git merge-base --is-ancestor $resolved HEAD
-              if ($LASTEXITCODE -eq 0) {
-                $base = $resolved
-                $guiImpact = @(git diff --name-only "$base..HEAD" | Where-Object {
-                  $_ -match '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$|scripts/package-windows-candidate\.ps1$|\.github/workflows/windows-candidate\.yml$)'
-                })
-                $requiresGuiSmoke = $guiImpact.Count -gt 0
+            $resolvedLines = @(git rev-parse --verify "$previous^{commit}" 2>$null)
+            $resolveExit = $LASTEXITCODE
+            if ($resolveExit -eq 0 -and $resolvedLines.Count -eq 1) {
+              $resolved = ([string]$resolvedLines[0]).Trim()
+              if ($resolved -match '^[0-9a-f]{40}$') {
+                git merge-base --is-ancestor $resolved HEAD
+                $ancestorExit = $LASTEXITCODE
+                if ($ancestorExit -eq 0) {
+                  $base = $resolved
+                  $guiImpact = @(git diff --name-only "$base..HEAD" | Where-Object {
+                    $_ -match '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$)'
+                  })
+                  $requiresGuiSmoke = $guiImpact.Count -gt 0
+                }
               }
             }
           }
