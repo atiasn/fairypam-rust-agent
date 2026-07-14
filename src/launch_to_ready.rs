@@ -281,7 +281,7 @@ struct ActiveExecutor {
 
 pub struct LaunchToReadyEngine {
     active: Option<ActiveExecutor>,
-    cleanup_receipt_recorded: bool,
+    last_cleanup_receipt: Option<TaskRunCleanupReceipt>,
     pending_cleanup_receipt: Option<TaskRunCleanupReceipt>,
 }
 
@@ -289,7 +289,7 @@ impl LaunchToReadyEngine {
     pub fn new() -> Self {
         Self {
             active: None,
-            cleanup_receipt_recorded: false,
+            last_cleanup_receipt: None,
             pending_cleanup_receipt: None,
         }
     }
@@ -326,7 +326,7 @@ impl LaunchToReadyEngine {
         {
             anyhow::bail!("unknown launch-to-ready template");
         }
-        self.cleanup_receipt_recorded = false;
+        self.last_cleanup_receipt = None;
         self.pending_cleanup_receipt = None;
         let launched = ops.launch_and_bind(&start)?;
         let registry = ActiveLaunchToReadyRun::new(&start, launched.binding);
@@ -590,18 +590,19 @@ impl LaunchToReadyEngine {
         owned_cleanup: OwnedCleanup,
         error_code: Option<String>,
     ) {
-        if self.cleanup_receipt_recorded {
-            return;
-        }
-        self.pending_cleanup_receipt = Some(TaskRunCleanupReceipt {
+        let receipt = TaskRunCleanupReceipt {
             task_run_id,
             trace_id,
             session_id,
             input_released,
             owned_cleanup,
             error_code,
-        });
-        self.cleanup_receipt_recorded = true;
+        };
+        if self.last_cleanup_receipt.as_ref() == Some(&receipt) {
+            return;
+        }
+        self.last_cleanup_receipt = Some(receipt.clone());
+        self.pending_cleanup_receipt = Some(receipt);
     }
 }
 
@@ -1223,7 +1224,12 @@ mod tests {
             (ops.release_count, ops.close_count, ops.force_close_count),
             (3, 4, 2)
         );
-        assert!(engine.take_cleanup_receipt().is_none());
+        let receipt = engine
+            .take_cleanup_receipt()
+            .expect("final cleanup receipt");
+        assert!(receipt.input_released);
+        assert_eq!(receipt.owned_cleanup, OwnedCleanup::Completed);
+        assert!(receipt.error_code.is_none());
     }
 
     #[test]
