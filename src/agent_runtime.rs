@@ -226,6 +226,15 @@ async fn enqueue_task_run_terminal(outbound: &OutboundWriter, message: HubMessag
         .context("task-run terminal enqueue failed")
 }
 
+async fn enqueue_task_run_cleanup_receipt(
+    outbound: &OutboundWriter,
+    receipt: protocol::TaskRunCleanupReceipt,
+) -> Result<()> {
+    enqueue_task_run_terminal(outbound, HubMessage::TaskRunCleanupReceipt(receipt))
+        .await
+        .context("task-run cleanup receipt enqueue failed")
+}
+
 fn dispatch_task_run_start<F>(
     exit_tx: mpsc::UnboundedSender<ConnectionTaskExit>,
     abort_handles: &mut Vec<AbortHandle>,
@@ -493,10 +502,11 @@ fn disconnect_launch_to_ready_with_ops<O: crate::launch_to_ready::LaunchToReadyO
     engine: &mut LaunchToReadyEngine,
     ops: &mut O,
     reason: &str,
-) {
+) -> Option<protocol::TaskRunCleanupReceipt> {
     if engine.disconnect(ops).is_err() {
         warn!("launch-to-ready cleanup failed during {reason}");
     }
+    engine.take_cleanup_receipt()
 }
 
 async fn disconnect_launch_to_ready(
@@ -505,19 +515,27 @@ async fn disconnect_launch_to_ready(
     input: &Arc<Mutex<InputController>>,
     owned: &Arc<Mutex<Option<TargetBinding>>>,
     capture: &ScreenCapture,
+    outbound: &OutboundWriter,
     reason: &str,
 ) {
-    let mut engine = engine.lock().await;
-    let mut process = process.lock().await;
-    let mut input = input.lock().await;
-    let mut owned = owned.lock().await;
-    let mut ops = ProductionLaunchToReadyOps {
-        process: &mut process,
-        input: &mut input,
-        capture,
-        owned: &mut owned,
+    let receipt = {
+        let mut engine = engine.lock().await;
+        let mut process = process.lock().await;
+        let mut input = input.lock().await;
+        let mut owned = owned.lock().await;
+        let mut ops = ProductionLaunchToReadyOps {
+            process: &mut process,
+            input: &mut input,
+            capture,
+            owned: &mut owned,
+        };
+        disconnect_launch_to_ready_with_ops(&mut engine, &mut ops, reason)
     };
-    disconnect_launch_to_ready_with_ops(&mut engine, &mut ops, reason);
+    if let Some(receipt) = receipt {
+        if let Err(err) = enqueue_task_run_cleanup_receipt(outbound, receipt).await {
+            warn!("launch-to-ready cleanup receipt enqueue failed during {reason}: {err}");
+        }
+    }
 }
 
 struct LaunchToReadyResources<'a> {
@@ -525,6 +543,7 @@ struct LaunchToReadyResources<'a> {
     process: &'a Arc<Mutex<ProcessManager>>,
     owned: &'a Arc<Mutex<Option<TargetBinding>>>,
     capture: &'a ScreenCapture,
+    outbound: &'a OutboundWriter,
 }
 
 async fn fail_connection_after_control_enqueue_error_with_cleanup<Cleanup>(
@@ -570,6 +589,7 @@ async fn fail_connection_after_control_enqueue_error(
             input_ctrl,
             launch.owned,
             launch.capture,
+            launch.outbound,
             operation,
         ),
     )
@@ -1393,14 +1413,18 @@ async fn run_agent_connection(
                                 Err(())
                             }
                         };
-                        Some((task_run_id, trace_id, session_id, result))
+                        let receipt = engine.take_cleanup_receipt();
+                        Some((task_run_id, trace_id, session_id, result, receipt))
                     } else {
                         None
                     }
                 };
-                let Some((task_run_id, trace_id, session_id, result)) = tick else {
+                let Some((task_run_id, trace_id, session_id, result, receipt)) = tick else {
                     continue;
                 };
+                if let Some(receipt) = receipt {
+                    enqueue_task_run_cleanup_receipt(&tick_outbound, receipt).await?;
+                }
                 match result {
                     Ok(Some(frame)) => {
                         let first_frame = frame.frame_seq == 0;
@@ -1523,6 +1547,7 @@ async fn run_agent_connection(
         process: &proc_mgr,
         owned: &launch_owned,
         capture: launch_capture.as_ref(),
+        outbound: &outbound,
     };
 
     loop {
@@ -1540,7 +1565,7 @@ async fn run_agent_connection(
                 cancel_connection(&connection_cancel_tx, "runtime stop requested");
                 cancel_active_environment_check(&active_environment_check, "runtime stop requested").await;
                 abort_connection_tasks(&connection_task_aborts);
-                disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, "runtime stop").await;
+                disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, &outbound, "runtime stop").await;
                 {
                     let mut ctrl = input_ctrl.lock().await;
                     if let Err(e) = ctrl.emergency_stop() {
@@ -1557,7 +1582,7 @@ async fn run_agent_connection(
                     if handle_connection_task_exit(&connection_cancel_tx, &exit) {
                         cancel_active_environment_check(&active_environment_check, &reconnect_reason).await;
                         abort_connection_tasks(&connection_task_aborts);
-                        disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, "critical task exit").await;
+                        disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, &outbound, "critical task exit").await;
                         {
                             let mut ctrl = input_ctrl.lock().await;
                             if let Err(e) = ctrl.emergency_stop() {
@@ -1580,7 +1605,7 @@ async fn run_agent_connection(
                     )
                     .await;
                     abort_connection_tasks(&connection_task_aborts);
-                    disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, "task exit channel close").await;
+                    disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, &outbound, "task exit channel close").await;
                     {
                         let mut ctrl = input_ctrl.lock().await;
                         if let Err(e) = ctrl.emergency_stop() {
@@ -2058,6 +2083,7 @@ async fn run_agent_connection(
                 let start_owned = launch_owned.clone();
                 let start_capture = launch_capture.clone();
                 let start_pending = pending_task_run_start.clone();
+                let start_outbound = outbound.clone();
                 dispatch_task_run_start_event(
                     event,
                     task_exit_tx.clone(),
@@ -2104,7 +2130,7 @@ async fn run_agent_connection(
                             } else {
                                 let result =
                                     engine.start(start.clone(), std::time::Instant::now(), &mut ops);
-                                if result.is_ok()
+                                let result = if result.is_ok()
                                     && !activate_pending_task_run_start(
                                         &start_pending,
                                         &start,
@@ -2112,7 +2138,7 @@ async fn run_agent_connection(
                                     )
                                     .await
                                 {
-                                    Some(engine.cancel(
+                                    engine.cancel(
                                         &protocol::TaskRunCancel {
                                             message_type: "task_run_cancel".into(),
                                             task_run_id: start.task_run_id.clone(),
@@ -2121,16 +2147,20 @@ async fn run_agent_connection(
                                             connection_id: start.connection_id,
                                         },
                                         &mut ops,
-                                    ))
+                                    )
                                 } else {
-                                    Some(result)
-                                }
+                                    result
+                                };
+                                Some((result, engine.take_cleanup_receipt()))
                             }
                         };
-                        let Some(result) = start_result else {
+                        let Some((result, receipt)) = start_result else {
                             clear_pending_task_run_start(&start_pending, &start).await;
                             return Ok(());
                         };
+                        if let Some(receipt) = receipt {
+                            enqueue_task_run_cleanup_receipt(&start_outbound, receipt).await?;
+                        }
                         if let Err(error) = result {
                             clear_pending_task_run_start(&start_pending, &start).await;
                             return if pending_start.is_cancelled() {
@@ -2147,41 +2177,56 @@ async fn run_agent_connection(
                 if cancel_pending_task_run_start(&pending_task_run_start, &cancel).await {
                     continue;
                 }
-                let result = {
+                let (result, receipt) = {
                     let mut engine = launch_engine.lock().await;
                     let mut process = proc_mgr.lock().await;
                     let mut input = input_ctrl.lock().await;
                     let mut owned = launch_owned.lock().await;
                     let mut ops = ProductionLaunchToReadyOps { process: &mut process, input: &mut input, capture: &launch_capture, owned: &mut owned };
-                    engine.cancel(&cancel, &mut ops)
+                    let result = engine.cancel(&cancel, &mut ops);
+                    (result, engine.take_cleanup_receipt())
                 };
+                if let Some(receipt) = receipt {
+                    if let Err(e) = enqueue_task_run_cleanup_receipt(&outbound, receipt).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_cancel_cleanup", e).await); }
+                }
                 if result.is_ok() { runtime_state.lock().await.finish_session(&cancel.session_id); }
                 else if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(cancel.task_run_id, cancel.trace_id, cancel.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_cancel", e).await); }
             }
             AgentEvent::TaskRunClick(click) => {
-                let result = {
+                let (result, receipt) = {
                     let mut engine = launch_engine.lock().await;
                     let mut process = proc_mgr.lock().await;
                     let mut input = input_ctrl.lock().await;
                     let mut owned = launch_owned.lock().await;
                     let mut ops = ProductionLaunchToReadyOps { process: &mut process, input: &mut input, capture: &launch_capture, owned: &mut owned };
-                    engine.click(&click, &mut ops)
+                    let result = engine.click(&click, &mut ops);
+                    (result, engine.take_cleanup_receipt())
                 };
+                if let Some(receipt) = receipt {
+                    if let Err(e) = enqueue_task_run_cleanup_receipt(&outbound, receipt).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_click_cleanup", e).await); }
+                }
                 if result.is_err() { if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(click.task_run_id, click.trace_id, click.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_click", e).await); } }
             }
             AgentEvent::TaskRunTerminal(terminal) => {
                 if consume_cancelled_pending_task_run_start(&pending_task_run_start, &terminal).await {
                     continue;
                 }
-                let (result, keep) = {
+                let (result, receipt) = {
                     let mut engine = launch_engine.lock().await;
-                    let keep = engine.keeps_session_on_success() && terminal.outcome == "succeeded";
                     let mut process = proc_mgr.lock().await;
                     let mut input = input_ctrl.lock().await;
                     let mut owned = launch_owned.lock().await;
                     let mut ops = ProductionLaunchToReadyOps { process: &mut process, input: &mut input, capture: &launch_capture, owned: &mut owned };
-                    (engine.terminal(&terminal, &mut ops), keep)
+                    let result = engine.terminal(&terminal, &mut ops);
+                    (result, engine.take_cleanup_receipt())
                 };
+                let keep = result.is_ok()
+                    && receipt.as_ref().is_some_and(|receipt| {
+                        receipt.owned_cleanup == protocol::OwnedCleanup::NotRequired
+                    });
+                if let Some(receipt) = receipt {
+                    if let Err(e) = enqueue_task_run_cleanup_receipt(&outbound, receipt).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_terminal_cleanup", e).await); }
+                }
                 if result.is_ok() { if !keep { runtime_state.lock().await.finish_session(&terminal.session_id); } }
                 else if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(terminal.task_run_id, terminal.trace_id, terminal.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_terminal", e).await); }
             }
@@ -2191,7 +2236,7 @@ async fn run_agent_connection(
                     cancel_connection(&connection_cancel_tx, "agent event channel closed");
                     cancel_active_environment_check(&active_environment_check, "agent event channel closed").await;
                     abort_connection_tasks(&connection_task_aborts);
-                    disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, "agent event channel close").await;
+                    disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, &outbound, "agent event channel close").await;
                     {
                         let mut ctrl = input_ctrl.lock().await;
                         if let Err(e) = ctrl.emergency_stop() {
@@ -2905,7 +2950,8 @@ mod tests {
             async move {
                 let mut engine = cleanup_engine.lock().await;
                 let mut ops = cleanup_ops.lock().await;
-                disconnect_launch_to_ready_with_ops(&mut engine, &mut *ops, "closed writer");
+                let _ =
+                    disconnect_launch_to_ready_with_ops(&mut engine, &mut *ops, "closed writer");
             },
         )
         .await;
@@ -2931,14 +2977,33 @@ mod tests {
         {
             let mut engine = engine.lock().await;
             let mut ops = ops.lock().await;
-            disconnect_launch_to_ready_with_ops(&mut engine, &mut *ops, "retry");
-            disconnect_launch_to_ready_with_ops(&mut engine, &mut *ops, "repeat");
+            let _ = disconnect_launch_to_ready_with_ops(&mut engine, &mut *ops, "retry");
+            let _ = disconnect_launch_to_ready_with_ops(&mut engine, &mut *ops, "repeat");
             assert!(engine.active_identity().is_none());
             assert_eq!(
                 (ops.release_count, ops.close_count, ops.force_close_count),
                 (3, 3, 1)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_receipt_enqueue_failure_does_not_mask_completed_local_cleanup() {
+        let mut engine = LaunchToReadyEngine::new();
+        let mut ops = LaunchCleanupFakeOps::new();
+        engine
+            .start(task_run_start(), std::time::Instant::now(), &mut ops)
+            .unwrap();
+        engine.cancel(&task_run_cancel(), &mut ops).unwrap();
+        let receipt = engine.take_cleanup_receipt().expect("cleanup receipt");
+
+        assert!(
+            enqueue_task_run_cleanup_receipt(&OutboundWriter::closed_for_test(), receipt)
+                .await
+                .is_err()
+        );
+        assert_eq!((ops.release_count, ops.close_count), (1, 1));
+        assert!(engine.active_identity().is_none());
     }
 
     #[test]

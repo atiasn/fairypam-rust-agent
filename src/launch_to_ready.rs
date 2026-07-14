@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::process::TargetBinding;
-use crate::protocol::{TaskRunCancel, TaskRunClick, TaskRunFrame, TaskRunStart, TaskRunTerminal};
+use crate::protocol::{
+    OwnedCleanup, TaskRunCancel, TaskRunCleanupReceipt, TaskRunClick, TaskRunFrame, TaskRunStart,
+    TaskRunTerminal,
+};
 use crate::{
     capture::ScreenCapture, input::InputController, process::ProcessManager, target_operation,
 };
@@ -278,17 +281,17 @@ struct ActiveExecutor {
 
 pub struct LaunchToReadyEngine {
     active: Option<ActiveExecutor>,
+    cleanup_receipt_recorded: bool,
+    pending_cleanup_receipt: Option<TaskRunCleanupReceipt>,
 }
 
 impl LaunchToReadyEngine {
     pub fn new() -> Self {
-        Self { active: None }
-    }
-
-    pub(crate) fn keeps_session_on_success(&self) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|active| active.leave_running)
+        Self {
+            active: None,
+            cleanup_receipt_recorded: false,
+            pending_cleanup_receipt: None,
+        }
     }
 
     pub(crate) fn active_identity(&self) -> Option<(String, String, String)> {
@@ -299,6 +302,10 @@ impl LaunchToReadyEngine {
                 active.start.session_id.clone(),
             )
         })
+    }
+
+    pub(crate) fn take_cleanup_receipt(&mut self) -> Option<TaskRunCleanupReceipt> {
+        self.pending_cleanup_receipt.take()
     }
 
     pub fn start<O: LaunchToReadyOps>(
@@ -319,13 +326,26 @@ impl LaunchToReadyEngine {
         {
             anyhow::bail!("unknown launch-to-ready template");
         }
+        self.cleanup_receipt_recorded = false;
+        self.pending_cleanup_receipt = None;
         let launched = ops.launch_and_bind(&start)?;
         let registry = ActiveLaunchToReadyRun::new(&start, launched.binding);
         let registry = match registry {
             Ok(registry) => registry,
             Err(err) => {
-                let _ = ops.release_input();
-                let _ = ops.close_owned_process();
+                let input_released = ops.release_input().is_ok();
+                let owned_cleanup = if ops.close_owned_process().is_ok() {
+                    OwnedCleanup::Completed
+                } else {
+                    OwnedCleanup::Failed
+                };
+                let error_code = cleanup_error_code(input_released, owned_cleanup);
+                self.record_cleanup_receipt_for_identity(
+                    &start,
+                    input_released,
+                    owned_cleanup,
+                    error_code,
+                );
                 return Err(err);
             }
         };
@@ -454,9 +474,13 @@ impl LaunchToReadyEngine {
                 .as_ref()
                 .is_some_and(|active| active.leave_running);
         if keep {
-            ops.release_input()?;
-            self.active = None;
-            Ok(())
+            if ops.release_input().is_ok() {
+                self.record_cleanup_receipt(true, OwnedCleanup::NotRequired, None);
+                self.active = None;
+                Ok(())
+            } else {
+                self.cleanup(ops)
+            }
         } else {
             self.cleanup(ops)
         }
@@ -507,10 +531,89 @@ impl LaunchToReadyEngine {
         if close.is_err() {
             close = ops.force_close_owned_process();
         }
+        let input_released = release.is_ok();
+        let owned_cleanup = if close.is_ok() {
+            OwnedCleanup::Completed
+        } else {
+            OwnedCleanup::Failed
+        };
+        let error_code = cleanup_error_code(input_released, owned_cleanup);
+        self.record_cleanup_receipt(input_released, owned_cleanup, error_code);
         if release.is_ok() && close.is_ok() {
             self.active = None;
         }
         release.and(close)
+    }
+
+    fn record_cleanup_receipt(
+        &mut self,
+        input_released: bool,
+        owned_cleanup: OwnedCleanup,
+        error_code: Option<String>,
+    ) {
+        let Some((task_run_id, trace_id, session_id)) = self.active_identity() else {
+            return;
+        };
+        self.record_cleanup_receipt_fields(
+            task_run_id,
+            trace_id,
+            session_id,
+            input_released,
+            owned_cleanup,
+            error_code,
+        );
+    }
+
+    fn record_cleanup_receipt_for_identity(
+        &mut self,
+        start: &TaskRunStart,
+        input_released: bool,
+        owned_cleanup: OwnedCleanup,
+        error_code: Option<String>,
+    ) {
+        self.record_cleanup_receipt_fields(
+            start.task_run_id.clone(),
+            start.trace_id.clone(),
+            start.session_id.clone(),
+            input_released,
+            owned_cleanup,
+            error_code,
+        );
+    }
+
+    fn record_cleanup_receipt_fields(
+        &mut self,
+        task_run_id: String,
+        trace_id: String,
+        session_id: String,
+        input_released: bool,
+        owned_cleanup: OwnedCleanup,
+        error_code: Option<String>,
+    ) {
+        if self.cleanup_receipt_recorded {
+            return;
+        }
+        self.pending_cleanup_receipt = Some(TaskRunCleanupReceipt {
+            task_run_id,
+            trace_id,
+            session_id,
+            input_released,
+            owned_cleanup,
+            error_code,
+        });
+        self.cleanup_receipt_recorded = true;
+    }
+}
+
+fn cleanup_error_code(input_released: bool, owned_cleanup: OwnedCleanup) -> Option<String> {
+    if input_released && owned_cleanup == OwnedCleanup::Completed {
+        None
+    } else if !input_released && owned_cleanup == OwnedCleanup::Failed {
+        Some("cleanup_failed".into())
+    } else if !input_released {
+        Some("input_release_failed".into())
+    } else {
+        Some("owned_cleanup_failed".into())
     }
 }
 
@@ -890,6 +993,12 @@ mod tests {
         assert_eq!(failing_ops.launch_count, 1);
         assert_eq!((failing_ops.release_count, failing_ops.close_count), (1, 1));
         assert!(engine.active.is_none());
+        let receipt = engine
+            .take_cleanup_receipt()
+            .expect("post-bind failure cleanup receipt");
+        assert!(receipt.input_released);
+        assert_eq!(receipt.owned_cleanup, OwnedCleanup::Completed);
+        assert!(receipt.error_code.is_none());
     }
 
     #[test]
@@ -1010,6 +1119,41 @@ mod tests {
     }
 
     #[test]
+    fn successful_leave_running_terminal_records_one_typed_cleanup_receipt() {
+        let mut ops = fake_ops();
+        let (mut engine, _) = started_engine(&mut ops, serde_json::json!({"leave_running": true}));
+
+        engine.terminal(&terminal("succeeded"), &mut ops).unwrap();
+
+        let receipt = engine.take_cleanup_receipt().expect("cleanup receipt");
+        assert_eq!(receipt.task_run_id, "task");
+        assert_eq!(receipt.trace_id, "trace");
+        assert_eq!(receipt.session_id, "session");
+        assert!(receipt.input_released);
+        assert_eq!(
+            receipt.owned_cleanup,
+            crate::protocol::OwnedCleanup::NotRequired
+        );
+        assert!(receipt.error_code.is_none());
+        assert!(engine.take_cleanup_receipt().is_none());
+    }
+
+    #[test]
+    fn failed_leave_running_input_release_falls_back_to_owned_cleanup_receipt() {
+        let mut ops = fake_ops();
+        ops.fail_release_once = true;
+        let (mut engine, _) = started_engine(&mut ops, serde_json::json!({"leave_running": true}));
+
+        engine.terminal(&terminal("succeeded"), &mut ops).unwrap();
+
+        let receipt = engine.take_cleanup_receipt().expect("cleanup receipt");
+        assert!(receipt.input_released);
+        assert_eq!(receipt.owned_cleanup, OwnedCleanup::Completed);
+        assert!(receipt.error_code.is_none());
+        assert_eq!((ops.release_count, ops.close_count), (2, 1));
+    }
+
+    #[test]
     fn timeout_cancel_disconnect_and_reconnect_cleanup_are_idempotent() {
         let mut ops = fake_ops();
         let now = Instant::now();
@@ -1021,13 +1165,24 @@ mod tests {
             .tick(now + Duration::from_secs(1), &mut ops)
             .unwrap()
             .is_none());
+        let receipt = engine
+            .take_cleanup_receipt()
+            .expect("timeout cleanup receipt");
+        assert!(receipt.input_released);
+        assert_eq!(receipt.owned_cleanup, OwnedCleanup::Completed);
         engine.disconnect(&mut ops).unwrap();
+        assert!(engine.take_cleanup_receipt().is_none());
         assert_eq!((ops.release_count, ops.close_count), (1, 1));
 
         engine
             .start(start(serde_json::json!({})), now, &mut ops)
             .unwrap();
         engine.cancel(&cancel(), &mut ops).unwrap();
+        let receipt = engine
+            .take_cleanup_receipt()
+            .expect("cancel cleanup receipt");
+        assert!(receipt.input_released);
+        assert_eq!(receipt.owned_cleanup, OwnedCleanup::Completed);
         engine.disconnect(&mut ops).unwrap();
         assert_eq!((ops.release_count, ops.close_count), (2, 2));
 
@@ -1055,6 +1210,12 @@ mod tests {
             (ops.release_count, ops.close_count, ops.force_close_count),
             (2, 2, 1)
         );
+        let receipt = engine
+            .take_cleanup_receipt()
+            .expect("failed cleanup receipt");
+        assert!(receipt.input_released);
+        assert_eq!(receipt.owned_cleanup, OwnedCleanup::Failed);
+        assert_eq!(receipt.error_code.as_deref(), Some("owned_cleanup_failed"));
 
         engine.disconnect(&mut ops).unwrap();
         assert!(engine.active.is_none());
@@ -1062,6 +1223,7 @@ mod tests {
             (ops.release_count, ops.close_count, ops.force_close_count),
             (3, 4, 2)
         );
+        assert!(engine.take_cleanup_receipt().is_none());
     }
 
     #[test]
@@ -1101,6 +1263,7 @@ mod tests {
         assert!(engine.cancel(&stale, &mut ops).is_err());
         assert!(engine.active.is_some());
         assert_eq!((ops.release_count, ops.close_count), (0, 0));
+        assert!(engine.take_cleanup_receipt().is_none());
     }
 
     #[test]

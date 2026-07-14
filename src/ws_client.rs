@@ -381,6 +381,7 @@ fn control_message_type(msg: &HubMessage) -> &'static str {
         HubMessage::TaskRunFrame(_) => "task_run_frame",
         HubMessage::TaskRunStep(_) => "task_run_step",
         HubMessage::TaskRunResult(_) => "task_run_result",
+        HubMessage::TaskRunCleanupReceipt(_) => "task_run_cleanup_receipt",
     }
 }
 

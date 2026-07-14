@@ -734,6 +734,27 @@ pub struct TaskRunResult {
     pub error_message: Option<String>,
 }
 
+/// 任务清理中 Agent 自有进程的最终处置结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnedCleanup {
+    Completed,
+    NotRequired,
+    Failed,
+}
+
+/// Agent 在本地清理完成后上报的可信 TaskRun 清理回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskRunCleanupReceipt {
+    pub task_run_id: String,
+    pub trace_id: String,
+    pub session_id: String,
+    pub input_released: bool,
+    pub owned_cleanup: OwnedCleanup,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
 fn default_success() -> bool {
     true
 }
@@ -770,6 +791,8 @@ pub enum HubMessage {
     TaskRunStep(TaskRunStep),
     #[serde(rename = "task_run_result")]
     TaskRunResult(TaskRunResult),
+    #[serde(rename = "task_run_cleanup_receipt")]
+    TaskRunCleanupReceipt(TaskRunCleanupReceipt),
 }
 
 // ============================================================
@@ -881,6 +904,26 @@ mod tests {
         assert_eq!(json["target_process_alive"], true);
         assert_eq!(json["target_window_alive"], true);
         assert!(json["last_applied_click_source_frame_seq"].is_null());
+    }
+
+    #[test]
+    fn task_run_cleanup_receipt_serializes_typed_safe_contract() {
+        let receipt = HubMessage::TaskRunCleanupReceipt(TaskRunCleanupReceipt {
+            task_run_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            trace_id: "660e8400-e29b-41d4-a716-446655440000".into(),
+            session_id: "770e8400-e29b-41d4-a716-446655440000".into(),
+            input_released: false,
+            owned_cleanup: OwnedCleanup::Failed,
+            error_code: Some("owned_cleanup_failed".into()),
+        });
+
+        let json = serde_json::to_value(receipt).unwrap();
+
+        assert_eq!(json["type"], "task_run_cleanup_receipt");
+        assert_eq!(json["input_released"], false);
+        assert_eq!(json["owned_cleanup"], "failed");
+        assert_eq!(json["error_code"], "owned_cleanup_failed");
+        assert!(json.get("connection_id").is_none());
     }
 
     #[test]
