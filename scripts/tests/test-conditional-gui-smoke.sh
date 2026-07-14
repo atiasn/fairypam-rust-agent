@@ -16,7 +16,10 @@ grep -Fq 'Cargo\.lock' "$WORKFLOW"
 grep -Fq 'rust-toolchain\.toml' "$WORKFLOW"
 grep -Fq 'build\.rs' "$WORKFLOW"
 grep -Fq 'scripts/package-windows-candidate.ps1' "$WORKFLOW"
-grep -Fq 'scripts/candidate-smoke-runner\.ps1' "$WORKFLOW"
+if grep -Fq 'scripts/candidate-smoke-runner\.ps1' "$WORKFLOW"; then
+  printf '[FAIL] runner-only smoke infrastructure must not require GUI smoke\n' >&2
+  exit 1
+fi
 grep -Fq 'requires_gui_smoke' "$PACKAGER"
 test "$(grep -Fc 'requires_gui_smoke' "$PACKAGER")" -ge 2
 grep -Fq 'gui_smoke_required' "$RUNNER"
@@ -207,7 +210,7 @@ requires_gui_smoke() {
     return 0
   fi
   git -C "$repo" diff --name-only "$resolved..HEAD" |
-    grep -Eq '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$|scripts/package-windows-candidate\.ps1$|scripts/candidate-smoke-runner\.ps1$|\.github/workflows/windows-candidate\.yml$)'
+    grep -Eq '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$|scripts/package-windows-candidate\.ps1$|\.github/workflows/windows-candidate\.yml$)'
 }
 
 validated_base_json() {
@@ -220,10 +223,18 @@ validated_base_json() {
   fi
 }
 
-for shared_path in src/lib.rs Cargo.toml Cargo.lock rust-toolchain.toml build.rs; do
+for shared_path in src/lib.rs Cargo.toml Cargo.lock rust-toolchain.toml build.rs scripts/package-windows-candidate.ps1 .github/workflows/windows-candidate.yml; do
   printf '%s\n' "$shared_path" |
-    grep -Eq '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$|scripts/package-windows-candidate\.ps1$|scripts/candidate-smoke-runner\.ps1$|\.github/workflows/windows-candidate\.yml$)'
+    grep -Eq '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$|scripts/package-windows-candidate\.ps1$|\.github/workflows/windows-candidate\.yml$)'
 done
+
+git -C "$repo" checkout -qb runner-only "$base"
+commit_path 'scripts/candidate-smoke-runner.ps1' runner 'runner-only change'
+if requires_gui_smoke "$base"; then
+  printf '[FAIL] runner-only change unexpectedly requires GUI smoke\n' >&2
+  exit 1
+fi
+git -C "$repo" checkout -q -
 
 commit_path 'tauri-ui/src/App.tsx' gui 'earlier GUI change'
 commit_path 'src/lib.rs' cli 'later CLI change'
