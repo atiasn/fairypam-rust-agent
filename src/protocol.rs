@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 // ============================================================
 // 共享子类型
@@ -150,6 +151,7 @@ pub struct GameProcessEvent {
 pub struct HubWelcome {
     pub protocol_version: u32,
     pub agent_id: String,
+    pub connection_id: Uuid,
     pub agent_name_effective: String,
     pub config: HubAgentConfig,
     pub accepted_capabilities: Vec<String>,
@@ -181,16 +183,17 @@ pub struct InputFrameResume {
 }
 
 /// 启动游戏指令。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GameLaunch {
-    pub session_id: String,
-    pub game_id: String,
+    #[serde(rename = "type", deserialize_with = "deserialize_game_launch_type")]
+    pub message_type: String,
+    pub session_id: Uuid,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
     pub trace_id: String,
-    pub executable: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub working_dir: Option<String>,
+    #[serde(deserialize_with = "deserialize_game_slug")]
+    pub game_slug: String,
+    pub connection_id: Uuid,
 }
 
 /// 终止游戏指令。
@@ -218,29 +221,45 @@ pub struct SettingsUpdate {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// Hub 请求 Agent 重新扫描本机米哈游游戏。
+/// Hub 请求 Agent 重新扫描系统游戏目录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MihoyoGameDiscoveryRescan {
+pub struct GameDiscoveryRequest {
     pub request_id: String,
 }
 
 /// Hub 下发的固定 environment-check/v1 任务。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentCheckStart {
+    #[serde(rename = "type")]
+    pub(crate) _message_type: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
     pub task_run_id: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
     pub trace_id: String,
-    pub template_id: String,
-    pub template_version: String,
-    pub game_id: String,
+    pub connection_id: Uuid,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub game_slug: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
     pub session_id: String,
-    pub executable: String,
-    #[serde(default)]
-    pub working_dir: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
     pub timeout_s: u64,
-    #[serde(default)]
     pub force_close_on_cleanup: bool,
+    #[serde(skip)]
+    pub(crate) resolved_executable: Option<String>,
+    #[serde(skip)]
+    pub(crate) resolved_working_dir: Option<String>,
+}
+
+impl EnvironmentCheckStart {
+    pub(crate) fn with_local_target(
+        mut self,
+        executable: String,
+        working_dir: Option<String>,
+    ) -> Self {
+        self.resolved_executable = Some(executable);
+        self.resolved_working_dir = working_dir;
+        self
+    }
 }
 
 /// Hub 下发的 environment-check/v1 取消信号。
@@ -250,6 +269,233 @@ pub struct EnvironmentCheckCancel {
     pub trace_id: String,
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+/// Hub 下发的版本化 TaskRun executor 启动请求。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRunStart {
+    #[serde(rename = "type", deserialize_with = "deserialize_task_run_start_type")]
+    pub message_type: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub task_run_id: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub trace_id: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub session_id: String,
+    pub connection_id: Uuid,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub game_slug: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub template_id: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub template_version: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+    pub timeout_s: u64,
+    #[serde(skip)]
+    pub(crate) resolved_executable: Option<String>,
+    #[serde(skip)]
+    pub(crate) resolved_working_dir: Option<String>,
+}
+
+impl TaskRunStart {
+    pub(crate) fn with_local_target(
+        mut self,
+        executable: String,
+        working_dir: Option<String>,
+    ) -> Self {
+        self.resolved_executable = Some(executable);
+        self.resolved_working_dir = working_dir;
+        self
+    }
+
+    pub(crate) fn local_target(&self) -> Option<(&str, Option<&str>)> {
+        self.resolved_executable
+            .as_deref()
+            .map(|executable| (executable, self.resolved_working_dir.as_deref()))
+    }
+}
+
+/// Hub 取消当前 TaskRun。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRunCancel {
+    #[serde(rename = "type", deserialize_with = "deserialize_task_run_cancel_type")]
+    pub message_type: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub task_run_id: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub trace_id: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub session_id: String,
+    pub connection_id: Uuid,
+}
+
+/// Hub 对当前 TaskRun 的最终判定。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRunTerminal {
+    #[serde(
+        rename = "type",
+        deserialize_with = "deserialize_task_run_terminal_type"
+    )]
+    pub message_type: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub task_run_id: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub trace_id: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub session_id: String,
+    pub connection_id: Uuid,
+    #[serde(deserialize_with = "deserialize_terminal_outcome")]
+    pub outcome: String,
+}
+
+/// Hub 下发的受限 TaskRun 单次左键点击。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRunClick {
+    #[serde(rename = "type", deserialize_with = "deserialize_task_run_click_type")]
+    pub message_type: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub task_run_id: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub trace_id: String,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub session_id: String,
+    pub connection_id: Uuid,
+    #[serde(deserialize_with = "deserialize_nonempty_string")]
+    pub click_id: String,
+    pub source_frame_seq: u64,
+    #[serde(deserialize_with = "deserialize_client_ratio")]
+    pub client_x_ratio: f64,
+    #[serde(deserialize_with = "deserialize_client_ratio")]
+    pub client_y_ratio: f64,
+    #[serde(deserialize_with = "deserialize_left_button")]
+    pub button: String,
+    #[serde(deserialize_with = "deserialize_single_click")]
+    pub click_count: u8,
+}
+
+fn deserialize_nonempty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(serde::de::Error::custom("value must not be empty"));
+    }
+    Ok(value)
+}
+
+fn deserialize_left_button<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_nonempty_string(deserializer)?;
+    if value != "left" {
+        return Err(serde::de::Error::custom("button must be left"));
+    }
+    Ok(value)
+}
+
+fn deserialize_task_run_click_type<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value != "task_run_click" {
+        return Err(serde::de::Error::custom("type must be task_run_click"));
+    }
+    Ok(value)
+}
+
+fn deserialize_game_launch_type<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_message_type(deserializer, "game_launch")
+}
+
+fn deserialize_game_slug<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_nonempty_string(deserializer)?;
+    if matches!(value.as_str(), "genshin" | "star-rail" | "zenless") {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom("unsupported canonical game slug"))
+    }
+}
+
+fn deserialize_message_type<'de, D>(deserializer: D, expected: &str) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value != expected {
+        return Err(serde::de::Error::custom(format!("type must be {expected}")));
+    }
+    Ok(value)
+}
+
+fn deserialize_task_run_start_type<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_message_type(deserializer, "task_run_start")
+}
+fn deserialize_task_run_cancel_type<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_message_type(deserializer, "task_run_cancel")
+}
+fn deserialize_task_run_terminal_type<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_message_type(deserializer, "task_run_terminal")
+}
+fn deserialize_terminal_outcome<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_nonempty_string(deserializer)?;
+    if matches!(
+        value.as_str(),
+        "succeeded" | "failed" | "canceled" | "interrupted"
+    ) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom("unknown terminal outcome"))
+    }
+}
+
+fn deserialize_single_click<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer)?;
+    if value != 1 {
+        return Err(serde::de::Error::custom("click_count must be 1"));
+    }
+    Ok(value)
+}
+
+fn deserialize_client_ratio<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = f64::deserialize(deserializer)?;
+    if !(value.is_finite() && 0.0 < value && value < 1.0) {
+        return Err(serde::de::Error::custom(
+            "client ratio must be finite and within (0,1)",
+        ));
+    }
+    Ok(value)
 }
 
 /// 暂停 AI 指令。
@@ -290,9 +536,13 @@ pub enum AgentMessage {
     GameLaunch(GameLaunch),
     GameKill(GameKill),
     SettingsUpdate(SettingsUpdate),
-    MihoyoGameDiscoveryRescan(MihoyoGameDiscoveryRescan),
+    GameDiscoveryRequest(GameDiscoveryRequest),
     EnvironmentCheckStart(EnvironmentCheckStart),
     EnvironmentCheckCancel(EnvironmentCheckCancel),
+    TaskRunStart(TaskRunStart),
+    TaskRunCancel(TaskRunCancel),
+    TaskRunClick(TaskRunClick),
+    TaskRunTerminal(TaskRunTerminal),
     PauseAI(PauseAI),
     ResumeAI(ResumeAI),
     Error(ErrorMessage),
@@ -310,6 +560,15 @@ pub struct AgentHello {
     pub protocol_version: u32,
     pub system_info: SystemInfo,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub supported_task_templates: Vec<SupportedTaskTemplate>,
+}
+
+/// 已编译进 Agent 的公开 TaskRun 模板键。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupportedTaskTemplate {
+    pub template_id: String,
+    pub template_version: String,
 }
 
 /// 心跳消息。
@@ -376,42 +635,29 @@ pub struct DebugOverlay {
     pub perf: Option<serde_json::Value>,
 }
 
-/// Agent 上报的米哈游游戏发现项。
+/// Agent 上报的 canonical 游戏发现项。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MihoyoGameDiscoveryItem {
-    pub discovery_id: String,
-    #[serde(default)]
-    pub game_id: Option<String>,
-    pub display_name: String,
-    #[serde(default)]
-    pub display_version: Option<String>,
-    #[serde(default)]
-    pub publisher: Option<String>,
-    #[serde(default)]
-    pub install_path: Option<String>,
-    #[serde(default)]
-    pub launch_path: Option<String>,
-    pub exists_on_disk: bool,
-    pub supported: bool,
-    #[serde(default)]
-    pub last_scanned_at: Option<String>,
-    pub status: String,
-    #[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct GameDiscoveryItem {
+    pub game_slug: String,
+    pub discovered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_discovered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-/// Agent 上报的米哈游游戏发现快照。
+/// Agent 上报的 canonical 游戏发现结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MihoyoGameDiscoverySnapshot {
-    #[serde(default)]
-    pub request_id: Option<String>,
+#[serde(deny_unknown_fields)]
+pub struct GameDiscoveryResult {
+    pub request_id: String,
     pub status: String,
-    #[serde(default)]
-    pub last_scanned_at: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(default)]
-    pub games: Vec<MihoyoGameDiscoveryItem>,
+    pub games: Vec<GameDiscoveryItem>,
 }
 
 /// Agent 回传环境检查步骤结果。
@@ -447,6 +693,47 @@ pub struct EnvironmentCheckResult {
     pub error_message: Option<String>,
 }
 
+/// Agent 上报的临时 TaskRun JPEG 帧；仅供 Hub 当前请求处理。
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskRunFrame {
+    pub task_run_id: String,
+    pub trace_id: String,
+    pub session_id: String,
+    pub connection_id: Uuid,
+    pub client_version: String,
+    pub frame_seq: u64,
+    pub window_width: u32,
+    pub window_height: u32,
+    pub frame_jpeg_base64: String,
+    pub target_process_alive: bool,
+    pub target_window_alive: bool,
+    pub last_applied_click_source_frame_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskRunStep {
+    pub task_run_id: String,
+    pub trace_id: String,
+    pub session_id: String,
+    pub step_id: String,
+    pub status: String,
+    pub result: serde_json::Value,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskRunResult {
+    pub task_run_id: String,
+    pub trace_id: String,
+    pub session_id: String,
+    pub status: String,
+    pub result: serde_json::Value,
+    pub steps: Vec<serde_json::Value>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
 fn default_success() -> bool {
     true
 }
@@ -471,12 +758,18 @@ pub enum HubMessage {
     GameEvent(GameEvent),
     #[serde(rename = "debug_overlay")]
     DebugOverlay(DebugOverlay),
-    #[serde(rename = "mihoyo_game_discovery_snapshot")]
-    MihoyoGameDiscoverySnapshot(MihoyoGameDiscoverySnapshot),
+    #[serde(rename = "game_discovery_result")]
+    GameDiscoveryResult(GameDiscoveryResult),
     #[serde(rename = "environment_check_step_result")]
     EnvironmentCheckStepResult(EnvironmentCheckStepResult),
     #[serde(rename = "environment_check_result")]
     EnvironmentCheckResult(EnvironmentCheckResult),
+    #[serde(rename = "task_run_frame")]
+    TaskRunFrame(TaskRunFrame),
+    #[serde(rename = "task_run_step")]
+    TaskRunStep(TaskRunStep),
+    #[serde(rename = "task_run_result")]
+    TaskRunResult(TaskRunResult),
 }
 
 // ============================================================
@@ -498,15 +791,19 @@ pub fn parse_message(text: &str) -> Result<AgentMessage, serde_json::Error> {
         "game_launch" => Ok(AgentMessage::GameLaunch(serde_json::from_value(raw)?)),
         "game_kill" => Ok(AgentMessage::GameKill(serde_json::from_value(raw)?)),
         "settings_update" => Ok(AgentMessage::SettingsUpdate(serde_json::from_value(raw)?)),
-        "mihoyo_game_discovery_rescan" => Ok(AgentMessage::MihoyoGameDiscoveryRescan(
-            serde_json::from_value(raw)?,
-        )),
+        "game_discovery_request" => Ok(AgentMessage::GameDiscoveryRequest(serde_json::from_value(
+            raw,
+        )?)),
         "environment_check_start" => Ok(AgentMessage::EnvironmentCheckStart(
             serde_json::from_value(raw)?,
         )),
         "environment_check_cancel" => Ok(AgentMessage::EnvironmentCheckCancel(
             serde_json::from_value(raw)?,
         )),
+        "task_run_start" => Ok(AgentMessage::TaskRunStart(serde_json::from_value(raw)?)),
+        "task_run_cancel" => Ok(AgentMessage::TaskRunCancel(serde_json::from_value(raw)?)),
+        "task_run_click" => Ok(AgentMessage::TaskRunClick(serde_json::from_value(raw)?)),
+        "task_run_terminal" => Ok(AgentMessage::TaskRunTerminal(serde_json::from_value(raw)?)),
         "pause_ai" => Ok(AgentMessage::PauseAI(serde_json::from_value(raw)?)),
         "resume_ai" => Ok(AgentMessage::ResumeAI(serde_json::from_value(raw)?)),
         "error" => Ok(AgentMessage::Error(serde_json::from_value(raw)?)),
@@ -551,78 +848,300 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovery_snapshot_serializes_snake_case_contract() {
-        let snapshot = HubMessage::MihoyoGameDiscoverySnapshot(MihoyoGameDiscoverySnapshot {
-            request_id: Some("req-1".to_string()),
-            status: "ready".to_string(),
-            last_scanned_at: Some("2026-07-04T00:00:00Z".to_string()),
-            error: None,
-            games: vec![MihoyoGameDiscoveryItem {
-                discovery_id: "hk4e_cn:c:/games".to_string(),
-                game_id: Some("hk4e_cn".to_string()),
-                display_name: "原神".to_string(),
-                display_version: Some("5.7.0".to_string()),
-                publisher: Some("miHoYo".to_string()),
-                install_path: Some(r"C:\HoYoPlay".to_string()),
-                launch_path: Some(
-                    r"C:\HoYoPlay\games\Genshin Impact Game\YuanShen.exe".to_string(),
-                ),
-                exists_on_disk: true,
-                supported: true,
-                last_scanned_at: Some("2026-07-04T00:00:00Z".to_string()),
-                status: "ok".to_string(),
-                error: None,
-            }],
+    fn task_run_frame_serializes_ephemeral_wire_contract() {
+        let connection_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let frame = HubMessage::TaskRunFrame(TaskRunFrame {
+            task_run_id: "task-a".into(),
+            trace_id: "trace-a".into(),
+            session_id: "session-a".into(),
+            connection_id,
+            client_version: "0.1.0".into(),
+            frame_seq: 7,
+            window_width: 1920,
+            window_height: 1080,
+            frame_jpeg_base64: "ZmFrZS1qcGVn".into(),
+            target_process_alive: true,
+            target_window_alive: true,
+            last_applied_click_source_frame_seq: None,
         });
 
-        let json = serde_json::to_string(&snapshot).unwrap();
+        let json = serde_json::to_value(frame).unwrap();
 
-        assert!(json.contains(r#""type":"mihoyo_game_discovery_snapshot""#));
-        assert!(json.contains(r#""request_id":"req-1""#));
-        assert!(json.contains(r#""discovery_id":"hk4e_cn:c:/games""#));
-        assert!(json.contains(r#""exists_on_disk":true"#));
-        assert!(!json.contains("requestId"));
-        assert!(!json.contains("existsOnDisk"));
+        assert_eq!(json["type"], "task_run_frame");
+        assert_eq!(json["task_run_id"], "task-a");
+        assert_eq!(json["trace_id"], "trace-a");
+        assert_eq!(json["session_id"], "session-a");
+        assert_eq!(
+            json["connection_id"],
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(json["frame_seq"], 7);
+        assert_eq!(json["window_width"], 1920);
+        assert_eq!(json["window_height"], 1080);
+        assert_eq!(json["target_process_alive"], true);
+        assert_eq!(json["target_window_alive"], true);
+        assert!(json["last_applied_click_source_frame_seq"].is_null());
     }
 
     #[test]
-    fn discovery_rescan_message_parses_request_id() {
-        let msg = parse_message(r#"{"type":"mihoyo_game_discovery_rescan","request_id":"req-2"}"#)
-            .unwrap();
+    fn task_run_click_parses_exact_left_single_click_contract() {
+        let msg = parse_message(
+            r#"{
+                "type":"task_run_click",
+                "task_run_id":"task-a",
+                "trace_id":"trace-a",
+                "session_id":"session-a",
+                "connection_id":"550e8400-e29b-41d4-a716-446655440000",
+                "click_id":"click-a",
+                "source_frame_seq":7,
+                "client_x_ratio":0.5,
+                "client_y_ratio":0.25,
+                "button":"left",
+                "click_count":1
+            }"#,
+        )
+        .unwrap();
 
         match msg {
-            AgentMessage::MihoyoGameDiscoveryRescan(request) => {
-                assert_eq!(request.request_id, "req-2");
+            AgentMessage::TaskRunClick(click) => {
+                assert_eq!(click.message_type, "task_run_click");
+                assert_eq!(click.task_run_id, "task-a");
+                assert_eq!(click.trace_id, "trace-a");
+                assert_eq!(click.session_id, "session-a");
+                assert_eq!(
+                    click.connection_id,
+                    Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+                );
+                assert_eq!(click.click_id, "click-a");
+                assert_eq!(click.source_frame_seq, 7);
+                assert_eq!(click.client_x_ratio, 0.5);
+                assert_eq!(click.client_y_ratio, 0.25);
+                assert_eq!(click.button, "left");
+                assert_eq!(click.click_count, 1);
             }
             other => panic!("unexpected message: {other:?}"),
         }
     }
 
     #[test]
-    fn environment_check_start_parses_fixed_wire_shape() {
+    fn task_run_click_rejects_missing_unknown_and_non_left_single_click_values() {
+        for payload in [
+            r#"{"type":"task_run_click","task_run_id":"task-a","trace_id":"trace-a","session_id":"session-a","source_frame_seq":1,"client_x_ratio":0.5,"client_y_ratio":0.5,"button":"left","click_count":1}"#,
+            r#"{"type":"task_run_click","task_run_id":"task-a","trace_id":"trace-a","session_id":"session-a","click_id":"click-a","source_frame_seq":1,"client_x_ratio":0.5,"client_y_ratio":0.5,"button":"left","click_count":1}"#,
+            r#"{"type":"task_run_click","task_run_id":"task-a","trace_id":"trace-a","session_id":"session-a","click_id":"click-a","source_frame_seq":1,"client_x_ratio":0.5,"client_y_ratio":0.5,"button":"right","click_count":1}"#,
+            r#"{"type":"task_run_click","task_run_id":"task-a","trace_id":"trace-a","session_id":"session-a","click_id":"click-a","source_frame_seq":1,"client_x_ratio":0.5,"client_y_ratio":0.5,"button":"left","click_count":2}"#,
+            r#"{"type":"task_run_click","task_run_id":"task-a","trace_id":"trace-a","session_id":"session-a","click_id":"click-a","source_frame_seq":1,"client_x_ratio":0.5,"client_y_ratio":0.5,"button":"left","click_count":1,"extra":"forbidden"}"#,
+            r#"{"type":"task_run_click","task_run_id":"","trace_id":"trace-a","session_id":"session-a","click_id":"click-a","source_frame_seq":1,"client_x_ratio":0.5,"client_y_ratio":0.5,"button":"left","click_count":1}"#,
+            r#"{"type":"other","task_run_id":"task-a","trace_id":"trace-a","session_id":"session-a","click_id":"click-a","source_frame_seq":1,"client_x_ratio":0.5,"client_y_ratio":0.5,"button":"left","click_count":1}"#,
+        ] {
+            assert!(parse_message(payload).is_err(), "payload must be rejected");
+        }
+    }
+
+    #[test]
+    fn task_run_click_rejects_malformed_connection_id() {
+        let payload = r#"{
+            "type":"task_run_click",
+            "task_run_id":"task-a",
+            "trace_id":"trace-a",
+            "session_id":"session-a",
+            "connection_id":"not-a-uuid",
+            "click_id":"click-a",
+            "source_frame_seq":7,
+            "client_x_ratio":0.5,
+            "client_y_ratio":0.25,
+            "button":"left",
+            "click_count":1
+        }"#;
+
+        assert!(parse_message(payload).is_err());
+
+        let empty_connection_id = r#"{
+            "type":"task_run_click",
+            "task_run_id":"task-a",
+            "trace_id":"trace-a",
+            "session_id":"session-a",
+            "connection_id":"",
+            "click_id":"click-a",
+            "source_frame_seq":7,
+            "client_x_ratio":0.5,
+            "client_y_ratio":0.25,
+            "button":"left",
+            "click_count":1
+        }"#;
+
+        assert!(parse_message(empty_connection_id).is_err());
+    }
+
+    #[test]
+    fn game_discovery_request_parses_and_private_rescan_is_rejected() {
+        let msg =
+            parse_message(r#"{"type":"game_discovery_request","request_id":"req-3"}"#).unwrap();
+
+        assert!(matches!(
+            msg,
+            AgentMessage::GameDiscoveryRequest(GameDiscoveryRequest { request_id }) if request_id == "req-3"
+        ));
+        assert!(
+            parse_message(r#"{"type":"mihoyo_game_discovery_rescan","request_id":"req-3"}"#)
+                .is_err()
+        );
+        assert!(parse_message(r#"{"type":"game_discovery_request"}"#).is_err());
+    }
+
+    #[test]
+    fn game_discovery_result_serializes_canonical_contract_without_paths() {
+        let result = HubMessage::GameDiscoveryResult(GameDiscoveryResult {
+            request_id: "req-3".to_string(),
+            status: "ready".to_string(),
+            error: None,
+            games: vec![GameDiscoveryItem {
+                game_slug: "genshin".to_string(),
+                discovered: true,
+                discovery_source: Some("registry".to_string()),
+                last_discovered_at: Some("2026-07-04T00:00:00Z".to_string()),
+                error: None,
+            }],
+        });
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains(r#""type":"game_discovery_result""#));
+        assert!(json.contains(r#""game_slug":"genshin""#));
+        assert!(json.contains(r#""discovered":true"#), "{json}");
+        assert!(!json.contains(r#"C:\\HoYoPlay"#));
+        assert!(!json.contains("executable_path"));
+        assert!(!json.contains("working_dir"));
+        assert!(!json.contains("mihoyo_game_discovery_snapshot"));
+    }
+
+    #[test]
+    fn game_discovery_item_rejects_removed_path_properties() {
+        assert!(serde_json::from_str::<GameDiscoveryItem>(
+            r#"{"game_slug":"genshin","discovered":true,"executable_path":"C:\\private"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn task_run_start_accepts_only_pathless_canonical_wire() {
+        let canonical = r#"{
+            "type":"task_run_start",
+            "task_run_id":"task-a",
+            "trace_id":"trace-a",
+            "session_id":"session-a",
+            "connection_id":"550e8400-e29b-41d4-a716-446655440002",
+            "game_slug":"genshin",
+            "template_id":"genshin/launch-to-ready",
+            "template_version":"v1",
+            "params":{"leave_running":true},
+            "timeout_s":30
+        }"#;
+
+        assert!(matches!(
+            parse_message(canonical),
+            Ok(AgentMessage::TaskRunStart(TaskRunStart { game_slug, .. })) if game_slug == "genshin"
+        ));
+
+        for removed_field in ["game_id", "executable", "executable_path", "working_dir"] {
+            let payload = canonical.replacen(
+                "\n        }",
+                &format!(",\n            \"{removed_field}\":\"private-value\"\n        }}"),
+                1,
+            );
+            assert!(
+                parse_message(&payload).is_err(),
+                "{removed_field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn environment_check_start_accepts_only_pathless_canonical_wire() {
         let msg = parse_message(
             r#"{
                 "type":"environment_check_start",
-                "task_run_id":"task-a",
+                "task_run_id":"550e8400-e29b-41d4-a716-446655440001",
                 "trace_id":"trace-a",
-                "template_id":"environment-check/v1",
-                "template_version":"v1",
-                "game_id":"game-a",
-                "session_id":"session-a",
-                "executable":"game.exe",
-                "timeout_s":10
+                "connection_id":"550e8400-e29b-41d4-a716-446655440002",
+                "game_slug":"genshin",
+                "session_id":"550e8400-e29b-41d4-a716-446655440003",
+                "timeout_s":10,
+                "force_close_on_cleanup":false
             }"#,
         )
         .unwrap();
 
         match msg {
             AgentMessage::EnvironmentCheckStart(command) => {
-                assert_eq!(command.template_id, "environment-check/v1");
-                assert_eq!(command.executable, "game.exe");
-                assert!(command.args.is_empty());
+                assert_eq!(command.game_slug, "genshin");
+                assert_eq!(
+                    command.connection_id,
+                    Uuid::parse_str("550e8400-e29b-41d4-a716-446655440002").unwrap()
+                );
             }
             other => panic!("unexpected message: {other:?}"),
         }
+
+        for removed_field in ["game_id", "executable", "working_dir"] {
+            let payload = format!(
+                r#"{{
+                    "type":"environment_check_start",
+                    "task_run_id":"550e8400-e29b-41d4-a716-446655440001",
+                    "trace_id":"trace-a",
+                    "connection_id":"550e8400-e29b-41d4-a716-446655440002",
+                    "game_slug":"genshin",
+                    "session_id":"550e8400-e29b-41d4-a716-446655440003",
+                    "timeout_s":10,
+                    "force_close_on_cleanup":false,
+                    "{removed_field}":"private-value"
+                }}"#,
+            );
+            assert!(
+                parse_message(&payload).is_err(),
+                "{removed_field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn game_launch_accepts_only_pathless_canonical_wire() {
+        let canonical = r#"{
+            "type":"game_launch",
+            "session_id":"550e8400-e29b-41d4-a716-446655440001",
+            "trace_id":"trace-a",
+            "game_slug":"genshin",
+            "connection_id":"550e8400-e29b-41d4-a716-446655440002"
+        }"#;
+
+        let message = parse_message(canonical).expect("canonical game launch parses");
+        assert!(matches!(
+            message,
+            AgentMessage::GameLaunch(GameLaunch { game_slug, .. }) if game_slug == "genshin"
+        ));
+
+        for removed_field in ["game_id", "executable", "working_dir", "unexpected"] {
+            let payload = format!(
+                r#"{{
+                    "type":"game_launch",
+                    "session_id":"550e8400-e29b-41d4-a716-446655440001",
+                    "trace_id":"trace-a",
+                    "game_slug":"genshin",
+                    "connection_id":"550e8400-e29b-41d4-a716-446655440002",
+                    "{removed_field}":"private-value"
+                }}"#,
+            );
+            assert!(
+                parse_message(&payload).is_err(),
+                "{removed_field} must be rejected"
+            );
+        }
+
+        assert!(parse_message(&canonical.replace("genshin", "unsupported")).is_err());
+        assert!(parse_message(
+            &canonical.replace("550e8400-e29b-41d4-a716-446655440001", "not-a-uuid",)
+        )
+        .is_err());
+        assert!(parse_message(&canonical.replace("\"trace-a\"", "\"\"")).is_err());
     }
 
     #[test]

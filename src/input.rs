@@ -11,6 +11,39 @@ use tracing::{debug, warn};
 
 use crate::protocol::{InputFrame, MouseState};
 
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VirtualDesktop {
+    pub left: i32,
+    pub top: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn virtual_desktop_absolute_point(
+    desktop: VirtualDesktop,
+    screen_x: i32,
+    screen_y: i32,
+) -> Result<(i32, i32)> {
+    if desktop.width <= 0
+        || desktop.height <= 0
+        || screen_x < desktop.left
+        || screen_y < desktop.top
+        || i64::from(screen_x) >= i64::from(desktop.left) + i64::from(desktop.width)
+        || i64::from(screen_y) >= i64::from(desktop.top) + i64::from(desktop.height)
+    {
+        anyhow::bail!("target point is outside the virtual desktop");
+    }
+    let scale = |offset: i32, size: i32| -> i32 {
+        ((i64::from(offset) * 65_535) / i64::from((size - 1).max(1))) as i32
+    };
+    Ok((
+        scale(screen_x - desktop.left, desktop.width),
+        scale(screen_y - desktop.top, desktop.height),
+    ))
+}
+
 /// 输入差异（需要变更的操作）。
 #[derive(Debug, Default)]
 pub struct InputDiff {
@@ -172,6 +205,66 @@ impl InputController {
         let result = Ok(());
 
         self.apply_emergency_stop_result(result)
+    }
+
+    /// Crate-private primitive for one validated target-bound left click.
+    pub(crate) fn click_left_once(&mut self, x: i32, y: i32) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+                MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+            };
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+                SM_YVIRTUALSCREEN,
+            };
+            let desktop = VirtualDesktop {
+                left: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+                top: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+                width: unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+                height: unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+            };
+            let (absolute_x, absolute_y) = virtual_desktop_absolute_point(desktop, x, y)?;
+            let inputs = [
+                mouse_input(
+                    absolute_x,
+                    absolute_y,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                ),
+                mouse_input(0, 0, MOUSEEVENTF_LEFTDOWN),
+                mouse_input(0, 0, MOUSEEVENTF_LEFTUP),
+            ];
+            let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            if sent != inputs.len() as u32 {
+                anyhow::bail!("SendInput only sent {sent}/{} click events", inputs.len());
+            }
+            fn mouse_input(
+                dx: i32,
+                dy: i32,
+                flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+            ) -> INPUT {
+                INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx,
+                            dy,
+                            mouseData: 0,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (x, y);
+            anyhow::bail!("target-bound click only supports Windows")
+        }
     }
 
     fn apply_emergency_stop_result(&mut self, result: Result<()>) -> Result<()> {
@@ -517,5 +610,25 @@ mod tests {
             assert_eq!(ctrl.current_kb.get("w").map(String::as_str), Some("down"));
             assert_eq!(ctrl.current_mouse.buttons.left, "down");
         }
+    }
+
+    #[test]
+    fn virtual_desktop_coordinates_support_negative_secondary_monitor() {
+        let desktop = VirtualDesktop {
+            left: -1920,
+            top: -180,
+            width: 3840,
+            height: 1260,
+        };
+
+        assert_eq!(
+            virtual_desktop_absolute_point(desktop, -1920, -180).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            virtual_desktop_absolute_point(desktop, 1919, 1079).unwrap(),
+            (65_535, 65_535)
+        );
+        assert!(virtual_desktop_absolute_point(desktop, -1921, 0).is_err());
     }
 }

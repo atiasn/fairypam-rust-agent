@@ -70,19 +70,19 @@ const KNOWN_GAMES: &[KnownGame] = &[
     },
     KnownGame {
         game_id: "hkrpg_cn",
-        profile_id: "star_rail",
+        profile_id: "star-rail",
         display_name: "崩坏：星穹铁道",
         game_dir: "Star Rail Game",
         process_name: "StarRail.exe",
-        supported: false,
+        supported: true,
     },
     KnownGame {
         game_id: "nap_cn",
-        profile_id: "zzz",
+        profile_id: "zenless",
         display_name: "绝区零",
         game_dir: "ZenlessZoneZero Game",
         process_name: "ZZZ.exe",
-        supported: false,
+        supported: true,
     },
 ];
 
@@ -578,12 +578,44 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_games_are_discovered_but_not_operable() {
+    fn canonical_profiles_are_discovered_as_supported() {
+        let installs = discover_from_entries(
+            vec![
+                entry(Some("hkrpg_cn"), r"C:\HoYoPlay"),
+                entry(Some("nap_cn"), r"C:\HoYoPlay"),
+            ],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(installs[0].profile_id.as_deref(), Some("star-rail"));
+        assert!(installs[0].supported);
+        assert_eq!(installs[1].profile_id.as_deref(), Some("zenless"));
+        assert!(installs[1].supported);
+        assert!(!installs[0].exists_on_disk);
+        assert!(!installs[1].exists_on_disk);
+    }
+
+    #[test]
+    fn discovery_reads_metadata_without_mutating_it() {
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-discovery-read-only-{}",
+            std::process::id()
+        ));
+        let config = root.join("config.ini");
+        std::fs::create_dir_all(root.join("games").join("Genshin Impact Game")).unwrap();
+        std::fs::write(&config, "game_version=5.7.0\n").unwrap();
+
         let installs =
-            discover_from_entries(vec![entry(Some("hkrpg_cn"), r"C:\HoYoPlay")], None).unwrap();
-        assert_eq!(installs[0].profile_id.as_deref(), Some("star_rail"));
-        assert!(!installs[0].supported);
-        assert!(!(installs[0].supported && installs[0].exists_on_disk));
+            discover_from_entries(vec![entry(Some("hk4e_cn"), root.to_str().unwrap())], None)
+                .unwrap();
+
+        assert_eq!(installs[0].game_version.as_deref(), Some("5.7.0"));
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "game_version=5.7.0\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

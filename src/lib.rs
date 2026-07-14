@@ -4,6 +4,7 @@ pub mod config;
 pub mod core_facade;
 pub mod environment_check;
 pub mod input;
+pub mod launch_to_ready;
 pub mod mihoyo_discovery;
 pub mod process;
 pub mod protocol;

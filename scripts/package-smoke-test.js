@@ -181,6 +181,7 @@ const server = net.createServer((socket) => {
                 protocol_version: 3,
                 agent_id: "00000000-0000-0000-0000-000000000001",
                 agent_name_effective: "candidate-smoke",
+                connection_id: "00000000-0000-0000-0000-000000000002",
                 config: {
                   heartbeat_interval_s: 1,
                   command_timeout_s: 5,

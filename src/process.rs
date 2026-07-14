@@ -2,9 +2,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-#[cfg(any(target_os = "windows", test))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use crate::config::GameProfileOverride;
@@ -142,7 +140,7 @@ pub(crate) fn default_game_profiles() -> HashMap<String, GameProfile> {
             &["yuanshen.exe", "genshinimpact.exe"],
         ),
         profile(
-            "star_rail",
+            "star-rail",
             "崩坏：星穹铁道",
             "hkrpg_cn",
             "StarRail.exe",
@@ -150,7 +148,7 @@ pub(crate) fn default_game_profiles() -> HashMap<String, GameProfile> {
             &["starrail.exe"],
         ),
         profile(
-            "zzz",
+            "zenless",
             "绝区零",
             "nap_cn",
             "ZZZ.exe",
@@ -229,7 +227,7 @@ fn profile_for_launch(
     executable: &str,
 ) -> Option<GameProfile> {
     if let Some(profile) = profiles.get(game_id) {
-        return Some(profile.clone());
+        return profile_matches_executable(profile, executable).then(|| profile.clone());
     }
 
     let executable_name = normalize_executable_name(executable);
@@ -246,11 +244,9 @@ fn profile_for_launch(
         .cloned()
 }
 
-fn with_explicit_profile_executable(mut profile: GameProfile, executable: &str) -> GameProfile {
-    if profile.executable_path.is_none() && executable.contains(['\\', '/']) {
-        profile.executable_path = Some(executable.to_string());
-    }
-    profile
+fn profile_matches_executable(profile: &GameProfile, executable: &str) -> bool {
+    normalize_executable_name(executable)
+        .is_some_and(|name| profile.aliases.iter().any(|alias| alias == &name))
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -264,6 +260,34 @@ fn extract_hyp_install_path(content: &str, internal_id: &str) -> Option<String> 
         .and_then(|path| path.as_str())
         .filter(|path| !path.trim().is_empty())
         .map(ToString::to_string)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn extract_hyp_game_version(content: &str, internal_id: &str) -> Option<String> {
+    let start = content.find(internal_id)?;
+    let json_start = content[start..].find('{')? + start;
+    let json = json_object_at(content, json_start)?;
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    value
+        .get("version")
+        .and_then(|version| version.as_str())
+        .map(str::trim)
+        .filter(|version| is_safe_client_version(version))
+        .map(ToString::to_string)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_safe_client_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn unknown_hyp_profile_diagnostic() -> &'static str {
+    "HYP config has no matching known game profile"
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -316,6 +340,7 @@ fn resolve_hyp_game_executable(game: &GameProfile) -> Result<Option<PathBuf>> {
     let content = std::fs::read_to_string(&data_path)
         .with_context(|| format!("failed to read HYP game data: {}", data_path.display()))?;
     let Some(install_path) = extract_hyp_install_path(&content, &game.hyp_internal_id) else {
+        warn!("{}", unknown_hyp_profile_diagnostic());
         return Ok(None);
     };
     Ok(Some(profile_executable_from_install_path(
@@ -336,7 +361,6 @@ fn missing_profile_executable_message(game: &GameProfile) -> String {
     )
 }
 
-#[cfg(any(target_os = "windows", test))]
 fn validate_profile_executable_path(game: &GameProfile, path: &Path) -> Result<String> {
     if path.exists() {
         return Ok(path.display().to_string());
@@ -348,30 +372,116 @@ fn validate_profile_executable_path(game: &GameProfile, path: &Path) -> Result<S
     )
 }
 
-#[cfg(target_os = "windows")]
-fn resolve_profile_executable(game: &GameProfile) -> Result<String> {
-    if let Some(path) = &game.executable_path {
-        return Ok(path.clone());
+fn resolve_discovered_profile_executable(
+    game: &GameProfile,
+    discoveries: &[crate::mihoyo_discovery::MihoyoGameInstall],
+) -> Option<PathBuf> {
+    discoveries.iter().find_map(|candidate| {
+        let path = candidate.launch_path.as_ref()?;
+        (candidate.profile_id.as_deref() == Some(game.profile_id.as_str())
+            && candidate.supported
+            && candidate.exists_on_disk
+            && path.is_file()
+            && profile_matches_executable(game, &path.display().to_string()))
+        .then(|| path.clone())
+    })
+}
+
+/// Resolves a canonical environment-check game only from local miHoYo discovery.
+/// The path is intentionally kept agent-local and must never be serialized to Hub.
+pub(crate) fn resolve_discovered_game_launch(game_slug: &str) -> Result<(String, Option<String>)> {
+    let discoveries = crate::mihoyo_discovery::discover_mihoyo_games()?;
+    resolve_discovered_game_launch_from_discoveries(game_slug, &discoveries)
+}
+
+fn resolve_discovered_game_launch_from_discoveries(
+    game_slug: &str,
+    discoveries: &[crate::mihoyo_discovery::MihoyoGameInstall],
+) -> Result<(String, Option<String>)> {
+    let game = default_game_profiles()
+        .remove(game_slug)
+        .ok_or_else(|| anyhow::anyhow!("unsupported canonical game slug"))?;
+    let executable = resolve_discovered_profile_executable(&game, discoveries)
+        .ok_or_else(|| anyhow::anyhow!("local discovered game target unavailable"))?;
+    let working_dir = executable
+        .parent()
+        .map(|path| path.to_string_lossy().into_owned());
+    Ok((executable.to_string_lossy().into_owned(), working_dir))
+}
+
+fn resolve_profile_executable_from_sources(
+    game: &GameProfile,
+    discoveries: &[crate::mihoyo_discovery::MihoyoGameInstall],
+    hyp_path: Option<PathBuf>,
+) -> Result<String> {
+    if let Some(path) = resolve_discovered_profile_executable(game, discoveries) {
+        info!(
+            "resolved HoYoverse launch target from local discovery: {}",
+            game.process_name
+        );
+        return validate_profile_executable_path(game, &path);
     }
 
-    match resolve_hyp_game_executable(game)? {
+    match hyp_path {
         Some(path) if path.exists() => {
             info!(
                 "resolved HoYoverse launch target from HYP config: {}",
                 game.process_name
             );
-            Ok(path.display().to_string())
+            validate_profile_executable_path(game, &path)
         }
         Some(path) => validate_profile_executable_path(game, &path),
-        None => anyhow::bail!("{}", missing_profile_executable_message(game)),
+        None => game
+            .executable_path
+            .as_deref()
+            .map(Path::new)
+            .map(|path| validate_profile_executable_path(game, path))
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("{}", missing_profile_executable_message(game))),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_profile_executable(game: &GameProfile) -> Result<String> {
+    let discoveries = match crate::mihoyo_discovery::discover_mihoyo_games() {
+        Ok(discoveries) => discoveries,
+        Err(err) => {
+            warn!("local HoYoverse discovery failed; falling back to HYP/config: {err}");
+            Vec::new()
+        }
+    };
+    resolve_profile_executable_from_sources(game, &discoveries, resolve_hyp_game_executable(game)?)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_profile_client_version(game: &GameProfile) -> Option<String> {
+    crate::mihoyo_discovery::discover_mihoyo_games()
+        .ok()
+        .and_then(|discoveries| {
+            discoveries.into_iter().find_map(|candidate| {
+                (candidate.profile_id.as_deref() == Some(game.profile_id.as_str())
+                    && candidate.supported)
+                    .then_some(candidate.game_version)
+                    .flatten()
+                    .filter(|version| is_safe_client_version(version))
+            })
+        })
+        .or_else(|| {
+            let data_path = hyp_game_data_path();
+            std::fs::read_to_string(data_path)
+                .ok()
+                .and_then(|content| extract_hyp_game_version(&content, &game.hyp_internal_id))
+        })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_profile_client_version(_game: &GameProfile) -> Option<String> {
+    None
 }
 
 #[cfg(not(target_os = "windows"))]
 fn resolve_profile_executable(game: &GameProfile) -> Result<String> {
-    game.executable_path
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("{}", missing_profile_executable_message(game)))
+    resolve_profile_executable_from_sources(game, &[], None)
 }
 
 #[cfg(target_os = "windows")]
@@ -518,6 +628,7 @@ pub struct ProcessManager {
     active_kill_pid: Option<u32>,
     active_executable: Option<String>,
     active_binding: Option<TargetBinding>,
+    active_client_version: Option<String>,
     profiles: HashMap<String, GameProfile>,
 }
 
@@ -536,6 +647,7 @@ impl ProcessManager {
             active_kill_pid: None,
             active_executable: None,
             active_binding: None,
+            active_client_version: None,
             profiles: default_game_profiles(),
         }
     }
@@ -547,6 +659,50 @@ impl ProcessManager {
             profiles: profiles_with_overrides(overrides)?,
             ..Self::new()
         })
+    }
+
+    /// Resolves a canonical game target only from Agent-local profile sources.
+    pub(crate) fn resolve_canonical_game_launch(
+        &self,
+        game_slug: &str,
+    ) -> Result<(String, Option<String>)> {
+        let profile = self
+            .profiles
+            .get(game_slug)
+            .ok_or_else(|| anyhow::anyhow!("unsupported canonical game slug"))?;
+        let executable = resolve_profile_executable(profile)?;
+        if !profile_matches_executable(profile, &executable) {
+            anyhow::bail!("local canonical target does not match game profile")
+        }
+        let working_dir = profile.working_dir.clone().or_else(|| {
+            Path::new(&executable)
+                .parent()
+                .map(|path| path.to_string_lossy().into_owned())
+        });
+        Ok((executable, working_dir))
+    }
+
+    #[cfg(test)]
+    fn resolve_canonical_game_launch_from_sources(
+        &self,
+        game_slug: &str,
+        discoveries: &[crate::mihoyo_discovery::MihoyoGameInstall],
+        hyp_path: Option<PathBuf>,
+    ) -> Result<(String, Option<String>)> {
+        let profile = self
+            .profiles
+            .get(game_slug)
+            .ok_or_else(|| anyhow::anyhow!("unsupported canonical game slug"))?;
+        let executable = resolve_profile_executable_from_sources(profile, discoveries, hyp_path)?;
+        if !profile_matches_executable(profile, &executable) {
+            anyhow::bail!("local canonical target does not match game profile")
+        }
+        let working_dir = profile.working_dir.clone().or_else(|| {
+            Path::new(&executable)
+                .parent()
+                .map(|path| path.to_string_lossy().into_owned())
+        });
+        Ok((executable, working_dir))
     }
 
     pub fn launch(
@@ -567,8 +723,10 @@ impl ProcessManager {
     ) -> Result<u32> {
         let requested_executable =
             normalize_launch_path(executable).unwrap_or_else(|| executable.trim().to_string());
-        let profile = profile_for_launch(&self.profiles, game_id, &requested_executable)
-            .map(|profile| with_explicit_profile_executable(profile, &requested_executable));
+        let profile = profile_for_launch(&self.profiles, game_id, &requested_executable);
+        if !game_id.is_empty() && profile.is_none() {
+            anyhow::bail!("launch rejected: executable does not match game profile: {game_id}");
+        }
         let mut executable = match profile.as_ref() {
             Some(profile) => resolve_profile_executable(profile)?,
             None => requested_executable.clone(),
@@ -583,7 +741,12 @@ impl ProcessManager {
             executable,
             working_dir.as_deref(),
         );
-        info!("launch process: {} {:?}", executable, args);
+        let client_version = profile.as_ref().and_then(resolve_profile_client_version);
+        info!(
+            "launch process: executable_name={}, args_count={}",
+            normalize_executable_name(&executable).unwrap_or_else(|| "unknown".to_string()),
+            args.len()
+        );
         #[cfg(target_os = "windows")]
         let existing_pids = matching_process_ids(&executable).unwrap_or_default();
 
@@ -631,6 +794,7 @@ impl ProcessManager {
         self.active_executable = Some(executable.to_string());
         self.active_kill_pid = Some(kill_pid);
         self.active_binding = binding;
+        self.active_client_version = client_version;
         info!("process launched: PID={}, kill_pid={}", pid, kill_pid);
         Ok(pid)
     }
@@ -682,6 +846,7 @@ impl ProcessManager {
         self.active_kill_pid = None;
         self.active_executable = None;
         self.active_binding = None;
+        self.active_client_version = None;
         Ok(())
     }
 
@@ -731,6 +896,10 @@ impl ProcessManager {
         Ok(refreshed)
     }
 
+    pub(crate) fn active_client_version(&self) -> Option<&str> {
+        self.active_client_version.as_deref()
+    }
+
     pub fn take_exit_event(&mut self) -> Option<ActiveProcessExit> {
         #[cfg(target_os = "windows")]
         if let Some(binding) = &self.active_binding {
@@ -770,6 +939,7 @@ impl ProcessManager {
         self.active_kill_pid = None;
         self.active_executable = None;
         self.active_binding = None;
+        self.active_client_version = None;
     }
 }
 
@@ -1100,6 +1270,19 @@ impl Default for ProcessManager {
 mod tests {
     use super::*;
 
+    fn discovered_install(
+        profile_id: &str,
+        launch_path: Option<PathBuf>,
+    ) -> crate::mihoyo_discovery::MihoyoGameInstall {
+        crate::mihoyo_discovery::MihoyoGameInstall {
+            profile_id: Some(profile_id.to_string()),
+            launch_path,
+            supported: true,
+            exists_on_disk: true,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_process_manager_new_has_no_active_pid() {
         let pm = ProcessManager::new();
@@ -1119,6 +1302,7 @@ mod tests {
             active_kill_pid: Some(6540),
             active_executable: Some("notepad.exe".to_string()),
             active_binding: None,
+            active_client_version: None,
             profiles: default_game_profiles(),
         };
 
@@ -1139,6 +1323,7 @@ mod tests {
             active_kill_pid: None,
             active_executable: Some("fairypam-agent-test".to_string()),
             active_binding: None,
+            active_client_version: None,
             profiles: default_game_profiles(),
         };
 
@@ -1158,6 +1343,7 @@ mod tests {
             active_kill_pid: None,
             active_executable: Some("missing-game.exe".to_string()),
             active_binding: None,
+            active_client_version: None,
             profiles: default_game_profiles(),
         };
 
@@ -1284,15 +1470,21 @@ mod tests {
         assert_eq!(genshin.window_title, "原神");
         assert_eq!(genshin.window_class, "UnityWndClass");
 
-        let zzz = known_game_for_executable(r"C:\Games\ZenlessZoneZero.exe").expect("zzz");
-        assert_eq!(zzz.hyp_internal_id, "nap_cn");
-        assert_eq!(zzz.process_name, "ZZZ.exe");
+        let star_rail = known_game_for_executable(r"C:\Games\StarRail.exe").expect("star rail");
+        assert_eq!(star_rail.profile_id, "star-rail");
+        assert_eq!(star_rail.hyp_internal_id, "hkrpg_cn");
+        assert_eq!(star_rail.window_title, "崩坏：星穹铁道");
+
+        let zenless = known_game_for_executable(r"C:\Games\ZenlessZoneZero.exe").expect("zenless");
+        assert_eq!(zenless.profile_id, "zenless");
+        assert_eq!(zenless.hyp_internal_id, "nap_cn");
+        assert_eq!(zenless.process_name, "ZZZ.exe");
     }
 
     #[test]
     fn profile_defaults_and_overrides_are_minimal_and_strict() {
         let defaults = default_game_profiles();
-        assert!(["genshin", "star_rail", "zzz"]
+        assert!(["genshin", "star-rail", "zenless"]
             .iter()
             .all(|profile_id| defaults.contains_key(*profile_id)));
         assert!(defaults
@@ -1324,6 +1516,87 @@ mod tests {
     }
 
     #[test]
+    fn game_id_launch_rejects_a_mismatched_profile_executable() {
+        let profiles = default_game_profiles();
+
+        assert!(profile_for_launch(&profiles, "genshin", r"C:\Games\ZZZ.exe").is_none());
+        assert!(profile_for_launch(&profiles, "zenless", r"C:\Games\ZZZ.exe").is_some());
+    }
+
+    #[test]
+    fn configured_profile_executable_must_still_exist_before_launch() {
+        let mut genshin = default_game_profiles().remove("genshin").expect("genshin");
+        genshin.executable_path = Some(r"Z:\FairyPam\missing\YuanShen.exe".into());
+
+        assert!(resolve_profile_executable_from_sources(&genshin, &[], None).is_err());
+    }
+
+    #[test]
+    fn canonical_launch_resolves_only_injected_local_sources() {
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-canonical-launch-profile-{}",
+            std::process::id()
+        ));
+        let configured_executable = root.join("configured").join("YuanShen.exe");
+        let hyp_executable = root.join("hyp").join("YuanShen.exe");
+        std::fs::create_dir_all(configured_executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(hyp_executable.parent().unwrap()).unwrap();
+        std::fs::write(&configured_executable, b"test").unwrap();
+        std::fs::write(&hyp_executable, b"test").unwrap();
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "genshin".to_string(),
+            GameProfileOverride {
+                executable_path: Some(configured_executable.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+        let manager = ProcessManager::with_profile_overrides(&overrides).unwrap();
+
+        let (resolved, working_dir) = manager
+            .resolve_canonical_game_launch_from_sources(
+                "genshin",
+                &[],
+                Some(hyp_executable.clone()),
+            )
+            .unwrap();
+        assert_eq!(resolved, hyp_executable.to_string_lossy());
+        assert_eq!(
+            working_dir.as_deref(),
+            hyp_executable.parent().and_then(|path| path.to_str())
+        );
+        let (resolved, working_dir) = manager
+            .resolve_canonical_game_launch_from_sources("genshin", &[], None)
+            .unwrap();
+        assert_eq!(resolved, configured_executable.to_string_lossy());
+        assert_eq!(
+            working_dir.as_deref(),
+            configured_executable
+                .parent()
+                .and_then(|path| path.to_str())
+        );
+        assert!(manager
+            .resolve_canonical_game_launch_from_sources("unsupported", &[], None)
+            .is_err());
+
+        overrides.insert(
+            "genshin".to_string(),
+            GameProfileOverride {
+                executable_path: Some(root.join("ZZZ.exe").to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+        std::fs::write(root.join("ZZZ.exe"), b"test").unwrap();
+        let mismatched = ProcessManager::with_profile_overrides(&overrides).unwrap();
+        assert!(mismatched
+            .resolve_canonical_game_launch_from_sources("genshin", &[], None)
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn profile_missing_path_error_is_explicit() {
         let genshin = default_game_profiles().remove("genshin").expect("genshin");
 
@@ -1332,33 +1605,127 @@ mod tests {
     }
 
     #[test]
-    fn explicit_hoyoverse_path_becomes_profile_executable_override() {
-        let profile = profile_for_launch(
+    fn discovery_resolves_matching_genshin_executable_before_fallbacks() {
+        let genshin = default_game_profiles().remove("genshin").expect("genshin");
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-discovery-profile-resolution-{}",
+            std::process::id()
+        ));
+        let executable = root.join("YuanShen.exe");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&executable, b"test").unwrap();
+
+        assert_eq!(
+            resolve_profile_executable_from_sources(
+                &genshin,
+                &[discovered_install("genshin", Some(executable.clone()))],
+                None,
+            )
+            .unwrap(),
+            executable.display().to_string()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn environment_check_resolver_uses_only_matching_discovered_canonical_target() {
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-environment-check-discovery-{}",
+            std::process::id()
+        ));
+        let executable = root.join("YuanShen.exe");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&executable, b"test").unwrap();
+        let discoveries = vec![discovered_install("genshin", Some(executable.clone()))];
+
+        let (resolved, working_dir) =
+            resolve_discovered_game_launch_from_discoveries("genshin", &discoveries).unwrap();
+        assert_eq!(resolved, executable.display().to_string());
+        assert_eq!(
+            working_dir.as_deref(),
+            Some(root.to_string_lossy().as_ref())
+        );
+        assert!(resolve_discovered_game_launch_from_discoveries("unknown", &discoveries).is_err());
+        assert!(
+            resolve_discovered_game_launch_from_discoveries("star-rail", &discoveries).is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovery_rejects_noncanonical_unsupported_missing_and_alias_mismatch_candidates() {
+        let genshin = default_game_profiles().remove("genshin").expect("genshin");
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-discovery-profile-rejections-{}",
+            std::process::id()
+        ));
+        let executable = root.join("YuanShen.exe");
+        let wrong_executable = root.join("ZZZ.exe");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&executable, b"test").unwrap();
+        std::fs::write(&wrong_executable, b"test").unwrap();
+
+        let mut unsupported = discovered_install("genshin", Some(executable.clone()));
+        unsupported.supported = false;
+        let mut missing = discovered_install("genshin", Some(executable.clone()));
+        missing.exists_on_disk = false;
+        let candidates = [
+            discovered_install("star-rail", Some(executable)),
+            unsupported,
+            missing,
+            discovered_install("genshin", Some(wrong_executable)),
+        ];
+
+        assert!(resolve_discovered_profile_executable(&genshin, &candidates).is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn profile_resolution_keeps_existing_error_when_all_sources_are_missing() {
+        let genshin = default_game_profiles().remove("genshin").expect("genshin");
+
+        assert!(resolve_profile_executable_from_sources(&genshin, &[], None)
+            .unwrap_err()
+            .to_string()
+            .contains("needs executable_path or HYP installPath"));
+    }
+
+    #[test]
+    fn explicit_hoyoverse_path_matches_profile_alias() {
+        assert!(profile_for_launch(
             &default_game_profiles(),
             "",
             r"C:\Program Files\miHoYo Launcher\games\Genshin Impact Game\YuanShen.exe",
         )
-        .expect("genshin profile");
-        let profile = with_explicit_profile_executable(
-            profile,
-            r"C:\Program Files\miHoYo Launcher\games\Genshin Impact Game\YuanShen.exe",
-        );
-
-        assert_eq!(
-            profile.executable_path.as_deref(),
-            Some(r"C:\Program Files\miHoYo Launcher\games\Genshin Impact Game\YuanShen.exe")
-        );
+        .is_some());
     }
 
     #[test]
     fn hyp_game_data_extracts_install_path() {
-        let content = r#"noise hk4e_cn ignored {"installPath":"C:\\Games\\Genshin Impact Game","version":""} tail"#;
+        let content = r#"noise hk4e_cn ignored {"installPath":"C:\\Games\\Genshin Impact Game","version":"5.7.0"} tail"#;
 
         assert_eq!(
             extract_hyp_install_path(content, "hk4e_cn"),
             Some(r"C:\Games\Genshin Impact Game".to_string())
         );
+        assert_eq!(
+            extract_hyp_game_version(content, "hk4e_cn"),
+            Some("5.7.0".to_string())
+        );
         assert_eq!(extract_hyp_install_path(content, "missing"), None);
+        assert_eq!(extract_hyp_game_version(content, "missing"), None);
+    }
+
+    #[test]
+    fn unknown_hyp_profile_diagnostic_is_bounded_and_path_free() {
+        let diagnostic = unknown_hyp_profile_diagnostic();
+
+        assert_eq!(diagnostic, "HYP config has no matching known game profile");
+        assert!(diagnostic.len() <= 80);
+        assert!(!diagnostic.contains([':', '\\', '/']));
     }
 
     #[test]

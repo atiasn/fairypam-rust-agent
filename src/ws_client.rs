@@ -16,7 +16,9 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info};
 
-use crate::protocol::{parse_message, AgentHello, AgentMessage, HubMessage, SystemInfo};
+use crate::protocol::{
+    parse_message, AgentHello, AgentMessage, HubMessage, SupportedTaskTemplate, SystemInfo,
+};
 
 const CONTROL_QUEUE_CAPACITY: usize = 32;
 const VIDEO_QUEUE_CAPACITY: usize = 2;
@@ -107,17 +109,7 @@ impl WsClient {
             writer: WsWriter { writer },
         };
 
-        let hello = HubMessage::AgentHello(AgentHello {
-            api_key: api_key.to_string(),
-            agent_name: agent_name.to_string(),
-            protocol_version: 3,
-            system_info,
-            capabilities: vec![
-                "game_control".to_string(),
-                "input_stream".to_string(),
-                "mihoyo_game_discovery".to_string(),
-            ],
-        });
+        let hello = HubMessage::AgentHello(agent_hello(api_key, agent_name, system_info));
         client.send_json(&hello).await?;
         debug!("agent_hello sent");
 
@@ -146,7 +138,39 @@ impl WsClient {
     }
 }
 
+fn agent_hello(api_key: &str, agent_name: &str, system_info: SystemInfo) -> AgentHello {
+    AgentHello {
+        api_key: api_key.to_string(),
+        agent_name: agent_name.to_string(),
+        protocol_version: 3,
+        system_info,
+        capabilities: vec![
+            "launch".to_string(),
+            "window_bind".to_string(),
+            "capture".to_string(),
+            "scene_detection".to_string(),
+            "game_discovery".to_string(),
+            "restricted_input".to_string(),
+        ],
+        supported_task_templates: vec![SupportedTaskTemplate {
+            template_id: "genshin/launch-to-ready".to_string(),
+            template_version: "v1".to_string(),
+        }],
+    }
+}
+
 impl OutboundWriter {
+    #[cfg(test)]
+    pub(crate) fn closed_for_test() -> Self {
+        let (control_tx, control_rx) = mpsc::channel(1);
+        drop(control_rx);
+        Self {
+            control_tx,
+            video_queue: Arc::new(VideoFrameQueue::new(1)),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub fn spawn(writer: WsWriter) -> (Self, JoinHandle<Result<()>>) {
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
         let video_queue = Arc::new(VideoFrameQueue::new(VIDEO_QUEUE_CAPACITY));
@@ -351,9 +375,12 @@ fn control_message_type(msg: &HubMessage) -> &'static str {
         HubMessage::InputFrameAck(_) => "input_frame_ack",
         HubMessage::GameEvent(_) => "game_event",
         HubMessage::DebugOverlay(_) => "debug_overlay",
-        HubMessage::MihoyoGameDiscoverySnapshot(_) => "mihoyo_game_discovery_snapshot",
+        HubMessage::GameDiscoveryResult(_) => "game_discovery_result",
         HubMessage::EnvironmentCheckStepResult(_) => "environment_check_step_result",
         HubMessage::EnvironmentCheckResult(_) => "environment_check_result",
+        HubMessage::TaskRunFrame(_) => "task_run_frame",
+        HubMessage::TaskRunStep(_) => "task_run_step",
+        HubMessage::TaskRunResult(_) => "task_run_result",
     }
 }
 
@@ -421,7 +448,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::protocol::{AgentHello, Heartbeat, HubMessage, SystemInfo};
+    use crate::protocol::{Heartbeat, HubMessage, SystemInfo};
 
     #[derive(Default)]
     struct RecordingSink {
@@ -451,11 +478,10 @@ mod tests {
 
     #[test]
     fn test_ws_client_hello_serialization() {
-        let hello = HubMessage::AgentHello(AgentHello {
-            api_key: "test".into(),
-            agent_name: "test".into(),
-            protocol_version: 3,
-            system_info: SystemInfo {
+        let hello = HubMessage::AgentHello(agent_hello(
+            "test",
+            "test",
+            SystemInfo {
                 hostname: "test-host".into(),
                 os_name: "Windows".into(),
                 os_version: "11".into(),
@@ -474,10 +500,33 @@ mod tests {
                 displays: vec![],
                 agent_version: "0.1.0".into(),
             },
-            capabilities: vec!["game_control".into()],
-        });
-        let json = serde_json::to_string(&hello).unwrap();
+        ));
+        let HubMessage::AgentHello(hello) = hello else {
+            unreachable!()
+        };
+        assert_eq!(
+            hello.capabilities,
+            [
+                "launch",
+                "window_bind",
+                "capture",
+                "scene_detection",
+                "game_discovery",
+                "restricted_input",
+            ]
+        );
+        assert_eq!(
+            hello.supported_task_templates,
+            vec![SupportedTaskTemplate {
+                template_id: "genshin/launch-to-ready".into(),
+                template_version: "v1".into(),
+            }]
+        );
+        let json = serde_json::to_string(&HubMessage::AgentHello(hello)).unwrap();
         assert!(json.contains("agent_hello"));
+        assert!(json.contains("genshin/launch-to-ready"));
+        assert!(json.contains("scene_detection"));
+        assert!(json.contains("game_discovery"));
     }
 
     #[tokio::test]

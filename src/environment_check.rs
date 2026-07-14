@@ -33,11 +33,15 @@ pub struct AgentEnvironmentCheckOps<'a> {
 
 impl EnvironmentCheckOps for AgentEnvironmentCheckOps<'_> {
     fn launch_game(&mut self, command: &EnvironmentCheckStart) -> Result<serde_json::Value> {
+        let executable = command
+            .resolved_executable
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("local game target was not resolved"))?;
         let pid = self.process.launch_game(
-            &command.game_id,
-            &command.executable,
-            &command.args,
-            command.working_dir.as_deref(),
+            "",
+            executable,
+            &[],
+            command.resolved_working_dir.as_deref(),
         )?;
         let (_, resolved_executable) = self
             .process
@@ -135,9 +139,6 @@ pub fn run_environment_check<O: EnvironmentCheckOps>(
     canceled: &AtomicBool,
 ) -> (Vec<EnvironmentCheckStepResult>, EnvironmentCheckResult) {
     let mut steps = Vec::new();
-    if command.template_id != "environment-check/v1" || command.template_version != "v1" {
-        return final_result(command, "failed", &steps, None, Some("unknown_template"));
-    }
     let deadline = timeout_deadline(command.timeout_s);
 
     for (step_id, action) in [
@@ -154,30 +155,43 @@ pub fn run_environment_check<O: EnvironmentCheckOps>(
                 "failed",
                 &steps,
                 Some("timeout"),
+                Some("timeout"),
                 Some("environment check timed out"),
             );
         }
         if canceled.load(Ordering::Relaxed) {
             push_cleanup(command, ops, &mut steps);
-            return final_result(command, "canceled", &steps, None, None);
+            return final_result(command, "canceled", &steps, None, None, None);
         }
         match run_step(action, command, ops) {
             Ok(result) => steps.push(step(command, step_id, "succeeded", result, None)),
             Err(err) => {
-                steps.push(step(
+                let (step_error_code, final_error_code, message) =
+                    if matches!(action, Action::InputProbe) {
+                        let (code, message) = input_probe_failure(&err);
+                        (Some(code), code, message)
+                    } else {
+                        (None, step_id, "environment check step failed")
+                    };
+                let mut failed_step = step(
                     command,
                     step_id,
                     "failed",
                     json!({}),
-                    Some(err.to_string()),
-                ));
+                    Some(message.to_string()),
+                );
+                if let Some(code) = step_error_code {
+                    failed_step.error_code = Some(code.to_string());
+                }
+                steps.push(failed_step);
                 push_cleanup(command, ops, &mut steps);
                 return final_result(
                     command,
                     "failed",
                     &steps,
                     Some(step_id),
-                    Some(&err.to_string()),
+                    Some(final_error_code),
+                    Some(message),
                 );
             }
         }
@@ -191,7 +205,39 @@ pub fn run_environment_check<O: EnvironmentCheckOps>(
         json!({"ok": true}),
         None,
     ));
-    final_result(command, "succeeded", &steps, None, None)
+    final_result(command, "succeeded", &steps, None, None, None)
+}
+
+fn input_probe_failure(err: &anyhow::Error) -> (&'static str, &'static str) {
+    let contains = |needle: &str| err.chain().any(|cause| cause.to_string().contains(needle));
+    if contains("target-not-found")
+        || contains("target-window-not-found")
+        || contains("target privilege is higher")
+    {
+        (
+            "input_probe_target",
+            "input probe target unavailable or not permitted",
+        )
+    } else if contains("target-focus-failed")
+        || contains("目标窗口聚焦失败")
+        || contains("目标窗口未成为前台窗口")
+        || contains("target window could not be focused")
+        || contains("target window did not become foreground")
+        || contains("target window input threads could not be attached")
+        || contains("target window input threads could not be detached")
+    {
+        (
+            "input_probe_focus",
+            "input probe target could not be focused",
+        )
+    } else if contains("SendInput") {
+        (
+            "input_probe_input_rejected",
+            "input probe input was rejected",
+        )
+    } else {
+        ("input_probe_other", "input probe failed")
+    }
 }
 
 fn timeout_deadline(timeout_s: u64) -> Option<Instant> {
@@ -233,12 +279,12 @@ fn push_cleanup<O: EnvironmentCheckOps>(
     let result = ops.cleanup(command.force_close_on_cleanup);
     match result {
         Ok(value) => steps.push(step(command, "close_game", "succeeded", value, None)),
-        Err(err) => steps.push(step(
+        Err(_) => steps.push(step(
             command,
             "close_game",
             "failed",
             json!({}),
-            Some(err.to_string()),
+            Some("environment check cleanup failed".to_string()),
         )),
     }
 }
@@ -267,6 +313,7 @@ fn final_result(
     status: &str,
     steps: &[EnvironmentCheckStepResult],
     failed_step: Option<&str>,
+    error_code: Option<&str>,
     error: Option<&str>,
 ) -> (Vec<EnvironmentCheckStepResult>, EnvironmentCheckResult) {
     let step_values = steps
@@ -285,7 +332,7 @@ fn final_result(
                 "cleanup_attempted": steps.iter().any(|step| step.step_id == "close_game")
             }),
             steps: step_values,
-            error_code: error.map(|_| failed_step.unwrap_or("environment_check").to_string()),
+            error_code: error_code.map(str::to_string),
             error_message: error.map(str::to_string),
         },
     )
@@ -299,6 +346,7 @@ mod tests {
     struct FakeOps {
         calls: Vec<String>,
         fail_step: Option<&'static str>,
+        fail_message: Option<&'static str>,
     }
 
     impl EnvironmentCheckOps for FakeOps {
@@ -328,7 +376,9 @@ mod tests {
         fn call(&mut self, name: &str) -> Result<serde_json::Value> {
             self.calls.push(name.to_string());
             if self.fail_step == Some(name) {
-                anyhow::bail!("{name} failed");
+                anyhow::bail!(self
+                    .fail_message
+                    .unwrap_or("environment check fake failure"));
             }
             Ok(json!({"artifact_ref": format!("artifact:{name}")}))
         }
@@ -336,17 +386,16 @@ mod tests {
 
     fn command() -> EnvironmentCheckStart {
         EnvironmentCheckStart {
+            _message_type: "environment_check_start".into(),
             task_run_id: "task-a".into(),
             trace_id: "trace-a".into(),
-            template_id: "environment-check/v1".into(),
-            template_version: "v1".into(),
-            game_id: "game-a".into(),
+            connection_id: uuid::Uuid::nil(),
+            game_slug: "genshin".into(),
             session_id: "session-a".into(),
-            executable: "game.exe".into(),
-            working_dir: None,
-            args: vec![],
             timeout_s: 10,
             force_close_on_cleanup: false,
+            resolved_executable: Some("YuanShen.exe".into()),
+            resolved_working_dir: None,
         }
     }
 
@@ -411,6 +460,71 @@ mod tests {
         assert_eq!(final_result.status, "failed");
         assert_eq!(steps[2].step_id, "capture_before");
         assert_eq!(steps[2].status, "failed");
+    }
+
+    #[test]
+    fn step_failure_never_serializes_local_path_error() {
+        let mut ops = FakeOps {
+            fail_step: Some("capture_before"),
+            fail_message: Some(r"C:\\private\\Genshin\\YuanShen.exe failed"),
+            ..Default::default()
+        };
+        let canceled = AtomicBool::new(false);
+        let (steps, final_result) = run_environment_check(&command(), &mut ops, &canceled);
+        let wire = serde_json::to_string(&(steps, final_result)).unwrap();
+
+        assert!(!wire.contains("private"));
+        assert!(!wire.contains("YuanShen.exe failed"));
+        assert!(wire.contains("environment check step failed"));
+    }
+
+    #[test]
+    fn input_probe_failure_uses_safe_stable_error_code() {
+        for (failure, expected_code, expected_message) in [
+            (
+                r"target-not-found: C:\\private\\Genshin\\YuanShen.exe",
+                "input_probe_target",
+                "input probe target unavailable or not permitted",
+            ),
+            (
+                "target window input threads could not be attached",
+                "input_probe_focus",
+                "input probe target could not be focused",
+            ),
+            (
+                "SendInput 只发送了 0/2 个事件",
+                "input_probe_input_rejected",
+                "input probe input was rejected",
+            ),
+            (
+                "unexpected local failure",
+                "input_probe_other",
+                "input probe failed",
+            ),
+        ] {
+            let mut ops = FakeOps {
+                fail_step: Some("input_probe"),
+                fail_message: Some(failure),
+                ..Default::default()
+            };
+            let canceled = AtomicBool::new(false);
+            let (steps, final_result) = run_environment_check(&command(), &mut ops, &canceled);
+            let probe = steps
+                .iter()
+                .find(|step| step.step_id == "input_probe")
+                .unwrap();
+            let wire = serde_json::to_string(&(&steps, &final_result)).unwrap();
+
+            assert_eq!(probe.error_code.as_deref(), Some(expected_code));
+            assert_eq!(probe.error_message.as_deref(), Some(expected_message));
+            assert_eq!(final_result.error_code.as_deref(), Some(expected_code));
+            assert_eq!(
+                final_result.error_message.as_deref(),
+                Some(expected_message)
+            );
+            assert!(!wire.contains(failure));
+            assert!(!wire.contains("private"));
+        }
     }
 
     #[test]

@@ -182,28 +182,151 @@ pub fn focus_window(window: &TargetWindow) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn focus_window_by_hwnd(hwnd: isize) -> Result<()> {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, SetForegroundWindow, ShowWindow, SW_RESTORE,
-    };
+    focus_with_api(&mut Win32FocusApi, hwnd)
+}
 
-    unsafe {
-        let hwnd = HWND(hwnd as *mut std::ffi::c_void);
-        let _ = ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd)
-            .as_bool()
-            .then_some(())
-            .ok_or_else(|| anyhow::anyhow!("目标窗口聚焦失败"))?;
+#[cfg(any(target_os = "windows", test))]
+trait FocusApi {
+    fn restore(&mut self, hwnd: isize);
+    fn foreground(&mut self) -> isize;
+    fn foreground_thread(&mut self, hwnd: isize) -> u32;
+    fn current_thread(&mut self) -> u32;
+    fn ensure_current_message_queue(&mut self) {}
+    fn bring_to_top(&mut self, _: isize) -> bool {
+        true
+    }
+    fn attach(&mut self, current: u32, foreground: u32, attach: bool) -> bool;
+    fn set_foreground(&mut self, hwnd: isize) -> bool;
+}
 
-        let started = Instant::now();
-        while started.elapsed() <= Duration::from_millis(750) {
-            if GetForegroundWindow() == hwnd {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(25));
+#[cfg(any(target_os = "windows", test))]
+struct ThreadInputAttachment<'a, A: FocusApi> {
+    api: &'a mut A,
+    current: u32,
+    foreground: u32,
+    attached: bool,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl<'a, A: FocusApi> ThreadInputAttachment<'a, A> {
+    fn attach(api: &'a mut A, current: u32, foreground: u32) -> Result<Self> {
+        if !api.attach(current, foreground, true) {
+            anyhow::bail!("target window input threads could not be attached")
         }
+        Ok(Self {
+            api,
+            current,
+            foreground,
+            attached: true,
+        })
+    }
 
-        anyhow::bail!("目标窗口未成为前台窗口")
+    fn detach(&mut self) -> Result<()> {
+        self.attached = false;
+        if !self.api.attach(self.current, self.foreground, false) {
+            anyhow::bail!("target window input threads could not be detached")
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl<A: FocusApi> Drop for ThreadInputAttachment<'_, A> {
+    fn drop(&mut self) {
+        if self.attached {
+            let _ = self.api.attach(self.current, self.foreground, false);
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn focus_with_api<A: FocusApi>(api: &mut A, hwnd: isize) -> Result<()> {
+    api.restore(hwnd);
+    let foreground = api.foreground();
+    if foreground == hwnd {
+        return Ok(());
+    }
+    let foreground_thread = api.foreground_thread(foreground);
+    let current_thread = api.current_thread();
+    if foreground_thread == 0 || current_thread == 0 {
+        anyhow::bail!("target window could not be focused")
+    }
+    api.ensure_current_message_queue();
+    let mut attachment = ThreadInputAttachment::attach(api, current_thread, foreground_thread)?;
+    if !attachment.api.bring_to_top(hwnd) {
+        anyhow::bail!("target window could not be raised")
+    }
+    if attachment.api.foreground() == hwnd {
+        attachment.detach()?;
+        return Ok(());
+    }
+    if !attachment.api.set_foreground(hwnd) {
+        anyhow::bail!("target window foreground activation was rejected")
+    }
+    if attachment.api.foreground() != hwnd {
+        anyhow::bail!("target window did not become foreground")
+    }
+    attachment.detach()?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+struct Win32FocusApi;
+
+#[cfg(target_os = "windows")]
+impl FocusApi for Win32FocusApi {
+    fn restore(&mut self, hwnd: isize) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_RESTORE};
+        unsafe {
+            let _ = ShowWindow(HWND(hwnd as *mut _), SW_RESTORE);
+        }
+    }
+    fn foreground(&mut self) -> isize {
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize }
+    }
+    fn foreground_thread(&mut self, hwnd: isize) -> u32 {
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                windows::Win32::Foundation::HWND(hwnd as *mut _),
+                None,
+            )
+        }
+    }
+    fn current_thread(&mut self) -> u32 {
+        unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
+    }
+    fn ensure_current_message_queue(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_NOREMOVE};
+
+        let mut message = MSG::default();
+        // SAFETY: PeekMessageW only writes to the initialized local MSG and creates the
+        // calling worker thread's message queue without removing queued messages.
+        unsafe {
+            let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+        }
+    }
+    fn bring_to_top(&mut self, hwnd: isize) -> bool {
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(
+                windows::Win32::Foundation::HWND(hwnd as *mut _),
+            )
+            .is_ok()
+        }
+    }
+    fn attach(&mut self, current: u32, foreground: u32, attach: bool) -> bool {
+        unsafe {
+            windows::Win32::System::Threading::AttachThreadInput(current, foreground, attach)
+                .as_bool()
+        }
+    }
+    fn set_foreground(&mut self, hwnd: isize) -> bool {
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(
+                windows::Win32::Foundation::HWND(hwnd as *mut _),
+            )
+            .as_bool()
+        }
     }
 }
 
@@ -579,6 +702,238 @@ fn matching_descendant_pid_for_window_win32(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static QUEUE_INITIALIZATIONS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    struct FakeFocus {
+        foreground: isize,
+        foreground_thread: u32,
+        current_thread: u32,
+        attach_ok: bool,
+        detach_ok: bool,
+        focus_ok: bool,
+        mismatch: bool,
+        attaches: usize,
+        detached: usize,
+        foreground_sets: usize,
+        bring_to_top_calls: usize,
+    }
+    impl FocusApi for FakeFocus {
+        fn restore(&mut self, _: isize) {}
+        fn foreground(&mut self) -> isize {
+            self.foreground
+        }
+        fn foreground_thread(&mut self, _: isize) -> u32 {
+            self.foreground_thread
+        }
+        fn current_thread(&mut self) -> u32 {
+            self.current_thread
+        }
+        fn ensure_current_message_queue(&mut self) {
+            QUEUE_INITIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn bring_to_top(&mut self, _: isize) -> bool {
+            self.bring_to_top_calls += 1;
+            true
+        }
+        fn attach(&mut self, _: u32, _: u32, attach: bool) -> bool {
+            if attach {
+                self.attaches += 1;
+                self.attach_ok
+            } else {
+                self.detached += 1;
+                self.detach_ok
+            }
+        }
+        fn set_foreground(&mut self, hwnd: isize) -> bool {
+            self.foreground_sets += 1;
+            if self.focus_ok {
+                if !self.mismatch {
+                    self.foreground = hwnd;
+                }
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn focus_api_detaches_after_success_and_failure() {
+        let mut ok = FakeFocus {
+            foreground: 1,
+            foreground_thread: 2,
+            current_thread: 1,
+            attach_ok: true,
+            detach_ok: true,
+            focus_ok: true,
+            mismatch: false,
+            attaches: 0,
+            detached: 0,
+            foreground_sets: 0,
+            bring_to_top_calls: 0,
+        };
+        assert!(focus_with_api(&mut ok, 7).is_ok());
+        assert_eq!(ok.detached, 1);
+        let mut fail = FakeFocus {
+            foreground: 1,
+            foreground_thread: 2,
+            current_thread: 1,
+            attach_ok: true,
+            detach_ok: true,
+            focus_ok: false,
+            mismatch: false,
+            attaches: 0,
+            detached: 0,
+            foreground_sets: 0,
+            bring_to_top_calls: 0,
+        };
+        assert!(focus_with_api(&mut fail, 7).is_err());
+        assert_eq!(fail.detached, 1);
+    }
+
+    #[test]
+    fn focus_api_rejects_attach_failure_and_foreground_mismatch() {
+        let mut attach = FakeFocus {
+            foreground: 1,
+            foreground_thread: 2,
+            current_thread: 1,
+            attach_ok: false,
+            detach_ok: true,
+            focus_ok: true,
+            mismatch: false,
+            attaches: 0,
+            detached: 0,
+            foreground_sets: 0,
+            bring_to_top_calls: 0,
+        };
+        assert!(focus_with_api(&mut attach, 7).is_err());
+        assert_eq!(attach.detached, 0);
+        let mut mismatch = FakeFocus {
+            foreground: 1,
+            foreground_thread: 2,
+            current_thread: 1,
+            attach_ok: true,
+            detach_ok: true,
+            focus_ok: true,
+            mismatch: true,
+            attaches: 0,
+            detached: 0,
+            foreground_sets: 0,
+            bring_to_top_calls: 0,
+        };
+        assert!(focus_with_api(&mut mismatch, 7).is_err());
+        assert_eq!(mismatch.detached, 1);
+    }
+
+    #[test]
+    fn focus_api_skips_attach_when_target_is_already_foreground() {
+        let mut focus = FakeFocus {
+            foreground: 7,
+            foreground_thread: 0,
+            current_thread: 0,
+            attach_ok: false,
+            detach_ok: false,
+            focus_ok: false,
+            mismatch: false,
+            attaches: 0,
+            detached: 0,
+            foreground_sets: 0,
+            bring_to_top_calls: 0,
+        };
+
+        assert!(focus_with_api(&mut focus, 7).is_ok());
+        assert_eq!(focus.attaches, 0);
+        assert_eq!(focus.detached, 0);
+        assert_eq!(focus.foreground_sets, 0);
+    }
+
+    #[test]
+    fn focus_api_fails_closed_without_thread_ids() {
+        let mut focus = FakeFocus {
+            foreground: 1,
+            foreground_thread: 0,
+            current_thread: 1,
+            attach_ok: true,
+            detach_ok: true,
+            focus_ok: true,
+            mismatch: false,
+            attaches: 0,
+            detached: 0,
+            foreground_sets: 0,
+            bring_to_top_calls: 0,
+        };
+
+        assert!(focus_with_api(&mut focus, 7).is_err());
+        assert_eq!(focus.attaches, 0);
+        assert_eq!(focus.detached, 0);
+    }
+
+    #[test]
+    fn focus_api_returns_error_when_detach_fails() {
+        let mut focus = FakeFocus {
+            foreground: 1,
+            foreground_thread: 2,
+            current_thread: 1,
+            attach_ok: true,
+            detach_ok: false,
+            focus_ok: true,
+            mismatch: false,
+            attaches: 0,
+            detached: 0,
+            foreground_sets: 0,
+            bring_to_top_calls: 0,
+        };
+
+        let error = focus_with_api(&mut focus, 7).unwrap_err().to_string();
+        assert!(error.contains("could not be detached"));
+        assert_eq!(focus.detached, 1);
+    }
+
+    #[test]
+    fn focus_api_prepares_worker_message_queue_before_attach() {
+        QUEUE_INITIALIZATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut focus = FakeFocus {
+            foreground: 1,
+            foreground_thread: 2,
+            current_thread: 1,
+            attach_ok: true,
+            detach_ok: true,
+            focus_ok: true,
+            mismatch: false,
+            attaches: 0,
+            detached: 0,
+            foreground_sets: 0,
+            bring_to_top_calls: 0,
+        };
+
+        focus_with_api(&mut focus, 7).unwrap();
+
+        assert!(QUEUE_INITIALIZATIONS.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        assert_eq!(focus.attaches, 1);
+    }
+
+    #[test]
+    fn focus_api_brings_target_to_top_before_foreground_request() {
+        let mut focus = FakeFocus {
+            foreground: 1,
+            foreground_thread: 2,
+            current_thread: 1,
+            attach_ok: true,
+            detach_ok: true,
+            focus_ok: true,
+            mismatch: false,
+            attaches: 0,
+            detached: 0,
+            foreground_sets: 0,
+            bring_to_top_calls: 0,
+        };
+
+        focus_with_api(&mut focus, 7).unwrap();
+
+        assert_eq!(focus.bring_to_top_calls, 1);
+    }
 
     #[test]
     fn window_pid_match_accepts_target_or_related_child() {

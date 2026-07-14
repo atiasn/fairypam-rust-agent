@@ -3,6 +3,11 @@ run-name: "Windows candidate ${{ github.sha }} #${{ github.run_number }}"
 
 on:
   workflow_dispatch:
+    inputs:
+      previous_validated_candidate_public_commit:
+        description: Previous validated candidate public commit or ref
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -18,6 +23,8 @@ jobs:
     steps:
       - name: Checkout mirror snapshot
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -63,8 +70,29 @@ jobs:
       - name: Package unsigned candidate
         id: package
         shell: pwsh
+        env:
+          PREVIOUS_VALIDATED_CANDIDATE_PUBLIC_COMMIT: ${{ inputs.previous_validated_candidate_public_commit }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
+          $base = $null
+          $requiresGuiSmoke = $true
+          $previous = $env:PREVIOUS_VALIDATED_CANDIDATE_PUBLIC_COMMIT
+          if (-not [string]::IsNullOrWhiteSpace($previous)) {
+            $resolved = (git rev-parse --verify "$previous^{commit}" 2>$null | Select-Object -First 1)
+            if ($LASTEXITCODE -eq 0 -and $resolved -match '^[0-9a-f]{40}$') {
+              git merge-base --is-ancestor $resolved HEAD
+              if ($LASTEXITCODE -eq 0) {
+                $base = $resolved
+                $guiImpact = @(git diff --name-only "$base..HEAD" | Where-Object {
+                  $_ -match '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$|scripts/package-windows-candidate\.ps1$|scripts/candidate-smoke-runner\.ps1$|\.github/workflows/windows-candidate\.yml$)'
+                })
+                $requiresGuiSmoke = $guiImpact.Count -gt 0
+              }
+            }
+          }
+          $baseOutput = if ($base) { $base } else { 'null' }
+          "validated_base_public_commit=$baseOutput" >> $env:GITHUB_OUTPUT
+          "requires_gui_smoke=$($requiresGuiSmoke.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           $sourceCommit = (Get-Content SOURCE_COMMIT -Raw).Trim()
           $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
             Where-Object name -eq 'fairypam-agent' |
@@ -77,6 +105,8 @@ jobs:
             -PublicCommit '${{ github.sha }}' `
             -RunId '${{ github.run_id }}' `
             -RunAttempt '${{ github.run_attempt }}' `
+            -ValidatedBasePublicCommit $base `
+            -RequiresGuiSmoke:$requiresGuiSmoke `
             -OutputDirectory dist
           "artifact_name=fairypam-agent-candidate-${{ github.run_id }}-${{ github.run_attempt }}" >> $env:GITHUB_OUTPUT
           "package=$(Get-ChildItem dist/*-portable.zip | Select-Object -ExpandProperty FullName)" >> $env:GITHUB_OUTPUT

@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc};
 use std::time::Duration;
 
@@ -14,16 +14,22 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{error, info, warn};
 
 use crate::input::InputController;
-use crate::process::{is_launch_allowed, normalize_executable_name, ProcessManager};
+use crate::process::{
+    is_launch_allowed, normalize_executable_name, resolve_discovered_game_launch, ProcessManager,
+    TargetBinding,
+};
 use crate::protocol::{
     AgentMessage, GameKillAck, GameLaunchAck, HubMessage, InputFrameAck, SystemInfo,
 };
 use crate::runtime_controller::{RuntimeStartSpec, RuntimeStatusUpdate};
 use crate::system::SystemMonitor;
 use crate::ws_client::{OutboundWriter, WsClient};
-use crate::{config, environment_check, mihoyo_discovery, protocol, system, target_operation};
+use crate::{
+    config, environment_check,
+    launch_to_ready::{LaunchToReadyEngine, ProductionLaunchToReadyOps},
+    mihoyo_discovery, protocol, system, target_operation,
+};
 
-#[cfg(target_os = "windows")]
 use crate::capture::ScreenCapture;
 
 const RECONNECT_BASE_DELAY_MS: u64 = 1_000;
@@ -35,18 +41,283 @@ enum AgentEvent {
     GameLaunch(protocol::GameLaunch),
     GameKill(protocol::GameKill),
     SettingsUpdate(protocol::SettingsUpdate),
-    MihoyoGameDiscoveryRescan(protocol::MihoyoGameDiscoveryRescan),
+    GameDiscoveryRequest(protocol::GameDiscoveryRequest),
     EnvironmentCheckStart(protocol::EnvironmentCheckStart),
     EnvironmentCheckCancel(protocol::EnvironmentCheckCancel),
+    TaskRunStart(protocol::TaskRunStart),
+    TaskRunCancel(protocol::TaskRunCancel),
+    TaskRunClick(protocol::TaskRunClick),
+    TaskRunTerminal(protocol::TaskRunTerminal),
 }
 
-type ActiveEnvironmentCheck = Arc<Mutex<Option<(String, Arc<AtomicBool>)>>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EnvironmentCheckIdentity {
+    task_run_id: String,
+    trace_id: String,
+    session_id: String,
+    connection_id: uuid::Uuid,
+}
+
+type ActiveEnvironmentCheck = Arc<Mutex<Option<(EnvironmentCheckIdentity, Arc<AtomicBool>)>>>;
+
+#[derive(Clone, Debug)]
+struct PendingTaskRunStart {
+    task_run_id: String,
+    trace_id: String,
+    session_id: String,
+    connection_id: uuid::Uuid,
+    phase: Arc<AtomicU8>,
+}
+
+impl PendingTaskRunStart {
+    const PENDING: u8 = 0;
+    const STARTING: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    fn from_start(start: &protocol::TaskRunStart) -> Self {
+        Self {
+            task_run_id: start.task_run_id.clone(),
+            trace_id: start.trace_id.clone(),
+            session_id: start.session_id.clone(),
+            connection_id: start.connection_id,
+            phase: Arc::new(AtomicU8::new(Self::PENDING)),
+        }
+    }
+
+    fn matches_cancel(&self, cancel: &protocol::TaskRunCancel) -> bool {
+        self.task_run_id == cancel.task_run_id
+            && self.trace_id == cancel.trace_id
+            && self.session_id == cancel.session_id
+            && self.connection_id == cancel.connection_id
+    }
+
+    fn matches_start(&self, start: &protocol::TaskRunStart) -> bool {
+        self.task_run_id == start.task_run_id
+            && self.trace_id == start.trace_id
+            && self.session_id == start.session_id
+            && self.connection_id == start.connection_id
+    }
+
+    fn matches_terminal(&self, terminal: &protocol::TaskRunTerminal) -> bool {
+        self.task_run_id == terminal.task_run_id
+            && self.trace_id == terminal.trace_id
+            && self.session_id == terminal.session_id
+            && self.connection_id == terminal.connection_id
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == Self::CANCELLED
+    }
+
+    fn claim_start(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                Self::PENDING,
+                Self::STARTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn cancel_before_start(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                Self::PENDING,
+                Self::CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn is_starting(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == Self::STARTING
+    }
+}
+
+type PendingTaskRunStartSlot = Arc<Mutex<Option<PendingTaskRunStart>>>;
+
+async fn cancel_pending_task_run_start(
+    pending: &PendingTaskRunStartSlot,
+    cancel: &protocol::TaskRunCancel,
+) -> bool {
+    let pending = pending.lock().await;
+    let Some(pending) = pending
+        .as_ref()
+        .filter(|pending| pending.matches_cancel(cancel))
+    else {
+        return false;
+    };
+    pending.cancel_before_start()
+}
+
+async fn clear_pending_task_run_start(
+    pending: &PendingTaskRunStartSlot,
+    start: &protocol::TaskRunStart,
+) {
+    let mut pending = pending.lock().await;
+    if pending
+        .as_ref()
+        .is_some_and(|pending| pending.matches_start(start) && !pending.is_cancelled())
+    {
+        *pending = None;
+    }
+}
+
+async fn consume_cancelled_pending_task_run_start(
+    pending: &PendingTaskRunStartSlot,
+    terminal: &protocol::TaskRunTerminal,
+) -> bool {
+    let mut pending = pending.lock().await;
+    if pending
+        .as_ref()
+        .is_some_and(|pending| pending.is_cancelled() && pending.matches_terminal(terminal))
+    {
+        *pending = None;
+        true
+    } else {
+        false
+    }
+}
+
+async fn clear_pending_task_run_start_on_disconnect(pending: &PendingTaskRunStartSlot) {
+    *pending.lock().await = None;
+}
+
+async fn activate_pending_task_run_start(
+    pending: &PendingTaskRunStartSlot,
+    start: &protocol::TaskRunStart,
+    state: &Arc<Mutex<AgentRuntimeState>>,
+) -> bool {
+    let mut pending = pending.lock().await;
+    if pending
+        .as_ref()
+        .is_some_and(|pending| pending.matches_start(start) && pending.is_starting())
+    {
+        state
+            .lock()
+            .await
+            .start_session(start.session_id.clone(), "genshin".into());
+        *pending = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn task_run_failure(task_run_id: String, trace_id: String, session_id: String) -> HubMessage {
+    HubMessage::TaskRunResult(protocol::TaskRunResult {
+        task_run_id,
+        trace_id,
+        session_id,
+        status: "failed".into(),
+        result: serde_json::json!({}),
+        steps: vec![],
+        error_code: Some("launch_to_ready_failed".into()),
+        error_message: Some("launch-to-ready execution failed".into()),
+    })
+}
+
+async fn enqueue_task_run_terminal(outbound: &OutboundWriter, message: HubMessage) -> Result<()> {
+    outbound
+        .send_control(message)
+        .await
+        .context("task-run terminal enqueue failed")
+}
+
+fn dispatch_task_run_start<F>(
+    exit_tx: mpsc::UnboundedSender<ConnectionTaskExit>,
+    abort_handles: &mut Vec<AbortHandle>,
+    future: F,
+) where
+    F: future::Future<Output = Result<()>> + Send + 'static,
+{
+    monitor_connection_task(
+        ConnectionTaskName::LaunchToReadyStart,
+        false,
+        exit_tx,
+        abort_handles,
+        tokio::spawn(future),
+    );
+}
+
+fn dispatch_task_run_start_event<F, Fut>(
+    event: AgentEvent,
+    exit_tx: mpsc::UnboundedSender<ConnectionTaskExit>,
+    abort_handles: &mut Vec<AbortHandle>,
+    outbound: OutboundWriter,
+    execute: F,
+) where
+    F: FnOnce(protocol::TaskRunStart) -> Fut + Send + 'static,
+    Fut: future::Future<Output = Result<()>> + Send + 'static,
+{
+    let AgentEvent::TaskRunStart(start) = event else {
+        unreachable!("task-run start dispatcher requires TaskRunStart")
+    };
+    info!(task_run_id = %start.task_run_id, trace_id = %start.trace_id, "task-run start received");
+    dispatch_task_run_start(exit_tx, abort_handles, async move {
+        match execute(start.clone()).await {
+            Ok(()) => {
+                info!(task_run_id = %start.task_run_id, trace_id = %start.trace_id, "task-run start activated");
+            }
+            Err(_) => {
+                warn!(task_run_id = %start.task_run_id, trace_id = %start.trace_id, "task-run start failed");
+                if let Err(err) = enqueue_task_run_terminal(
+                    &outbound,
+                    task_run_failure(
+                        start.task_run_id.clone(),
+                        start.trace_id.clone(),
+                        start.session_id.clone(),
+                    ),
+                )
+                .await
+                {
+                    error!(task_run_id = %start.task_run_id, trace_id = %start.trace_id, error = %err, "task-run terminal enqueue failed");
+                    return Err(err);
+                }
+                info!(task_run_id = %start.task_run_id, trace_id = %start.trace_id, "task-run failure result enqueued");
+            }
+        }
+        Ok(())
+    });
+}
+
+fn environment_check_failure(
+    command: &protocol::EnvironmentCheckStart,
+    error_code: &str,
+    error_message: &str,
+) -> HubMessage {
+    HubMessage::EnvironmentCheckResult(protocol::EnvironmentCheckResult {
+        task_run_id: command.task_run_id.clone(),
+        trace_id: command.trace_id.clone(),
+        session_id: command.session_id.clone(),
+        status: "failed".into(),
+        result: serde_json::json!({}),
+        steps: vec![],
+        error_code: Some(error_code.to_string()),
+        error_message: Some(error_message.to_string()),
+    })
+}
+
+fn environment_check_cancel_matches(
+    identity: &EnvironmentCheckIdentity,
+    cancel: &protocol::EnvironmentCheckCancel,
+) -> bool {
+    identity.task_run_id == cancel.task_run_id
+        && identity.trace_id == cancel.trace_id
+        && cancel
+            .session_id
+            .as_deref()
+            .is_none_or(|session_id| identity.session_id == session_id)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionTaskName {
     Recv,
     Heartbeat,
-    Discovery,
+    LaunchToReadyStart,
+    LaunchToReadyTick,
     #[cfg(any(target_os = "windows", test))]
     Capture,
     Writer,
@@ -81,6 +352,7 @@ pub struct AgentRuntimeContext {
 
 #[derive(Debug, Default)]
 struct AgentRuntimeState {
+    connection_id: uuid::Uuid,
     auto_update: bool,
     auto_start: bool,
     command_timeout_s: u64,
@@ -117,31 +389,24 @@ fn clamp_command_timeout_s(value: u64) -> u64 {
     value.clamp(10, 600)
 }
 
-fn discovery_snapshot_from_result(
-    request_id: Option<String>,
+const CANONICAL_GAME_SLUGS: [&str; 3] = ["genshin", "star-rail", "zenless"];
+
+fn game_discovery_result_from_result(
+    request_id: String,
     result: Result<Vec<mihoyo_discovery::MihoyoGameInstall>>,
-) -> protocol::MihoyoGameDiscoverySnapshot {
+) -> protocol::GameDiscoveryResult {
     match result {
-        Ok(games) => {
-            let last_scanned_at = games
-                .iter()
-                .filter_map(|game| game.last_scanned_at)
-                .max()
-                .map(|time| time.to_rfc3339());
-            protocol::MihoyoGameDiscoverySnapshot {
-                request_id,
-                status: "ready".to_string(),
-                last_scanned_at,
-                error: None,
-                games: games.into_iter().map(discovery_item_from_install).collect(),
-            }
-        }
-        Err(err) => protocol::MihoyoGameDiscoverySnapshot {
+        Ok(games) => protocol::GameDiscoveryResult {
+            request_id,
+            status: "ready".to_string(),
+            error: None,
+            games: canonical_game_discovery_items(&games),
+        },
+        Err(_) => protocol::GameDiscoveryResult {
             request_id,
             status: "failed".to_string(),
-            last_scanned_at: Some(chrono::Utc::now().to_rfc3339()),
-            error: Some(err.to_string()),
-            games: Vec::new(),
+            error: Some("discovery_failed".to_string()),
+            games: canonical_game_discovery_items(&[]),
         },
     }
 }
@@ -172,40 +437,37 @@ async fn collect_game_process_events(
     }]
 }
 
-fn discovery_item_from_install(
-    game: mihoyo_discovery::MihoyoGameInstall,
-) -> protocol::MihoyoGameDiscoveryItem {
-    protocol::MihoyoGameDiscoveryItem {
-        discovery_id: game.discovery_id,
-        game_id: game.registry.game_id,
-        display_name: game.display_name,
-        display_version: game.registry.display_version,
-        publisher: game.registry.publisher,
-        install_path: game
-            .registry
-            .install_location
-            .map(|path| path.display().to_string()),
-        launch_path: game.launch_path.map(|path| path.display().to_string()),
-        exists_on_disk: game.exists_on_disk,
-        supported: game.supported,
-        last_scanned_at: game.last_scanned_at.map(|time| time.to_rfc3339()),
-        status: game.scan_status.unwrap_or_else(|| "ok".to_string()),
-        error: game.error,
-    }
+fn canonical_game_discovery_items(
+    games: &[mihoyo_discovery::MihoyoGameInstall],
+) -> Vec<protocol::GameDiscoveryItem> {
+    CANONICAL_GAME_SLUGS
+        .iter()
+        .map(|slug| {
+            let game = games.iter().find(|game| {
+                game.profile_id.as_deref() == Some(*slug) && game.supported && game.exists_on_disk
+            });
+            protocol::GameDiscoveryItem {
+                game_slug: (*slug).to_string(),
+                discovered: game.is_some(),
+                discovery_source: game.map(|_| "registry".to_string()),
+                last_discovered_at: game
+                    .and_then(|game| game.last_scanned_at)
+                    .map(|time| time.to_rfc3339()),
+                error: None,
+            }
+        })
+        .collect()
 }
 
-async fn send_discovery_snapshot(
-    outbound: OutboundWriter,
-    request_id: Option<String>,
-) -> Result<()> {
+async fn send_game_discovery_result(outbound: OutboundWriter, request_id: String) -> Result<()> {
     let result = match tokio::task::spawn_blocking(mihoyo_discovery::discover_mihoyo_games).await {
         Ok(result) => result,
         Err(err) => Err(anyhow::anyhow!("discovery task failed: {err}")),
     };
-    let snapshot = discovery_snapshot_from_result(request_id, result);
+    let result = game_discovery_result_from_result(request_id, result);
     outbound
-        .try_send_control(HubMessage::MihoyoGameDiscoverySnapshot(snapshot))
-        .context("mihoyo discovery snapshot enqueue failed")
+        .try_send_control(HubMessage::GameDiscoveryResult(result))
+        .context("game discovery result enqueue failed")
 }
 
 async fn cleanup_local_runtime(
@@ -227,20 +489,91 @@ async fn cleanup_local_runtime(
     emergency_stop_ok
 }
 
-async fn fail_connection_after_control_enqueue_error(
+fn disconnect_launch_to_ready_with_ops<O: crate::launch_to_ready::LaunchToReadyOps>(
+    engine: &mut LaunchToReadyEngine,
+    ops: &mut O,
+    reason: &str,
+) {
+    if engine.disconnect(ops).is_err() {
+        warn!("launch-to-ready cleanup failed during {reason}");
+    }
+}
+
+async fn disconnect_launch_to_ready(
+    engine: &Arc<Mutex<LaunchToReadyEngine>>,
+    process: &Arc<Mutex<ProcessManager>>,
+    input: &Arc<Mutex<InputController>>,
+    owned: &Arc<Mutex<Option<TargetBinding>>>,
+    capture: &ScreenCapture,
+    reason: &str,
+) {
+    let mut engine = engine.lock().await;
+    let mut process = process.lock().await;
+    let mut input = input.lock().await;
+    let mut owned = owned.lock().await;
+    let mut ops = ProductionLaunchToReadyOps {
+        process: &mut process,
+        input: &mut input,
+        capture,
+        owned: &mut owned,
+    };
+    disconnect_launch_to_ready_with_ops(&mut engine, &mut ops, reason);
+}
+
+struct LaunchToReadyResources<'a> {
+    engine: &'a Arc<Mutex<LaunchToReadyEngine>>,
+    process: &'a Arc<Mutex<ProcessManager>>,
+    owned: &'a Arc<Mutex<Option<TargetBinding>>>,
+    capture: &'a ScreenCapture,
+}
+
+async fn fail_connection_after_control_enqueue_error_with_cleanup<Cleanup>(
     cancel_tx: &watch::Sender<bool>,
     abort_handles: &[AbortHandle],
     input_ctrl: &Arc<Mutex<InputController>>,
     runtime_state: &Arc<Mutex<AgentRuntimeState>>,
     operation: &str,
     err: anyhow::Error,
-) -> ConnectionRunResult {
+    launch_cleanup: Cleanup,
+) -> ConnectionRunResult
+where
+    Cleanup: future::Future<Output = ()>,
+{
     let reason = format!("{operation} control enqueue failed: {err}");
     warn!("{reason}");
     cancel_connection(cancel_tx, &reason);
     abort_connection_tasks(abort_handles);
+    launch_cleanup.await;
     cleanup_local_runtime(input_ctrl, runtime_state, operation).await;
     ConnectionRunResult::Reconnect { reason }
+}
+
+async fn fail_connection_after_control_enqueue_error(
+    cancel_tx: &watch::Sender<bool>,
+    abort_handles: &[AbortHandle],
+    input_ctrl: &Arc<Mutex<InputController>>,
+    runtime_state: &Arc<Mutex<AgentRuntimeState>>,
+    launch: &LaunchToReadyResources<'_>,
+    operation: &str,
+    err: anyhow::Error,
+) -> ConnectionRunResult {
+    fail_connection_after_control_enqueue_error_with_cleanup(
+        cancel_tx,
+        abort_handles,
+        input_ctrl,
+        runtime_state,
+        operation,
+        err,
+        disconnect_launch_to_ready(
+            launch.engine,
+            launch.process,
+            input_ctrl,
+            launch.owned,
+            launch.capture,
+            operation,
+        ),
+    )
+    .await
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -312,7 +645,7 @@ async fn cancel_active_environment_check(active: &ActiveEnvironmentCheck, reason
         let active = active.lock().await;
         active
             .as_ref()
-            .map(|(task_run_id, flag)| (task_run_id.clone(), flag.clone()))
+            .map(|(identity, flag)| (identity.task_run_id.clone(), flag.clone()))
     };
     if let Some((task_run_id, flag)) = active_check {
         warn!("environment check cancel requested: task_run_id={task_run_id}, reason={reason}");
@@ -325,7 +658,7 @@ fn handle_connection_task_exit(cancel_tx: &watch::Sender<bool>, exit: &Connectio
         "connection task exited: task={:?}, critical={}, reason={}",
         exit.task, exit.critical, exit.reason
     );
-    if exit.critical {
+    if exit.critical || exit.task == ConnectionTaskName::LaunchToReadyStart {
         cancel_connection(cancel_tx, &format!("{:?}: {}", exit.task, exit.reason));
         return true;
     }
@@ -468,7 +801,10 @@ pub fn build_runtime_context(config_path: &Path, log_path: &Path) -> Result<Agen
 
 impl AgentRuntimeState {
     fn from_welcome(welcome: &protocol::HubWelcome) -> Self {
-        let mut state = Self::default();
+        let mut state = Self {
+            connection_id: welcome.connection_id,
+            ..Self::default()
+        };
         state.apply_hub_config(&welcome.config);
         state
     }
@@ -480,8 +816,18 @@ impl AgentRuntimeState {
         self.launch_allowlist = normalize_launch_allowlist(&config.launch_allowlist);
     }
 
-    fn validate_launch(&self, launch: &protocol::GameLaunch) -> Result<()> {
-        if is_launch_allowed(&launch.executable, &self.launch_allowlist) {
+    fn validate_game_launch(&self, launch: &protocol::GameLaunch) -> Result<()> {
+        if launch.connection_id != self.connection_id {
+            anyhow::bail!("game launch rejected: stale connection");
+        }
+        if self.active_session.is_some() {
+            anyhow::bail!("game launch rejected: active session exists");
+        }
+        Ok(())
+    }
+
+    fn validate_resolved_launch(&self, executable: &str) -> Result<()> {
+        if is_launch_allowed(executable, &self.launch_allowlist) {
             Ok(())
         } else if self.launch_allowlist.is_empty() {
             anyhow::bail!("launch rejected: empty launch allowlist");
@@ -668,6 +1014,7 @@ pub async fn run_agent(
     runtime_context: AgentRuntimeContext,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     runtime_status_tx: Option<std_mpsc::Sender<RuntimeStatusUpdate>>,
+    safe_smoke: bool,
 ) -> Result<()> {
     let log_path = runtime_context.log_path.clone();
     append_log_line(
@@ -686,13 +1033,17 @@ pub async fn run_agent(
             warn!("runtime stop requested before connection attempt");
             return Ok(());
         }
-        let connection_result = run_agent_connection(
-            app_config.clone(),
-            runtime_context.clone(),
-            &mut shutdown,
-            runtime_status_tx.as_ref(),
-        )
-        .await;
+        let connection_result = if safe_smoke {
+            run_safe_smoke_connection(&app_config, &mut shutdown).await
+        } else {
+            run_agent_connection(
+                app_config.clone(),
+                runtime_context.clone(),
+                &mut shutdown,
+                runtime_status_tx.as_ref(),
+            )
+            .await
+        };
 
         let reconnect_reason = match connection_result {
             Ok(ConnectionRunResult::Stopped) => return Ok(()),
@@ -720,19 +1071,14 @@ pub async fn run_agent(
     }
 }
 
-async fn run_agent_connection(
-    app_config: config::AppConfig,
-    runtime_context: AgentRuntimeContext,
-    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
-    runtime_status_tx: Option<&std_mpsc::Sender<RuntimeStatusUpdate>>,
-) -> Result<ConnectionRunResult> {
+fn connection_system_info() -> SystemInfo {
     let sys_metrics = SystemMonitor::new().collect().unwrap_or_default();
 
     let cpu_cores = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1);
 
-    let system_info = SystemInfo {
+    SystemInfo {
         hostname: system::hostname(),
         os_name: std::env::consts::OS.to_string(),
         os_version: String::new(),
@@ -750,13 +1096,74 @@ async fn run_agent_connection(
         network_adapters: vec![],
         displays: vec![],
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
-    };
+    }
+}
 
+async fn run_safe_smoke_connection(
+    app_config: &config::AppConfig,
+    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<ConnectionRunResult> {
     let connect_fut = WsClient::connect(
         &app_config.hub.ws_url,
         &app_config.hub.api_key,
         &app_config.agent.name,
-        system_info,
+        connection_system_info(),
+    );
+    let shutdown_fut = async {
+        if let Some(rx) = shutdown.as_mut() {
+            let _ = rx.changed().await;
+        } else {
+            future::pending::<()>().await;
+        }
+    };
+    let (ws, _) = tokio::select! {
+        _ = shutdown_fut => return Ok(ConnectionRunResult::Stopped),
+        result = connect_fut => result?,
+    };
+    let (mut writer, mut reader) = ws.into_split();
+    let heartbeat_sys = SystemMonitor::new();
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+    loop {
+        tokio::select! {
+            _ = async {
+                if let Some(rx) = shutdown.as_mut() {
+                    let _ = rx.changed().await;
+                } else {
+                    future::pending::<()>().await;
+                }
+            } => return Ok(ConnectionRunResult::Stopped),
+            _ = interval.tick() => {
+                let metrics = heartbeat_sys.collect().unwrap_or_default();
+                writer.send_json(&HubMessage::Heartbeat(protocol::Heartbeat {
+                    cpu_usage: metrics.cpu_usage,
+                    memory_available_gb: metrics.memory_available_gb,
+                    active_processes: metrics.active_processes,
+                    game_process_events: vec![],
+                })).await?;
+            }
+            message = reader.recv_json() => match message? {
+                AgentMessage::HubWelcome(_) | AgentMessage::HeartbeatAck(_) => {}
+                AgentMessage::Error(error) => {
+                    error!("safe smoke Hub error: {} - {}", error.code, error.message);
+                }
+                _ => warn!("safe smoke ignored unsupported Hub message"),
+            },
+        }
+    }
+}
+
+async fn run_agent_connection(
+    app_config: config::AppConfig,
+    runtime_context: AgentRuntimeContext,
+    shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    runtime_status_tx: Option<&std_mpsc::Sender<RuntimeStatusUpdate>>,
+) -> Result<ConnectionRunResult> {
+    let connect_fut = WsClient::connect(
+        &app_config.hub.ws_url,
+        &app_config.hub.api_key,
+        &app_config.agent.name,
+        connection_system_info(),
     );
     let shutdown_fut = async {
         if let Some(rx) = shutdown.as_mut() {
@@ -794,6 +1201,10 @@ async fn run_agent_connection(
     let proc_mgr = Arc::new(Mutex::new(ProcessManager::with_profile_overrides(
         &app_config.game_profiles,
     )?));
+    let launch_engine = Arc::new(Mutex::new(LaunchToReadyEngine::new()));
+    let launch_owned = Arc::new(Mutex::new(Option::<TargetBinding>::None));
+    let launch_capture = Arc::new(ScreenCapture::new(&app_config.capture)?);
+    let pending_task_run_start: PendingTaskRunStartSlot = Arc::new(Mutex::new(None));
     let active_environment_check: ActiveEnvironmentCheck = Arc::new(Mutex::new(None));
     let (outbound, writer_task) = OutboundWriter::spawn(ws_writer);
     let (connection_cancel_tx, _) = watch::channel(false);
@@ -833,9 +1244,9 @@ async fn run_agent_connection(
                             .await
                             .context("agent event channel closed")?;
                     }
-                    AgentMessage::MihoyoGameDiscoveryRescan(request) => {
+                    AgentMessage::GameDiscoveryRequest(request) => {
                         recv_tx
-                            .send(AgentEvent::MihoyoGameDiscoveryRescan(request))
+                            .send(AgentEvent::GameDiscoveryRequest(request))
                             .await
                             .context("agent event channel closed")?;
                     }
@@ -860,6 +1271,30 @@ async fn run_agent_connection(
                     AgentMessage::EnvironmentCheckCancel(cancel) => {
                         recv_tx
                             .send(AgentEvent::EnvironmentCheckCancel(cancel))
+                            .await
+                            .context("agent event channel closed")?;
+                    }
+                    AgentMessage::TaskRunClick(click) => {
+                        recv_tx
+                            .send(AgentEvent::TaskRunClick(click))
+                            .await
+                            .context("agent event channel closed")?;
+                    }
+                    AgentMessage::TaskRunStart(start) => {
+                        recv_tx
+                            .send(AgentEvent::TaskRunStart(start))
+                            .await
+                            .context("agent event channel closed")?;
+                    }
+                    AgentMessage::TaskRunCancel(cancel) => {
+                        recv_tx
+                            .send(AgentEvent::TaskRunCancel(cancel))
+                            .await
+                            .context("agent event channel closed")?;
+                    }
+                    AgentMessage::TaskRunTerminal(terminal) => {
+                        recv_tx
+                            .send(AgentEvent::TaskRunTerminal(terminal))
                             .await
                             .context("agent event channel closed")?;
                     }
@@ -921,17 +1356,80 @@ async fn run_agent_connection(
         },
     );
 
-    let discovery_outbound = outbound.clone();
-    let mut discovery_cancel = connection_cancel_tx.subscribe();
+    let tick_outbound = outbound.clone();
+    let tick_engine = launch_engine.clone();
+    let tick_process = proc_mgr.clone();
+    let tick_input = input_ctrl.clone();
+    let tick_owned = launch_owned.clone();
+    let tick_capture = launch_capture.clone();
+    let tick_state = runtime_state.clone();
+    let mut tick_cancel = connection_cancel_tx.subscribe();
+    let tick_ms = (1000 / app_config.capture.fps.max(1)).max(1) as u64;
     spawn_connection_task(
-        ConnectionTaskName::Discovery,
-        false,
+        ConnectionTaskName::LaunchToReadyTick,
+        true,
         task_exit_tx.clone(),
         &mut connection_task_aborts,
         async move {
-            tokio::select! {
-                _ = discovery_cancel.changed() => Ok(()),
-                result = send_discovery_snapshot(discovery_outbound, None) => result,
+            let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
+            loop {
+                tokio::select! { _ = tick_cancel.changed() => return Ok(()), _ = interval.tick() => {} }
+                let tick = {
+                    let mut engine = tick_engine.lock().await;
+                    if let Some((task_run_id, trace_id, session_id)) = engine.active_identity() {
+                        let mut process = tick_process.lock().await;
+                        let mut input = tick_input.lock().await;
+                        let mut owned = tick_owned.lock().await;
+                        let mut ops = ProductionLaunchToReadyOps {
+                            process: &mut process,
+                            input: &mut input,
+                            capture: &tick_capture,
+                            owned: &mut owned,
+                        };
+                        let result = match engine.tick(std::time::Instant::now(), &mut ops) {
+                            Ok(result) => Ok(result),
+                            Err(_) => {
+                                let _ = engine.disconnect(&mut ops);
+                                Err(())
+                            }
+                        };
+                        Some((task_run_id, trace_id, session_id, result))
+                    } else {
+                        None
+                    }
+                };
+                let Some((task_run_id, trace_id, session_id, result)) = tick else {
+                    continue;
+                };
+                match result {
+                    Ok(Some(frame)) => {
+                        let first_frame = frame.frame_seq == 0;
+                        let task_run_id = frame.task_run_id.clone();
+                        let trace_id = frame.trace_id.clone();
+                        tick_outbound.try_send_control(HubMessage::TaskRunFrame(frame))?;
+                        if first_frame {
+                            info!(task_run_id, trace_id, "task-run first frame enqueued");
+                        }
+                    }
+                    Ok(None) => {
+                        tick_state.lock().await.finish_session(&session_id);
+                        warn!(task_run_id, trace_id, "task-run deadline reached");
+                        enqueue_task_run_terminal(
+                            &tick_outbound,
+                            task_run_failure(task_run_id, trace_id, session_id),
+                        )
+                        .await?;
+                    }
+                    Err(()) => {
+                        tick_state.lock().await.finish_session(&session_id);
+                        warn!(task_run_id, trace_id, "task-run tick failed");
+                        enqueue_task_run_terminal(
+                            &tick_outbound,
+                            task_run_failure(task_run_id, trace_id, session_id),
+                        )
+                        .await?;
+                    }
+                }
             }
         },
     );
@@ -1020,6 +1518,13 @@ async fn run_agent_connection(
         let _ = tx.send(RuntimeStatusUpdate::Running);
     }
 
+    let launch_resources = LaunchToReadyResources {
+        engine: &launch_engine,
+        process: &proc_mgr,
+        owned: &launch_owned,
+        capture: launch_capture.as_ref(),
+    };
+
     loop {
         let shutdown_fut = async {
             if let Some(rx) = shutdown.as_mut() {
@@ -1035,6 +1540,7 @@ async fn run_agent_connection(
                 cancel_connection(&connection_cancel_tx, "runtime stop requested");
                 cancel_active_environment_check(&active_environment_check, "runtime stop requested").await;
                 abort_connection_tasks(&connection_task_aborts);
+                disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, "runtime stop").await;
                 {
                     let mut ctrl = input_ctrl.lock().await;
                     if let Err(e) = ctrl.emergency_stop() {
@@ -1042,6 +1548,7 @@ async fn run_agent_connection(
                     }
                 }
                 runtime_state.lock().await.clear_session();
+                clear_pending_task_run_start_on_disconnect(&pending_task_run_start).await;
                 return Ok(ConnectionRunResult::Stopped);
             }
             maybe_exit = task_exit_rx.recv() => match maybe_exit {
@@ -1050,6 +1557,7 @@ async fn run_agent_connection(
                     if handle_connection_task_exit(&connection_cancel_tx, &exit) {
                         cancel_active_environment_check(&active_environment_check, &reconnect_reason).await;
                         abort_connection_tasks(&connection_task_aborts);
+                        disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, "critical task exit").await;
                         {
                             let mut ctrl = input_ctrl.lock().await;
                             if let Err(e) = ctrl.emergency_stop() {
@@ -1057,6 +1565,7 @@ async fn run_agent_connection(
                             }
                         }
                         runtime_state.lock().await.clear_session();
+                        clear_pending_task_run_start_on_disconnect(&pending_task_run_start).await;
                         return Ok(ConnectionRunResult::Reconnect {
                             reason: reconnect_reason,
                         });
@@ -1071,6 +1580,7 @@ async fn run_agent_connection(
                     )
                     .await;
                     abort_connection_tasks(&connection_task_aborts);
+                    disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, "task exit channel close").await;
                     {
                         let mut ctrl = input_ctrl.lock().await;
                         if let Err(e) = ctrl.emergency_stop() {
@@ -1078,6 +1588,7 @@ async fn run_agent_connection(
                         }
                     }
                     runtime_state.lock().await.clear_session();
+                    clear_pending_task_run_start_on_disconnect(&pending_task_run_start).await;
                     return Ok(ConnectionRunResult::Reconnect {
                         reason: "connection task exit channel closed".to_string(),
                     });
@@ -1138,6 +1649,7 @@ async fn run_agent_connection(
                         &connection_task_aborts,
                         &input_ctrl,
                         &runtime_state,
+                        &launch_resources,
                         "input_frame_ack",
                         e,
                     )
@@ -1214,6 +1726,7 @@ async fn run_agent_connection(
                         &connection_task_aborts,
                         &input_ctrl,
                         &runtime_state,
+                        &launch_resources,
                         "input_frame_resume_ack",
                         e,
                     )
@@ -1222,10 +1735,10 @@ async fn run_agent_connection(
             }
             AgentEvent::GameLaunch(launch) => {
                 info!("game_launch received");
-                if let Err(e) = runtime_state.lock().await.validate_launch(&launch) {
+                if let Err(e) = runtime_state.lock().await.validate_game_launch(&launch) {
                     warn!("game_launch rejected: {e}");
                     let ack = GameLaunchAck {
-                        session_id: launch.session_id,
+                        session_id: launch.session_id.to_string(),
                         process_id: 0,
                         success: false,
                         error: Some(e.to_string()),
@@ -1236,6 +1749,7 @@ async fn run_agent_connection(
                             &connection_task_aborts,
                             &input_ctrl,
                             &runtime_state,
+                            &launch_resources,
                             "game_launch_reject_ack",
                             e,
                         )
@@ -1251,35 +1765,41 @@ async fn run_agent_connection(
 
                 let result = tokio::time::timeout(command_timeout, async {
                     let mut pm = proc_mgr.lock().await;
+                    let (executable, working_dir) = pm.resolve_canonical_game_launch(&launch.game_slug)?;
+                    {
+                        let state = runtime_state.lock().await;
+                        state.validate_game_launch(&launch)?;
+                        state.validate_resolved_launch(&executable)?;
+                    }
                     pm.launch_game(
-                        &launch.game_id,
-                        &launch.executable,
-                        &launch.args,
-                        launch.working_dir.as_deref(),
+                        &launch.game_slug,
+                        &executable,
+                        &[],
+                        working_dir.as_deref(),
                     )
                 })
                 .await;
 
                 let ack = match result {
                     Ok(Ok(pid)) => GameLaunchAck {
-                        session_id: launch.session_id.clone(),
+                        session_id: launch.session_id.to_string(),
                         process_id: pid,
                         success: true,
                         error: None,
                     },
-                    Ok(Err(e)) => {
-                        error!("game launch failed: {e}");
+                    Ok(Err(_)) => {
+                        error!("game launch failed");
                         GameLaunchAck {
-                            session_id: launch.session_id.clone(),
+                            session_id: launch.session_id.to_string(),
                             process_id: 0,
                             success: false,
-                            error: Some(e.to_string()),
+                            error: Some("local game launch failed".to_string()),
                         }
                     }
                     Err(_) => {
                         warn!("game launch timed out after {}s", command_timeout.as_secs());
                         GameLaunchAck {
-                            session_id: launch.session_id.clone(),
+                            session_id: launch.session_id.to_string(),
                             process_id: 0,
                             success: false,
                             error: Some(format!(
@@ -1294,7 +1814,7 @@ async fn run_agent_connection(
                     runtime_state
                         .lock()
                         .await
-                        .start_session(ack.session_id.clone(), launch.game_id.clone());
+                        .start_session(ack.session_id.clone(), launch.game_slug.clone());
                 }
 
                 if let Err(e) = outbound.try_send_control(HubMessage::GameLaunchAck(ack)) {
@@ -1303,6 +1823,7 @@ async fn run_agent_connection(
                         &connection_task_aborts,
                         &input_ctrl,
                         &runtime_state,
+                        &launch_resources,
                         "game_launch_ack",
                         e,
                     )
@@ -1368,6 +1889,7 @@ async fn run_agent_connection(
                         &connection_task_aborts,
                         &input_ctrl,
                         &runtime_state,
+                        &launch_resources,
                         "game_kill_ack",
                         e,
                     )
@@ -1398,17 +1920,18 @@ async fn run_agent_connection(
                     error!("auto_start sync failed: {e}");
                 }
             }
-            AgentEvent::MihoyoGameDiscoveryRescan(request) => {
-                info!("mihoyo_game_discovery_rescan received");
+            AgentEvent::GameDiscoveryRequest(request) => {
+                info!("game_discovery_request received");
                 if let Err(e) =
-                    send_discovery_snapshot(outbound.clone(), Some(request.request_id)).await
+                    send_game_discovery_result(outbound.clone(), request.request_id).await
                 {
                     return Ok(fail_connection_after_control_enqueue_error(
                         &connection_cancel_tx,
                         &connection_task_aborts,
                         &input_ctrl,
                         &runtime_state,
-                        "mihoyo_discovery_snapshot",
+                        &launch_resources,
+                        "game_discovery_result",
                         e,
                     )
                     .await);
@@ -1416,65 +1939,55 @@ async fn run_agent_connection(
             }
             AgentEvent::EnvironmentCheckStart(command) => {
                 info!("environment_check_start received: task_run_id={}", command.task_run_id);
-                if command.template_id != "environment-check/v1" || command.template_version != "v1" {
-                    warn!("environment check rejected: unknown template");
-                    let final_result = protocol::EnvironmentCheckResult {
-                        task_run_id: command.task_run_id,
-                        trace_id: command.trace_id,
-                        session_id: command.session_id,
-                        status: "failed".into(),
-                        result: serde_json::json!({}),
-                        steps: vec![],
-                        error_code: Some("unknown_template".into()),
-                        error_message: Some("unknown environment check template".into()),
-                    };
-                    let _ = outbound.try_send_control(HubMessage::EnvironmentCheckResult(final_result));
+                let (executable, working_dir) = match resolve_discovered_game_launch(&command.game_slug) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        let _ = outbound.try_send_control(environment_check_failure(
+                            &command,
+                            "game_not_available",
+                            "local game target unavailable",
+                        ));
+                        continue;
+                    }
+                };
+                if runtime_state
+                    .lock()
+                    .await
+                    .validate_resolved_launch(&executable)
+                    .is_err()
+                {
+                    let _ = outbound.try_send_control(environment_check_failure(
+                        &command,
+                        "launch_rejected",
+                        "local game target rejected",
+                    ));
                     continue;
                 }
-                if let Err(e) = runtime_state.lock().await.validate_launch(&protocol::GameLaunch {
-                    session_id: command.session_id.clone(),
-                    game_id: command.game_id.clone(),
+                let command = command.with_local_target(executable, working_dir);
+                let identity = EnvironmentCheckIdentity {
+                    task_run_id: command.task_run_id.clone(),
                     trace_id: command.trace_id.clone(),
-                    executable: command.executable.clone(),
-                    args: command.args.clone(),
-                    working_dir: command.working_dir.clone(),
-                }) {
-                    let final_result = protocol::EnvironmentCheckResult {
-                        task_run_id: command.task_run_id,
-                        trace_id: command.trace_id,
-                        session_id: command.session_id,
-                        status: "failed".into(),
-                        result: serde_json::json!({}),
-                        steps: vec![],
-                        error_code: Some("launch_rejected".into()),
-                        error_message: Some(e.to_string()),
-                    };
-                    let _ = outbound.try_send_control(HubMessage::EnvironmentCheckResult(final_result));
-                    continue;
-                }
+                    session_id: command.session_id.clone(),
+                    connection_id: command.connection_id,
+                };
                 let cancel_flag = Arc::new(AtomicBool::new(false));
                 {
                     let mut active = active_environment_check.lock().await;
                     if active.is_some() {
-                        let final_result = protocol::EnvironmentCheckResult {
-                            task_run_id: command.task_run_id,
-                            trace_id: command.trace_id,
-                            session_id: command.session_id,
-                            status: "failed".into(),
-                            result: serde_json::json!({}),
-                            steps: vec![],
-                            error_code: Some("environment_check_busy".into()),
-                            error_message: Some("environment check already running".into()),
-                        };
-                        let _ = outbound.try_send_control(HubMessage::EnvironmentCheckResult(final_result));
+                        let _ = outbound.try_send_control(environment_check_failure(
+                            &command,
+                            "environment_check_busy",
+                            "environment check already running",
+                        ));
                         continue;
                     }
-                    *active = Some((command.task_run_id.clone(), cancel_flag.clone()));
+                    *active = Some((identity.clone(), cancel_flag.clone()));
                 }
                 let task_proc_mgr = proc_mgr.clone();
                 let task_input_ctrl = input_ctrl.clone();
                 let task_outbound = outbound.clone();
                 let task_active_environment_check = active_environment_check.clone();
+                let task_identity = identity.clone();
                 let capture_config = app_config.capture.clone();
                 let launch_allowlist = runtime_state.lock().await.launch_allowlist.clone();
                 tokio::spawn(async move {
@@ -1499,15 +2012,20 @@ async fn run_agent_connection(
                         error!("environment check final result enqueue failed: {e}");
                     }
                     let mut active = task_active_environment_check.lock().await;
-                    *active = None;
+                    if active
+                        .as_ref()
+                        .is_some_and(|(active_identity, _)| active_identity == &task_identity)
+                    {
+                        *active = None;
+                    }
                 });
             }
             AgentEvent::EnvironmentCheckCancel(cancel) => {
                 info!("environment_check_cancel received: task_run_id={}", cancel.task_run_id);
                 let cancel_flag = {
                     let active = active_environment_check.lock().await;
-                    active.as_ref().and_then(|(task_run_id, flag)| {
-                        (task_run_id == &cancel.task_run_id).then(|| flag.clone())
+                    active.as_ref().and_then(|(identity, flag)| {
+                        environment_check_cancel_matches(identity, &cancel).then(|| flag.clone())
                     })
                 };
                 if let Some(flag) = cancel_flag {
@@ -1518,12 +2036,162 @@ async fn run_agent_connection(
                     }
                 }
             }
+            event @ AgentEvent::TaskRunStart(_) => {
+                let start = match &event {
+                    AgentEvent::TaskRunStart(start) => start,
+                    _ => unreachable!(),
+                };
+                let pending_start = PendingTaskRunStart::from_start(start);
+                let reserved = {
+                    let mut pending = pending_task_run_start.lock().await;
+                    if pending.is_some() {
+                        false
+                    } else {
+                        *pending = Some(pending_start.clone());
+                        true
+                    }
+                };
+                let start_state = runtime_state.clone();
+                let start_engine = launch_engine.clone();
+                let start_process = proc_mgr.clone();
+                let start_input = input_ctrl.clone();
+                let start_owned = launch_owned.clone();
+                let start_capture = launch_capture.clone();
+                let start_pending = pending_task_run_start.clone();
+                dispatch_task_run_start_event(
+                    event,
+                    task_exit_tx.clone(),
+                    &mut connection_task_aborts,
+                    outbound.clone(),
+                    move |start| async move {
+                        if !reserved {
+                            anyhow::bail!("launch-to-ready executor busy");
+                        }
+                        if pending_start.is_cancelled() {
+                            clear_pending_task_run_start(&start_pending, &start).await;
+                            return Ok(());
+                        }
+                        let (executable, working_dir) = {
+                            let process = start_process.lock().await;
+                            process.resolve_canonical_game_launch(&start.game_slug)?
+                        };
+                        let allowed = start_state
+                            .lock()
+                            .await
+                            .validate_resolved_launch(&executable);
+                        if allowed.is_err() {
+                            clear_pending_task_run_start(&start_pending, &start).await;
+                            return if pending_start.is_cancelled() {
+                                Ok(())
+                            } else {
+                                allowed
+                            };
+                        }
+                        let start = start.with_local_target(executable, working_dir);
+                        let start_result = {
+                            let mut engine = start_engine.lock().await;
+                            let mut process = start_process.lock().await;
+                            let mut input = start_input.lock().await;
+                            let mut owned = start_owned.lock().await;
+                            let mut ops = ProductionLaunchToReadyOps {
+                                process: &mut process,
+                                input: &mut input,
+                                capture: &start_capture,
+                                owned: &mut owned,
+                            };
+                            if !pending_start.claim_start() {
+                                None
+                            } else {
+                                let result =
+                                    engine.start(start.clone(), std::time::Instant::now(), &mut ops);
+                                if result.is_ok()
+                                    && !activate_pending_task_run_start(
+                                        &start_pending,
+                                        &start,
+                                        &start_state,
+                                    )
+                                    .await
+                                {
+                                    Some(engine.cancel(
+                                        &protocol::TaskRunCancel {
+                                            message_type: "task_run_cancel".into(),
+                                            task_run_id: start.task_run_id.clone(),
+                                            trace_id: start.trace_id.clone(),
+                                            session_id: start.session_id.clone(),
+                                            connection_id: start.connection_id,
+                                        },
+                                        &mut ops,
+                                    ))
+                                } else {
+                                    Some(result)
+                                }
+                            }
+                        };
+                        let Some(result) = start_result else {
+                            clear_pending_task_run_start(&start_pending, &start).await;
+                            return Ok(());
+                        };
+                        if let Err(error) = result {
+                            clear_pending_task_run_start(&start_pending, &start).await;
+                            return if pending_start.is_cancelled() {
+                                Ok(())
+                            } else {
+                                Err(error)
+                            };
+                        }
+                        Ok(())
+                    },
+                );
+            }
+            AgentEvent::TaskRunCancel(cancel) => {
+                if cancel_pending_task_run_start(&pending_task_run_start, &cancel).await {
+                    continue;
+                }
+                let result = {
+                    let mut engine = launch_engine.lock().await;
+                    let mut process = proc_mgr.lock().await;
+                    let mut input = input_ctrl.lock().await;
+                    let mut owned = launch_owned.lock().await;
+                    let mut ops = ProductionLaunchToReadyOps { process: &mut process, input: &mut input, capture: &launch_capture, owned: &mut owned };
+                    engine.cancel(&cancel, &mut ops)
+                };
+                if result.is_ok() { runtime_state.lock().await.finish_session(&cancel.session_id); }
+                else if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(cancel.task_run_id, cancel.trace_id, cancel.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_cancel", e).await); }
+            }
+            AgentEvent::TaskRunClick(click) => {
+                let result = {
+                    let mut engine = launch_engine.lock().await;
+                    let mut process = proc_mgr.lock().await;
+                    let mut input = input_ctrl.lock().await;
+                    let mut owned = launch_owned.lock().await;
+                    let mut ops = ProductionLaunchToReadyOps { process: &mut process, input: &mut input, capture: &launch_capture, owned: &mut owned };
+                    engine.click(&click, &mut ops)
+                };
+                if result.is_err() { if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(click.task_run_id, click.trace_id, click.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_click", e).await); } }
+            }
+            AgentEvent::TaskRunTerminal(terminal) => {
+                if consume_cancelled_pending_task_run_start(&pending_task_run_start, &terminal).await {
+                    continue;
+                }
+                let (result, keep) = {
+                    let mut engine = launch_engine.lock().await;
+                    let keep = engine.keeps_session_on_success() && terminal.outcome == "succeeded";
+                    let mut process = proc_mgr.lock().await;
+                    let mut input = input_ctrl.lock().await;
+                    let mut owned = launch_owned.lock().await;
+                    let mut ops = ProductionLaunchToReadyOps { process: &mut process, input: &mut input, capture: &launch_capture, owned: &mut owned };
+                    (engine.terminal(&terminal, &mut ops), keep)
+                };
+                if result.is_ok() { if !keep { runtime_state.lock().await.finish_session(&terminal.session_id); } }
+                else if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(terminal.task_run_id, terminal.trace_id, terminal.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_terminal", e).await); }
+            }
                 },
                 None => {
                     warn!("agent event channel closed");
                     cancel_connection(&connection_cancel_tx, "agent event channel closed");
                     cancel_active_environment_check(&active_environment_check, "agent event channel closed").await;
                     abort_connection_tasks(&connection_task_aborts);
+                    disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, "agent event channel close").await;
                     {
                         let mut ctrl = input_ctrl.lock().await;
                         if let Err(e) = ctrl.emergency_stop() {
@@ -1531,6 +2199,7 @@ async fn run_agent_connection(
                         }
                     }
                     runtime_state.lock().await.clear_session();
+                    clear_pending_task_run_start_on_disconnect(&pending_task_run_start).await;
                     return Ok(ConnectionRunResult::Reconnect {
                         reason: "agent event channel closed".to_string(),
                     });
@@ -1579,6 +2248,7 @@ pub fn in_process_runtime_runner(
                 context,
                 Some(stop_rx),
                 Some(status_tx.clone()),
+                false,
             ))
         })();
         let _ = status_tx.send(RuntimeStatusUpdate::Stopped(
@@ -1590,6 +2260,148 @@ pub fn in_process_runtime_runner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LaunchCleanupFakeOps {
+        binding: TargetBinding,
+        release_count: usize,
+        close_count: usize,
+        force_close_count: usize,
+        fail_release: bool,
+        fail_close: bool,
+        fail_force_close: bool,
+    }
+
+    impl LaunchCleanupFakeOps {
+        fn new() -> Self {
+            Self {
+                binding: TargetBinding {
+                    profile_id: Some("genshin".into()),
+                    resolved_executable: "YuanShen.exe".into(),
+                    process_name: "YuanShen.exe".into(),
+                    hwnd: 1,
+                    pid: 2,
+                    title: "Genshin".into(),
+                    class_name: Some("UnityWndClass".into()),
+                    rect: crate::window::WindowRect {
+                        left: 0,
+                        top: 0,
+                        right: 100,
+                        bottom: 100,
+                    },
+                },
+                release_count: 0,
+                close_count: 0,
+                force_close_count: 0,
+                fail_release: false,
+                fail_close: false,
+                fail_force_close: false,
+            }
+        }
+    }
+
+    impl crate::launch_to_ready::LaunchToReadyOps for LaunchCleanupFakeOps {
+        fn launch_and_bind(
+            &mut self,
+            _start: &protocol::TaskRunStart,
+        ) -> Result<crate::launch_to_ready::LaunchedTarget> {
+            Ok(crate::launch_to_ready::LaunchedTarget {
+                binding: self.binding.clone(),
+                client_version: "test".into(),
+            })
+        }
+
+        fn capture_target(&mut self) -> Result<crate::launch_to_ready::CapturedTarget> {
+            anyhow::bail!("capture is not used by cleanup")
+        }
+
+        fn click_target(
+            &mut self,
+            _binding: &TargetBinding,
+            _source_width: u32,
+            _source_height: u32,
+            _x: u32,
+            _y: u32,
+        ) -> Result<()> {
+            anyhow::bail!("click is not used by cleanup")
+        }
+
+        fn release_input(&mut self) -> Result<()> {
+            self.release_count += 1;
+            if self.fail_release {
+                anyhow::bail!("fake release failure")
+            }
+            Ok(())
+        }
+
+        fn close_owned_process(&mut self) -> Result<()> {
+            self.close_count += 1;
+            if self.fail_close {
+                anyhow::bail!("fake close failure")
+            }
+            Ok(())
+        }
+
+        fn force_close_owned_process(&mut self) -> Result<()> {
+            self.force_close_count += 1;
+            if self.fail_force_close {
+                anyhow::bail!("fake force-close failure")
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn environment_check_cancel_requires_current_task_trace_and_session() {
+        let identity = EnvironmentCheckIdentity {
+            task_run_id: "task-a".into(),
+            trace_id: "trace-a".into(),
+            session_id: "session-a".into(),
+            connection_id: uuid::Uuid::nil(),
+        };
+        let current = protocol::EnvironmentCheckCancel {
+            task_run_id: "task-a".into(),
+            trace_id: "trace-a".into(),
+            session_id: Some("session-a".into()),
+        };
+        let stale_trace = protocol::EnvironmentCheckCancel {
+            trace_id: "trace-old".into(),
+            ..current.clone()
+        };
+        let stale_session = protocol::EnvironmentCheckCancel {
+            session_id: Some("session-old".into()),
+            ..current.clone()
+        };
+
+        assert!(environment_check_cancel_matches(&identity, &current));
+        assert!(!environment_check_cancel_matches(&identity, &stale_trace));
+        assert!(!environment_check_cancel_matches(&identity, &stale_session));
+    }
+
+    #[test]
+    fn environment_check_failure_is_pathless() {
+        let command = protocol::EnvironmentCheckStart {
+            _message_type: "environment_check_start".into(),
+            task_run_id: "task-a".into(),
+            trace_id: "trace-a".into(),
+            connection_id: uuid::Uuid::nil(),
+            game_slug: "genshin".into(),
+            session_id: "session-a".into(),
+            timeout_s: 10,
+            force_close_on_cleanup: false,
+            resolved_executable: Some(r"C:\\private\\YuanShen.exe".into()),
+            resolved_working_dir: Some(r"C:\\private".into()),
+        };
+
+        let wire = serde_json::to_string(&environment_check_failure(
+            &command,
+            "game_not_available",
+            "local game target unavailable",
+        ))
+        .unwrap();
+        assert!(!wire.contains("private"));
+        assert!(!wire.contains("executable_path"));
+        assert!(!wire.contains("working_dir"));
+    }
 
     #[test]
     fn auto_start_command_requires_explicit_agent_executable() {
@@ -1606,15 +2418,158 @@ mod tests {
         assert!(command.contains("--run"));
     }
 
-    fn launch(executable: &str) -> protocol::GameLaunch {
+    fn game_launch(connection_id: uuid::Uuid) -> protocol::GameLaunch {
         protocol::GameLaunch {
-            session_id: "session-a".into(),
-            game_id: "game-a".into(),
+            message_type: "game_launch".into(),
+            session_id: uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").unwrap(),
             trace_id: "trace-a".into(),
-            executable: executable.into(),
-            args: vec![],
-            working_dir: None,
+            game_slug: "genshin".into(),
+            connection_id,
         }
+    }
+
+    fn hub_welcome(connection_id: uuid::Uuid) -> protocol::HubWelcome {
+        protocol::HubWelcome {
+            protocol_version: 3,
+            agent_id: "agent-a".into(),
+            connection_id,
+            agent_name_effective: "agent-a".into(),
+            config: protocol::HubAgentConfig {
+                heartbeat_interval_s: 10,
+                command_timeout_s: 60,
+                auto_update: false,
+                auto_start: false,
+                launch_allowlist: vec!["yuanshen.exe".into()],
+            },
+            accepted_capabilities: vec![],
+        }
+    }
+
+    fn task_run_start() -> protocol::TaskRunStart {
+        protocol::TaskRunStart {
+            message_type: "task_run_start".into(),
+            task_run_id: "task-a".into(),
+            trace_id: "trace-a".into(),
+            session_id: "session-a".into(),
+            connection_id: uuid::Uuid::nil(),
+            game_slug: "genshin".into(),
+            template_id: "genshin/launch-to-ready".into(),
+            template_version: "v1".into(),
+            params: serde_json::json!({}),
+            timeout_s: 30,
+            resolved_executable: Some("YuanShen.exe".into()),
+            resolved_working_dir: None,
+        }
+    }
+
+    fn task_run_cancel() -> protocol::TaskRunCancel {
+        protocol::TaskRunCancel {
+            message_type: "task_run_cancel".into(),
+            task_run_id: "task-a".into(),
+            trace_id: "trace-a".into(),
+            session_id: "session-a".into(),
+            connection_id: uuid::Uuid::nil(),
+        }
+    }
+
+    fn terminal(outcome: &str) -> protocol::TaskRunTerminal {
+        protocol::TaskRunTerminal {
+            message_type: "task_run_terminal".into(),
+            task_run_id: "task-a".into(),
+            trace_id: "trace-a".into(),
+            session_id: "session-a".into(),
+            connection_id: uuid::Uuid::nil(),
+            outcome: outcome.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_task_run_start_accepts_matching_cancel_before_engine_registration() {
+        let pending = Arc::new(Mutex::new(Some(PendingTaskRunStart::from_start(
+            &task_run_start(),
+        ))));
+
+        assert!(cancel_pending_task_run_start(&pending, &task_run_cancel()).await);
+        assert!(pending
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(PendingTaskRunStart::is_cancelled));
+    }
+
+    #[tokio::test]
+    async fn pending_task_run_start_rejects_mismatched_cancel_identity() {
+        let pending = Arc::new(Mutex::new(Some(PendingTaskRunStart::from_start(
+            &task_run_start(),
+        ))));
+        let cancels = [
+            protocol::TaskRunCancel {
+                task_run_id: "task-other".into(),
+                ..task_run_cancel()
+            },
+            protocol::TaskRunCancel {
+                trace_id: "trace-other".into(),
+                ..task_run_cancel()
+            },
+            protocol::TaskRunCancel {
+                session_id: "session-other".into(),
+                ..task_run_cancel()
+            },
+            protocol::TaskRunCancel {
+                connection_id: uuid::Uuid::new_v4(),
+                ..task_run_cancel()
+            },
+        ];
+
+        for cancel in cancels {
+            assert!(!cancel_pending_task_run_start(&pending, &cancel).await);
+        }
+        assert!(!pending
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(PendingTaskRunStart::is_cancelled));
+    }
+
+    #[tokio::test]
+    async fn pending_task_run_start_cancel_during_start_defers_to_engine_cleanup() {
+        let start = task_run_start();
+        let pending = Arc::new(Mutex::new(Some(PendingTaskRunStart::from_start(&start))));
+        let state = Arc::new(Mutex::new(AgentRuntimeState::default()));
+        let reservation = pending.lock().await.as_ref().cloned().unwrap();
+
+        assert!(reservation.claim_start());
+        assert!(!cancel_pending_task_run_start(&pending, &task_run_cancel()).await);
+        assert!(activate_pending_task_run_start(&pending, &start, &state).await);
+        assert!(state.lock().await.active_session.is_some());
+        state.lock().await.finish_session(&start.session_id);
+        assert!(state.lock().await.active_session.is_none());
+        assert!(pending.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_start_consumes_matching_terminal_once() {
+        let start = task_run_start();
+        let pending = Arc::new(Mutex::new(Some(PendingTaskRunStart::from_start(&start))));
+
+        assert!(cancel_pending_task_run_start(&pending, &task_run_cancel()).await);
+        assert!(consume_cancelled_pending_task_run_start(&pending, &terminal("canceled")).await);
+        assert!(!consume_cancelled_pending_task_run_start(&pending, &terminal("canceled")).await);
+        assert!(pending.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_start_rejects_mismatched_terminal_and_clears_on_disconnect() {
+        let start = task_run_start();
+        let pending = Arc::new(Mutex::new(Some(PendingTaskRunStart::from_start(&start))));
+        let mut mismatch = terminal("canceled");
+        mismatch.trace_id = "trace-other".into();
+
+        assert!(cancel_pending_task_run_start(&pending, &task_run_cancel()).await);
+        assert!(!consume_cancelled_pending_task_run_start(&pending, &mismatch).await);
+        assert!(pending.lock().await.is_some());
+        clear_pending_task_run_start_on_disconnect(&pending).await;
+        assert!(pending.lock().await.is_none());
     }
 
     #[tokio::test]
@@ -1669,6 +2624,160 @@ mod tests {
         assert!(handle_connection_task_exit(&cancel_tx, &exit));
         assert!(*cancel_rx.borrow());
         abort_connection_tasks(&abort_handles);
+    }
+
+    #[tokio::test]
+    async fn task_run_start_production_dispatcher_keeps_cancel_control_path_responsive() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let mut abort_handles = Vec::new();
+
+        dispatch_task_run_start_event(
+            AgentEvent::TaskRunStart(task_run_start()),
+            exit_tx,
+            &mut abort_handles,
+            OutboundWriter::closed_for_test(),
+            |_start| async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                Ok(())
+            },
+        );
+
+        entered_rx.await.unwrap();
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        control_tx
+            .send(AgentEvent::TaskRunCancel(protocol::TaskRunCancel {
+                message_type: "task_run_cancel".into(),
+                task_run_id: "task-a".into(),
+                trace_id: "trace-a".into(),
+                session_id: "session-a".into(),
+                connection_id: uuid::Uuid::nil(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(50), control_rx.recv())
+                .await
+                .unwrap(),
+            Some(AgentEvent::TaskRunCancel(_))
+        ));
+
+        let _ = release_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn task_run_start_production_dispatcher_rejects_duplicate_active_owner() {
+        let active = Arc::new(AtomicBool::new(false));
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel::<()>();
+        let (duplicate_tx, duplicate_rx) = tokio::sync::oneshot::channel();
+        let (exit_tx, mut exit_rx) = mpsc::unbounded_channel();
+        let mut abort_handles = Vec::new();
+
+        let first_active = active.clone();
+        dispatch_task_run_start_event(
+            AgentEvent::TaskRunStart(task_run_start()),
+            exit_tx.clone(),
+            &mut abort_handles,
+            OutboundWriter::closed_for_test(),
+            move |_start| async move {
+                if first_active.swap(true, Ordering::SeqCst) {
+                    anyhow::bail!("duplicate task-run start");
+                }
+                let _ = first_entered_tx.send(());
+                let _ = release_first_rx.await;
+                Ok(())
+            },
+        );
+        first_entered_rx.await.unwrap();
+
+        let second_active = active.clone();
+        dispatch_task_run_start_event(
+            AgentEvent::TaskRunStart(task_run_start()),
+            exit_tx,
+            &mut abort_handles,
+            OutboundWriter::closed_for_test(),
+            move |_start| async move {
+                if second_active.swap(true, Ordering::SeqCst) {
+                    let _ = duplicate_tx.send(());
+                    anyhow::bail!("duplicate task-run start");
+                }
+                Ok(())
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(1), duplicate_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(1), exit_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit.task, ConnectionTaskName::LaunchToReadyStart);
+        assert!(exit.reason.contains("task-run terminal enqueue failed"));
+
+        abort_connection_tasks(&abort_handles);
+        drop(release_first_tx);
+    }
+
+    #[tokio::test]
+    async fn task_run_start_production_dispatcher_aborts_pending_start_on_disconnect() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, mut completed_rx) = mpsc::channel(1);
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let mut abort_handles = Vec::new();
+
+        dispatch_task_run_start_event(
+            AgentEvent::TaskRunStart(task_run_start()),
+            exit_tx,
+            &mut abort_handles,
+            OutboundWriter::closed_for_test(),
+            |_start| async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                let _ = completed_tx.send(()).await;
+                Ok(())
+            },
+        );
+        entered_rx.await.unwrap();
+
+        abort_connection_tasks(&abort_handles);
+        tokio::task::yield_now().await;
+        let _ = release_tx.send(());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(50), completed_rx.recv())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn task_run_start_production_terminal_enqueue_failure_reconnects() {
+        let (exit_tx, mut exit_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let mut abort_handles = Vec::new();
+
+        dispatch_task_run_start_event(
+            AgentEvent::TaskRunStart(task_run_start()),
+            exit_tx,
+            &mut abort_handles,
+            OutboundWriter::closed_for_test(),
+            |_start| async { anyhow::bail!("start failed") },
+        );
+
+        let exit = tokio::time::timeout(Duration::from_secs(1), exit_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(exit.task, ConnectionTaskName::LaunchToReadyStart);
+        assert!(exit.reason.contains("task-run terminal enqueue failed"));
+        assert!(handle_connection_task_exit(&cancel_tx, &exit));
+        assert!(*cancel_rx.borrow());
     }
 
     #[test]
@@ -1737,13 +2846,14 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(50),
-            fail_connection_after_control_enqueue_error(
+            fail_connection_after_control_enqueue_error_with_cleanup(
                 &cancel_tx,
                 &abort_handles,
                 &input_ctrl,
                 &runtime_state,
                 "input_frame_ack",
                 anyhow::anyhow!("outbound control queue full"),
+                async {},
             ),
         )
         .await
@@ -1760,6 +2870,77 @@ mod tests {
         let _ = pending_task.await;
     }
 
+    #[tokio::test]
+    async fn closed_control_writer_cleans_active_launch_before_reconnect_and_can_retry() {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let input_ctrl = Arc::new(Mutex::new(InputController::new()));
+        let runtime_state = Arc::new(Mutex::new(AgentRuntimeState::default()));
+        runtime_state
+            .lock()
+            .await
+            .start_session("session-a".into(), "genshin".into());
+
+        let engine = Arc::new(Mutex::new(LaunchToReadyEngine::new()));
+        let ops = Arc::new(Mutex::new(LaunchCleanupFakeOps::new()));
+        {
+            let mut engine = engine.lock().await;
+            let mut ops = ops.lock().await;
+            engine
+                .start(task_run_start(), std::time::Instant::now(), &mut *ops)
+                .unwrap();
+            ops.fail_release = true;
+            ops.fail_close = true;
+            ops.fail_force_close = true;
+        }
+
+        let cleanup_engine = engine.clone();
+        let cleanup_ops = ops.clone();
+        let result = fail_connection_after_control_enqueue_error_with_cleanup(
+            &cancel_tx,
+            &[],
+            &input_ctrl,
+            &runtime_state,
+            "task_run_terminal",
+            anyhow::anyhow!("outbound control writer closed"),
+            async move {
+                let mut engine = cleanup_engine.lock().await;
+                let mut ops = cleanup_ops.lock().await;
+                disconnect_launch_to_ready_with_ops(&mut engine, &mut *ops, "closed writer");
+            },
+        )
+        .await;
+
+        assert!(matches!(result, ConnectionRunResult::Reconnect { .. }));
+        assert!(*cancel_rx.borrow());
+        assert!(runtime_state.lock().await.active_session.is_none());
+        {
+            let ops = ops.lock().await;
+            assert_eq!(
+                (ops.release_count, ops.close_count, ops.force_close_count),
+                (2, 2, 1)
+            );
+        }
+        assert!(engine.lock().await.active_identity().is_some());
+
+        {
+            let mut ops = ops.lock().await;
+            ops.fail_release = false;
+            ops.fail_close = false;
+            ops.fail_force_close = false;
+        }
+        {
+            let mut engine = engine.lock().await;
+            let mut ops = ops.lock().await;
+            disconnect_launch_to_ready_with_ops(&mut engine, &mut *ops, "retry");
+            disconnect_launch_to_ready_with_ops(&mut engine, &mut *ops, "repeat");
+            assert!(engine.active_identity().is_none());
+            assert_eq!(
+                (ops.release_count, ops.close_count, ops.force_close_count),
+                (3, 3, 1)
+            );
+        }
+    }
+
     #[test]
     fn process_name_for_log_strips_local_paths() {
         let process_name =
@@ -1773,6 +2954,7 @@ mod tests {
     #[test]
     fn allowlist_accepts_matching_filename_case_insensitive() {
         let state = AgentRuntimeState {
+            connection_id: uuid::Uuid::nil(),
             auto_update: false,
             auto_start: false,
             command_timeout_s: 60,
@@ -1780,38 +2962,59 @@ mod tests {
             active_session: None,
         };
         assert!(state
-            .validate_launch(&launch("C:\\Games\\GenshinImpact.exe"))
+            .validate_resolved_launch("C:\\Games\\GenshinImpact.exe")
             .is_ok());
-        assert!(state.validate_launch(&launch("genshinimpact.exe")).is_ok());
+        assert!(state.validate_resolved_launch("genshinimpact.exe").is_ok());
     }
 
     #[test]
-    fn discovery_snapshot_maps_empty_success_and_failure() {
-        let ready = discovery_snapshot_from_result(Some("req-a".to_string()), Ok(Vec::new()));
-        assert_eq!(ready.request_id.as_deref(), Some("req-a"));
-        assert_eq!(ready.status, "ready");
-        assert!(ready.games.is_empty());
-        assert!(ready.error.is_none());
+    fn game_discovery_result_always_has_three_redacted_canonical_games() {
+        let genshin = mihoyo_discovery::MihoyoGameInstall {
+            profile_id: Some("genshin".to_string()),
+            launch_path: Some(PathBuf::from(r"C:\private\YuanShen.exe")),
+            exists_on_disk: true,
+            supported: true,
+            ..Default::default()
+        };
+        let result =
+            game_discovery_result_from_result("req-canonical".to_string(), Ok(vec![genshin]));
 
-        let failed = discovery_snapshot_from_result(
-            Some("req-b".to_string()),
-            Err(anyhow::anyhow!("scan failed")),
+        assert_eq!(result.request_id, "req-canonical");
+        assert_eq!(result.status, "ready");
+        assert_eq!(
+            result
+                .games
+                .iter()
+                .map(|game| game.game_slug.as_str())
+                .collect::<Vec<_>>(),
+            ["genshin", "star-rail", "zenless"]
         );
-        assert_eq!(failed.request_id.as_deref(), Some("req-b"));
+        assert!(result.games[0].discovered);
+        assert!(result.games[1..].iter().all(|game| !game.discovered));
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains(r"C:\private"));
+        assert!(!json.contains("executable_path"));
+        assert!(!json.contains("working_dir"));
+
+        let failed = game_discovery_result_from_result(
+            "req-failed".to_string(),
+            Err(anyhow::anyhow!(r"scan failed at C:\private")),
+        );
         assert_eq!(failed.status, "failed");
-        assert!(failed.games.is_empty());
-        assert_eq!(failed.error.as_deref(), Some("scan failed"));
+        assert_eq!(failed.error.as_deref(), Some("discovery_failed"));
+        assert_eq!(failed.games.len(), 3);
     }
 
     #[test]
     fn allowlist_rejects_empty_list_conservatively() {
         let state = AgentRuntimeState::default();
-        assert!(state.validate_launch(&launch("calc.exe")).is_err());
+        assert!(state.validate_resolved_launch("calc.exe").is_err());
     }
 
     #[test]
     fn allowlist_rejects_non_matching_executable() {
         let state = AgentRuntimeState {
+            connection_id: uuid::Uuid::nil(),
             auto_update: false,
             auto_start: false,
             command_timeout_s: 60,
@@ -1819,7 +3022,43 @@ mod tests {
             active_session: None,
         };
 
-        assert!(state.validate_launch(&launch("notepad.exe")).is_err());
+        assert!(state.validate_resolved_launch("notepad.exe").is_err());
+    }
+
+    #[test]
+    fn canonical_game_launch_requires_current_connection_and_no_active_owner() {
+        let connection_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440002").unwrap();
+        let mut state = AgentRuntimeState {
+            connection_id,
+            ..Default::default()
+        };
+        let launch = game_launch(connection_id);
+
+        assert!(state.validate_game_launch(&launch).is_ok());
+        assert!(state
+            .validate_game_launch(&game_launch(uuid::Uuid::nil()))
+            .is_err());
+
+        state.start_session("other-session".into(), "genshin".into());
+        assert!(state.validate_game_launch(&launch).is_err());
+    }
+
+    #[test]
+    fn reconnect_replaces_the_trusted_game_launch_connection() {
+        let first = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440002").unwrap();
+        let second = uuid::Uuid::parse_str("660e8400-e29b-41d4-a716-446655440002").unwrap();
+        let first_state = AgentRuntimeState::from_welcome(&hub_welcome(first));
+        let second_state = AgentRuntimeState::from_welcome(&hub_welcome(second));
+
+        assert!(first_state
+            .validate_game_launch(&game_launch(first))
+            .is_ok());
+        assert!(second_state
+            .validate_game_launch(&game_launch(first))
+            .is_err());
+        assert!(second_state
+            .validate_game_launch(&game_launch(second))
+            .is_ok());
     }
 
     #[test]

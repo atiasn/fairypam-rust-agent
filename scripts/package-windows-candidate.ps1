@@ -12,10 +12,17 @@ param(
     [string]$RunId,
     [Parameter(Mandatory = $true)]
     [string]$RunAttempt,
+    [AllowNull()]
+    [string]$ValidatedBasePublicCommit = $null,
+    [bool]$RequiresGuiSmoke = $true,
     [string]$OutputDirectory = 'dist'
 )
 
 $ErrorActionPreference = 'Stop'
+$ValidatedBasePublicCommit = if ([string]::IsNullOrWhiteSpace($ValidatedBasePublicCommit)) { $null } else { $ValidatedBasePublicCommit.ToLowerInvariant() }
+if ($null -ne $ValidatedBasePublicCommit -and $ValidatedBasePublicCommit -notmatch '^[0-9a-f]{40,64}$') {
+    throw 'ValidatedBasePublicCommit must be null or a full hexadecimal commit'
+}
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $CoreExe = Join-Path $Root 'target/release/fairypam-agent.exe'
 $TauriExe = Join-Path $Root 'tauri-ui/src-tauri/target/release/fairypam-agent-tauri-ui.exe'
@@ -45,13 +52,16 @@ try {
         build_id = $BuildId
         source_commit = $SourceCommit.ToLowerInvariant()
         public_commit = $PublicCommit.ToLowerInvariant()
+        validated_base_public_commit = $ValidatedBasePublicCommit
         workflow_run_id = $RunId
         workflow_run_attempt = $RunAttempt
         built_at = $BuiltAt
         signed = $false
+        requires_gui_smoke = $RequiresGuiSmoke
         gates = [ordered]@{
             'WINDOWS-BUILD' = 'passed'
             'RUST-CLI-SAFE' = 'pending'
+            'TAURI-GUI-SMOKE' = $(if ($RequiresGuiSmoke) { 'pending' } else { 'not_required' })
         }
     }
     $BuildManifest | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 -Path (Join-Path $Stage 'BUILD-MANIFEST.json')
@@ -64,7 +74,7 @@ Source commit: $SourceCommit
 
 This is not a stable release and is not Authenticode signed.
 The package intentionally does not include config.yaml or credentials.
-Only promote it in FairyPam Hub after RUST-CLI-SAFE smoke passes.
+Only promote it in FairyPam Hub after required candidate smoke gates pass.
 "@ | Set-Content -Encoding utf8 -Path (Join-Path $Stage 'README.txt')
 
     $ExpectedMembers = @(
@@ -103,16 +113,19 @@ Only promote it in FairyPam Hub after RUST-CLI-SAFE smoke passes.
         platform = 'windows-x64'
         source_commit = $SourceCommit.ToLowerInvariant()
         public_commit = $PublicCommit.ToLowerInvariant()
+        validated_base_public_commit = $ValidatedBasePublicCommit
         workflow_run_id = $RunId
         workflow_run_attempt = $RunAttempt
         built_at = $BuiltAt
         signed = $false
+        requires_gui_smoke = $RequiresGuiSmoke
         file_name = $PackageName
         sha256 = $Hash
         size_bytes = $Size
         gates = [ordered]@{
             'WINDOWS-BUILD' = 'passed'
             'RUST-CLI-SAFE' = 'pending'
+            'TAURI-GUI-SMOKE' = $(if ($RequiresGuiSmoke) { 'pending' } else { 'not_required' })
         }
     }
     $CandidateManifest | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 -Path (Join-Path $Output 'candidate-manifest.json')

@@ -204,6 +204,7 @@ async fn main() -> Result<()> {
         runtime_context,
         automation_shutdown_receiver(),
         None,
+        args.mode == Mode::SafeSmoke,
     )
     .await
 }
