@@ -29,7 +29,7 @@ function Write-AtomicJsonFile([string]$Path, $Payload) {
     [IO.File]::WriteAllText($temporary, (($Payload | ConvertTo-Json -Depth 12) + [Environment]::NewLine), $encoding)
     try {
         if ([IO.File]::Exists($targetPath)) {
-            [IO.File]::Replace($temporary, $targetPath, $null)
+            [IO.File]::Replace($temporary, $targetPath, [System.Management.Automation.Language.NullString]::Value)
         } else {
             [IO.File]::Move($temporary, $targetPath)
         }
