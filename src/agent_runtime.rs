@@ -48,6 +48,7 @@ enum AgentEvent {
     TaskRunCancel(protocol::TaskRunCancel),
     TaskRunClick(protocol::TaskRunClick),
     TaskRunTerminal(protocol::TaskRunTerminal),
+    AgentUpdateRequest(protocol::AgentUpdateRequest),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,6 +363,9 @@ pub struct AgentRuntimeContext {
     pub auto_start_executable: Option<PathBuf>,
     pub config_path: PathBuf,
     pub log_path: PathBuf,
+    pub build_id: String,
+    pub update_handoff: Option<protocol::AgentUpdateHandoff>,
+    pub launch_mode: &'static str,
 }
 
 #[derive(Debug, Default)]
@@ -401,6 +405,73 @@ fn should_start_capture(capture: &config::CaptureConfig) -> bool {
 
 fn clamp_command_timeout_s(value: u64) -> u64 {
     value.clamp(10, 600)
+}
+
+fn update_progress(
+    connection_id: uuid::Uuid,
+    request: &protocol::AgentUpdateRequest,
+    status: protocol::AgentUpdateProgressStatus,
+) -> protocol::AgentUpdateProgress {
+    protocol::AgentUpdateProgress {
+        connection_id,
+        update_id: request.update_id,
+        source_build_id: request.source_build_id.clone(),
+        target_build_id: request.target_build_id.clone(),
+        attempt_nonce: request.attempt_nonce.clone(),
+        status,
+    }
+}
+
+fn update_result(
+    connection_id: uuid::Uuid,
+    request: protocol::AgentUpdateRequest,
+    status: protocol::AgentUpdateResultStatus,
+    error_code: Option<&str>,
+) -> protocol::AgentUpdateResult {
+    protocol::AgentUpdateResult {
+        connection_id,
+        update_id: request.update_id,
+        source_build_id: request.source_build_id,
+        target_build_id: request.target_build_id,
+        attempt_nonce: request.attempt_nonce,
+        status,
+        error_code: error_code.map(str::to_owned),
+    }
+}
+
+fn update_error_code(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    for code in [
+        "agent_update_artifact_digest_mismatch",
+        "agent_update_zip_layout_invalid",
+        "agent_update_zip_limit_exceeded",
+        "agent_update_manifest_identity_mismatch",
+        "agent_update_manifest_member_mismatch",
+        "agent_update_target_exists",
+        "agent_update_config_copy_failed",
+        "agent_update_helper_params_invalid",
+        "agent_update_helper_start_failed",
+        "agent_update_transport_invalid",
+    ] {
+        if message.contains(code) {
+            return code;
+        }
+    }
+    "agent_update_failed"
+}
+
+fn update_request_matches_runtime(
+    request: &protocol::AgentUpdateRequest,
+    connection_id: uuid::Uuid,
+    running_build_id: &str,
+    has_active_session: bool,
+    restarting_handoff: bool,
+) -> bool {
+    request.connection_id == connection_id
+        && request.source_build_id == running_build_id
+        && request.target_build_id != running_build_id
+        && !has_active_session
+        && !restarting_handoff
 }
 
 const CANONICAL_GAME_SLUGS: [&str; 3] = ["genshin", "star-rail", "zenless"];
@@ -825,13 +896,33 @@ fn persist_runtime_config(config_path: &Path, runtime: config::RuntimeConfig) ->
 
 pub fn build_runtime_context(config_path: &Path, log_path: &Path) -> Result<AgentRuntimeContext> {
     let current_dir = std::env::current_dir().context("failed to get current directory")?;
+    let executable = std::env::current_exe().context("failed to locate current executable")?;
+    let (build_id, update_handoff) = runtime_build_identity(&executable)?;
     Ok(AgentRuntimeContext {
-        auto_start_executable: Some(
-            std::env::current_exe().context("failed to locate current executable")?,
-        ),
+        auto_start_executable: Some(executable),
         config_path: absolute_path(&current_dir, config_path),
         log_path: absolute_path(&current_dir, log_path),
+        build_id,
+        update_handoff,
+        launch_mode: "cli",
     })
+}
+
+fn runtime_build_identity(
+    executable: &Path,
+) -> Result<(String, Option<protocol::AgentUpdateHandoff>)> {
+    let build_id = crate::agent_updater::running_build_id(executable)?;
+    let update_handoff = crate::agent_updater::read_update_handoff(&build_id)?.map(|handoff| {
+        protocol::AgentUpdateHandoff {
+            update_id: handoff.update_id,
+            attempt_nonce: handoff.attempt_nonce,
+            source_build_id: handoff.source_build_id,
+            target_build_id: handoff.target_build_id,
+            prior_connection_id: handoff.prior_connection_id,
+            running_build_id: handoff.running_build_id,
+        }
+    });
+    Ok((build_id, update_handoff))
 }
 
 impl AgentRuntimeState {
@@ -1143,6 +1234,8 @@ async fn run_safe_smoke_connection(
         &app_config.hub.api_key,
         &app_config.agent.name,
         connection_system_info(),
+        None,
+        None,
     );
     let shutdown_fut = async {
         if let Some(rx) = shutdown.as_mut() {
@@ -1199,6 +1292,8 @@ async fn run_agent_connection(
         &app_config.hub.api_key,
         &app_config.agent.name,
         connection_system_info(),
+        Some(runtime_context.build_id.clone()),
+        runtime_context.update_handoff.clone(),
     );
     let shutdown_fut = async {
         if let Some(rx) = shutdown.as_mut() {
@@ -1216,6 +1311,18 @@ async fn run_agent_connection(
     };
 
     let runtime_state = Arc::new(Mutex::new(AgentRuntimeState::from_welcome(&welcome)));
+    if let Some(handoff) = &runtime_context.update_handoff {
+        crate::agent_updater::write_handoff_ready_marker(
+            &crate::agent_updater::UpdateHandoffFile {
+                update_id: handoff.update_id,
+                attempt_nonce: handoff.attempt_nonce.clone(),
+                source_build_id: handoff.source_build_id.clone(),
+                target_build_id: handoff.target_build_id.clone(),
+                prior_connection_id: handoff.prior_connection_id,
+                running_build_id: handoff.running_build_id.clone(),
+            },
+        )?;
+    }
     {
         let auto_start = runtime_state.lock().await.auto_start;
         if let Err(e) = sync_auto_start_setting(auto_start, &runtime_context) {
@@ -1330,6 +1437,12 @@ async fn run_agent_connection(
                     AgentMessage::TaskRunTerminal(terminal) => {
                         recv_tx
                             .send(AgentEvent::TaskRunTerminal(terminal))
+                            .await
+                            .context("agent event channel closed")?;
+                    }
+                    AgentMessage::AgentUpdateRequest(request) => {
+                        recv_tx
+                            .send(AgentEvent::AgentUpdateRequest(request))
                             .await
                             .context("agent event channel closed")?;
                     }
@@ -2245,6 +2358,157 @@ async fn run_agent_connection(
                 if result.is_ok() { if !keep { runtime_state.lock().await.finish_session(&terminal.session_id); } }
                 else if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(terminal.task_run_id, terminal.trace_id, terminal.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &mut connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_terminal", e).await); }
             }
+            AgentEvent::AgentUpdateRequest(request) => {
+                let (current_connection_id, has_active_session) = {
+                    let state = runtime_state.lock().await;
+                    (state.connection_id, state.active_session.is_some())
+                };
+                let valid = update_request_matches_runtime(
+                    &request,
+                    current_connection_id,
+                    &runtime_context.build_id,
+                    has_active_session,
+                    runtime_context.update_handoff.is_some(),
+                );
+                if !valid {
+                    if let Err(e) = outbound.try_send_control(HubMessage::AgentUpdateResult(
+                        update_result(
+                            current_connection_id,
+                            request,
+                            protocol::AgentUpdateResultStatus::Failed,
+                            Some("agent_update_identity_mismatch"),
+                        ),
+                    )) {
+                        return Ok(fail_connection_after_control_enqueue_error(
+                            &connection_cancel_tx,
+                            &mut connection_task_aborts,
+                            &input_ctrl,
+                            &runtime_state,
+                            &launch_resources,
+                            "agent_update_result",
+                            e,
+                        )
+                        .await);
+                    }
+                    continue;
+                }
+                let downloading = update_progress(
+                    current_connection_id,
+                    &request,
+                    protocol::AgentUpdateProgressStatus::Downloading,
+                );
+                if let Err(e) = outbound.try_send_control(HubMessage::AgentUpdateProgress(downloading)) {
+                    return Ok(fail_connection_after_control_enqueue_error(
+                        &connection_cancel_tx,
+                        &mut connection_task_aborts,
+                        &input_ctrl,
+                        &runtime_state,
+                        &launch_resources,
+                        "agent_update_downloading",
+                        e,
+                    )
+                    .await);
+                }
+                let request_for_stage = request.clone();
+                let ws_url = app_config.hub.ws_url.clone();
+                let api_key = app_config.hub.api_key.clone();
+                let source_config = runtime_context.config_path.clone();
+                let old_executable = match runtime_context.auto_start_executable.clone() {
+                    Some(executable) => executable,
+                    None => {
+                        let result = update_result(
+                            current_connection_id,
+                            request,
+                            protocol::AgentUpdateResultStatus::Failed,
+                            Some("agent_update_running_identity_invalid"),
+                        );
+                        outbound.try_send_control(HubMessage::AgentUpdateResult(result))?;
+                        continue;
+                    }
+                };
+                let launch_mode = runtime_context.launch_mode;
+                let staged = tokio::task::spawn_blocking(move || {
+                    let bytes = crate::agent_updater::download_bound_artifact(
+                        &ws_url,
+                        &api_key,
+                        &request_for_stage,
+                    )?;
+                    let install_root = old_executable
+                        .parent()
+                        .context("agent_update_running_identity_invalid")?;
+                    let staged = crate::agent_updater::stage_update(
+                        &bytes,
+                        &request_for_stage,
+                        install_root,
+                        &source_config,
+                    )?;
+                    let plan = crate::agent_updater::prepare_helper_plan(
+                        &staged,
+                        &request_for_stage,
+                        &old_executable,
+                        launch_mode,
+                    )?;
+                    Ok::<_, anyhow::Error>((staged, plan))
+                })
+                .await;
+                let (_, plan) = match staged {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        let result = update_result(
+                            current_connection_id,
+                            request,
+                            protocol::AgentUpdateResultStatus::Failed,
+                            Some(update_error_code(&error)),
+                        );
+                        outbound.try_send_control(HubMessage::AgentUpdateResult(result))?;
+                        continue;
+                    }
+                    Err(_) => {
+                        let result = update_result(
+                            current_connection_id,
+                            request,
+                            protocol::AgentUpdateResultStatus::Failed,
+                            Some("agent_update_worker_failed"),
+                        );
+                        outbound.try_send_control(HubMessage::AgentUpdateResult(result))?;
+                        continue;
+                    }
+                };
+                if let Err(e) = outbound.try_send_control(HubMessage::AgentUpdateProgress(
+                    update_progress(
+                        current_connection_id,
+                        &request,
+                        protocol::AgentUpdateProgressStatus::Staged,
+                    ),
+                )) {
+                    return Ok(fail_connection_after_control_enqueue_error(
+                        &connection_cancel_tx,
+                        &mut connection_task_aborts,
+                        &input_ctrl,
+                        &runtime_state,
+                        &launch_resources,
+                        "agent_update_staged",
+                        e,
+                    )
+                    .await);
+                }
+                if let Err(error) = crate::agent_updater::spawn_update_helper(&plan) {
+                    let result = update_result(
+                        current_connection_id,
+                        request,
+                        protocol::AgentUpdateResultStatus::Failed,
+                        Some(update_error_code(&error)),
+                    );
+                    outbound.try_send_control(HubMessage::AgentUpdateResult(result))?;
+                    continue;
+                }
+                outbound.try_send_control(HubMessage::AgentUpdateProgress(update_progress(
+                    current_connection_id,
+                    &request,
+                    protocol::AgentUpdateProgressStatus::Restarting,
+                )))?;
+                return Ok(ConnectionRunResult::Stopped);
+            }
                 },
                 None => {
                     warn!("agent event channel closed");
@@ -2298,10 +2562,16 @@ pub fn in_process_runtime_runner(
                 .enable_all()
                 .build()
                 .context("failed to create Agent runtime")?;
+            let executable =
+                std::env::current_exe().context("failed to locate current executable")?;
+            let (build_id, update_handoff) = runtime_build_identity(&executable)?;
             let context = AgentRuntimeContext {
                 auto_start_executable: spec.auto_start_executable,
                 config_path: spec.config_path,
                 log_path: spec.log_path,
+                build_id,
+                update_handoff,
+                launch_mode: "gui",
             };
             runtime.block_on(run_agent(
                 spec.app_config,
@@ -2477,6 +2747,9 @@ mod tests {
             auto_start_executable: None,
             config_path: PathBuf::from("config.yaml"),
             log_path: PathBuf::from("agent.log"),
+            build_id: "test-build".into(),
+            update_handoff: None,
+            launch_mode: "cli",
         };
         assert!(build_auto_start_command_line(&context).is_err());
 
@@ -2484,6 +2757,62 @@ mod tests {
         let command = build_auto_start_command_line(&context).unwrap();
         assert!(command.contains("fairypam-agent.exe"));
         assert!(command.contains("--run"));
+    }
+
+    #[test]
+    fn update_request_requires_current_connection_source_build_and_idle_runtime() {
+        let connection_id = uuid::Uuid::new_v4();
+        let request = protocol::AgentUpdateRequest {
+            message_type: "agent_update_request".into(),
+            connection_id,
+            update_id: uuid::Uuid::new_v4(),
+            promotion_id: uuid::Uuid::new_v4(),
+            source_build_id: "build-old".into(),
+            target_build_id: "build-new".into(),
+            attempt_nonce: "0123456789abcdef".into(),
+            artifact_path: format!(
+                "/api/v1/agents/{}/updates/{}/artifact",
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4()
+            ),
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+        };
+        assert!(update_request_matches_runtime(
+            &request,
+            connection_id,
+            "build-old",
+            false,
+            false,
+        ));
+        assert!(!update_request_matches_runtime(
+            &request,
+            uuid::Uuid::new_v4(),
+            "build-old",
+            false,
+            false,
+        ));
+        assert!(!update_request_matches_runtime(
+            &request,
+            connection_id,
+            "other-build",
+            false,
+            false,
+        ));
+        assert!(!update_request_matches_runtime(
+            &request,
+            connection_id,
+            "build-old",
+            true,
+            false,
+        ));
+        assert!(!update_request_matches_runtime(
+            &request,
+            connection_id,
+            "build-old",
+            false,
+            true,
+        ));
     }
 
     fn game_launch(connection_id: uuid::Uuid) -> protocol::GameLaunch {

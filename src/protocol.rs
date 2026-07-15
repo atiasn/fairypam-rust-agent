@@ -418,6 +418,82 @@ where
     deserialize_message_type(deserializer, "game_launch")
 }
 
+fn deserialize_agent_update_request_type<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_message_type(deserializer, "agent_update_request")
+}
+
+fn deserialize_build_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_nonempty_string(deserializer)?;
+    if value.len() > 128 {
+        return Err(serde::de::Error::custom("build_id is too long"));
+    }
+    Ok(value)
+}
+
+fn deserialize_attempt_nonce<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_nonempty_string(deserializer)?;
+    if !(16..=128).contains(&value.len()) {
+        return Err(serde::de::Error::custom("attempt_nonce length is invalid"));
+    }
+    Ok(value)
+}
+
+fn deserialize_agent_update_artifact_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_nonempty_string(deserializer)?;
+    let parts: Vec<_> = value.split('/').collect();
+    if parts.len() != 8
+        || !parts[0].is_empty()
+        || parts[1..4] != ["api", "v1", "agents"]
+        || parts[5] != "updates"
+        || parts[7] != "artifact"
+        || Uuid::parse_str(parts[4]).is_err()
+        || Uuid::parse_str(parts[6]).is_err()
+    {
+        return Err(serde::de::Error::custom("invalid update artifact path"));
+    }
+    Ok(value)
+}
+
+fn deserialize_sha256<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(serde::de::Error::custom(
+            "sha256 must be lowercase hexadecimal",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_positive_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("size_bytes must be positive"));
+    }
+    Ok(value)
+}
+
 fn deserialize_game_slug<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -525,6 +601,35 @@ pub struct ErrorMessage {
     pub details: Option<serde_json::Value>,
 }
 
+/// Hub 下发的、与当前连接和目标候选精确绑定的更新请求。
+///
+/// 该 wire 从不携带 URL、命令或本地路径；`artifact_path` 只能是当前
+/// Agent 的固定 Hub artifact endpoint。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentUpdateRequest {
+    #[serde(
+        rename = "type",
+        deserialize_with = "deserialize_agent_update_request_type"
+    )]
+    pub message_type: String,
+    pub connection_id: Uuid,
+    pub update_id: Uuid,
+    pub promotion_id: Uuid,
+    #[serde(deserialize_with = "deserialize_build_id")]
+    pub source_build_id: String,
+    #[serde(deserialize_with = "deserialize_build_id")]
+    pub target_build_id: String,
+    #[serde(deserialize_with = "deserialize_attempt_nonce")]
+    pub attempt_nonce: String,
+    #[serde(deserialize_with = "deserialize_agent_update_artifact_path")]
+    pub artifact_path: String,
+    #[serde(deserialize_with = "deserialize_sha256")]
+    pub sha256: String,
+    #[serde(deserialize_with = "deserialize_positive_size")]
+    pub size_bytes: u64,
+}
+
 /// 入站消息枚举（Hub → Agent）。
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -543,6 +648,7 @@ pub enum AgentMessage {
     TaskRunCancel(TaskRunCancel),
     TaskRunClick(TaskRunClick),
     TaskRunTerminal(TaskRunTerminal),
+    AgentUpdateRequest(AgentUpdateRequest),
     PauseAI(PauseAI),
     ResumeAI(ResumeAI),
     Error(ErrorMessage),
@@ -562,6 +668,66 @@ pub struct AgentHello {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub supported_task_templates: Vec<SupportedTaskTemplate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_handoff: Option<AgentUpdateHandoff>,
+}
+
+/// 仅在更新后的新进程首次握手中携带的重启证明。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentUpdateHandoff {
+    pub update_id: Uuid,
+    #[serde(deserialize_with = "deserialize_attempt_nonce")]
+    pub attempt_nonce: String,
+    #[serde(deserialize_with = "deserialize_build_id")]
+    pub source_build_id: String,
+    #[serde(deserialize_with = "deserialize_build_id")]
+    pub target_build_id: String,
+    pub prior_connection_id: Uuid,
+    #[serde(deserialize_with = "deserialize_build_id")]
+    pub running_build_id: String,
+}
+
+/// Update 的非终态进度。每条消息均携带完整五元身份。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentUpdateProgress {
+    pub connection_id: Uuid,
+    pub update_id: Uuid,
+    pub source_build_id: String,
+    pub target_build_id: String,
+    pub attempt_nonce: String,
+    pub status: AgentUpdateProgressStatus,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentUpdateProgressStatus {
+    Downloading,
+    Staged,
+    Restarting,
+}
+
+/// Update 的终态结果；错误码只能是稳定、脱敏的固定 code。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentUpdateResult {
+    pub connection_id: Uuid,
+    pub update_id: Uuid,
+    pub source_build_id: String,
+    pub target_build_id: String,
+    pub attempt_nonce: String,
+    pub status: AgentUpdateResultStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentUpdateResultStatus {
+    Succeeded,
+    Failed,
+    RolledBack,
 }
 
 /// 已编译进 Agent 的公开 TaskRun 模板键。
@@ -793,6 +959,10 @@ pub enum HubMessage {
     TaskRunResult(TaskRunResult),
     #[serde(rename = "task_run_cleanup_receipt")]
     TaskRunCleanupReceipt(TaskRunCleanupReceipt),
+    #[serde(rename = "agent_update_progress")]
+    AgentUpdateProgress(AgentUpdateProgress),
+    #[serde(rename = "agent_update_result")]
+    AgentUpdateResult(AgentUpdateResult),
 }
 
 // ============================================================
@@ -827,6 +997,9 @@ pub fn parse_message(text: &str) -> Result<AgentMessage, serde_json::Error> {
         "task_run_cancel" => Ok(AgentMessage::TaskRunCancel(serde_json::from_value(raw)?)),
         "task_run_click" => Ok(AgentMessage::TaskRunClick(serde_json::from_value(raw)?)),
         "task_run_terminal" => Ok(AgentMessage::TaskRunTerminal(serde_json::from_value(raw)?)),
+        "agent_update_request" => Ok(AgentMessage::AgentUpdateRequest(serde_json::from_value(
+            raw,
+        )?)),
         "pause_ai" => Ok(AgentMessage::PauseAI(serde_json::from_value(raw)?)),
         "resume_ai" => Ok(AgentMessage::ResumeAI(serde_json::from_value(raw)?)),
         "error" => Ok(AgentMessage::Error(serde_json::from_value(raw)?)),
@@ -1205,5 +1378,112 @@ mod tests {
         assert!(json.contains(r#""type":"environment_check_result""#));
         assert!(json.contains(r#""task_run_id":"task-a""#));
         assert!(!json.contains("taskRunId"));
+    }
+
+    #[test]
+    fn agent_update_request_accepts_only_canonical_bound_wire() {
+        let payload = r#"{
+            "type":"agent_update_request",
+            "connection_id":"550e8400-e29b-41d4-a716-446655440001",
+            "update_id":"550e8400-e29b-41d4-a716-446655440002",
+            "promotion_id":"550e8400-e29b-41d4-a716-446655440003",
+            "source_build_id":"build-old",
+            "target_build_id":"build-new",
+            "attempt_nonce":"0123456789abcdef",
+            "artifact_path":"/api/v1/agents/550e8400-e29b-41d4-a716-446655440004/updates/550e8400-e29b-41d4-a716-446655440002/artifact",
+            "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "size_bytes":123
+        }"#;
+        assert!(matches!(
+            parse_message(payload),
+            Ok(AgentMessage::AgentUpdateRequest(AgentUpdateRequest { target_build_id, .. }))
+                if target_build_id == "build-new"
+        ));
+
+        for invalid in [
+            payload.replace("/artifact\"", "/artifact\",\"url\":\"https://unsafe\""),
+            payload.replace("/api/v1/agents/", "/api/v1/other/"),
+            payload.replace(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+            payload.replace("\"size_bytes\":123", "\"size_bytes\":0"),
+        ] {
+            assert!(
+                parse_message(&invalid).is_err(),
+                "unsafe update wire must reject"
+            );
+        }
+    }
+
+    #[test]
+    fn update_messages_and_hello_handoff_serialize_typed_identity() {
+        let connection_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").unwrap();
+        let update_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440002").unwrap();
+        let handoff = AgentUpdateHandoff {
+            update_id,
+            attempt_nonce: "0123456789abcdef".into(),
+            source_build_id: "build-old".into(),
+            target_build_id: "build-new".into(),
+            prior_connection_id: connection_id,
+            running_build_id: "build-new".into(),
+        };
+        let progress = serde_json::to_value(HubMessage::AgentUpdateProgress(AgentUpdateProgress {
+            connection_id,
+            update_id,
+            source_build_id: "build-old".into(),
+            target_build_id: "build-new".into(),
+            attempt_nonce: "0123456789abcdef".into(),
+            status: AgentUpdateProgressStatus::Staged,
+        }))
+        .unwrap();
+        assert_eq!(progress["type"], "agent_update_progress");
+        assert_eq!(progress["status"], "staged");
+        let result = serde_json::to_value(HubMessage::AgentUpdateResult(AgentUpdateResult {
+            connection_id,
+            update_id,
+            source_build_id: "build-old".into(),
+            target_build_id: "build-new".into(),
+            attempt_nonce: "0123456789abcdef".into(),
+            status: AgentUpdateResultStatus::Failed,
+            error_code: Some("agent_update_artifact_digest_mismatch".into()),
+        }))
+        .unwrap();
+        assert_eq!(result["type"], "agent_update_result");
+        assert_eq!(
+            result["error_code"],
+            "agent_update_artifact_digest_mismatch"
+        );
+        let json = serde_json::to_value(AgentHello {
+            api_key: "redacted".into(),
+            agent_name: "agent".into(),
+            protocol_version: 3,
+            system_info: SystemInfo {
+                hostname: "host".into(),
+                os_name: "Windows".into(),
+                os_version: String::new(),
+                os_build: String::new(),
+                os_arch: "x64".into(),
+                net_version: String::new(),
+                timezone: String::new(),
+                locale: String::new(),
+                last_boot_time: String::new(),
+                cpu_name: "cpu".into(),
+                cpu_cores: 1,
+                cpu_threads: 1,
+                memory_total_gb: 1.0,
+                disks: vec![],
+                network_adapters: vec![],
+                displays: vec![],
+                agent_version: "0".into(),
+            },
+            capabilities: vec![],
+            supported_task_templates: vec![],
+            build_id: Some("build-new".into()),
+            update_handoff: Some(handoff),
+        })
+        .unwrap();
+        assert_eq!(json["build_id"], "build-new");
+        assert_eq!(json["update_handoff"]["running_build_id"], "build-new");
     }
 }

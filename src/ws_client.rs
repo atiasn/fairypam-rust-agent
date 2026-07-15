@@ -17,7 +17,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use tracing::{debug, error, info};
 
 use crate::protocol::{
-    parse_message, AgentHello, AgentMessage, HubMessage, SupportedTaskTemplate, SystemInfo,
+    parse_message, AgentHello, AgentMessage, AgentUpdateHandoff, HubMessage, SupportedTaskTemplate,
+    SystemInfo,
 };
 
 const CONTROL_QUEUE_CAPACITY: usize = 32;
@@ -96,6 +97,8 @@ impl WsClient {
         api_key: &str,
         agent_name: &str,
         system_info: SystemInfo,
+        build_id: Option<String>,
+        update_handoff: Option<AgentUpdateHandoff>,
     ) -> Result<(Self, crate::protocol::HubWelcome)> {
         info!("Connecting to Hub: {}", url);
         let (ws, _) = connect_async(url)
@@ -109,7 +112,13 @@ impl WsClient {
             writer: WsWriter { writer },
         };
 
-        let hello = HubMessage::AgentHello(agent_hello(api_key, agent_name, system_info));
+        let hello = HubMessage::AgentHello(agent_hello(
+            api_key,
+            agent_name,
+            system_info,
+            build_id,
+            update_handoff,
+        ));
         client.send_json(&hello).await?;
         debug!("agent_hello sent");
 
@@ -138,7 +147,13 @@ impl WsClient {
     }
 }
 
-fn agent_hello(api_key: &str, agent_name: &str, system_info: SystemInfo) -> AgentHello {
+fn agent_hello(
+    api_key: &str,
+    agent_name: &str,
+    system_info: SystemInfo,
+    build_id: Option<String>,
+    update_handoff: Option<AgentUpdateHandoff>,
+) -> AgentHello {
     AgentHello {
         api_key: api_key.to_string(),
         agent_name: agent_name.to_string(),
@@ -156,6 +171,8 @@ fn agent_hello(api_key: &str, agent_name: &str, system_info: SystemInfo) -> Agen
             template_id: "genshin/launch-to-ready".to_string(),
             template_version: "v1".to_string(),
         }],
+        build_id,
+        update_handoff,
     }
 }
 
@@ -382,6 +399,8 @@ fn control_message_type(msg: &HubMessage) -> &'static str {
         HubMessage::TaskRunStep(_) => "task_run_step",
         HubMessage::TaskRunResult(_) => "task_run_result",
         HubMessage::TaskRunCleanupReceipt(_) => "task_run_cleanup_receipt",
+        HubMessage::AgentUpdateProgress(_) => "agent_update_progress",
+        HubMessage::AgentUpdateResult(_) => "agent_update_result",
     }
 }
 
@@ -501,6 +520,8 @@ mod tests {
                 displays: vec![],
                 agent_version: "0.1.0".into(),
             },
+            Some("build-test".into()),
+            None,
         ));
         let HubMessage::AgentHello(hello) = hello else {
             unreachable!()
@@ -528,6 +549,7 @@ mod tests {
         assert!(json.contains("genshin/launch-to-ready"));
         assert!(json.contains("scene_detection"));
         assert!(json.contains("game_discovery"));
+        assert!(json.contains("build-test"));
     }
 
     #[tokio::test]

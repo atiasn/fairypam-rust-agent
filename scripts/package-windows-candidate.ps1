@@ -45,6 +45,26 @@ try {
     Copy-Item -LiteralPath $CoreExe -Destination (Join-Path $Stage 'fairypam-agent.exe')
     Copy-Item -LiteralPath $TauriExe -Destination (Join-Path $Stage 'fairypam-agent-tauri-ui.exe')
 
+    @"
+FairyPam Rust Agent unsigned candidate
+
+Build ID: $BuildId
+Source commit: $SourceCommit
+
+This is not a stable release and is not Authenticode signed.
+The package intentionally does not include config.yaml or credentials.
+Only promote it in FairyPam Hub after required candidate smoke gates pass.
+"@ | Set-Content -Encoding utf8 -Path (Join-Path $Stage 'README.txt')
+
+    $PayloadMembers = @('README.txt', 'fairypam-agent.exe', 'fairypam-agent-tauri-ui.exe')
+    $MemberIdentities = [ordered]@{}
+    foreach ($member in $PayloadMembers) {
+        $item = Get-Item -LiteralPath (Join-Path $Stage $member)
+        $MemberIdentities[$member] = [ordered]@{
+            sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            size_bytes = [int64]$item.Length
+        }
+    }
     $BuiltAt = (Get-Date).ToUniversalTime().ToString('o')
     $BuildManifest = [ordered]@{
         schema_version = 1
@@ -57,7 +77,10 @@ try {
         workflow_run_attempt = $RunAttempt
         built_at = $BuiltAt
         signed = $false
+        attestation_identity = "actions:$RunId.$RunAttempt"
+        tauri_gui_changed = $RequiresGuiSmoke
         requires_gui_smoke = $RequiresGuiSmoke
+        members = $MemberIdentities
         gates = [ordered]@{
             'WINDOWS-BUILD' = 'passed'
             'RUST-CLI-SAFE' = 'pending'
@@ -65,17 +88,6 @@ try {
         }
     }
     $BuildManifest | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 -Path (Join-Path $Stage 'BUILD-MANIFEST.json')
-
-    @"
-FairyPam Rust Agent unsigned candidate
-
-Build ID: $BuildId
-Source commit: $SourceCommit
-
-This is not a stable release and is not Authenticode signed.
-The package intentionally does not include config.yaml or credentials.
-Only promote it in FairyPam Hub after required candidate smoke gates pass.
-"@ | Set-Content -Encoding utf8 -Path (Join-Path $Stage 'README.txt')
 
     $ExpectedMembers = @(
         'BUILD-MANIFEST.json',
@@ -96,11 +108,35 @@ Only promote it in FairyPam Hub after required candidate smoke gates pass.
     $Archive = [IO.Compression.ZipFile]::OpenRead($PackagePath)
     try {
         $ZipMembers = @($Archive.Entries | Sort-Object FullName | Select-Object -ExpandProperty FullName)
+        $ManifestEntry = $Archive.GetEntry('BUILD-MANIFEST.json')
+        if ($null -eq $ManifestEntry) { throw 'candidate BUILD-MANIFEST.json is missing' }
+        $ManifestReader = [IO.StreamReader]::new($ManifestEntry.Open(), [Text.Encoding]::UTF8)
+        try {
+            $ArchivedManifest = $ManifestReader.ReadToEnd() | ConvertFrom-Json
+        } finally {
+            $ManifestReader.Dispose()
+        }
     } finally {
         $Archive.Dispose()
     }
     if (Compare-Object $ExpectedMembers $ZipMembers) {
         throw "candidate ZIP members are not exact: $($ZipMembers -join ', ')"
+    }
+    if ($ArchivedManifest.build_id -cne $BuildId -or
+        $ArchivedManifest.source_commit -cne $SourceCommit.ToLowerInvariant() -or
+        $ArchivedManifest.attestation_identity -cne "actions:$RunId.$RunAttempt" -or
+        $null -eq $ArchivedManifest.members -or
+        @($ArchivedManifest.members.PSObject.Properties.Name | Sort-Object) -ne @($PayloadMembers | Sort-Object)) {
+        throw 'candidate BUILD-MANIFEST identity is invalid'
+    }
+    foreach ($member in $PayloadMembers) {
+        $identity = $ArchivedManifest.members.$member
+        $item = Get-Item -LiteralPath (Join-Path $Stage $member)
+        if ($null -eq $identity -or
+            $identity.sha256 -cne (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -or
+            [int64]$identity.size_bytes -ne [int64]$item.Length) {
+            throw "candidate BUILD-MANIFEST payload identity is invalid: $member"
+        }
     }
 
     $Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $PackagePath).Hash.ToLowerInvariant()

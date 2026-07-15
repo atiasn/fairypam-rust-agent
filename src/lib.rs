@@ -1,4 +1,5 @@
 pub mod agent_runtime;
+pub mod agent_updater;
 pub mod capture;
 pub mod config;
 pub mod core_facade;
