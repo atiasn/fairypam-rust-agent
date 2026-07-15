@@ -237,7 +237,7 @@ async fn enqueue_task_run_cleanup_receipt(
 
 fn dispatch_task_run_start<F>(
     exit_tx: mpsc::UnboundedSender<ConnectionTaskExit>,
-    abort_handles: &mut Vec<AbortHandle>,
+    connection_tasks: &mut Vec<ConnectionTask>,
     future: F,
 ) where
     F: future::Future<Output = Result<()>> + Send + 'static,
@@ -246,7 +246,7 @@ fn dispatch_task_run_start<F>(
         ConnectionTaskName::LaunchToReadyStart,
         false,
         exit_tx,
-        abort_handles,
+        connection_tasks,
         tokio::spawn(future),
     );
 }
@@ -254,7 +254,7 @@ fn dispatch_task_run_start<F>(
 fn dispatch_task_run_start_event<F, Fut>(
     event: AgentEvent,
     exit_tx: mpsc::UnboundedSender<ConnectionTaskExit>,
-    abort_handles: &mut Vec<AbortHandle>,
+    connection_tasks: &mut Vec<ConnectionTask>,
     outbound: OutboundWriter,
     execute: F,
 ) where
@@ -265,7 +265,7 @@ fn dispatch_task_run_start_event<F, Fut>(
         unreachable!("task-run start dispatcher requires TaskRunStart")
     };
     info!(task_run_id = %start.task_run_id, trace_id = %start.trace_id, "task-run start received");
-    dispatch_task_run_start(exit_tx, abort_handles, async move {
+    dispatch_task_run_start(exit_tx, connection_tasks, async move {
         match execute(start.clone()).await {
             Ok(()) => {
                 info!(task_run_id = %start.task_run_id, trace_id = %start.trace_id, "task-run start activated");
@@ -337,6 +337,11 @@ struct ConnectionTaskExit {
     task: ConnectionTaskName,
     reason: String,
     critical: bool,
+}
+
+struct ConnectionTask {
+    abort: AbortHandle,
+    monitor: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,7 +553,7 @@ struct LaunchToReadyResources<'a> {
 
 async fn fail_connection_after_control_enqueue_error_with_cleanup<Cleanup>(
     cancel_tx: &watch::Sender<bool>,
-    abort_handles: &[AbortHandle],
+    connection_tasks: &mut Vec<ConnectionTask>,
     input_ctrl: &Arc<Mutex<InputController>>,
     runtime_state: &Arc<Mutex<AgentRuntimeState>>,
     operation: &str,
@@ -561,7 +566,7 @@ where
     let reason = format!("{operation} control enqueue failed: {err}");
     warn!("{reason}");
     cancel_connection(cancel_tx, &reason);
-    abort_connection_tasks(abort_handles);
+    abort_connection_tasks(connection_tasks).await;
     launch_cleanup.await;
     cleanup_local_runtime(input_ctrl, runtime_state, operation).await;
     ConnectionRunResult::Reconnect { reason }
@@ -569,7 +574,7 @@ where
 
 async fn fail_connection_after_control_enqueue_error(
     cancel_tx: &watch::Sender<bool>,
-    abort_handles: &[AbortHandle],
+    connection_tasks: &mut Vec<ConnectionTask>,
     input_ctrl: &Arc<Mutex<InputController>>,
     runtime_state: &Arc<Mutex<AgentRuntimeState>>,
     launch: &LaunchToReadyResources<'_>,
@@ -578,7 +583,7 @@ async fn fail_connection_after_control_enqueue_error(
 ) -> ConnectionRunResult {
     fail_connection_after_control_enqueue_error_with_cleanup(
         cancel_tx,
-        abort_handles,
+        connection_tasks,
         input_ctrl,
         runtime_state,
         operation,
@@ -609,11 +614,11 @@ fn monitor_connection_task(
     task: ConnectionTaskName,
     critical: bool,
     exit_tx: mpsc::UnboundedSender<ConnectionTaskExit>,
-    abort_handles: &mut Vec<AbortHandle>,
+    connection_tasks: &mut Vec<ConnectionTask>,
     handle: JoinHandle<Result<()>>,
 ) {
-    abort_handles.push(handle.abort_handle());
-    tokio::spawn(async move {
+    let abort = handle.abort_handle();
+    let monitor = tokio::spawn(async move {
         let exit = match handle.await {
             Ok(Ok(())) if critical => ConnectionTaskExit {
                 task,
@@ -635,18 +640,25 @@ fn monitor_connection_task(
         };
         let _ = exit_tx.send(exit);
     });
+    connection_tasks.push(ConnectionTask { abort, monitor });
 }
 
 fn spawn_connection_task<F>(
     task: ConnectionTaskName,
     critical: bool,
     exit_tx: mpsc::UnboundedSender<ConnectionTaskExit>,
-    abort_handles: &mut Vec<AbortHandle>,
+    connection_tasks: &mut Vec<ConnectionTask>,
     future: F,
 ) where
     F: future::Future<Output = Result<()>> + Send + 'static,
 {
-    monitor_connection_task(task, critical, exit_tx, abort_handles, tokio::spawn(future));
+    monitor_connection_task(
+        task,
+        critical,
+        exit_tx,
+        connection_tasks,
+        tokio::spawn(future),
+    );
 }
 
 fn cancel_connection(cancel_tx: &watch::Sender<bool>, reason: &str) {
@@ -654,9 +666,12 @@ fn cancel_connection(cancel_tx: &watch::Sender<bool>, reason: &str) {
     let _ = cancel_tx.send(true);
 }
 
-fn abort_connection_tasks(abort_handles: &[AbortHandle]) {
-    for handle in abort_handles {
-        handle.abort();
+async fn abort_connection_tasks(connection_tasks: &mut Vec<ConnectionTask>) {
+    for task in connection_tasks.iter() {
+        task.abort.abort();
+    }
+    while let Some(task) = connection_tasks.pop() {
+        let _ = task.monitor.await;
     }
 }
 
@@ -1564,7 +1579,7 @@ async fn run_agent_connection(
                 warn!("runtime stop requested");
                 cancel_connection(&connection_cancel_tx, "runtime stop requested");
                 cancel_active_environment_check(&active_environment_check, "runtime stop requested").await;
-                abort_connection_tasks(&connection_task_aborts);
+                abort_connection_tasks(&mut connection_task_aborts).await;
                 disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, &outbound, "runtime stop").await;
                 {
                     let mut ctrl = input_ctrl.lock().await;
@@ -1581,7 +1596,7 @@ async fn run_agent_connection(
                     let reconnect_reason = format!("{:?}: {}", exit.task, exit.reason);
                     if handle_connection_task_exit(&connection_cancel_tx, &exit) {
                         cancel_active_environment_check(&active_environment_check, &reconnect_reason).await;
-                        abort_connection_tasks(&connection_task_aborts);
+                        abort_connection_tasks(&mut connection_task_aborts).await;
                         disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, &outbound, "critical task exit").await;
                         {
                             let mut ctrl = input_ctrl.lock().await;
@@ -1604,7 +1619,7 @@ async fn run_agent_connection(
                         "connection task exit channel closed",
                     )
                     .await;
-                    abort_connection_tasks(&connection_task_aborts);
+                    abort_connection_tasks(&mut connection_task_aborts).await;
                     disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, &outbound, "task exit channel close").await;
                     {
                         let mut ctrl = input_ctrl.lock().await;
@@ -1671,7 +1686,7 @@ async fn run_agent_connection(
                 if let Err(e) = outbound.try_send_control(HubMessage::InputFrameAck(ack)) {
                     return Ok(fail_connection_after_control_enqueue_error(
                         &connection_cancel_tx,
-                        &connection_task_aborts,
+                        &mut connection_task_aborts,
                         &input_ctrl,
                         &runtime_state,
                         &launch_resources,
@@ -1748,7 +1763,7 @@ async fn run_agent_connection(
                 if let Err(e) = outbound.try_send_control(HubMessage::InputFrameAck(ack)) {
                     return Ok(fail_connection_after_control_enqueue_error(
                         &connection_cancel_tx,
-                        &connection_task_aborts,
+                        &mut connection_task_aborts,
                         &input_ctrl,
                         &runtime_state,
                         &launch_resources,
@@ -1771,7 +1786,7 @@ async fn run_agent_connection(
                     if let Err(e) = outbound.try_send_control(HubMessage::GameLaunchAck(ack)) {
                         return Ok(fail_connection_after_control_enqueue_error(
                             &connection_cancel_tx,
-                            &connection_task_aborts,
+                            &mut connection_task_aborts,
                             &input_ctrl,
                             &runtime_state,
                             &launch_resources,
@@ -1845,7 +1860,7 @@ async fn run_agent_connection(
                 if let Err(e) = outbound.try_send_control(HubMessage::GameLaunchAck(ack)) {
                     return Ok(fail_connection_after_control_enqueue_error(
                         &connection_cancel_tx,
-                        &connection_task_aborts,
+                        &mut connection_task_aborts,
                         &input_ctrl,
                         &runtime_state,
                         &launch_resources,
@@ -1911,7 +1926,7 @@ async fn run_agent_connection(
                 if let Err(e) = outbound.try_send_control(HubMessage::GameKillAck(ack)) {
                     return Ok(fail_connection_after_control_enqueue_error(
                         &connection_cancel_tx,
-                        &connection_task_aborts,
+                        &mut connection_task_aborts,
                         &input_ctrl,
                         &runtime_state,
                         &launch_resources,
@@ -1952,7 +1967,7 @@ async fn run_agent_connection(
                 {
                     return Ok(fail_connection_after_control_enqueue_error(
                         &connection_cancel_tx,
-                        &connection_task_aborts,
+                        &mut connection_task_aborts,
                         &input_ctrl,
                         &runtime_state,
                         &launch_resources,
@@ -2187,10 +2202,10 @@ async fn run_agent_connection(
                     (result, engine.take_cleanup_receipt())
                 };
                 if let Some(receipt) = receipt {
-                    if let Err(e) = enqueue_task_run_cleanup_receipt(&outbound, receipt).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_cancel_cleanup", e).await); }
+                    if let Err(e) = enqueue_task_run_cleanup_receipt(&outbound, receipt).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &mut connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_cancel_cleanup", e).await); }
                 }
                 if result.is_ok() { runtime_state.lock().await.finish_session(&cancel.session_id); }
-                else if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(cancel.task_run_id, cancel.trace_id, cancel.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_cancel", e).await); }
+                else if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(cancel.task_run_id, cancel.trace_id, cancel.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &mut connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_cancel", e).await); }
             }
             AgentEvent::TaskRunClick(click) => {
                 let (result, receipt) = {
@@ -2203,9 +2218,9 @@ async fn run_agent_connection(
                     (result, engine.take_cleanup_receipt())
                 };
                 if let Some(receipt) = receipt {
-                    if let Err(e) = enqueue_task_run_cleanup_receipt(&outbound, receipt).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_click_cleanup", e).await); }
+                    if let Err(e) = enqueue_task_run_cleanup_receipt(&outbound, receipt).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &mut connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_click_cleanup", e).await); }
                 }
-                if result.is_err() { if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(click.task_run_id, click.trace_id, click.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_click", e).await); } }
+                if result.is_err() { if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(click.task_run_id, click.trace_id, click.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &mut connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_click", e).await); } }
             }
             AgentEvent::TaskRunTerminal(terminal) => {
                 if consume_cancelled_pending_task_run_start(&pending_task_run_start, &terminal).await {
@@ -2225,17 +2240,17 @@ async fn run_agent_connection(
                         receipt.owned_cleanup == protocol::OwnedCleanup::NotRequired
                     });
                 if let Some(receipt) = receipt {
-                    if let Err(e) = enqueue_task_run_cleanup_receipt(&outbound, receipt).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_terminal_cleanup", e).await); }
+                    if let Err(e) = enqueue_task_run_cleanup_receipt(&outbound, receipt).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &mut connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_terminal_cleanup", e).await); }
                 }
                 if result.is_ok() { if !keep { runtime_state.lock().await.finish_session(&terminal.session_id); } }
-                else if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(terminal.task_run_id, terminal.trace_id, terminal.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_terminal", e).await); }
+                else if let Err(e) = enqueue_task_run_terminal(&outbound, task_run_failure(terminal.task_run_id, terminal.trace_id, terminal.session_id)).await { return Ok(fail_connection_after_control_enqueue_error(&connection_cancel_tx, &mut connection_task_aborts, &input_ctrl, &runtime_state, &launch_resources, "task_run_terminal", e).await); }
             }
                 },
                 None => {
                     warn!("agent event channel closed");
                     cancel_connection(&connection_cancel_tx, "agent event channel closed");
                     cancel_active_environment_check(&active_environment_check, "agent event channel closed").await;
-                    abort_connection_tasks(&connection_task_aborts);
+                    abort_connection_tasks(&mut connection_task_aborts).await;
                     disconnect_launch_to_ready(&launch_engine, &proc_mgr, &input_ctrl, &launch_owned, &launch_capture, &outbound, "agent event channel close").await;
                     {
                         let mut ctrl = input_ctrl.lock().await;
@@ -2305,6 +2320,14 @@ pub fn in_process_runtime_runner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TaskCompletionGuard(Arc<AtomicBool>);
+
+    impl Drop for TaskCompletionGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     struct LaunchCleanupFakeOps {
         binding: TargetBinding,
@@ -2641,7 +2664,7 @@ mod tests {
         assert!(exit.reason.contains("writer failed"));
         assert!(handle_connection_task_exit(&cancel_tx, &exit));
         assert!(*cancel_rx.borrow());
-        abort_connection_tasks(&abort_handles);
+        abort_connection_tasks(&mut abort_handles).await;
     }
 
     #[tokio::test]
@@ -2668,7 +2691,31 @@ mod tests {
         assert!(exit.reason.contains("completed unexpectedly"));
         assert!(handle_connection_task_exit(&cancel_tx, &exit));
         assert!(*cancel_rx.borrow());
-        abort_connection_tasks(&abort_handles);
+        abort_connection_tasks(&mut abort_handles).await;
+    }
+
+    #[tokio::test]
+    async fn connection_cleanup_waits_for_cancelled_tasks_before_reconnect() {
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let mut abort_handles = Vec::new();
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_completed = completed.clone();
+
+        monitor_connection_task(
+            ConnectionTaskName::Writer,
+            true,
+            exit_tx,
+            &mut abort_handles,
+            tokio::spawn(async move {
+                let _guard = TaskCompletionGuard(task_completed);
+                future::pending::<Result<()>>().await
+            }),
+        );
+        tokio::task::yield_now().await;
+
+        abort_connection_tasks(&mut abort_handles).await;
+
+        assert!(completed.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -2763,7 +2810,7 @@ mod tests {
         assert_eq!(exit.task, ConnectionTaskName::LaunchToReadyStart);
         assert!(exit.reason.contains("task-run terminal enqueue failed"));
 
-        abort_connection_tasks(&abort_handles);
+        abort_connection_tasks(&mut abort_handles).await;
         drop(release_first_tx);
     }
 
@@ -2789,7 +2836,7 @@ mod tests {
         );
         entered_rx.await.unwrap();
 
-        abort_connection_tasks(&abort_handles);
+        abort_connection_tasks(&mut abort_handles).await;
         tokio::task::yield_now().await;
         let _ = release_tx.send(());
         assert_eq!(
@@ -2886,14 +2933,21 @@ mod tests {
             .lock()
             .await
             .start_manual_session("manual-local".into());
-        let pending_task = tokio::spawn(async { future::pending::<Result<()>>().await });
-        let abort_handles = vec![pending_task.abort_handle()];
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let mut connection_tasks = Vec::new();
+        spawn_connection_task(
+            ConnectionTaskName::Writer,
+            true,
+            exit_tx,
+            &mut connection_tasks,
+            async { future::pending::<Result<()>>().await },
+        );
 
         let result = tokio::time::timeout(
             Duration::from_millis(50),
             fail_connection_after_control_enqueue_error_with_cleanup(
                 &cancel_tx,
-                &abort_handles,
+                &mut connection_tasks,
                 &input_ctrl,
                 &runtime_state,
                 "input_frame_ack",
@@ -2911,8 +2965,6 @@ mod tests {
         ));
         assert!(*cancel_rx.borrow());
         assert!(runtime_state.lock().await.active_session.is_none());
-
-        let _ = pending_task.await;
     }
 
     #[tokio::test]
@@ -2940,9 +2992,10 @@ mod tests {
 
         let cleanup_engine = engine.clone();
         let cleanup_ops = ops.clone();
+        let mut connection_tasks = Vec::new();
         let result = fail_connection_after_control_enqueue_error_with_cleanup(
             &cancel_tx,
-            &[],
+            &mut connection_tasks,
             &input_ctrl,
             &runtime_state,
             "task_run_terminal",
