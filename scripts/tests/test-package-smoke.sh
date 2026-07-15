@@ -22,6 +22,13 @@ fi
   if [ -f "${CANDIDATE_EXE}.exe" ]; then
     CANDIDATE_EXE="${CANDIDATE_EXE}.exe"
   fi
+  MANIFEST_PATH="$(dirname "$CANDIDATE_EXE")/BUILD-MANIFEST.json"
+  if [ -e "$MANIFEST_PATH" ]; then
+    printf '[ERROR] package smoke manifest path already exists: %s\n' "$MANIFEST_PATH" >&2
+    exit 1
+  fi
+  trap 'rm -f "$MANIFEST_PATH"' EXIT
+  printf '%s\n' '{"build_id":"local-package-smoke","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tauri_gui_changed":false,"attestation_identity":"local-package-smoke","members":{}}' > "$MANIFEST_PATH"
   FAIRYPAM_CANDIDATE_EXE="$CANDIDATE_EXE" \
   FAIRYPAM_CANDIDATE_BUILD_ID="local-package-smoke" \
   FAIRYPAM_CANDIDATE_SOURCE_COMMIT="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
