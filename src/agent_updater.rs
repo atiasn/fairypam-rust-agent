@@ -27,10 +27,30 @@ const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuildManifest {
+    #[serde(rename = "schema_version", default)]
+    _schema_version: Option<u8>,
+    #[serde(rename = "kind", default)]
+    _kind: Option<String>,
+    #[serde(rename = "built_at", default)]
+    _built_at: Option<String>,
     build_id: String,
     source_commit: String,
+    #[serde(rename = "public_commit", default)]
+    _public_commit: Option<String>,
+    #[serde(rename = "signed", default)]
+    _signed: Option<bool>,
     tauri_gui_changed: bool,
     attestation_identity: String,
+    #[serde(rename = "workflow_run_id", default)]
+    _workflow_run_id: Option<String>,
+    #[serde(rename = "workflow_run_attempt", default)]
+    _workflow_run_attempt: Option<String>,
+    #[serde(rename = "validated_base_public_commit", default)]
+    _validated_base_public_commit: Option<String>,
+    #[serde(rename = "requires_gui_smoke", default)]
+    _requires_gui_smoke: Option<bool>,
+    #[serde(rename = "gates", default)]
+    _gates: Option<HashMap<String, String>>,
     members: HashMap<String, MemberIdentity>,
 }
 
@@ -188,24 +208,10 @@ pub fn download_bound_artifact(
     request: &AgentUpdateRequest,
 ) -> Result<Vec<u8>> {
     validate_request_artifact_path(request)?;
-    let mut hub = reqwest::Url::parse(hub_ws_url).context("agent_update_download_failed")?;
-    let is_loopback = matches!(
-        hub.host_str(),
-        Some("127.0.0.1") | Some("localhost") | Some("::1")
-    );
-    let scheme = match hub.scheme() {
-        "wss" => "https",
-        "ws" if is_loopback => "http",
-        _ => anyhow::bail!("agent_update_transport_invalid"),
-    };
-    hub.set_scheme(scheme)
-        .map_err(|_| anyhow::anyhow!("agent_update_transport_invalid"))?;
-    hub.set_path(&request.artifact_path);
-    hub.set_query(None);
-    hub.set_fragment(None);
+    let hub = artifact_download_url(hub_ws_url, &request.artifact_path)?;
 
     let client = reqwest::blocking::Client::builder()
-        .https_only(!is_loopback)
+        .https_only(hub.scheme() == "https")
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(60))
@@ -241,6 +247,21 @@ pub fn download_bound_artifact(
     Ok(bytes)
 }
 
+fn artifact_download_url(hub_ws_url: &str, artifact_path: &str) -> Result<reqwest::Url> {
+    let mut hub = reqwest::Url::parse(hub_ws_url).context("agent_update_download_failed")?;
+    let scheme = match hub.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        _ => anyhow::bail!("agent_update_transport_invalid"),
+    };
+    hub.set_scheme(scheme)
+        .map_err(|_| anyhow::anyhow!("agent_update_transport_invalid"))?;
+    hub.set_path(artifact_path);
+    hub.set_query(None);
+    hub.set_fragment(None);
+    Ok(hub)
+}
+
 /// Stage an already verified archive into a fresh side-by-side version
 /// directory.  Any partial target is removed before returning the fixed error.
 pub fn stage_update(
@@ -256,6 +277,15 @@ pub fn stage_update(
         &request.target_build_id,
     )?;
     let target = target_version_dir(install_root, &request.target_build_id)?;
+    let target = if request.source_build_id == request.target_build_id {
+        let parent = target.parent().context("agent_update_stage_failed")?;
+        parent.join(format!(
+            "{}-reinstall-{}",
+            request.target_build_id, request.update_id
+        ))
+    } else {
+        target
+    };
     let parent = target.parent().context("agent_update_stage_failed")?;
     std::fs::create_dir_all(parent).context("agent_update_stage_failed")?;
     if target.exists() || std::fs::symlink_metadata(&target).is_ok() {
@@ -531,7 +561,6 @@ fn parse_handoff_bytes(bytes: &[u8], running_build_id: &str) -> Result<UpdateHan
         || wire.attempt_nonce.len() > 128
         || wire.source_build_id.is_empty()
         || wire.target_build_id.is_empty()
-        || wire.source_build_id == wire.target_build_id
         || wire.running_build_id != running_build_id
         || !correct_mode
     {
@@ -637,6 +666,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn update_transport_maps_hub_ws_schemes_without_query_or_fragment() {
+        let artifact_path = "/api/v1/agents/11111111-1111-1111-1111-111111111111/updates/22222222-2222-2222-2222-222222222222/artifact";
+        let lan = artifact_download_url(
+            "ws://hub.lan:8005/ws?ignored=query#ignored-fragment",
+            artifact_path,
+        )
+        .unwrap();
+        assert_eq!(lan.as_str(), format!("http://hub.lan:8005{artifact_path}"));
+        assert!(lan.query().is_none());
+        assert!(lan.fragment().is_none());
+
+        let tls = artifact_download_url("wss://hub.example:9443/ws", artifact_path).unwrap();
+        assert_eq!(
+            tls.as_str(),
+            format!("https://hub.example:9443{artifact_path}")
+        );
+
+        for source in [
+            "http://hub.lan/ws",
+            "https://hub.lan/ws",
+            "ftp://hub.lan/ws",
+        ] {
+            assert!(artifact_download_url(source, artifact_path).is_err());
+        }
+    }
+
     fn package() -> (Vec<u8>, String) {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default();
@@ -686,7 +742,7 @@ mod tests {
         std::fs::write(&executable, b"cli").unwrap();
         std::fs::write(
             temp.join("BUILD-MANIFEST.json"),
-            r#"{"build_id":"build-new","source_commit":"abc","tauri_gui_changed":false,"attestation_identity":"actions","members":{"README.txt":{"sha256":"a","size_bytes":1},"fairypam-agent.exe":{"sha256":"b","size_bytes":1},"fairypam-agent-tauri-ui.exe":{"sha256":"c","size_bytes":1}}}"#,
+            r#"{"schema_version":1,"kind":"fairypam-windows-agent-candidate","built_at":"2026-07-15T12:07:21.1265436Z","build_id":"build-new","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","public_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signed":false,"tauri_gui_changed":false,"attestation_identity":"actions:1.1","workflow_run_id":"1","workflow_run_attempt":"1","validated_base_public_commit":null,"requires_gui_smoke":false,"gates":{"WINDOWS-BUILD":"passed","RUST-CLI-SAFE":"pending","TAURI-GUI-SMOKE":"not_required"},"members":{"README.txt":{"sha256":"a","size_bytes":1},"fairypam-agent.exe":{"sha256":"b","size_bytes":1},"fairypam-agent-tauri-ui.exe":{"sha256":"c","size_bytes":1}}}"#,
         )
         .unwrap();
         assert_eq!(running_build_id(&executable).unwrap(), "build-new");
@@ -745,6 +801,66 @@ mod tests {
         assert_eq!(handoff.wire.running_build_id, request.target_build_id);
         assert!(stage_update(&bytes, &request, &root, &source).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_build_reinstall_uses_fresh_directory_without_overwriting_existing_target() {
+        let (bytes, hash) = package();
+        let root =
+            std::env::temp_dir().join(format!("fairypam-update-stage-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source-config.yaml");
+        let canonical = target_version_dir(&root, "build-2").unwrap();
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(canonical.join("untrusted-existing.txt"), b"keep").unwrap();
+        std::fs::write(&source, b"config").unwrap();
+        let agent_id = uuid::Uuid::new_v4();
+        let update_id = uuid::Uuid::new_v4();
+        let request = AgentUpdateRequest {
+            message_type: "agent_update_request".into(),
+            connection_id: uuid::Uuid::new_v4(),
+            update_id,
+            promotion_id: uuid::Uuid::new_v4(),
+            source_build_id: "build-2".into(),
+            target_build_id: "build-2".into(),
+            attempt_nonce: "0123456789abcdef".into(),
+            artifact_path: format!("/api/v1/agents/{agent_id}/updates/{update_id}/artifact"),
+            sha256: hash,
+            size_bytes: bytes.len() as u64,
+        };
+
+        let staged = stage_update(&bytes, &request, &root, &source).unwrap();
+        assert_ne!(staged.install_dir, canonical);
+        assert!(staged.install_dir.join("fairypam-agent.exe").is_file());
+        assert_eq!(
+            std::fs::read(canonical.join("untrusted-existing.txt")).unwrap(),
+            b"keep"
+        );
+        assert!(stage_update(&bytes, &request, &root, &source).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_build_restart_handoff_is_accepted() {
+        let wire = UpdateHandoffFile {
+            update_id: uuid::Uuid::new_v4(),
+            attempt_nonce: "0123456789abcdef".into(),
+            source_build_id: "build-current".into(),
+            target_build_id: "build-current".into(),
+            prior_connection_id: uuid::Uuid::new_v4(),
+            running_build_id: "build-current".into(),
+        };
+        let envelope = HelperHandoffFile {
+            schema_version: 1,
+            mode: "restart".into(),
+            agent_id: uuid::Uuid::new_v4(),
+            promotion_id: uuid::Uuid::new_v4(),
+            wire: wire.clone(),
+        };
+
+        assert_eq!(
+            parse_handoff_bytes(&serde_json::to_vec(&envelope).unwrap(), "build-current").unwrap(),
+            wire
+        );
     }
 
     #[test]

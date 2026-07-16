@@ -469,7 +469,6 @@ fn update_request_matches_runtime(
 ) -> bool {
     request.connection_id == connection_id
         && request.source_build_id == running_build_id
-        && request.target_build_id != running_build_id
         && !has_active_session
         && !restarting_handoff
 }
@@ -2812,6 +2811,35 @@ mod tests {
             "build-old",
             false,
             true,
+        ));
+    }
+
+    #[test]
+    fn update_request_allows_authorized_same_build_reinstall() {
+        let connection_id = uuid::Uuid::new_v4();
+        let request = protocol::AgentUpdateRequest {
+            message_type: "agent_update_request".into(),
+            connection_id,
+            update_id: uuid::Uuid::new_v4(),
+            promotion_id: uuid::Uuid::new_v4(),
+            source_build_id: "build-current".into(),
+            target_build_id: "build-current".into(),
+            attempt_nonce: "0123456789abcdef".into(),
+            artifact_path: format!(
+                "/api/v1/agents/{}/updates/{}/artifact",
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4()
+            ),
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+        };
+
+        assert!(update_request_matches_runtime(
+            &request,
+            connection_id,
+            "build-current",
+            false,
+            false,
         ));
     }
 

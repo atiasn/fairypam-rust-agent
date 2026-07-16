@@ -88,7 +88,7 @@ jobs:
                 if ($ancestorExit -eq 0) {
                   $base = $resolved
                   $guiImpact = @(git diff --name-only "$base..HEAD" | Where-Object {
-                    $_ -match '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$)'
+                    $_ -match '^(tauri-ui/)'
                   })
                   $requiresGuiSmoke = $guiImpact.Count -gt 0
                 }

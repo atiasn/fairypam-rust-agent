@@ -10,12 +10,14 @@ CLEIAGENT="$ROOT_DIR/scripts/run-cleiagent.sh"
 grep -Fq 'git diff --name-only' "$WORKFLOW"
 grep -Fq '$requiresGuiSmoke = $true' "$WORKFLOW"
 grep -Fq 'tauri-ui/' "$WORKFLOW"
-grep -Fq 'src/' "$WORKFLOW"
-grep -Fq 'Cargo\.toml' "$WORKFLOW"
-grep -Fq 'Cargo\.lock' "$WORKFLOW"
-grep -Fq 'rust-toolchain\.toml' "$WORKFLOW"
-grep -Fq 'build\.rs' "$WORKFLOW"
 impact_rule="$(grep -F '$_ -match' "$WORKFLOW")"
+[[ "$impact_rule" == *"'^(tauri-ui/)'"* ]]
+for core_path in 'src/' 'Cargo\.toml' 'Cargo\.lock' 'rust-toolchain\.toml' 'build\.rs'; do
+  if [[ "$impact_rule" == *"$core_path"* ]]; then
+    printf '[FAIL] core input must not require GUI smoke: %s\n' "$core_path" >&2
+    exit 1
+  fi
+done
 for control_plane_path in 'scripts/package-windows-candidate\.ps1' 'scripts/candidate-smoke-runner\.ps1' '.github/workflows/windows-candidate\.yml'; do
   if [[ "$impact_rule" == *"$control_plane_path"* ]]; then
     printf '[FAIL] control-plane input must not require GUI smoke: %s\n' "$control_plane_path" >&2
@@ -219,7 +221,7 @@ requires_gui_smoke() {
     return 0
   fi
   git -C "$repo" diff --name-only "$resolved..HEAD" |
-    grep -Eq '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$)'
+    grep -Eq '^(tauri-ui/)'
 }
 
 validated_base_json() {
@@ -232,9 +234,25 @@ validated_base_json() {
   fi
 }
 
+printf '%s\n' 'tauri-ui/src/App.tsx' | grep -Eq '^(tauri-ui/)'
+for core_path in src/agent_updater.rs Cargo.toml Cargo.lock rust-toolchain.toml build.rs; do
+  if printf '%s\n' "$core_path" | grep -Eq '^(tauri-ui/)'; then
+    printf '[FAIL] core input unexpectedly requires GUI smoke: %s\n' "$core_path" >&2
+    exit 1
+  fi
+done
+
+git -C "$repo" checkout -qb core-only "$base"
+commit_path 'src/agent_updater.rs' core 'core runtime change'
+if requires_gui_smoke "$base"; then
+  printf '[FAIL] core runtime change unexpectedly requires GUI smoke\n' >&2
+  exit 1
+fi
+git -C "$repo" checkout -q -
+
 for shared_path in src/lib.rs Cargo.toml Cargo.lock rust-toolchain.toml build.rs; do
   printf '%s\n' "$shared_path" |
-    grep -Eq '^(tauri-ui/|src/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|build\.rs$)'
+    grep -Ev '^(tauri-ui/)'
 done
 
 git -C "$repo" checkout -qb control-plane "$base"

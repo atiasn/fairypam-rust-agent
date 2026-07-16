@@ -106,8 +106,7 @@ pub(crate) fn compact_log_file(log_path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn acquire_single_instance_guard() -> Result<SingleInstanceGuard> {
-    let mutex_name = "Local\\FairyPam.Agent";
+fn acquire_single_instance_guard(mutex_name: &str) -> Result<SingleInstanceGuard> {
     let mutex_name: Vec<u16> = mutex_name.encode_utf16().chain(Some(0)).collect();
 
     unsafe {
@@ -123,13 +122,12 @@ fn acquire_single_instance_guard() -> Result<SingleInstanceGuard> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn acquire_single_instance_guard() -> Result<SingleInstanceGuard> {
+fn acquire_single_instance_guard(_mutex_name: &str) -> Result<SingleInstanceGuard> {
     Ok(SingleInstanceGuard)
 }
 
 #[cfg(target_os = "windows")]
-fn single_instance_running() -> bool {
-    let mutex_name = "Local\\FairyPam.Agent";
+fn single_instance_running(mutex_name: &str) -> bool {
     let mutex_name: Vec<u16> = mutex_name.encode_utf16().chain(Some(0)).collect();
 
     unsafe {
@@ -161,7 +159,8 @@ async fn main() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        if single_instance_running() {
+        let mutex_name = single_instance_mutex_name(args.mode);
+        if single_instance_running(mutex_name) {
             anyhow::bail!("another FairyPam Agent is already running");
         }
 
@@ -177,7 +176,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    let _single_instance_guard = acquire_single_instance_guard()?;
+    let _single_instance_guard =
+        acquire_single_instance_guard(single_instance_mutex_name(args.mode))?;
 
     match args.mode {
         Mode::Gui => {
@@ -385,6 +385,13 @@ impl Mode {
             Mode::SafeSmoke => "--safe-smoke",
             Mode::Automation => "automation",
         }
+    }
+}
+
+fn single_instance_mutex_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::SafeSmoke => "Local\\FairyPam.Agent.SafeSmoke",
+        Mode::Gui | Mode::Run | Mode::Automation => "Local\\FairyPam.Agent",
     }
 }
 
@@ -1118,6 +1125,18 @@ mod tests {
     #[test]
     fn safe_smoke_mode_has_an_explicit_flag() {
         assert_eq!(Mode::SafeSmoke.flag(), "--safe-smoke");
+    }
+
+    #[test]
+    fn safe_smoke_uses_an_isolated_single_instance_mutex() {
+        assert_eq!(
+            single_instance_mutex_name(Mode::SafeSmoke),
+            "Local\\FairyPam.Agent.SafeSmoke"
+        );
+        assert_eq!(
+            single_instance_mutex_name(Mode::Run),
+            "Local\\FairyPam.Agent"
+        );
     }
 
     #[test]

@@ -122,11 +122,13 @@ Only promote it in FairyPam Hub after required candidate smoke gates pass.
     if (Compare-Object $ExpectedMembers $ZipMembers) {
         throw "candidate ZIP members are not exact: $($ZipMembers -join ', ')"
     }
+    $ManifestMembers = @($ArchivedManifest.members.PSObject.Properties.Name | Sort-Object)
+    $ExpectedPayloadMembers = @($PayloadMembers | Sort-Object)
     if ($ArchivedManifest.build_id -cne $BuildId -or
         $ArchivedManifest.source_commit -cne $SourceCommit.ToLowerInvariant() -or
         $ArchivedManifest.attestation_identity -cne "actions:$RunId.$RunAttempt" -or
         $null -eq $ArchivedManifest.members -or
-        @($ArchivedManifest.members.PSObject.Properties.Name | Sort-Object) -ne @($PayloadMembers | Sort-Object)) {
+        (Compare-Object $ExpectedPayloadMembers $ManifestMembers)) {
         throw 'candidate BUILD-MANIFEST identity is invalid'
     }
     foreach ($member in $PayloadMembers) {
