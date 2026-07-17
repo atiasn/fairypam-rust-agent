@@ -181,7 +181,7 @@ mod windows {
             .into());
         }
         let binding = targets.lock(&profile, candidates[0].selector.clone())?;
-        let snapshot = targets.revalidate(&binding)?;
+        let snapshot = targets.focus(&binding)?;
 
         let phrase = TestArmAuthorization::expected_confirmation(BUILD_ID, &arguments.profile_id);
         print!("Type exactly `{phrase}` to authorize this signed-Profile input test: ");
