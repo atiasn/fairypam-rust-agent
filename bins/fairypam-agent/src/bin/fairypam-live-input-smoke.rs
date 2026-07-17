@@ -184,7 +184,7 @@ mod windows {
         let snapshot = targets.focus(&binding)?;
 
         let phrase = TestArmAuthorization::expected_confirmation(BUILD_ID, &arguments.profile_id);
-        print!("Type exactly `{phrase}` to authorize this signed-Profile input test: ");
+        println!("Type exactly `{phrase}` to authorize this signed-Profile input test:");
         io::stdout().flush()?;
         let mut confirmation = String::new();
         io::stdin().read_line(&mut confirmation)?;
