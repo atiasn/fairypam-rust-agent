@@ -1,0 +1,38 @@
+{
+  "content": {
+    "schema_version": 1,
+    "profile": {
+      "id": "genshin-impact",
+      "version": "1.0.0",
+      "display_name": "原神",
+      "target": {
+        "process_names": ["YuanShen.exe"],
+        "process_path_sha256": [
+          "aa42c410fe42d3de8b20121fa6f2520cc2c4c12a225e35b03c4f1a00a73a45fe",
+          "cd2516e4359c1c1166adf8d025dcd027073a8293d197eec494675ec750baf762"
+        ],
+        "window_classes": ["UnityWndClass"],
+        "title_patterns": ["原神*"],
+        "require_elevated": true,
+        "minimum_client_width": 1280,
+        "minimum_client_height": 720,
+        "minimum_dpi": 96
+      },
+      "capture_sources": [
+        {
+          "id": "client",
+          "region": {"kind": "full_client"},
+          "maximum_fps": 10,
+          "encodings": ["jpeg", "png"]
+        }
+      ],
+      "actions": {
+        "interaction.confirm": {"kind": "pulse", "scan_code": 33},
+        "move.forward": {"kind": "hold", "scan_code": 17}
+      }
+    },
+    "files": []
+  },
+  "content_sha256": "308bd2ed4ed6e7cda8eee5bc6c7df418a605209d70a862155c294b498aaab216",
+  "signature": "7250ef70a7cf24c4fd8e205a58824d35534dced8ec92f4b450e9d4ad4a5b21814fe0917232c96fb1ef06154eeb69ee68bc02f71d6f017335162ee309c81ea108"
+}

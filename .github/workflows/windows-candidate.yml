@@ -1,37 +1,21 @@
-name: Windows candidate
-run-name: "Windows candidate ${{ github.sha }} #${{ github.run_number }}"
+name: Windows core build
+run-name: "Windows core build ${{ github.sha }} #${{ github.run_number }}"
 
 on:
   workflow_dispatch:
-    inputs:
-      previous_validated_candidate_public_commit:
-        description: Previous validated candidate public commit or ref
-        required: false
-        type: string
 
 permissions:
   contents: read
-  id-token: write
-  attestations: write
 
 jobs:
   build:
-    name: Build unsigned Windows candidate
+    name: Build non-promotable Windows core artifact
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
       - name: Checkout mirror snapshot
         uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: tauri-ui/package-lock.json
 
       - name: Install pinned Rust toolchain
         shell: pwsh
@@ -43,91 +27,54 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Test and build Rust core
-        shell: pwsh
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          cargo fmt --all -- --check
-          bash scripts/tests/test-safe-smoke-mode.sh
-          bash scripts/tests/test-package-smoke.sh
-          cargo test --locked --all-targets
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo build --locked --release
-
-      - name: Test and build Tauri UI
-        shell: pwsh
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          Set-Location tauri-ui
-          npm ci
-          Set-Location src-tauri
-          cargo fmt --all -- --check
-          cargo test --locked --all-targets
-          cargo clippy --locked --all-targets -- -D warnings
-          Set-Location ..
-          npm run tauri build -- --no-bundle --ci
-
-      - name: Package unsigned candidate
-        id: package
+      - name: Test workspace and build release binaries
         shell: pwsh
         env:
-          PREVIOUS_VALIDATED_CANDIDATE_PUBLIC_COMMIT: ${{ inputs.previous_validated_candidate_public_commit }}
+          FAIRYPAM_BUILD_ID: public-core-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $base = $null
-          $requiresGuiSmoke = $true
-          $previous = $env:PREVIOUS_VALIDATED_CANDIDATE_PUBLIC_COMMIT
-          if (-not [string]::IsNullOrWhiteSpace($previous)) {
-            $resolvedLines = @(git rev-parse --verify "$previous^{commit}" 2>$null)
-            $resolveExit = $LASTEXITCODE
-            if ($resolveExit -eq 0 -and $resolvedLines.Count -eq 1) {
-              $resolved = ([string]$resolvedLines[0]).Trim()
-              if ($resolved -match '^[0-9a-f]{40}$') {
-                git merge-base --is-ancestor $resolved HEAD
-                $ancestorExit = $LASTEXITCODE
-                if ($ancestorExit -eq 0) {
-                  $base = $resolved
-                  $guiImpact = @(git diff --name-only "$base..HEAD" | Where-Object {
-                    $_ -match '^(tauri-ui/)'
-                  })
-                  $requiresGuiSmoke = $guiImpact.Count -gt 0
-                }
-              }
-            }
-          }
-          $baseOutput = if ($base) { $base } else { 'null' }
-          "validated_base_public_commit=$baseOutput" >> $env:GITHUB_OUTPUT
-          "requires_gui_smoke=$($requiresGuiSmoke.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          $env:FAIRYPAM_BUILD_COMMIT = (Get-Content SOURCE_COMMIT -Raw).Trim()
+          cargo fmt --all -- --check
+          cargo check --workspace --all-targets --locked
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo build --workspace --release --locked
+
+      - name: Package non-promotable core build
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force -Path dist/core | Out-Null
+          Copy-Item target/release/fairypam-agent.exe dist/core/
+          Copy-Item target/release/fairypam-agent-guardian.exe dist/core/
+          Copy-Item -Recurse profiles dist/core/profiles
+          Copy-Item test-profile-root-public-key.hex dist/core/
           $sourceCommit = (Get-Content SOURCE_COMMIT -Raw).Trim()
-          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
-            Where-Object name -eq 'fairypam-agent' |
-            Select-Object -ExpandProperty version
-          $sourceShort = $sourceCommit.Substring(0, 8)
-          $buildId = "$version-dev.$sourceShort.run${{ github.run_id }}"
-          ./scripts/package-windows-candidate.ps1 `
-            -BuildId $buildId `
-            -SourceCommit $sourceCommit `
-            -PublicCommit '${{ github.sha }}' `
-            -RunId '${{ github.run_id }}' `
-            -RunAttempt '${{ github.run_attempt }}' `
-            -ValidatedBasePublicCommit $base `
-            -RequiresGuiSmoke:$requiresGuiSmoke `
-            -OutputDirectory dist
-          "artifact_name=fairypam-agent-candidate-${{ github.run_id }}-${{ github.run_attempt }}" >> $env:GITHUB_OUTPUT
-          "package=$(Get-ChildItem dist/*-portable.zip | Select-Object -ExpandProperty FullName)" >> $env:GITHUB_OUTPUT
-          "manifest=$(Resolve-Path dist/candidate-manifest.json)" >> $env:GITHUB_OUTPUT
+          $agent = Get-Item dist/core/fairypam-agent.exe
+          $guardian = Get-Item dist/core/fairypam-agent-guardian.exe
+          $receipt = [ordered]@{
+            schema_version = 1
+            artifact_class = 'core-build-only'
+            promotable = $false
+            source_commit = $sourceCommit
+            public_commit = '${{ github.sha }}'
+            build_id = 'public-core-${{ github.run_id }}-${{ github.run_attempt }}'
+            run_id = '${{ github.run_id }}'
+            run_attempt = '${{ github.run_attempt }}'
+            agent_sha256 = (Get-FileHash $agent -Algorithm SHA256).Hash.ToLowerInvariant()
+            agent_size = $agent.Length
+            guardian_sha256 = (Get-FileHash $guardian -Algorithm SHA256).Hash.ToLowerInvariant()
+            guardian_size = $guardian.Length
+          }
+          $receipt | ConvertTo-Json | Set-Content -Encoding utf8 dist/core-build-receipt.json
+          Compress-Archive -Path dist/core/* -DestinationPath dist/fairypam-agent-core-windows.zip
 
-      - name: Attest candidate provenance
-        uses: actions/attest@v4
-        with:
-          subject-path: |
-            ${{ steps.package.outputs.package }}
-            ${{ steps.package.outputs.manifest }}
-
-      - name: Upload candidate artifact
+      - name: Upload non-promotable core artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.package.outputs.artifact_name }}
-          path: dist/*
+          name: fairypam-agent-core-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/fairypam-agent-core-windows.zip
+            dist/core-build-receipt.json
           if-no-files-found: error
           retention-days: 14

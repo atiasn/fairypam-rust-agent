@@ -1,0 +1,17 @@
+[package]
+name = "fairypam-agent-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+fairypam-agent-transport = { path = "../fairypam-agent-transport" }
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ed25519-dalek.workspace = true
+tokio = { version = "1", features = ["time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"

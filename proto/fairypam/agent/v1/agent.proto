@@ -1,0 +1,201 @@
+syntax = "proto3";
+
+package fairypam.agent.v1;
+
+service AgentControlService {
+  rpc ControlTunnel(stream AgentControlEvent) returns (stream HubControlCommand);
+}
+
+service AgentFrameService {
+  rpc FrameTunnel(stream FramePacket) returns (stream FrameDirective);
+}
+
+message SessionRef {
+  string agent_id = 1;
+  string session_id = 2;
+  uint64 generation = 3;
+}
+
+message CommandRef {
+  SessionRef session = 1;
+  string command_id = 2;
+  uint64 sequence = 3;
+  int64 expires_at_unix_ms = 4;
+}
+
+message AgentHello {
+  string agent_id = 1;
+  string agent_version = 2;
+  uint32 protocol_major = 3;
+  uint32 protocol_minor = 4;
+  string build_commit = 5;
+  repeated string installed_profile_ids = 6;
+}
+
+message HubHello {
+  SessionRef session = 1;
+  uint32 heartbeat_interval_ms = 2;
+  uint32 max_input_lease_ms = 3;
+  uint32 max_frame_bytes = 4;
+  uint32 accepted_protocol_minor = 5;
+}
+
+message AgentControlEvent {
+  oneof payload {
+    AgentHello hello = 1;
+    Heartbeat heartbeat = 2;
+    AgentStatus status = 3;
+    CommandAck ack = 4;
+    CommandNack nack = 5;
+    TargetCandidates target_candidates = 6;
+    SafetyEvent safety_event = 7;
+  }
+}
+
+message HubControlCommand {
+  oneof payload {
+    HubHello hello = 1;
+    EnumerateTargets enumerate_targets = 2;
+    LockTarget lock_target = 3;
+    StartCapture start_capture = 4;
+    StopCapture stop_capture = 5;
+    InputLease input_lease = 6;
+    PulseAction pulse_action = 7;
+    MouseDeltaAction mouse_delta_action = 8;
+    WindowPointClickAction window_point_click_action = 9;
+    ReleaseAll release_all = 10;
+    StopSession stop_session = 11;
+    FocusTarget focus_target = 12;
+    CloseTarget close_target = 13;
+  }
+}
+
+message Heartbeat {
+  SessionRef session = 1;
+  int64 sent_at_unix_ms = 2;
+}
+
+message AgentStatus {
+  SessionRef session = 1;
+  string state = 2;
+  string profile_id = 3;
+}
+
+message CommandAck {
+  CommandRef command = 1;
+  string result_json = 2;
+}
+
+message CommandNack {
+  CommandRef command = 1;
+  string error_code = 2;
+  string message = 3;
+}
+
+message TargetCandidate {
+  uint64 hwnd = 1;
+  uint32 pid = 2;
+  string process_path_sha256 = 3;
+  string window_class = 4;
+  string title = 5;
+}
+
+message TargetCandidates {
+  CommandRef command = 1;
+  repeated TargetCandidate candidates = 2;
+}
+
+message SafetyEvent {
+  SessionRef session = 1;
+  string reason = 2;
+  string state = 3;
+}
+
+message EnumerateTargets {
+  CommandRef command = 1;
+  string profile_id = 2;
+}
+
+message LockTarget {
+  CommandRef command = 1;
+  uint64 hwnd = 2;
+  uint32 pid = 3;
+  string profile_id = 4;
+}
+
+message FocusTarget {
+  CommandRef command = 1;
+}
+
+message CloseTarget {
+  CommandRef command = 1;
+  uint32 timeout_ms = 2;
+}
+
+message StartCapture {
+  CommandRef command = 1;
+  string source_id = 2;
+  uint32 fps = 3;
+  string encoding = 4;
+  uint32 quality = 5;
+}
+
+message StopCapture {
+  CommandRef command = 1;
+  string source_id = 2;
+}
+
+message InputLease {
+  CommandRef command = 1;
+  uint32 ttl_ms = 2;
+  repeated string desired_hold_actions = 3;
+}
+
+message PulseAction {
+  CommandRef command = 1;
+  string action_id = 2;
+}
+
+message MouseDeltaAction {
+  CommandRef command = 1;
+  string action_id = 2;
+  sint32 delta_x = 3;
+  sint32 delta_y = 4;
+}
+
+message WindowPointClickAction {
+  CommandRef command = 1;
+  string action_id = 2;
+  float normalized_x = 3;
+  float normalized_y = 4;
+}
+
+message ReleaseAll {
+  CommandRef command = 1;
+  string reason = 2;
+}
+
+message StopSession {
+  CommandRef command = 1;
+  string reason = 2;
+}
+
+message FramePacket {
+  SessionRef session = 1;
+  string capture_source_id = 2;
+  uint64 frame_sequence = 3;
+  int64 captured_at_unix_us = 4;
+  uint32 width = 5;
+  uint32 height = 6;
+  string encoding = 7;
+  bytes payload = 8;
+}
+
+message FrameDirective {
+  SessionRef session = 1;
+  string capture_source_id = 2;
+  bool enabled = 3;
+  uint32 fps = 4;
+  string encoding = 5;
+  uint32 quality = 6;
+}

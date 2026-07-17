@@ -1,0 +1,35 @@
+{
+  "content": {
+    "schema_version": 1,
+    "profile": {
+      "id": "fairypam-test-window",
+      "version": "1.0.0",
+      "display_name": "FairyPam Test Window",
+      "target": {
+        "process_names": ["fairypam-test-window.exe"],
+        "process_path_sha256": ["069490c773d1da4ef2a7128ec37e65d4ceba428a166f8d4effdbd3f0b78e6832"],
+        "window_classes": ["FairyPamTestWindow"],
+        "title_patterns": ["FairyPam Test Window"],
+        "require_elevated": false,
+        "minimum_client_width": 640,
+        "minimum_client_height": 360,
+        "minimum_dpi": 96
+      },
+      "capture_sources": [
+        {
+          "id": "client",
+          "region": {"kind": "full_client"},
+          "maximum_fps": 10,
+          "encodings": ["jpeg", "png"]
+        }
+      ],
+      "actions": {
+        "input.pulse": {"kind": "pulse", "scan_code": 57},
+        "move.forward": {"kind": "hold", "scan_code": 17}
+      }
+    },
+    "files": []
+  },
+  "content_sha256": "b7f82942de4fcc7b8aae2a87b754dc3cee367b349bdc0fb7b9ec43e8a846ba5c",
+  "signature": "0aaeed2c8bdf3f4eabe4f8b0d31ce8124989010a7fd65c0a6a525fcce17d24cb3d93a2350615a1467ea7019deb73441819e97c61db329bbdfce7bea8b31d1903"
+}
