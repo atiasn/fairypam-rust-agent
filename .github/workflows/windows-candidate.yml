@@ -48,14 +48,14 @@ jobs:
           Copy-Item 'target/release/fairypam-agent.exe' (Join-Path $output 'fairypam-agent-prod.exe')
           Copy-Item 'target/release/fairypam-agent-guardian.exe' $output
 
-          cargo build --release --locked -p fairypam-agent --features dev-automation --bin fairypam-agent
-          Copy-Item 'target/release/fairypam-agent.exe' (Join-Path $output 'fairypam-agent-dev.exe')
-          cargo build --release --locked -p fairypam-agentctl --features dev-automation --bin fairypam-agentctl
-          Copy-Item 'target/release/fairypam-agentctl.exe' $output
-          cargo build --release --locked -p fairypam-agent-windows --features dev-automation --bin fairypam-agent-testbed
-          Copy-Item 'target/release/fairypam-agent-testbed.exe' $output
-          cargo build --release --locked -p fairypam-agent-windows --features testbed --bin fairypam-test-window
-          Copy-Item 'target/release/fairypam-test-window.exe' $output
+          cargo build --profile dev-automation --locked -p fairypam-agent --features dev-automation --bin fairypam-agent
+          Copy-Item 'target/dev-automation/fairypam-agent.exe' (Join-Path $output 'fairypam-agent-dev.exe')
+          cargo build --profile dev-automation --locked -p fairypam-agentctl --features dev-automation --bin fairypam-agentctl
+          Copy-Item 'target/dev-automation/fairypam-agentctl.exe' $output
+          cargo build --profile dev-automation --locked -p fairypam-agent-windows --features dev-automation --bin fairypam-agent-testbed
+          Copy-Item 'target/dev-automation/fairypam-agent-testbed.exe' $output
+          cargo build --profile dev-automation --locked -p fairypam-agent-windows --features testbed --bin fairypam-test-window
+          Copy-Item 'target/dev-automation/fairypam-test-window.exe' $output
 
           Copy-Item -Recurse 'profiles' (Join-Path $output 'profiles')
           Copy-Item 'test-profile-root-public-key.hex' $output
