@@ -65,8 +65,7 @@ impl PipeIdentity {
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
             .map_err(|_| LocalClientError::TargetProcessUnavailable)?;
         let process = OwnedHandle(process);
-        Self::for_process(process.0, flavor)
-            .map_err(|_| LocalClientError::TargetProcessUnavailable)
+        Self::for_process(process.0, flavor).map_err(|_| LocalClientError::TargetProcessUnavailable)
     }
 
     fn for_process(process: HANDLE, flavor: PipeFlavor) -> Result<Self, LocalClientError> {

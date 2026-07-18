@@ -192,7 +192,9 @@ async fn verify_dev_status(
         {
             Ok(payload)
         }
-        _ => Err(LocalClientError::Protocol("development identity probe mismatch".into())),
+        _ => Err(LocalClientError::Protocol(
+            "development identity probe mismatch".into(),
+        )),
     }
 }
 
@@ -216,7 +218,9 @@ async fn verify_production_diagnostics(
         {
             Ok(payload)
         }
-        _ => Err(LocalClientError::Protocol("production identity probe mismatch".into())),
+        _ => Err(LocalClientError::Protocol(
+            "production identity probe mismatch".into(),
+        )),
     }
 }
 
@@ -240,7 +244,9 @@ async fn verify_unavailable(development: bool) -> Result<LocalPayload, LocalClie
             audit_enabled: true,
         }),
         Err(error) => Err(error),
-        Ok(_) => Err(LocalClientError::Protocol("expected Agent to be unavailable".into())),
+        Ok(_) => Err(LocalClientError::Protocol(
+            "expected Agent to be unavailable".into(),
+        )),
     }
 }
 
@@ -282,7 +288,8 @@ fn run_local_control_prepare(request: &str) -> Result<LocalPayload, LocalClientE
         ) {
             Ok(manifest) => manifest,
             Err(error)
-                if error.code == fairypam_agent_local_protocol::LocalErrorCode::PermissionDenied =>
+                if error.code
+                    == fairypam_agent_local_protocol::LocalErrorCode::PermissionDenied =>
             {
                 let request = request.display().to_string();
                 if request.contains('"') {

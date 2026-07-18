@@ -300,7 +300,9 @@ pub fn prepare_local_control_authority_request(
             "local-control authority request must be an object",
         )
     })?;
-    let source_commit = object.get("source_commit").and_then(serde_json::Value::as_str);
+    let source_commit = object
+        .get("source_commit")
+        .and_then(serde_json::Value::as_str);
     let build_id = object.get("build_id").and_then(serde_json::Value::as_str);
     let nonce = object.get("nonce").and_then(serde_json::Value::as_str);
     let runner_sha256 = object
@@ -320,7 +322,10 @@ pub fn prepare_local_control_authority_request(
     fs::create_dir_all(&authority_root).map_err(io_error)?;
     protect_tree(&layout.root, &manifest.developer_sid)?;
     let destination = authority_root.join("request.json");
-    write_atomic(&destination, &serde_json::to_vec(&request).map_err(json_error)?)?;
+    write_atomic(
+        &destination,
+        &serde_json::to_vec(&request).map_err(json_error)?,
+    )?;
     run_system_tool(
         "schtasks.exe",
         ["/Run", "/TN", &manifest.local_control_authority_task],
