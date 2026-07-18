@@ -476,7 +476,7 @@ fn wts_session_text(session_id: u32, class: WTS_INFO_CLASS) -> Result<String, St
             &mut bytes,
         )
     };
-    let result = if query.is_err() || buffer.is_null() || bytes < 2 || bytes % 2 != 0 {
+    let result = if query.is_err() || buffer.is_null() || bytes < 2 || !bytes.is_multiple_of(2) {
         Err("interactive user session identity could not be resolved".into())
     } else {
         let units = unsafe { std::slice::from_raw_parts(buffer.0, bytes as usize / 2) };
@@ -539,7 +539,7 @@ fn account_sid(account: &str) -> Result<String, String> {
             PCWSTR(account.as_ptr()),
             Some(PSID(sid.as_mut_ptr().cast())),
             &mut sid_bytes,
-            (!domain.is_empty()).then(|| PWSTR(domain.as_mut_ptr())),
+            (!domain.is_empty()).then_some(PWSTR(domain.as_mut_ptr())),
             &mut domain_chars,
             &mut sid_type,
         )
