@@ -4,6 +4,7 @@ fn main() {
         let manifest = std::path::Path::new("windows-app-manifest.xml")
             .canonicalize()
             .expect("installer manifest must exist");
+        println!("cargo:rustc-link-arg-bin=FairyPamAgentSetup=/MANIFESTUAC:NO");
         println!("cargo:rustc-link-arg-bin=FairyPamAgentSetup=/MANIFEST:EMBED");
         println!(
             "cargo:rustc-link-arg-bin=FairyPamAgentSetup=/MANIFESTINPUT:{}",
