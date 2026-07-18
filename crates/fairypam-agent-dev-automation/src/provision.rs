@@ -343,7 +343,7 @@ fn program_data() -> Result<PathBuf, ProtocolError> {
         .map_err(|error| windows_error("cannot locate ProgramData", error))?;
     let value = unsafe { path.to_string() }
         .map(PathBuf::from)
-        .map_err(|error| windows_error("ProgramData path is invalid", error));
+        .map_err(|error| windows_error("ProgramData path is invalid", error.into()));
     unsafe {
         windows::Win32::System::Com::CoTaskMemFree(Some(path.0.cast()));
     }
