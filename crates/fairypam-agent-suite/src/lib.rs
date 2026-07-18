@@ -646,10 +646,18 @@ mod tests {
 
     #[test]
     fn powershell_path_is_absolute_and_beneath_system32() {
-        let path = powershell_path_from_system_directory(Path::new("/Windows/System32")).unwrap();
+        let system = Path::new(if cfg!(windows) {
+            r"C:\Windows\System32"
+        } else {
+            "/Windows/System32"
+        });
+        let path = powershell_path_from_system_directory(system).unwrap();
         assert_eq!(
             path,
-            Path::new("/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+            system
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
         );
         assert!(powershell_path_from_system_directory(Path::new("System32")).is_err());
     }
