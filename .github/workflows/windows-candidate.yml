@@ -36,3 +36,61 @@ jobs:
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo build --workspace --release --locked
+
+      - name: Prepare exact local-control gate artifact
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $PWD 'dist/local-control-gate'
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+
+          Copy-Item 'target/release/fairypam-agent.exe' (Join-Path $output 'fairypam-agent-prod.exe')
+          Copy-Item 'target/release/fairypam-agent-guardian.exe' $output
+
+          cargo build --release --locked -p fairypam-agent --features dev-automation --bin fairypam-agent
+          Copy-Item 'target/release/fairypam-agent.exe' (Join-Path $output 'fairypam-agent-dev.exe')
+          cargo build --release --locked -p fairypam-agentctl --features dev-automation --bin fairypam-agentctl
+          Copy-Item 'target/release/fairypam-agentctl.exe' $output
+          cargo build --release --locked -p fairypam-agent-windows --features dev-automation --bin fairypam-agent-testbed
+          Copy-Item 'target/release/fairypam-agent-testbed.exe' $output
+          cargo build --release --locked -p fairypam-agent-windows --features testbed --bin fairypam-test-window
+          Copy-Item 'target/release/fairypam-test-window.exe' $output
+
+          Copy-Item -Recurse 'profiles' (Join-Path $output 'profiles')
+          Copy-Item 'test-profile-root-public-key.hex' $output
+          $sourceCommit = (Get-Content 'SOURCE_COMMIT' -Raw).Trim()
+          if ($sourceCommit -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'SOURCE_COMMIT must be one exact private commit'
+          }
+          $members = [ordered]@{}
+          Get-ChildItem -LiteralPath $output -File -Recurse | Sort-Object FullName | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($output, $_.FullName).Replace('\\', '/')
+            $members[$relative] = [ordered]@{
+              sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              size_bytes = [int64]$_.Length
+            }
+          }
+          $manifest = [ordered]@{
+            schema_version = 1
+            gate = 'RUST-CLI-LOCAL-CONTROL-BUILD'
+            source_commit = $sourceCommit
+            public_commit = $env:GITHUB_SHA
+            build_id = ($sourceCommit.Substring(0, 12) + '.run' + $env:GITHUB_RUN_ID)
+            workflow_run_id = $env:GITHUB_RUN_ID
+            workflow_run_attempt = $env:GITHUB_RUN_ATTEMPT
+            members = $members
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $output 'BUILD-RECEIPT.json'),
+            ($manifest | ConvertTo-Json -Depth 6),
+            [Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Upload local-control gate artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: local-control-gate-windows-x64-${{ github.run_id }}
+          path: dist/local-control-gate
+          if-no-files-found: error
+          retention-days: 7
