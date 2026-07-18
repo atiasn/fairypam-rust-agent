@@ -20,9 +20,8 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows::Win32::System::SystemServices::{
-    SE_GROUP_LOGON_ID,
     SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
-    SECURITY_MANDATORY_SYSTEM_RID,
+    SECURITY_MANDATORY_SYSTEM_RID, SE_GROUP_LOGON_ID,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
