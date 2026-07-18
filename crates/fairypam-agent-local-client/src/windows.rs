@@ -16,11 +16,11 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     EqualSid, GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
     TokenIntegrityLevel, TokenLogonSid, TokenSessionId, TokenUser, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, SE_GROUP_LOGON_ID, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    TOKEN_USER,
+    SECURITY_ATTRIBUTES, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows::Win32::System::SystemServices::{
+    SE_GROUP_LOGON_ID,
     SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
     SECURITY_MANDATORY_SYSTEM_RID,
 };
