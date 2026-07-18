@@ -145,7 +145,7 @@ impl LocalClient {
         {
             let mut client = self;
             client.timeout = timeout;
-            return Ok(client);
+            Ok(client)
         }
         #[cfg(not(windows))]
         Ok(self)
