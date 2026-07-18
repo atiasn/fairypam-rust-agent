@@ -341,9 +341,10 @@ fn token_logon_sid(token: HANDLE) -> Result<OwnedSid, LocalClientError> {
     let groups = unsafe { &*buffer.as_ptr::<TOKEN_GROUPS>() };
     let groups =
         unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) };
+    let logon_id = SE_GROUP_LOGON_ID as u32;
     let group = groups
         .iter()
-        .find(|group| group.Attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID)
+        .find(|group| group.Attributes & logon_id == logon_id)
         .ok_or(LocalClientError::PermissionDenied)?;
     OwnedSid::copy(group.Sid)
 }
