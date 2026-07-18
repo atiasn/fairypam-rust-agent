@@ -1,22 +1,20 @@
-name: Windows Agent suite candidate
-run-name: "Windows Agent suite ${{ github.sha }} #${{ github.run_number }}"
+name: Windows Agent Cargo CI
+run-name: "Windows Agent Cargo CI ${{ github.sha }} #${{ github.run_number }}"
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write
-  attestations: write
 
 jobs:
   build:
-    name: Build unsigned non-promotable Windows suite
+    name: Check and build Windows Agent
     runs-on: windows-latest
     timeout-minutes: 60
 
     steps:
-      - name: Checkout approved public snapshot
+      - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Install pinned Rust toolchain
@@ -29,63 +27,12 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Build, test, and package exact suite
-        shell: pwsh
-        env:
-          FAIRYPAM_BUILD_ID: suite-${{ github.run_id }}-${{ github.run_attempt }}
-          FAIRYPAM_PUBLIC_COMMIT: ${{ github.sha }}
-          FAIRYPAM_ARTIFACT_DIR: ${{ github.workspace }}\dist
-          FAIRYPAM_PRODUCTION_SECURITY_POLICY_JSON: ${{ secrets.FAIRYPAM_PRODUCTION_SECURITY_POLICY_JSON }}
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          if ([string]::IsNullOrWhiteSpace($env:FAIRYPAM_PRODUCTION_SECURITY_POLICY_JSON)) {
-            throw 'FAIRYPAM_PRODUCTION_SECURITY_POLICY_JSON is required'
-          }
-          $policyPath = Join-Path $env:RUNNER_TEMP 'fairypam-production-security-policy.json'
-          [IO.File]::WriteAllText($policyPath, $env:FAIRYPAM_PRODUCTION_SECURITY_POLICY_JSON, [Text.UTF8Encoding]::new($false))
-          $env:FAIRYPAM_PRODUCTION_SECURITY_POLICY = $policyPath
-          $sourceCommit = (Get-Content SOURCE_COMMIT -Raw).Trim()
-          if ($sourceCommit -notmatch '^[a-fA-F0-9]{40,64}$') { throw 'SOURCE_COMMIT is invalid' }
-          $env:FAIRYPAM_SOURCE_COMMIT = $sourceCommit
-          $env:FAIRYPAM_BUILD_COMMIT = $sourceCommit
-          cmd /c scripts\build-and-test.bat package
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Verify unsigned candidate boundary
+      - name: Check, test, lint, and build release
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $manifest = Get-Content -Raw dist\candidate-manifest.json | ConvertFrom-Json
-          if ($manifest.schema_version -ne 2 -or
-              $manifest.kind -cne 'fairypam-windows-agent-suite-candidate' -or
-              $manifest.signed -ne $false -or $manifest.promotable -ne $false -or
-              $manifest.gates.'WINDOWS-BUILD' -cne 'passed' -or
-              $manifest.gates.TUF -cne 'pending' -or
-              $manifest.gates.AUTHENTICODE -cne 'pending') {
-            throw 'public build must remain unsigned and non-promotable'
-          }
-          $asset = Get-Item (Join-Path dist $manifest.file_name)
-          if ((Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant() -cne $manifest.sha256 -or $asset.Length -ne $manifest.size_bytes) {
-            throw 'candidate outer identity mismatch'
-          }
-
-      - name: Attest suite candidate provenance
-        uses: actions/attest@v4
-        with:
-          subject-path: dist/fairypam-agent-suite-windows-x64-*.zip
-
-      - name: Attest candidate metadata provenance
-        uses: actions/attest@v4
-        with:
-          subject-path: dist/candidate-manifest.json
-
-      - name: Upload unsigned suite candidate
-        uses: actions/upload-artifact@v7
-        with:
-          name: fairypam-agent-suite-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            dist/fairypam-agent-suite-windows-x64-*.zip
-            dist/candidate-manifest.json
-            dist/SHA256SUMS
-          if-no-files-found: error
-          retention-days: 14
+          cargo fmt --all -- --check
+          cargo check --workspace --all-targets --locked
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo build --workspace --release --locked
