@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-query-agent-status"
+description = "Enables the query_agent_status command without any pre-configured scope."
+commands.allow = ["query_agent_status"]
+
+[[permission]]
+identifier = "deny-query-agent-status"
+description = "Denies the query_agent_status command without any pre-configured scope."
+commands.deny = ["query_agent_status"]

@@ -1,0 +1,34 @@
+[package]
+name = "fairypam-agentctl"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[features]
+default = []
+dev-automation = [
+    "dep:fairypam-agent-dev-automation",
+    "fairypam-agent-local-client/dev-automation",
+    "fairypam-agent-local-protocol/dev-automation",
+]
+
+[dependencies]
+fairypam-agent-dev-automation = { path = "../../crates/fairypam-agent-dev-automation", optional = true }
+fairypam-agent-local-client = { path = "../../crates/fairypam-agent-local-client" }
+fairypam-agent-local-protocol = { path = "../../crates/fairypam-agent-local-protocol" }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[bin]]
+name = "fairypam-agentctl"
+path = "src/main.rs"

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fairypam_agent_core::profile::{CaptureRegion, VerifiedProfile};
 use fairypam_agent_core::target::{TargetBinding, TargetCandidate, TargetSelector, TargetSnapshot};
 use fairypam_agent_core::AgentError;
+use fairypam_agent_local_protocol::ControlMode;
 use fairypam_agent_protocol::v1::{
     hub_control_command, FramePacket, HubControlCommand, SessionRef,
 };
@@ -17,6 +18,7 @@ use serde_json::json;
 use crate::profile_store::ProfileStore;
 
 const MAX_CLOSE_TIMEOUT_MS: u32 = 5_000;
+const MAX_LOCAL_PREVIEW_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeCaptureEncoding {
@@ -138,8 +140,35 @@ pub struct CommandExecutor {
     platform: Box<dyn RuntimePlatform>,
     active_profile: Option<VerifiedProfile>,
     binding: Option<TargetBinding>,
+    local_target_id: Option<String>,
     capture: Option<CaptureWorker>,
     frame_sequences: BTreeMap<String, Arc<AtomicU64>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalExecutionStatus {
+    pub active_profile_id: Option<String>,
+    pub target_locked: bool,
+    pub capture_active: bool,
+    pub control_mode: ControlMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalTarget {
+    pub profile_id: String,
+    pub target_id: String,
+    pub title: String,
+    pub process_name: String,
+    pub foreground: Option<bool>,
+    pub capturable: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalPreview {
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub mime_type: &'static str,
 }
 
 impl CommandExecutor {
@@ -153,9 +182,127 @@ impl CommandExecutor {
             platform,
             active_profile: None,
             binding: None,
+            local_target_id: None,
             capture: None,
             frame_sequences: BTreeMap::new(),
         }
+    }
+
+    pub fn local_status(&self) -> LocalExecutionStatus {
+        LocalExecutionStatus {
+            active_profile_id: self
+                .active_profile
+                .as_ref()
+                .map(|profile| profile.profile().id.clone()),
+            target_locked: self.binding.is_some(),
+            capture_active: self.capture.is_some(),
+            // ponytail: target/runtime fields do not prove Core control authority;
+            // use Machine::current when it is shared with this runtime.
+            control_mode: ControlMode::Unknown,
+        }
+    }
+
+    pub fn local_list_targets(&mut self, profile_id: &str) -> Result<Vec<LocalTarget>, AgentError> {
+        let (_, candidates) = self.enumerate_profile(profile_id)?;
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| LocalTarget {
+                profile_id: profile_id.to_owned(),
+                target_id: candidate.selector.candidate_id,
+                title: candidate.window_title,
+                process_name: candidate.process_name,
+                foreground: None,
+                capturable: None,
+            })
+            .collect())
+    }
+
+    pub fn local_select_target(
+        &mut self,
+        profile_id: &str,
+        target_id: &str,
+    ) -> Result<LocalTarget, AgentError> {
+        let (profile, candidates) = self.enumerate_profile(profile_id)?;
+        let selector = candidates
+            .iter()
+            .find(|candidate| candidate.selector.candidate_id == target_id)
+            .map(|candidate| candidate.selector.clone())
+            .ok_or_else(|| {
+                AgentError::new(
+                    "target.not_found",
+                    "opaque target id is not a current signed Profile candidate",
+                )
+            })?;
+        let binding = self.select_target(profile, selector)?;
+        Ok(local_target(&binding, target_id, None))
+    }
+
+    pub fn local_focus_target(&mut self) -> Result<LocalTarget, AgentError> {
+        let snapshot = self.focus_target()?;
+        let target_id = self.local_target_id.as_deref().ok_or_else(|| {
+            AgentError::new("target.not_locked", "focus requires a locked target")
+        })?;
+        Ok(local_target(&snapshot.binding, target_id, Some(&snapshot)))
+    }
+
+    pub fn local_close_target(&mut self, timeout_ms: u32) -> Result<LocalTarget, AgentError> {
+        let target_id = self.local_target_id.clone().ok_or_else(|| {
+            AgentError::new("target.not_locked", "close requires a locked target")
+        })?;
+        let binding = self.close_target(timeout_ms)?;
+        Ok(local_target(&binding, &target_id, None))
+    }
+
+    pub fn local_release_all(&mut self) -> Result<u32, AgentError> {
+        self.reset()?;
+        Ok(0)
+    }
+
+    pub fn local_capture_preview(&mut self, quality: u8) -> Result<LocalPreview, AgentError> {
+        if self.capture.is_some() {
+            return Err(AgentError::new(
+                "capture.preview_busy",
+                "preview is unavailable while the remote capture stream is active",
+            ));
+        }
+        let profile = self.active_profile.clone().ok_or_else(|| {
+            AgentError::new("profile.not_active", "preview requires an active Profile")
+        })?;
+        let binding = self.binding.clone().ok_or_else(|| {
+            AgentError::new("target.not_locked", "preview requires a locked target")
+        })?;
+        let source = profile.profile().capture_sources.first().ok_or_else(|| {
+            AgentError::new(
+                "capture.source_not_allowed",
+                "the active Profile has no capture source",
+            )
+        })?;
+        let (encoding, mime_type) = if source.encodings.iter().any(|value| value == "jpeg") {
+            (RuntimeCaptureEncoding::Jpeg { quality }, "image/jpeg")
+        } else if source.encodings.iter().any(|value| value == "png") {
+            (RuntimeCaptureEncoding::Png, "image/png")
+        } else {
+            return Err(AgentError::new(
+                "capture.encoding_not_allowed",
+                "the active Profile has no supported preview encoding",
+            ));
+        };
+        let mut capture = self
+            .platform
+            .start_capture(&binding, source.region.clone(), encoding)?;
+        let frame = capture.next_frame(Instant::now() + Duration::from_secs(3))?;
+        if frame.bytes.len() > MAX_LOCAL_PREVIEW_BYTES {
+            return Err(AgentError::new(
+                "capture.preview_too_large",
+                "encoded preview exceeds 1 MiB",
+            ));
+        }
+        Ok(LocalPreview {
+            bytes: frame.bytes,
+            width: frame.width,
+            height: frame.height,
+            mime_type,
+        })
     }
 
     pub fn execute(
@@ -178,10 +325,10 @@ impl CommandExecutor {
         match command.payload.as_ref() {
             Some(Payload::EnumerateTargets(value)) => {
                 self.stop_capture(None)?;
-                let profile = self.profiles.get(&value.profile_id)?.clone();
-                let candidates = self.platform.enumerate(&profile)?;
+                let (profile, candidates) = self.enumerate_profile(&value.profile_id)?;
                 self.active_profile = Some(profile);
                 self.binding = None;
+                self.local_target_id = None;
                 let candidates = candidates
                     .iter()
                     .map(|candidate| {
@@ -199,9 +346,7 @@ impl CommandExecutor {
                 ))
             }
             Some(Payload::LockTarget(value)) => {
-                self.stop_capture(None)?;
-                let profile = self.profiles.get(&value.profile_id)?.clone();
-                let candidates = self.platform.enumerate(&profile)?;
+                let (profile, candidates) = self.enumerate_profile(&value.profile_id)?;
                 let selector = candidates
                     .iter()
                     .find(|candidate| {
@@ -214,9 +359,7 @@ impl CommandExecutor {
                             "requested target is not a current signed Profile candidate",
                         )
                     })?;
-                let binding = self.platform.lock(&profile, selector)?;
-                self.active_profile = Some(profile);
-                self.binding = Some(binding.clone());
+                let binding = self.select_target(profile, selector)?;
                 Ok(CommandOutcome::Ack(
                     json!({
                         "profile_id": binding.profile_id,
@@ -228,11 +371,7 @@ impl CommandExecutor {
                 ))
             }
             Some(Payload::FocusTarget(_)) => {
-                let binding = self.binding.clone().ok_or_else(|| {
-                    AgentError::new("target.not_locked", "focus requires a locked target")
-                })?;
-                let snapshot = self.platform.focus(&binding)?;
-                self.binding = Some(snapshot.binding.clone());
+                let snapshot = self.focus_target()?;
                 Ok(CommandOutcome::Ack(
                     json!({
                         "profile_id": snapshot.binding.profile_id,
@@ -252,20 +391,7 @@ impl CommandExecutor {
                 ))
             }
             Some(Payload::CloseTarget(value)) => {
-                if !(1..=MAX_CLOSE_TIMEOUT_MS).contains(&value.timeout_ms) {
-                    return Err(AgentError::new(
-                        "target.close_timeout_invalid",
-                        "close timeout must be between 1 and 5000 ms",
-                    ));
-                }
-                let binding = self.binding.clone().ok_or_else(|| {
-                    AgentError::new("target.not_locked", "close requires a locked target")
-                })?;
-                self.stop_capture(None)?;
-                self.platform
-                    .close(&binding, Duration::from_millis(u64::from(value.timeout_ms)))?;
-                self.active_profile = None;
-                self.binding = None;
+                let binding = self.close_target(value.timeout_ms)?;
                 Ok(CommandOutcome::Ack(
                     json!({
                         "profile_id": binding.profile_id,
@@ -337,6 +463,7 @@ impl CommandExecutor {
                 self.stop_capture(None)?;
                 self.active_profile = None;
                 self.binding = None;
+                self.local_target_id = None;
                 Ok(CommandOutcome::Ack(
                     json!({"state": "ConnectedIdle"}).to_string(),
                 ))
@@ -372,12 +499,79 @@ impl CommandExecutor {
         Ok(())
     }
 
+    fn enumerate_profile(
+        &mut self,
+        profile_id: &str,
+    ) -> Result<(VerifiedProfile, Vec<TargetCandidate>), AgentError> {
+        let profile = self.profiles.get(profile_id)?.clone();
+        let candidates = self.platform.enumerate(&profile)?;
+        Ok((profile, candidates))
+    }
+
+    fn select_target(
+        &mut self,
+        profile: VerifiedProfile,
+        selector: TargetSelector,
+    ) -> Result<TargetBinding, AgentError> {
+        self.stop_capture(None)?;
+        let target_id = selector.candidate_id.clone();
+        let binding = self.platform.lock(&profile, selector)?;
+        self.active_profile = Some(profile);
+        self.binding = Some(binding.clone());
+        self.local_target_id = Some(target_id);
+        Ok(binding)
+    }
+
+    fn focus_target(&mut self) -> Result<TargetSnapshot, AgentError> {
+        let binding = self.binding.clone().ok_or_else(|| {
+            AgentError::new("target.not_locked", "focus requires a locked target")
+        })?;
+        let snapshot = self.platform.focus(&binding)?;
+        self.binding = Some(snapshot.binding.clone());
+        Ok(snapshot)
+    }
+
+    fn close_target(&mut self, timeout_ms: u32) -> Result<TargetBinding, AgentError> {
+        if !(1..=MAX_CLOSE_TIMEOUT_MS).contains(&timeout_ms) {
+            return Err(AgentError::new(
+                "target.close_timeout_invalid",
+                "close timeout must be between 1 and 5000 ms",
+            ));
+        }
+        let binding = self.binding.clone().ok_or_else(|| {
+            AgentError::new("target.not_locked", "close requires a locked target")
+        })?;
+        self.stop_capture(None)?;
+        self.platform
+            .close(&binding, Duration::from_millis(u64::from(timeout_ms)))?;
+        self.active_profile = None;
+        self.binding = None;
+        self.local_target_id = None;
+        Ok(binding)
+    }
+
     pub fn reset(&mut self) -> Result<(), AgentError> {
         self.stop_capture(None)?;
         self.active_profile = None;
         self.binding = None;
+        self.local_target_id = None;
         self.frame_sequences.clear();
         Ok(())
+    }
+}
+
+fn local_target(
+    binding: &TargetBinding,
+    target_id: &str,
+    snapshot: Option<&TargetSnapshot>,
+) -> LocalTarget {
+    LocalTarget {
+        profile_id: binding.profile_id.clone(),
+        target_id: target_id.to_owned(),
+        title: binding.window_title.clone(),
+        process_name: binding.process_name.clone(),
+        foreground: snapshot.map(|snapshot| snapshot.foreground),
+        capturable: snapshot.map(|snapshot| snapshot.capturable),
     }
 }
 
@@ -1134,6 +1328,40 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.close_calls.len(), 1);
         assert_eq!(state.close_calls[0].1, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn local_status_does_not_infer_dry_run_from_target_lock() {
+        let (mut executor, _) = executor_with_state();
+        let targets = executor.local_list_targets("testbed").unwrap();
+        executor
+            .local_select_target("testbed", &targets[0].target_id)
+            .unwrap();
+
+        assert_eq!(executor.local_status().control_mode, ControlMode::Unknown);
+    }
+
+    #[test]
+    fn local_domain_control_reuses_opaque_target_and_shared_state_transitions() {
+        let (mut executor, state) = executor_with_state();
+        let targets = executor.local_list_targets("testbed").unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].target_id, "candidate-1");
+        assert!(!targets[0].target_id.contains("hwnd"));
+
+        let selected = executor
+            .local_select_target("testbed", &targets[0].target_id)
+            .unwrap();
+        assert_eq!(selected.target_id, "candidate-1");
+        assert!(executor.local_status().target_locked);
+
+        let focused = executor.local_focus_target().unwrap();
+        assert_eq!(focused.target_id, "candidate-1");
+        assert_eq!(focused.foreground, Some(true));
+
+        executor.local_release_all().unwrap();
+        assert!(!executor.local_status().target_locked);
+        assert_eq!(state.lock().unwrap().focus_calls.len(), 1);
     }
 
     #[cfg(not(windows))]

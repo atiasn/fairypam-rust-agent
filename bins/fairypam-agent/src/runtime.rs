@@ -1,4 +1,6 @@
+#[cfg(not(feature = "dev-automation"))]
 use std::env;
+#[cfg(not(feature = "dev-automation"))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,6 +17,7 @@ use fairypam_agent_transport::{
     receive_hub_hello, CappedBackoff, ControlSender, ControlSession, SessionFrameSlot,
     TransportConfig, TransportError, VerifiedSession,
 };
+#[cfg(not(feature = "dev-automation"))]
 use http::Uri;
 use tokio_util::sync::CancellationToken;
 
@@ -31,36 +34,80 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn from_env() -> Result<Self, AgentError> {
-        let verifier = Ed25519SignatureVerifier::from_public_key_hex(&required(
-            "FAIRYPAM_PROFILE_ROOT_PUBLIC_KEY_HEX",
-        )?)?;
-        let profiles = ProfileStore::load(&required_path("FAIRYPAM_PROFILE_DIR")?, &verifier)?;
+        #[cfg(feature = "dev-automation")]
+        {
+            return Self::from_dev_slot();
+        }
+        #[cfg(not(feature = "dev-automation"))]
+        {
+            let verifier = Ed25519SignatureVerifier::from_public_key_hex(&required(
+                "FAIRYPAM_PROFILE_ROOT_PUBLIC_KEY_HEX",
+            )?)?;
+            let profiles = ProfileStore::load(&required_path("FAIRYPAM_PROFILE_DIR")?, &verifier)?;
+            Ok(Self {
+                transport: TransportConfig {
+                    control_endpoint: required_uri("FAIRYPAM_CONTROL_ENDPOINT")?,
+                    frame_endpoint: required_uri("FAIRYPAM_FRAME_ENDPOINT")?,
+                    server_name: required("FAIRYPAM_HUB_SERVER_NAME")?,
+                    agent_id: required("FAIRYPAM_AGENT_ID")?,
+                    ca_pem: required_path("FAIRYPAM_CA_PEM")?,
+                    identity_cert_pem: required_path("FAIRYPAM_AGENT_CERT_PEM")?,
+                    identity_key_pem: required_path("FAIRYPAM_AGENT_KEY_PEM")?,
+                    connect_timeout: Duration::from_secs(10),
+                },
+                agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+                build_commit: option_env!("FAIRYPAM_BUILD_COMMIT")
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                profiles,
+            })
+        }
+    }
+
+    #[cfg(feature = "dev-automation")]
+    fn from_dev_slot() -> Result<Self, AgentError> {
+        let (manifest, runtime) =
+            fairypam_agent_dev_automation::provision::load_runtime_environment().map_err(
+                |error| AgentError::new("runtime.dev_config_invalid", error.to_string()),
+            )?;
+        let verifier =
+            Ed25519SignatureVerifier::from_public_key_hex(&runtime.profile_root_public_key_hex)?;
+        let profiles = ProfileStore::load(&manifest.profile_dir, &verifier)?;
         Ok(Self {
             transport: TransportConfig {
-                control_endpoint: required_uri("FAIRYPAM_CONTROL_ENDPOINT")?,
-                frame_endpoint: required_uri("FAIRYPAM_FRAME_ENDPOINT")?,
-                server_name: required("FAIRYPAM_HUB_SERVER_NAME")?,
-                agent_id: required("FAIRYPAM_AGENT_ID")?,
-                ca_pem: required_path("FAIRYPAM_CA_PEM")?,
-                identity_cert_pem: required_path("FAIRYPAM_AGENT_CERT_PEM")?,
-                identity_key_pem: required_path("FAIRYPAM_AGENT_KEY_PEM")?,
+                control_endpoint: runtime.control_endpoint.parse().map_err(|error| {
+                    AgentError::new(
+                        "runtime.dev_config_invalid",
+                        format!("dev control endpoint is invalid: {error}"),
+                    )
+                })?,
+                frame_endpoint: runtime.frame_endpoint.parse().map_err(|error| {
+                    AgentError::new(
+                        "runtime.dev_config_invalid",
+                        format!("dev frame endpoint is invalid: {error}"),
+                    )
+                })?,
+                server_name: runtime.server_name,
+                agent_id: runtime.agent_id,
+                ca_pem: manifest.ca_path,
+                identity_cert_pem: manifest.certificate_path,
+                identity_key_pem: manifest.private_key_path,
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
-            build_commit: option_env!("FAIRYPAM_BUILD_COMMIT")
-                .unwrap_or("unknown")
-                .to_owned(),
+            build_commit: manifest.build_id,
             profiles,
         })
     }
 }
 
 #[derive(Default)]
-struct RuntimeState {
-    control: Option<ControlSession>,
-    sender: Option<ControlSender>,
-    session: Option<VerifiedSession>,
-    frames: Option<SessionFrameSlot>,
+pub(crate) struct RuntimeState {
+    pub(crate) control: Option<ControlSession>,
+    pub(crate) sender: Option<ControlSender>,
+    pub(crate) session: Option<VerifiedSession>,
+    pub(crate) frames: Option<SessionFrameSlot>,
+    pub(crate) accepting_commands: bool,
 }
 
 pub struct GrpcSessionDriver {
@@ -130,6 +177,7 @@ impl SessionDriver for GrpcSessionDriver {
             sender: Some(sender),
             session: Some(session),
             frames: Some(frames),
+            accepting_commands: true,
         };
         Ok(())
     }
@@ -162,6 +210,11 @@ impl SessionDriver for GrpcSessionDriver {
                     let reference = command_reference(&command).ok_or_else(|| {
                         AgentError::new("runtime.command_invalid", "verified command lost CommandRef")
                     })?;
+                    let accepting_commands = self.state.lock().map_err(lock_error)?.accepting_commands;
+                    if !accepting_commands {
+                        sender.try_send(nack_event(reference, "runtime.update_quiesced", "Agent is not accepting work during a suite transaction")).map_err(map_transport)?;
+                        continue;
+                    }
                     let frames = {
                         let state = self.state.lock().map_err(lock_error)?;
                         state.frames.clone().ok_or_else(session_missing)?
@@ -226,13 +279,22 @@ impl SessionDriver for GrpcSessionDriver {
 pub struct RuntimeSafetyHooks {
     state: Arc<Mutex<RuntimeState>>,
     execution: Arc<Mutex<CommandExecutor>>,
+    #[cfg(feature = "dev-automation")]
+    dev_input: Arc<Mutex<crate::dev_input::DevInputController>>,
 }
 
 impl RuntimeSafetyHooks {
-    pub fn for_driver(driver: &GrpcSessionDriver) -> Self {
+    pub fn for_driver(
+        driver: &GrpcSessionDriver,
+        #[cfg(feature = "dev-automation")] dev_input: Arc<
+            Mutex<crate::dev_input::DevInputController>,
+        >,
+    ) -> Self {
         Self {
             state: Arc::clone(&driver.state),
             execution: Arc::clone(&driver.execution),
+            #[cfg(feature = "dev-automation")]
+            dev_input,
         }
     }
 }
@@ -244,11 +306,18 @@ impl SupervisorHooks for RuntimeSafetyHooks {
     }
 
     fn guardian_release_all(&mut self) -> Result<(), String> {
-        // The production binary never arms without a separate local authority.
-        // Thus no physical holds can exist in this DryRun runtime. The hook is
-        // still explicit so the full Windows input owner can replace it in the
-        // Task 9 harness without changing supervisor ordering.
+        #[cfg(feature = "dev-automation")]
+        self.dev_input
+            .lock()
+            .map_err(|_| "dev input state is poisoned".to_owned())?
+            .release_all();
+        #[cfg(not(feature = "dev-automation"))]
         tracing::info!(effect = "guardian_release_all", state = "dry_run_no_holds");
+        #[cfg(feature = "dev-automation")]
+        tracing::info!(
+            effect = "guardian_release_all",
+            state = "dev_input_released"
+        );
         Ok(())
     }
 
@@ -285,17 +354,102 @@ impl SupervisorHooks for RuntimeSafetyHooks {
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
+    #[cfg(feature = "dev-automation")]
+    tracing::info!(
+        build_flavor = crate::DEV_BUILD_MARKER,
+        "starting isolated dev-automation Agent"
+    );
     let driver = GrpcSessionDriver::new(config);
-    let hooks = RuntimeSafetyHooks::for_driver(&driver);
+    #[cfg(feature = "dev-automation")]
+    let dev_input = Arc::new(Mutex::new(crate::dev_input::DevInputController::default()));
+    #[cfg(windows)]
+    let local_cancellation = CancellationToken::new();
+    #[cfg(windows)]
+    let local_server = {
+        use crate::local_control::AgentLocalControl;
+        use fairypam_agent_local_client::{serve, LocalRequestHandler, PipeFlavor, PipeIdentity};
+
+        #[cfg(feature = "dev-automation")]
+        let flavor = PipeFlavor::Development;
+        #[cfg(not(feature = "dev-automation"))]
+        let flavor = PipeFlavor::Production;
+        let identity = PipeIdentity::current(flavor)
+            .map_err(|error| AgentError::new("local_control.identity_failed", error.to_string()))?;
+        let handler = Arc::new(AgentLocalControl::new(
+            Arc::clone(&driver.state),
+            Arc::clone(&driver.execution),
+            driver.config.profiles.clone(),
+            driver.config.agent_version.clone(),
+            driver.config.build_commit.clone(),
+            #[cfg(feature = "dev-automation")]
+            driver.config.build_commit.clone(),
+            #[cfg(feature = "dev-automation")]
+            Arc::clone(&dev_input),
+        ));
+        let cancellation = local_cancellation.clone();
+        #[cfg(feature = "dev-automation")]
+        {
+            let handler = Arc::clone(&handler);
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(100));
+                loop {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => break,
+                        _ = interval.tick() => {
+                            if let Err(error) = handler.tick_automation() {
+                                tracing::error!(error = %error, "dev automation cleanup tick failed");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        let handler: Arc<dyn LocalRequestHandler> = handler;
+        tokio::spawn(async move { serve(identity, handler, cancellation).await })
+    };
+    let hooks = RuntimeSafetyHooks::for_driver(
+        &driver,
+        #[cfg(feature = "dev-automation")]
+        dev_input,
+    );
     let backoff = CappedBackoff::new(Duration::from_millis(250), Duration::from_secs(30))
         .map_err(map_transport)?;
     let mut supervisor = SessionSupervisor::new(hooks, backoff);
+    #[cfg(windows)]
+    {
+        tokio::select! {
+            result = supervisor.run(&driver) => match result {
+                Ok(never) => match never {},
+                Err(error) => Err(error),
+            },
+            result = local_server => {
+                local_cancellation.cancel();
+                match result {
+                    Ok(Ok(())) => Err(AgentError::new(
+                        "local_control.stopped",
+                        "local control server stopped unexpectedly",
+                    )),
+                    Ok(Err(error)) => Err(AgentError::new(
+                        "local_control.failed",
+                        error.to_string(),
+                    )),
+                    Err(error) => Err(AgentError::new(
+                        "local_control.join_failed",
+                        error.to_string(),
+                    )),
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
     match supervisor.run(&driver).await {
         Ok(never) => match never {},
         Err(error) => Err(error),
     }
 }
 
+#[cfg(not(feature = "dev-automation"))]
 fn required(name: &'static str) -> Result<String, AgentError> {
     env::var(name).map_err(|_| {
         AgentError::new(
@@ -305,6 +459,7 @@ fn required(name: &'static str) -> Result<String, AgentError> {
     })
 }
 
+#[cfg(not(feature = "dev-automation"))]
 fn required_uri(name: &'static str) -> Result<Uri, AgentError> {
     required(name)?.parse().map_err(|error| {
         AgentError::new(
@@ -314,6 +469,7 @@ fn required_uri(name: &'static str) -> Result<Uri, AgentError> {
     })
 }
 
+#[cfg(not(feature = "dev-automation"))]
 fn required_path(name: &'static str) -> Result<PathBuf, AgentError> {
     Ok(PathBuf::from(required(name)?))
 }

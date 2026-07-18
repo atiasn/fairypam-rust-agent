@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-query-diagnostics"
+description = "Enables the query_diagnostics command without any pre-configured scope."
+commands.allow = ["query_diagnostics"]
+
+[[permission]]
+identifier = "deny-query-diagnostics"
+description = "Denies the query_diagnostics command without any pre-configured scope."
+commands.deny = ["query_diagnostics"]

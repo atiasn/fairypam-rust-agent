@@ -372,10 +372,15 @@ dependencies = [
 name = "fairypam-agent"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "ed25519-dalek",
  "fairypam-agent-core",
+ "fairypam-agent-dev-automation",
  "fairypam-agent-input",
+ "fairypam-agent-local-client",
+ "fairypam-agent-local-protocol",
  "fairypam-agent-protocol",
+ "fairypam-agent-suite",
  "fairypam-agent-transport",
  "fairypam-agent-windows",
  "http",
@@ -400,6 +405,19 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "fairypam-agent-dev-automation"
+version = "0.1.0"
+dependencies = [
+ "fairypam-agent-local-client",
+ "fairypam-agent-local-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "windows",
 ]
 
 [[package]]
@@ -432,6 +450,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "fairypam-agent-installer"
+version = "0.1.0"
+dependencies = [
+ "fairypam-agent-suite",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
+name = "fairypam-agent-local-client"
+version = "0.1.0"
+dependencies = [
+ "fairypam-agent-local-protocol",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "windows",
+]
+
+[[package]]
+name = "fairypam-agent-local-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "fairypam-agent-protocol"
 version = "0.1.0"
 dependencies = [
@@ -440,6 +489,18 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "fairypam-agent-suite"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "windows",
 ]
 
 [[package]]
@@ -461,6 +522,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fairypam-agent-updater"
+version = "0.1.0"
+dependencies = [
+ "fairypam-agent-suite",
+ "serde_json",
+]
+
+[[package]]
 name = "fairypam-agent-windows"
 version = "0.1.0"
 dependencies = [
@@ -470,6 +539,19 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "windows",
+]
+
+[[package]]
+name = "fairypam-agentctl"
+version = "0.1.0"
+dependencies = [
+ "fairypam-agent-dev-automation",
+ "fairypam-agent-local-client",
+ "fairypam-agent-local-protocol",
+ "serde_json",
+ "tokio",
+ "tokio-util",
  "windows",
 ]
 
