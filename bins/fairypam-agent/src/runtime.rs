@@ -29,6 +29,8 @@ pub struct RuntimeConfig {
     pub transport: TransportConfig,
     pub agent_version: String,
     pub build_commit: String,
+    #[cfg(feature = "dev-automation")]
+    pub build_id: String,
     pub profiles: ProfileStore,
 }
 
@@ -73,6 +75,27 @@ impl RuntimeConfig {
         let verifier =
             Ed25519SignatureVerifier::from_public_key_hex(&runtime.profile_root_public_key_hex)?;
         let profiles = ProfileStore::load(&manifest.profile_dir, &verifier)?;
+        let build_id = option_env!("FAIRYPAM_BUILD_ID").ok_or_else(|| {
+            AgentError::new(
+                "runtime.dev_build_identity_missing",
+                "dev-automation build is missing compile-time FAIRYPAM_BUILD_ID",
+            )
+        })?;
+        let build_commit = option_env!("FAIRYPAM_BUILD_COMMIT").ok_or_else(|| {
+            AgentError::new(
+                "runtime.dev_build_identity_missing",
+                "dev-automation build is missing compile-time FAIRYPAM_BUILD_COMMIT",
+            )
+        })?;
+        if manifest.build_id != build_id
+            || build_commit.len() != 40
+            || !build_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(AgentError::new(
+                "runtime.dev_build_identity_mismatch",
+                "canonical dev slot does not match the compile-time build identity",
+            ));
+        }
         Ok(Self {
             transport: TransportConfig {
                 control_endpoint: runtime.control_endpoint.parse().map_err(|error| {
@@ -95,7 +118,8 @@ impl RuntimeConfig {
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
-            build_commit: manifest.build_id,
+            build_commit: build_commit.to_owned(),
+            build_id: build_id.to_owned(),
             profiles,
         })
     }
@@ -381,8 +405,9 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
             driver.config.profiles.clone(),
             driver.config.agent_version.clone(),
             driver.config.build_commit.clone(),
+            false,
             #[cfg(feature = "dev-automation")]
-            driver.config.build_commit.clone(),
+            driver.config.build_id.clone(),
             #[cfg(feature = "dev-automation")]
             Arc::clone(&dev_input),
         ));
@@ -447,6 +472,61 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
         Ok(never) => match never {},
         Err(error) => Err(error),
     }
+}
+
+#[cfg(windows)]
+pub async fn run_local_control_only(config: RuntimeConfig) -> Result<(), AgentError> {
+    if config.build_commit.len() != 40
+        || !config
+            .build_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AgentError::new(
+            "runtime.build_identity_missing",
+            "local-control-only mode requires an exact compile-time source commit",
+        ));
+    }
+    let driver = GrpcSessionDriver::new(config);
+    use crate::local_control::AgentLocalControl;
+    use fairypam_agent_local_client::{serve, LocalRequestHandler, PipeFlavor, PipeIdentity};
+
+    #[cfg(feature = "dev-automation")]
+    let flavor = PipeFlavor::Development;
+    #[cfg(not(feature = "dev-automation"))]
+    let flavor = PipeFlavor::Production;
+    let identity = PipeIdentity::current(flavor)
+        .map_err(|error| AgentError::new("local_control.identity_failed", error.to_string()))?;
+    #[cfg(feature = "dev-automation")]
+    let dev_input = Arc::new(Mutex::new(crate::dev_input::DevInputController::default()));
+    let handler: Arc<dyn LocalRequestHandler> = Arc::new(AgentLocalControl::new(
+        Arc::clone(&driver.state),
+        Arc::clone(&driver.execution),
+        driver.config.profiles.clone(),
+        driver.config.agent_version.clone(),
+        driver.config.build_commit.clone(),
+        true,
+        #[cfg(feature = "dev-automation")]
+        driver.config.build_id.clone(),
+        #[cfg(feature = "dev-automation")]
+        dev_input,
+    ));
+    let cancellation = CancellationToken::new();
+    match serve(identity, handler, cancellation).await {
+        Ok(()) => Err(AgentError::new(
+            "local_control.stopped",
+            "local-control-only server stopped unexpectedly",
+        )),
+        Err(error) => Err(AgentError::new("local_control.failed", error.to_string())),
+    }
+}
+
+#[cfg(not(windows))]
+pub async fn run_local_control_only(_config: RuntimeConfig) -> Result<(), AgentError> {
+    Err(AgentError::new(
+        "local_control.unsupported_platform",
+        "local-control-only mode is available on Windows only",
+    ))
 }
 
 #[cfg(not(feature = "dev-automation"))]

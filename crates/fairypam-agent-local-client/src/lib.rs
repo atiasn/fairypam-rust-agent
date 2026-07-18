@@ -35,6 +35,8 @@ const MAX_CACHED_RESPONSES: usize = 1_024;
 #[cfg(any(windows, test))]
 // ponytail: two slots match the client's two-attempt retry; widen only with that contract.
 const RELEASE_ALL_CACHE_RESERVE: usize = 2;
+#[cfg(any(windows, test))]
+const SERVER_IDENTITY_REJECTION: &str = "server_identity_rejected";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallerIdentity {
@@ -72,6 +74,8 @@ pub struct LocalClient {
     client_version: String,
     #[cfg(windows)]
     timeout: Duration,
+    #[cfg(windows)]
+    expected_server_process_id: Option<u32>,
 }
 
 #[cfg(windows)]
@@ -104,24 +108,47 @@ impl LocalConnection {
 impl LocalClient {
     #[cfg(windows)]
     pub fn production(client_name: impl Into<String>) -> Result<Self, LocalClientError> {
-        Self::for_identity(PipeIdentity::current(PipeFlavor::Production)?, client_name)
+        Self::for_identity(
+            PipeIdentity::current(PipeFlavor::Production)?,
+            client_name,
+            None,
+        )
     }
 
     #[cfg(all(windows, feature = "dev-automation"))]
     pub fn development(client_name: impl Into<String>) -> Result<Self, LocalClientError> {
-        Self::for_identity(PipeIdentity::current(PipeFlavor::Development)?, client_name)
+        Self::for_identity(
+            PipeIdentity::current(PipeFlavor::Development)?,
+            client_name,
+            None,
+        )
+    }
+
+    #[cfg(all(windows, feature = "dev-automation"))]
+    pub fn production_for_test_process(
+        process_id: u32,
+        client_name: impl Into<String>,
+    ) -> Result<Self, LocalClientError> {
+        // ponytail: this test-only route changes pipe selection, never server authorization.
+        Self::for_identity(
+            PipeIdentity::for_process_id(process_id, PipeFlavor::Production)?,
+            client_name,
+            Some(process_id),
+        )
     }
 
     #[cfg(windows)]
     fn for_identity(
         identity: PipeIdentity,
         client_name: impl Into<String>,
+        expected_server_process_id: Option<u32>,
     ) -> Result<Self, LocalClientError> {
         Ok(Self {
             pipe_name: identity.pipe_name().to_owned(),
             client_name: client_name.into(),
             client_version: env!("CARGO_PKG_VERSION").to_owned(),
             timeout: DEFAULT_TIMEOUT,
+            expected_server_process_id,
         })
     }
 
@@ -167,7 +194,13 @@ impl LocalClient {
                         random_nonce().map_err(LocalClientError::from)?,
                         command.clone(),
                     );
-                    match windows::open_client(&self.pipe_name, &cancellation).await {
+                    match windows::open_client(
+                        &self.pipe_name,
+                        &cancellation,
+                        self.expected_server_process_id,
+                    )
+                    .await
+                    {
                         Ok(mut pipe) => {
                             match exchange(
                                 &mut pipe,
@@ -210,7 +243,12 @@ impl LocalClient {
         cancellation: CancellationToken,
     ) -> Result<LocalConnection, LocalClientError> {
         let operation = async {
-            let mut pipe = windows::open_client(&self.pipe_name, &cancellation).await?;
+            let mut pipe = windows::open_client(
+                &self.pipe_name,
+                &cancellation,
+                self.expected_server_process_id,
+            )
+            .await?;
             handshake(&mut pipe, &self.client_name, &self.client_version).await?;
             Ok(LocalConnection {
                 pipe,
@@ -310,6 +348,9 @@ where
 #[cfg(any(windows, test))]
 fn map_remote(code: LocalErrorCode, message: String, retryable: bool) -> LocalClientError {
     match code {
+        LocalErrorCode::PermissionDenied if message == SERVER_IDENTITY_REJECTION => {
+            LocalClientError::ServerIdentityRejected
+        }
         LocalErrorCode::PermissionDenied => LocalClientError::PermissionDenied,
         LocalErrorCode::AgentUnavailable => LocalClientError::Unavailable,
         LocalErrorCode::ProtocolVersionMismatch | LocalErrorCode::ProtocolViolation => {
@@ -329,6 +370,10 @@ pub enum LocalClientError {
     Unavailable,
     #[error("local Agent rejected the caller identity")]
     PermissionDenied,
+    #[error("local Agent rejected the connected caller identity")]
+    ServerIdentityRejected,
+    #[error("target process identity is unavailable")]
+    TargetProcessUnavailable,
     #[error("local Agent request timed out")]
     Timeout,
     #[error("local Agent request was cancelled")]
@@ -352,6 +397,8 @@ impl LocalClientError {
         match self {
             Self::Unavailable => "agent_unavailable",
             Self::PermissionDenied => "permission_denied",
+            Self::ServerIdentityRejected => "server_identity_rejected",
+            Self::TargetProcessUnavailable => "target_process_unavailable",
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::Protocol(_) => "protocol_error",
@@ -566,8 +613,8 @@ pub async fn serve(
         let caller = match windows::validate_client(&server, &identity) {
             Ok(caller) => caller,
             Err(error) => {
-                drop(server);
                 tracing_permission_denied(&error);
+                tokio::spawn(reject_identity(server));
                 continue;
             }
         };
@@ -580,6 +627,27 @@ pub async fn serve(
             handler.client_disconnected(&caller);
         });
     }
+}
+
+#[cfg(windows)]
+async fn reject_identity<S>(mut stream: S) -> Result<(), LocalClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(hello) = read_request_or_error(&mut stream).await? else {
+        return Ok(());
+    };
+    write_response(
+        &mut stream,
+        &LocalResponse::error(
+            hello.request_id,
+            ProtocolError::new(
+                LocalErrorCode::PermissionDenied,
+                SERVER_IDENTITY_REJECTION,
+            ),
+        ),
+    )
+    .await
 }
 
 #[cfg(windows)]

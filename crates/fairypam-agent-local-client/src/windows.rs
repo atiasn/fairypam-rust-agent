@@ -18,7 +18,9 @@ use windows::Win32::Security::{
     TokenIntegrityLevel, TokenLogonSid, TokenSessionId, TokenUser, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_ATTRIBUTES, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
-use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
+use windows::Win32::System::Pipes::{
+    GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+};
 use windows::Win32::System::SystemServices::{
     SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
     SECURITY_MANDATORY_SYSTEM_RID, SE_GROUP_LOGON_ID,
@@ -57,6 +59,22 @@ pub struct PipeIdentity {
 impl PipeIdentity {
     pub fn current(flavor: PipeFlavor) -> Result<Self, LocalClientError> {
         let process = unsafe { GetCurrentProcess() };
+        Self::for_process(process, flavor)
+    }
+
+    #[cfg(feature = "dev-automation")]
+    pub fn for_process_id(
+        process_id: u32,
+        flavor: PipeFlavor,
+    ) -> Result<Self, LocalClientError> {
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+            .map_err(|_| LocalClientError::TargetProcessUnavailable)?;
+        let process = OwnedHandle(process);
+        Self::for_process(process.0, flavor)
+            .map_err(|_| LocalClientError::TargetProcessUnavailable)
+    }
+
+    fn for_process(process: HANDLE, flavor: PipeFlavor) -> Result<Self, LocalClientError> {
         let token = OwnedHandle::process_token(process)?;
         let user_sid = token_sid(token.0, TokenUser)?;
         let logon_sid = token_logon_sid(token.0)?;
@@ -97,10 +115,16 @@ impl PipeIdentity {
 pub async fn open_client(
     pipe_name: &str,
     cancellation: &CancellationToken,
+    expected_server_process_id: Option<u32>,
 ) -> Result<NamedPipeClient, LocalClientError> {
     loop {
         match ClientOptions::new().read(true).write(true).open(pipe_name) {
-            Ok(client) => return Ok(client),
+            Ok(client) => {
+                if let Some(expected_process_id) = expected_server_process_id {
+                    validate_server_process_id(&client, expected_process_id)?;
+                }
+                return Ok(client);
+            }
             Err(error) if error.raw_os_error() == Some(231) => {
                 tokio::select! {
                     _ = cancellation.cancelled() => return Err(LocalClientError::Cancelled),
@@ -116,6 +140,19 @@ pub async fn open_client(
             Err(error) => return Err(LocalClientError::Io(error)),
         }
     }
+}
+
+fn validate_server_process_id(
+    pipe: &NamedPipeClient,
+    expected_process_id: u32,
+) -> Result<(), LocalClientError> {
+    let mut process_id = 0_u32;
+    unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut process_id) }
+        .map_err(|_| LocalClientError::ServerIdentityRejected)?;
+    if process_id == 0 || process_id != expected_process_id {
+        return Err(LocalClientError::ServerIdentityRejected);
+    }
+    Ok(())
 }
 
 pub fn create_server(

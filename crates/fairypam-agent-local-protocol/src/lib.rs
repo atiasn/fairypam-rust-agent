@@ -381,6 +381,7 @@ pub enum LocalPayload {
     #[cfg(feature = "dev-automation")]
     DevStatus {
         provisioned_build_id: Option<String>,
+        build_commit: String,
         active_session_id: Option<String>,
         expires_at_unix_ms: Option<u64>,
     },

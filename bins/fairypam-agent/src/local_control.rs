@@ -28,6 +28,7 @@ pub(crate) struct AgentLocalControl {
     profiles: ProfileStore,
     agent_version: String,
     build_commit: String,
+    local_control_only: bool,
     #[cfg(feature = "dev-automation")]
     automation: Mutex<AutomationManager>,
     #[cfg(feature = "dev-automation")]
@@ -41,6 +42,7 @@ impl AgentLocalControl {
         profiles: ProfileStore,
         agent_version: String,
         build_commit: String,
+        local_control_only: bool,
         #[cfg(feature = "dev-automation")] provisioned_build_id: String,
         #[cfg(feature = "dev-automation")] dev_input: Arc<
             Mutex<crate::dev_input::DevInputController>,
@@ -56,6 +58,7 @@ impl AgentLocalControl {
             profiles,
             agent_version,
             build_commit,
+            local_control_only,
             #[cfg(feature = "dev-automation")]
             automation: Mutex::new(automation),
             #[cfg(feature = "dev-automation")]
@@ -70,8 +73,16 @@ impl AgentLocalControl {
     ) -> Result<LocalPayload, ProtocolError> {
         #[cfg(not(feature = "dev-automation"))]
         let _ = caller;
+        if self.local_control_only && !local_control_only_command(&request.command) {
+            return Err(ProtocolError::new(
+                LocalErrorCode::PermissionDenied,
+                "local-control-only mode permits identity diagnostics only",
+            ));
+        }
         #[cfg(feature = "dev-automation")]
-        self.expire_automation()?;
+        if !self.local_control_only {
+            self.expire_automation()?;
+        }
         // Cargo feature unification can expose dependency-only dev variants to a
         // production package selected in a broad workspace command. Keep that
         // accidental surface fail-closed without making the normal production
@@ -255,6 +266,7 @@ impl AgentLocalControl {
                 let automation = self.automation()?;
                 Ok(LocalPayload::DevStatus {
                     provisioned_build_id: automation.provisioned_build_id().map(str::to_owned),
+                    build_commit: self.build_commit.clone(),
                     active_session_id: automation.active().map(|value| value.session_id.clone()),
                     expires_at_unix_ms: automation.active().map(|value| value.expires_at_unix_ms),
                 })
@@ -467,6 +479,15 @@ impl AgentLocalControl {
     #[cfg(feature = "dev-automation")]
     pub(crate) fn tick_automation(&self) -> Result<(), ProtocolError> {
         self.expire_automation()
+    }
+}
+
+fn local_control_only_command(command: &LocalCommand) -> bool {
+    match command {
+        LocalCommand::Diagnostics {} => true,
+        #[cfg(feature = "dev-automation")]
+        LocalCommand::DevStatus {} => true,
+        _ => false,
     }
 }
 
@@ -831,5 +852,28 @@ mod tests {
             Some(arguments),
         )
         .is_err());
+    }
+
+    #[test]
+    fn local_control_only_policy_rejects_every_platform_effect() {
+        assert!(local_control_only_command(&LocalCommand::Diagnostics {}));
+        #[cfg(feature = "dev-automation")]
+        assert!(local_control_only_command(&LocalCommand::DevStatus {}));
+        for command in [
+            LocalCommand::ListProfiles {},
+            LocalCommand::ListTargets {
+                profile_id: "profile".into(),
+            },
+            LocalCommand::SelectTarget {
+                profile_id: "profile".into(),
+                target_id: "target".into(),
+            },
+            LocalCommand::FocusTarget {},
+            LocalCommand::CloseTarget { timeout_ms: 100 },
+            LocalCommand::CapturePreview { quality: 50 },
+            LocalCommand::ReleaseAll {},
+        ] {
+            assert!(!local_control_only_command(&command));
+        }
     }
 }

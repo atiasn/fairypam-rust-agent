@@ -95,7 +95,42 @@ async fn run_dev(mut arguments: VecDeque<String>) -> Result<LocalPayload, LocalC
             require_empty(&arguments)?;
             run_provision(&build_id)
         }
+        "local-control-prepare" => {
+            let request = flag(&mut arguments, "--request")?;
+            require_empty(&arguments)?;
+            run_local_control_prepare(&request)
+        }
         "status" => dev_request(LocalCommand::DevStatus {}, arguments).await,
+        "verify-status" => {
+            let build_id = flag(&mut arguments, "--build-id")?;
+            let build_commit = flag(&mut arguments, "--build-commit")?;
+            require_empty(&arguments)?;
+            verify_dev_status(&build_id, &build_commit).await
+        }
+        "verify-production" => {
+            let build_commit = flag(&mut arguments, "--build-commit")?;
+            require_empty(&arguments)?;
+            verify_production_diagnostics(&build_commit).await
+        }
+        "verify-dev-unavailable" => {
+            require_empty(&arguments)?;
+            verify_unavailable(true).await
+        }
+        "verify-production-unavailable" => {
+            require_empty(&arguments)?;
+            verify_unavailable(false).await
+        }
+        #[cfg(windows)]
+        "diagnostics-as-process" => {
+            let process_id = flag(&mut arguments, "--target-pid")?
+                .parse()
+                .map_err(|_| LocalClientError::Protocol("--target-pid is invalid".into()))?;
+            require_empty(&arguments)?;
+            LocalClient::production_for_test_process(process_id, "fairypam-agentctl")?
+                .with_timeout(Duration::from_secs(5))?
+                .request(LocalCommand::Diagnostics {}, CancellationToken::new())
+                .await
+        }
         "run-testbed-pulse" => {
             let integrity = flag(&mut arguments, "--integrity")?;
             let ttl_ms = flag(&mut arguments, "--ttl-ms")?
@@ -139,16 +174,69 @@ async fn run_dev(mut arguments: VecDeque<String>) -> Result<LocalPayload, LocalC
     }
 }
 
+#[cfg(feature = "dev-automation")]
+async fn verify_dev_status(
+    expected_build_id: &str,
+    expected_build_commit: &str,
+) -> Result<LocalPayload, LocalClientError> {
+    let payload = dev_request(LocalCommand::DevStatus {}, VecDeque::new()).await?;
+    match &payload {
+        LocalPayload::DevStatus { provisioned_build_id, build_commit, active_session_id, .. }
+            if provisioned_build_id.as_deref() == Some(expected_build_id)
+                && build_commit == expected_build_commit
+                && active_session_id.is_none() => Ok(payload),
+        _ => Err(LocalClientError::Protocol("development identity probe mismatch".into())),
+    }
+}
+
+#[cfg(feature = "dev-automation")]
+async fn verify_production_diagnostics(
+    expected_build_commit: &str,
+) -> Result<LocalPayload, LocalClientError> {
+    let payload = LocalClient::production("fairypam-agentctl")?
+        .with_timeout(Duration::from_secs(5))?
+        .request(LocalCommand::Diagnostics {}, CancellationToken::new()).await?;
+    match &payload {
+        LocalPayload::Diagnostics { build_commit, protocol, control_connected, .. }
+            if build_commit == expected_build_commit
+                && protocol == "fairypam-local-v1"
+                && !control_connected => Ok(payload),
+        _ => Err(LocalClientError::Protocol("production identity probe mismatch".into())),
+    }
+}
+
+#[cfg(feature = "dev-automation")]
+async fn verify_unavailable(development: bool) -> Result<LocalPayload, LocalClientError> {
+    let client = if development {
+        LocalClient::development("fairypam-agentctl")?
+    } else {
+        LocalClient::production("fairypam-agentctl")?
+    };
+    match client.with_timeout(Duration::from_secs(5))?
+        .request(LocalCommand::Diagnostics {}, CancellationToken::new()).await {
+        Err(LocalClientError::Unavailable) => Ok(LocalPayload::Diagnostics {
+            agent_version: env!("CARGO_PKG_VERSION").into(), build_commit: String::new(),
+            protocol: "agent-unavailable-v1".into(), control_connected: false, audit_enabled: true,
+        }),
+        Err(error) => Err(error),
+        Ok(_) => Err(LocalClientError::Protocol("expected Agent to be unavailable".into())),
+    }
+}
+
 #[cfg(all(feature = "dev-automation", windows))]
 fn run_provision(build_id: &str) -> Result<LocalPayload, LocalClientError> {
     validate_build_id(build_id)?;
-    let manifest = match fairypam_agent_dev_automation::provision::provision_current_build(build_id)
-    {
+    // ponytail: compile-time embedding makes the elevated provisioner the runner trust root.
+    let embedded_local_control_runner = include_bytes!("../../../scripts/local-control-safe-runner.ps1");
+    let manifest = match fairypam_agent_dev_automation::provision::provision_current_build(
+        build_id,
+        embedded_local_control_runner,
+    ) {
         Ok(manifest) => manifest,
         Err(error)
             if error.code == fairypam_agent_local_protocol::LocalErrorCode::PermissionDenied =>
         {
-            elevate_provision(build_id)?;
+            elevate_command(&format!("dev provision --build-id {build_id}"))?;
             fairypam_agent_dev_automation::provision::load_and_validate_current_slot()
                 .map_err(LocalClientError::from)?
         }
@@ -164,7 +252,39 @@ fn run_provision(build_id: &str) -> Result<LocalPayload, LocalClientError> {
 }
 
 #[cfg(all(feature = "dev-automation", windows))]
-fn elevate_provision(build_id: &str) -> Result<(), LocalClientError> {
+fn run_local_control_prepare(request: &str) -> Result<LocalPayload, LocalClientError> {
+    let request = std::path::Path::new(request);
+    let manifest = match fairypam_agent_dev_automation::provision::prepare_local_control_authority_request(request) {
+        Ok(manifest) => manifest,
+        Err(error)
+            if error.code == fairypam_agent_local_protocol::LocalErrorCode::PermissionDenied =>
+        {
+            let request = request.display().to_string();
+            if request.contains('"') {
+                return Err(LocalClientError::Protocol("request path is invalid".into()));
+            }
+            elevate_command(&format!("dev local-control-prepare --request \"{request}\""))?;
+            fairypam_agent_dev_automation::provision::load_and_validate_current_slot()
+                .map_err(LocalClientError::from)?
+        }
+        Err(error) => return Err(LocalClientError::from(error)),
+    };
+    Ok(LocalPayload::Diagnostics {
+        agent_version: env!("CARGO_PKG_VERSION").into(),
+        build_commit: manifest.build_id,
+        protocol: "local-control-authority-v1".into(),
+        control_connected: false,
+        audit_enabled: true,
+    })
+}
+
+#[cfg(all(feature = "dev-automation", not(windows)))]
+fn run_local_control_prepare(_request: &str) -> Result<LocalPayload, LocalClientError> {
+    Err(LocalClientError::UnsupportedPlatform)
+}
+
+#[cfg(all(feature = "dev-automation", windows))]
+fn elevate_command(arguments: &str) -> Result<(), LocalClientError> {
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
@@ -173,7 +293,7 @@ fn elevate_provision(build_id: &str) -> Result<(), LocalClientError> {
 
     let executable = std::env::current_exe().map_err(LocalClientError::Io)?;
     let executable = wide(&executable.display().to_string());
-    let parameters = wide(&format!("dev provision --build-id {build_id}"));
+    let parameters = wide(arguments);
     let mut launch = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS,
@@ -382,7 +502,7 @@ fn usage() -> &'static str {
 
 #[cfg(feature = "dev-automation")]
 fn dev_usage() -> &'static str {
-    "usage: fairypam-agentctl dev provision --build-id ID|status|run-testbed-pulse --integrity normal|high --ttl-ms MS|run-testbed-hold --integrity normal|high --ttl-ms MS --duration-ms MS|stop|emergency-stop"
+    "usage: fairypam-agentctl dev provision --build-id ID|local-control-prepare --request ABSOLUTE_PATH|status|verify-status --build-id ID --build-commit COMMIT|verify-production --build-commit COMMIT|verify-dev-unavailable|verify-production-unavailable|diagnostics-as-process --target-pid PID|run-testbed-pulse --integrity normal|high --ttl-ms MS|run-testbed-hold --integrity normal|high --ttl-ms MS --duration-ms MS|stop|emergency-stop"
 }
 
 fn fail(category: &str, message: &str) -> ExitCode {

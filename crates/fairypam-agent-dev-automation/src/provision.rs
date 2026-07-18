@@ -14,6 +14,7 @@ use windows::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath, KF_F
 use fairypam_agent_local_protocol::{LocalErrorCode, ProtocolError};
 
 const TASK_PREFIX: &str = r"\FairyPam\Dev\";
+const LOCAL_CONTROL_AUTHORITY_SUFFIX: &str = "-LocalControlAuthority";
 const MANIFEST_NAME: &str = "dev-provision.json";
 const DEV_BUILD_MARKER: &[u8] = b"FAIRYPAM_DEV_AUTOMATION_BUILD_V1";
 
@@ -23,6 +24,11 @@ pub struct DevProvisionManifest {
     pub schema_version: u32,
     pub build_id: String,
     pub agent_sha256: String,
+    pub agentctl_path: PathBuf,
+    pub agentctl_sha256: String,
+    pub local_control_runner_path: PathBuf,
+    pub local_control_runner_sha256: String,
+    pub local_control_authority_task: String,
     pub developer_sid: String,
     pub developer_sid_hash: String,
     pub task_name: String,
@@ -63,8 +69,10 @@ pub struct DevResourceLayout {
     pub ca: PathBuf,
     pub profiles: PathBuf,
     pub task_xml: PathBuf,
+    pub authority_task_xml: PathBuf,
     pub manifest: PathBuf,
     pub task_name: String,
+    pub authority_task_name: String,
     pub pipe_name: String,
 }
 
@@ -89,8 +97,14 @@ impl DevResourceLayout {
                 ca: slot.join("dev-ca.pem"),
                 profiles: slot.join("profiles"),
                 task_xml: root.join("dev-agent-task.xml"),
+                authority_task_xml: root.join("local-control-authority-task.xml"),
                 manifest: root.join(MANIFEST_NAME),
                 task_name: format!("{TASK_PREFIX}{}", &sid_hash[..24]),
+                authority_task_name: format!(
+                    "{TASK_PREFIX}{}{}",
+                    &sid_hash[..24],
+                    LOCAL_CONTROL_AUTHORITY_SUFFIX
+                ),
                 pipe_name: identity.pipe_name().to_owned(),
                 root,
                 slot,
@@ -101,7 +115,10 @@ impl DevResourceLayout {
     }
 }
 
-pub fn provision_current_build(build_id: &str) -> Result<DevProvisionManifest, ProtocolError> {
+pub fn provision_current_build(
+    build_id: &str,
+    embedded_local_control_runner: &[u8],
+) -> Result<DevProvisionManifest, ProtocolError> {
     require_elevated()?;
     validate_build_id(build_id)?;
     let (layout, identity) = DevResourceLayout::current()?;
@@ -153,7 +170,11 @@ pub fn provision_current_build(build_id: &str) -> Result<DevProvisionManifest, P
     fs::create_dir_all(&layout.slot).map_err(io_error)?;
     fs::create_dir_all(&layout.state).map_err(io_error)?;
     let installed_agent = layout.slot.join("fairypam-agent.exe");
+    let installed_agentctl = layout.slot.join("fairypam-agentctl.exe");
+    let installed_local_control_runner = layout.slot.join("local-control-safe-runner.ps1");
     fs::copy(&source_agent, &installed_agent).map_err(io_error)?;
+    fs::copy(&current, &installed_agentctl).map_err(io_error)?;
+    fs::write(&installed_local_control_runner, embedded_local_control_runner).map_err(io_error)?;
     fs::copy(&source_certificate, &layout.certificate).map_err(io_error)?;
     fs::copy(&source_private_key, &layout.private_key).map_err(io_error)?;
     fs::copy(&source_guardian, &layout.guardian).map_err(io_error)?;
@@ -179,6 +200,11 @@ pub fn provision_current_build(build_id: &str) -> Result<DevProvisionManifest, P
         schema_version: 1,
         build_id: build_id.to_owned(),
         agent_sha256: file_sha256(&installed_agent)?,
+        agentctl_path: installed_agentctl.clone(),
+        agentctl_sha256: file_sha256(&installed_agentctl)?,
+        local_control_runner_path: installed_local_control_runner.clone(),
+        local_control_runner_sha256: bytes_sha256(embedded_local_control_runner),
+        local_control_authority_task: layout.authority_task_name.clone(),
         developer_sid: identity.user_sid().to_owned(),
         developer_sid_hash: identity.user_sid_hash().map_err(map_client)?,
         task_name: layout.task_name.clone(),
@@ -201,6 +227,8 @@ pub fn provision_current_build(build_id: &str) -> Result<DevProvisionManifest, P
     .map_err(io_error)?;
     write_task_xml(&layout, identity.user_sid(), &installed_agent)?;
     register_task(&layout)?;
+    write_authority_task_xml(&layout, &installed_local_control_runner)?;
+    register_authority_task(&layout)?;
     Ok(manifest)
 }
 
@@ -213,6 +241,7 @@ pub fn load_and_validate_current_slot() -> Result<DevProvisionManifest, Protocol
         || manifest.developer_sid != identity.user_sid()
         || manifest.developer_sid_hash != identity.user_sid_hash().map_err(map_client)?
         || manifest.task_name != layout.task_name
+        || manifest.local_control_authority_task != layout.authority_task_name
         || manifest.pipe_name != layout.pipe_name
         || manifest.slot_dir != layout.slot
         || manifest.state_dir != layout.state
@@ -225,6 +254,10 @@ pub fn load_and_validate_current_slot() -> Result<DevProvisionManifest, Protocol
         || manifest.ca_path != layout.ca
         || manifest.profile_dir != layout.profiles
         || file_sha256(&layout.slot.join("fairypam-agent.exe"))? != manifest.agent_sha256
+        || manifest.agentctl_path != layout.slot.join("fairypam-agentctl.exe")
+        || file_sha256(&manifest.agentctl_path)? != manifest.agentctl_sha256
+        || manifest.local_control_runner_path != layout.slot.join("local-control-safe-runner.ps1")
+        || file_sha256(&manifest.local_control_runner_path)? != manifest.local_control_runner_sha256
     {
         return Err(ProtocolError::new(
             LocalErrorCode::PermissionDenied,
@@ -241,6 +274,54 @@ pub fn load_runtime_environment(
         serde_json::from_slice(&fs::read(&manifest.runtime_config_path).map_err(io_error)?)
             .map_err(json_error)?;
     Ok((manifest, runtime))
+}
+
+pub fn prepare_local_control_authority_request(
+    request_path: &Path,
+) -> Result<DevProvisionManifest, ProtocolError> {
+    require_elevated()?;
+    let (layout, _) = DevResourceLayout::current()?;
+    let manifest = load_and_validate_current_slot()?;
+    let request = fs::read(request_path).map_err(io_error)?;
+    if request.is_empty() || request.len() > 64 * 1024 {
+        return Err(ProtocolError::new(
+            LocalErrorCode::InvalidArgument,
+            "local-control authority request size is invalid",
+        ));
+    }
+    let request: serde_json::Value = serde_json::from_slice(&request).map_err(json_error)?;
+    let object = request.as_object().ok_or_else(|| {
+        ProtocolError::new(
+            LocalErrorCode::InvalidArgument,
+            "local-control authority request must be an object",
+        )
+    })?;
+    let source_commit = object.get("source_commit").and_then(serde_json::Value::as_str);
+    let build_id = object.get("build_id").and_then(serde_json::Value::as_str);
+    let nonce = object.get("nonce").and_then(serde_json::Value::as_str);
+    let runner_sha256 = object
+        .get("runner_sha256")
+        .and_then(serde_json::Value::as_str);
+    if !source_commit.is_some_and(is_commit)
+        || build_id != Some(manifest.build_id.as_str())
+        || !nonce.is_some_and(is_sha256)
+        || runner_sha256 != Some(manifest.local_control_runner_sha256.as_str())
+    {
+        return Err(ProtocolError::new(
+            LocalErrorCode::PermissionDenied,
+            "local-control authority request does not bind the protected provision",
+        ));
+    }
+    let authority_root = layout.state.join("local-control");
+    fs::create_dir_all(&authority_root).map_err(io_error)?;
+    protect_tree(&layout.root, &manifest.developer_sid)?;
+    let destination = authority_root.join("request.json");
+    write_atomic(&destination, &serde_json::to_vec(&request).map_err(json_error)?)?;
+    run_system_tool(
+        "schtasks.exe",
+        ["/Run", "/TN", &manifest.local_control_authority_task],
+    )?;
+    Ok(manifest)
 }
 
 fn write_task_xml(
@@ -273,6 +354,43 @@ fn register_task(layout: &DevResourceLayout) -> Result<(), ProtocolError> {
             &layout.task_name,
             "/XML",
             &layout.task_xml.display().to_string(),
+            "/F",
+        ],
+    )
+}
+
+fn write_authority_task_xml(
+    layout: &DevResourceLayout,
+    runner: &Path,
+) -> Result<(), ProtocolError> {
+    let powershell = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
+    let authority_root = layout.state.join("local-control");
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals><Principal id="Authority"><UserId>S-1-5-18</UserId><LogonType>ServiceAccount</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
+  <Actions Context="Authority"><Exec><Command>{}</Command><Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{}" -Mode Authority -AuthorityRoot "{}"</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>
+</Task>"#,
+        xml_escape(&powershell.display().to_string()),
+        xml_escape(&runner.display().to_string()),
+        xml_escape(&authority_root.display().to_string()),
+        xml_escape(&layout.root.display().to_string()),
+    );
+    let mut utf16 = vec![0xff, 0xfe];
+    utf16.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+    fs::write(&layout.authority_task_xml, utf16).map_err(io_error)
+}
+
+fn register_authority_task(layout: &DevResourceLayout) -> Result<(), ProtocolError> {
+    run_system_tool(
+        "schtasks.exe",
+        [
+            "/Create",
+            "/TN",
+            &layout.authority_task_name,
+            "/XML",
+            &layout.authority_task_xml.display().to_string(),
             "/F",
         ],
     )
@@ -375,6 +493,27 @@ fn file_sha256(path: &Path) -> Result<String, ProtocolError> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+fn bytes_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn is_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, bytes).map_err(io_error)?;
+    fs::rename(temporary, path).map_err(io_error)
 }
 
 fn copy_profile_tree(source: &Path, destination: &Path) -> Result<(), ProtocolError> {
