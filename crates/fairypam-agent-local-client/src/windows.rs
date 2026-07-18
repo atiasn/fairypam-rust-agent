@@ -18,9 +18,7 @@ use windows::Win32::Security::{
     TokenIntegrityLevel, TokenLogonSid, TokenSessionId, TokenUser, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_ATTRIBUTES, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
-use windows::Win32::System::Pipes::{
-    GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
-};
+use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
 use windows::Win32::System::SystemServices::{
     SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
     SECURITY_MANDATORY_SYSTEM_RID, SE_GROUP_LOGON_ID,
@@ -63,10 +61,7 @@ impl PipeIdentity {
     }
 
     #[cfg(feature = "dev-automation")]
-    pub fn for_process_id(
-        process_id: u32,
-        flavor: PipeFlavor,
-    ) -> Result<Self, LocalClientError> {
+    pub fn for_process_id(process_id: u32, flavor: PipeFlavor) -> Result<Self, LocalClientError> {
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
             .map_err(|_| LocalClientError::TargetProcessUnavailable)?;
         let process = OwnedHandle(process);
@@ -265,7 +260,10 @@ fn identity_facts_match(
         // The fixed updater/installer tasks run with the same user, logon SID and
         // session at high integrity. Identity remains exact; only SYSTEM/unknown
         // callers stay excluded from this per-user control pipe.
-        && matches!(caller.integrity, ClientIntegrity::Low | ClientIntegrity::Medium | ClientIntegrity::High)
+        && matches!(
+            caller.integrity,
+            ClientIntegrity::Low | ClientIntegrity::Medium | ClientIntegrity::High
+        )
 }
 
 impl Drop for PipeSecurity {

@@ -174,7 +174,11 @@ pub fn provision_current_build(
     let installed_local_control_runner = layout.slot.join("local-control-safe-runner.ps1");
     fs::copy(&source_agent, &installed_agent).map_err(io_error)?;
     fs::copy(&current, &installed_agentctl).map_err(io_error)?;
-    fs::write(&installed_local_control_runner, embedded_local_control_runner).map_err(io_error)?;
+    fs::write(
+        &installed_local_control_runner,
+        embedded_local_control_runner,
+    )
+    .map_err(io_error)?;
     fs::copy(&source_certificate, &layout.certificate).map_err(io_error)?;
     fs::copy(&source_private_key, &layout.private_key).map_err(io_error)?;
     fs::copy(&source_guardian, &layout.guardian).map_err(io_error)?;

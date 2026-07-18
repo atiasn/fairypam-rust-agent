@@ -181,10 +181,17 @@ async fn verify_dev_status(
 ) -> Result<LocalPayload, LocalClientError> {
     let payload = dev_request(LocalCommand::DevStatus {}, VecDeque::new()).await?;
     match &payload {
-        LocalPayload::DevStatus { provisioned_build_id, build_commit, active_session_id, .. }
-            if provisioned_build_id.as_deref() == Some(expected_build_id)
-                && build_commit == expected_build_commit
-                && active_session_id.is_none() => Ok(payload),
+        LocalPayload::DevStatus {
+            provisioned_build_id,
+            build_commit,
+            active_session_id,
+            ..
+        } if provisioned_build_id.as_deref() == Some(expected_build_id)
+            && build_commit == expected_build_commit
+            && active_session_id.is_none() =>
+        {
+            Ok(payload)
+        }
         _ => Err(LocalClientError::Protocol("development identity probe mismatch".into())),
     }
 }
@@ -195,12 +202,20 @@ async fn verify_production_diagnostics(
 ) -> Result<LocalPayload, LocalClientError> {
     let payload = LocalClient::production("fairypam-agentctl")?
         .with_timeout(Duration::from_secs(5))?
-        .request(LocalCommand::Diagnostics {}, CancellationToken::new()).await?;
+        .request(LocalCommand::Diagnostics {}, CancellationToken::new())
+        .await?;
     match &payload {
-        LocalPayload::Diagnostics { build_commit, protocol, control_connected, .. }
-            if build_commit == expected_build_commit
-                && protocol == "fairypam-local-v1"
-                && !control_connected => Ok(payload),
+        LocalPayload::Diagnostics {
+            build_commit,
+            protocol,
+            control_connected,
+            ..
+        } if build_commit == expected_build_commit
+            && protocol == "fairypam-local-v1"
+            && !control_connected =>
+        {
+            Ok(payload)
+        }
         _ => Err(LocalClientError::Protocol("production identity probe mismatch".into())),
     }
 }
@@ -212,11 +227,17 @@ async fn verify_unavailable(development: bool) -> Result<LocalPayload, LocalClie
     } else {
         LocalClient::production("fairypam-agentctl")?
     };
-    match client.with_timeout(Duration::from_secs(5))?
-        .request(LocalCommand::Diagnostics {}, CancellationToken::new()).await {
+    match client
+        .with_timeout(Duration::from_secs(5))?
+        .request(LocalCommand::Diagnostics {}, CancellationToken::new())
+        .await
+    {
         Err(LocalClientError::Unavailable) => Ok(LocalPayload::Diagnostics {
-            agent_version: env!("CARGO_PKG_VERSION").into(), build_commit: String::new(),
-            protocol: "agent-unavailable-v1".into(), control_connected: false, audit_enabled: true,
+            agent_version: env!("CARGO_PKG_VERSION").into(),
+            build_commit: String::new(),
+            protocol: "agent-unavailable-v1".into(),
+            control_connected: false,
+            audit_enabled: true,
         }),
         Err(error) => Err(error),
         Ok(_) => Err(LocalClientError::Protocol("expected Agent to be unavailable".into())),
@@ -227,7 +248,8 @@ async fn verify_unavailable(development: bool) -> Result<LocalPayload, LocalClie
 fn run_provision(build_id: &str) -> Result<LocalPayload, LocalClientError> {
     validate_build_id(build_id)?;
     // ponytail: compile-time embedding makes the elevated provisioner the runner trust root.
-    let embedded_local_control_runner = include_bytes!("../../../scripts/local-control-safe-runner.ps1");
+    let embedded_local_control_runner =
+        include_bytes!("../../../scripts/local-control-safe-runner.ps1");
     let manifest = match fairypam_agent_dev_automation::provision::provision_current_build(
         build_id,
         embedded_local_control_runner,
@@ -254,21 +276,26 @@ fn run_provision(build_id: &str) -> Result<LocalPayload, LocalClientError> {
 #[cfg(all(feature = "dev-automation", windows))]
 fn run_local_control_prepare(request: &str) -> Result<LocalPayload, LocalClientError> {
     let request = std::path::Path::new(request);
-    let manifest = match fairypam_agent_dev_automation::provision::prepare_local_control_authority_request(request) {
-        Ok(manifest) => manifest,
-        Err(error)
-            if error.code == fairypam_agent_local_protocol::LocalErrorCode::PermissionDenied =>
-        {
-            let request = request.display().to_string();
-            if request.contains('"') {
-                return Err(LocalClientError::Protocol("request path is invalid".into()));
+    let manifest =
+        match fairypam_agent_dev_automation::provision::prepare_local_control_authority_request(
+            request,
+        ) {
+            Ok(manifest) => manifest,
+            Err(error)
+                if error.code == fairypam_agent_local_protocol::LocalErrorCode::PermissionDenied =>
+            {
+                let request = request.display().to_string();
+                if request.contains('"') {
+                    return Err(LocalClientError::Protocol("request path is invalid".into()));
+                }
+                elevate_command(&format!(
+                    "dev local-control-prepare --request \"{request}\""
+                ))?;
+                fairypam_agent_dev_automation::provision::load_and_validate_current_slot()
+                    .map_err(LocalClientError::from)?
             }
-            elevate_command(&format!("dev local-control-prepare --request \"{request}\""))?;
-            fairypam_agent_dev_automation::provision::load_and_validate_current_slot()
-                .map_err(LocalClientError::from)?
-        }
-        Err(error) => return Err(LocalClientError::from(error)),
-    };
+            Err(error) => return Err(LocalClientError::from(error)),
+        };
     Ok(LocalPayload::Diagnostics {
         agent_version: env!("CARGO_PKG_VERSION").into(),
         build_commit: manifest.build_id,

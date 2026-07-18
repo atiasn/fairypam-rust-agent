@@ -108,20 +108,12 @@ impl LocalConnection {
 impl LocalClient {
     #[cfg(windows)]
     pub fn production(client_name: impl Into<String>) -> Result<Self, LocalClientError> {
-        Self::for_identity(
-            PipeIdentity::current(PipeFlavor::Production)?,
-            client_name,
-            None,
-        )
+        Self::for_identity(PipeIdentity::current(PipeFlavor::Production)?, client_name, None)
     }
 
     #[cfg(all(windows, feature = "dev-automation"))]
     pub fn development(client_name: impl Into<String>) -> Result<Self, LocalClientError> {
-        Self::for_identity(
-            PipeIdentity::current(PipeFlavor::Development)?,
-            client_name,
-            None,
-        )
+        Self::for_identity(PipeIdentity::current(PipeFlavor::Development)?, client_name, None)
     }
 
     #[cfg(all(windows, feature = "dev-automation"))]
