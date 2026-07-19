@@ -262,7 +262,9 @@ fn run_provision(build_id: &str) -> Result<LocalPayload, LocalClientError> {
     ) {
         Ok(manifest) => manifest,
         Err(error)
-            if error.code == fairypam_agent_local_protocol::LocalErrorCode::PermissionDenied =>
+            if error.code == fairypam_agent_local_protocol::LocalErrorCode::PermissionDenied
+                && error.message
+                    == fairypam_agent_dev_automation::provision::ELEVATION_REQUIRED_MESSAGE =>
         {
             elevate_command(&format!("dev provision --build-id {build_id}"))?;
             fairypam_agent_dev_automation::provision::load_and_validate_current_slot()
@@ -289,7 +291,9 @@ fn run_local_control_prepare(request: &str) -> Result<LocalPayload, LocalClientE
             Ok(manifest) => manifest,
             Err(error)
                 if error.code
-                    == fairypam_agent_local_protocol::LocalErrorCode::PermissionDenied =>
+                    == fairypam_agent_local_protocol::LocalErrorCode::PermissionDenied
+                    && error.message
+                        == fairypam_agent_dev_automation::provision::ELEVATION_REQUIRED_MESSAGE =>
             {
                 let request = request.display().to_string();
                 if request.contains('"') {

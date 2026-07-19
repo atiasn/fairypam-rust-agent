@@ -99,7 +99,9 @@ mod platform {
                 .map_err(map_safety)?;
             input
                 .execute_pulse(
-                    &ActionId::new(PULSE_ACTION_ID.to_owned()).map_err(map_safety)?,
+                    &ActionId::new(PULSE_ACTION_ID.to_owned()).map_err(|error| {
+                        AgentError::new("guardian.protocol_error", error.to_string())
+                    })?,
                     &session,
                     &permit,
                     Instant::now(),
@@ -134,7 +136,9 @@ mod platform {
                         sequence: 1,
                         expires_at: hold_until,
                         desired_holds: BTreeSet::from([
-                            ActionId::new(HOLD_ACTION_ID.to_owned()).map_err(map_safety)?
+                            ActionId::new(HOLD_ACTION_ID.to_owned()).map_err(|error| {
+                                AgentError::new("guardian.protocol_error", error.to_string())
+                            })?
                         ]),
                     },
                     &permit,

@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,6 +18,8 @@ const TASK_PREFIX: &str = r"\FairyPam\Dev\";
 const LOCAL_CONTROL_AUTHORITY_SUFFIX: &str = "-LocalControlAuthority";
 const MANIFEST_NAME: &str = "dev-provision.json";
 const DEV_BUILD_MARKER: &[u8] = b"FAIRYPAM_DEV_AUTOMATION_BUILD_V1";
+pub const ELEVATION_REQUIRED_MESSAGE: &str =
+    "dev provision requires one explicit elevated launch";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +56,53 @@ pub struct DevRuntimeEnvironment {
     pub server_name: String,
     pub agent_id: String,
     pub profile_root_public_key_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LocalControlAuthorityRequest {
+    source_commit: String,
+    build_id: String,
+    nonce: String,
+    runner_sha256: String,
+    prod_agent_path: String,
+    prod_agent_sha256: String,
+    agentctl_path: String,
+    agentctl_sha256: String,
+    prod_environment_path: String,
+    prod_environment_sha256: String,
+    build_receipt_path: String,
+    build_receipt_sha256: String,
+    timeout_seconds: u32,
+}
+
+impl LocalControlAuthorityRequest {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_build_id(&self.build_id)?;
+        if !is_commit(&self.source_commit)
+            || !is_sha256(&self.nonce)
+            || !is_sha256(&self.runner_sha256)
+            || !is_sha256(&self.prod_agent_sha256)
+            || !is_sha256(&self.agentctl_sha256)
+            || !is_sha256(&self.prod_environment_sha256)
+            || !is_sha256(&self.build_receipt_sha256)
+            || !(10..=300).contains(&self.timeout_seconds)
+            || [
+                &self.prod_agent_path,
+                &self.agentctl_path,
+                &self.prod_environment_path,
+                &self.build_receipt_path,
+            ]
+            .into_iter()
+            .any(|value| !Path::new(value).is_absolute())
+        {
+            return Err(ProtocolError::new(
+                LocalErrorCode::InvalidArgument,
+                "local-control authority request shape is invalid",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,35 +343,78 @@ pub fn prepare_local_control_authority_request(
             "local-control authority request size is invalid",
         ));
     }
-    let request: serde_json::Value = serde_json::from_slice(&request).map_err(json_error)?;
-    let object = request.as_object().ok_or_else(|| {
-        ProtocolError::new(
-            LocalErrorCode::InvalidArgument,
-            "local-control authority request must be an object",
-        )
-    })?;
-    let source_commit = object
-        .get("source_commit")
-        .and_then(serde_json::Value::as_str);
-    let build_id = object.get("build_id").and_then(serde_json::Value::as_str);
-    let nonce = object.get("nonce").and_then(serde_json::Value::as_str);
-    let runner_sha256 = object
-        .get("runner_sha256")
-        .and_then(serde_json::Value::as_str);
-    if !source_commit.is_some_and(is_commit)
-        || build_id != Some(manifest.build_id.as_str())
-        || !nonce.is_some_and(is_sha256)
-        || runner_sha256 != Some(manifest.local_control_runner_sha256.as_str())
+    let request: LocalControlAuthorityRequest =
+        serde_json::from_slice(&request).map_err(json_error)?;
+    request.validate()?;
+    if request.build_id != manifest.build_id
+        || request.runner_sha256 != manifest.local_control_runner_sha256
     {
         return Err(ProtocolError::new(
             LocalErrorCode::PermissionDenied,
             "local-control authority request does not bind the protected provision",
         ));
     }
+    let nonce = request.nonce.as_str();
     let authority_root = layout.state.join("local-control");
     fs::create_dir_all(&authority_root).map_err(io_error)?;
     protect_tree(&layout.root, &manifest.developer_sid)?;
     let destination = authority_root.join("request.json");
+    let claim_path = authority_root.join("request.claim.json");
+    let claim = serde_json::json!({
+        "schema_version": 1,
+        "source_commit": &request.source_commit,
+        "build_id": &request.build_id,
+        "nonce": nonce,
+        "runner_sha256": &request.runner_sha256,
+    });
+    let mut claim_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&claim_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ProtocolError::new(
+                    LocalErrorCode::ReplayDetected,
+                    "another local-control authority request is active; explicit recovery is required",
+                )
+            } else {
+                io_error(error)
+            }
+        })?;
+    claim_file
+        .write_all(&serde_json::to_vec(&claim).map_err(json_error)?)
+        .map_err(io_error)?;
+    claim_file.sync_all().map_err(io_error)?;
+    drop(claim_file);
+    let prior_request_uses_nonce = match optional_metadata(&destination)? {
+        Some(metadata) => {
+            if !metadata.is_file() {
+                return Err(ProtocolError::new(
+                    LocalErrorCode::PermissionDenied,
+                    "protected local-control authority request is not a regular file",
+                ));
+            }
+            let prior_request: LocalControlAuthorityRequest =
+                serde_json::from_slice(&fs::read(&destination).map_err(io_error)?)
+                    .map_err(json_error)?;
+            prior_request.validate()?;
+            prior_request.nonce == nonce
+        }
+        None => false,
+    };
+    let receipt_path = authority_root
+        .join("receipts")
+        .join(format!("local-control-safe-receipt-{nonce}.json"));
+    if optional_metadata(&authority_root.join(nonce))?.is_some()
+        || optional_metadata(&receipt_path)?.is_some()
+        || prior_request_uses_nonce
+    {
+        fs::remove_file(&claim_path).map_err(io_error)?;
+        return Err(ProtocolError::new(
+            LocalErrorCode::ReplayDetected,
+            "local-control authority nonce was already used; choose a fresh nonce",
+        ));
+    }
     write_atomic(
         &destination,
         &serde_json::to_vec(&request).map_err(json_error)?,
@@ -331,6 +424,14 @@ pub fn prepare_local_control_authority_request(
         ["/Run", "/TN", &manifest.local_control_authority_task],
     )?;
     Ok(manifest)
+}
+
+fn optional_metadata(path: &Path) -> Result<Option<fs::Metadata>, ProtocolError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error(error)),
+    }
 }
 
 fn write_task_xml(
@@ -459,7 +560,7 @@ fn require_elevated() -> Result<(), ProtocolError> {
     if elevation.TokenIsElevated == 0 {
         return Err(ProtocolError::new(
             LocalErrorCode::PermissionDenied,
-            "dev provision requires one explicit elevated launch",
+            ELEVATION_REQUIRED_MESSAGE,
         ));
     }
     Ok(())
@@ -512,11 +613,15 @@ fn bytes_sha256(bytes: &[u8]) -> String {
 }
 
 fn is_commit(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 40 && value.bytes().all(is_lower_hex)
 }
 
 fn is_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 64 && value.bytes().all(is_lower_hex)
+}
+
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
@@ -578,11 +683,13 @@ fn required_env(name: &str) -> Result<String, ProtocolError> {
 }
 
 fn validate_build_id(value: &str) -> Result<(), ProtocolError> {
-    if value.is_empty()
-        || value.len() > 96
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+    let mut bytes = value.bytes();
+    let first_is_alphanumeric = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric());
+    if value.len() > 96
+        || !first_is_alphanumeric
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
     {
         return Err(ProtocolError::new(
             LocalErrorCode::InvalidArgument,
@@ -618,4 +725,25 @@ fn windows_error(context: &str, error: windows::core::Error) -> ProtocolError {
         LocalErrorCode::OperationFailed,
         format!("{context}: {error}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_commit, is_sha256, validate_build_id};
+
+    #[test]
+    fn canonical_identities_require_lowercase_hex() {
+        assert!(is_commit(&"a".repeat(40)));
+        assert!(is_sha256(&"f".repeat(64)));
+        assert!(!is_commit(&"A".repeat(40)));
+        assert!(!is_sha256(&"F".repeat(64)));
+    }
+
+    #[test]
+    fn build_id_must_start_with_an_alphanumeric_character() {
+        assert!(validate_build_id("build-1.dev+local").is_ok());
+        for invalid in ["", ".build", "-build", "+build", "_build"] {
+            assert!(validate_build_id(invalid).is_err(), "accepted {invalid}");
+        }
+    }
 }

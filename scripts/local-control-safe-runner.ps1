@@ -958,6 +958,16 @@ function Invoke-Authority {
         throw 'embedded local-control runner path is not canonical'
     }
     $request = Read-JsonFile (Assert-ProtectedFile (Join-Path $authorityRoot 'request.json') 'local_control_authority_request')
+    $claimPath = Join-Path $authorityRoot 'request.claim.json'
+    $claim = Read-JsonFile (Assert-ProtectedFile $claimPath 'local_control_authority_claim')
+    if (@($claim.PSObject.Properties.Name | Sort-Object) -join ',' -cne 'build_id,nonce,runner_sha256,schema_version,source_commit' -or
+        [int]$claim.schema_version -ne 1 -or
+        [string]$claim.source_commit -cne [string]$request.source_commit -or
+        [string]$claim.build_id -cne [string]$request.build_id -or
+        [string]$claim.nonce -cne [string]$request.nonce -or
+        [string]$claim.runner_sha256 -cne [string]$request.runner_sha256) {
+        throw 'authority claim does not bind the protected request'
+    }
     if ([string]$request.build_id -cne [string]$manifest.build_id -or
         [string]$request.runner_sha256 -cne [string]$manifest.local_control_runner_sha256) {
         throw 'authority request does not bind the protected provision'
@@ -965,6 +975,8 @@ function Invoke-Authority {
     $receiptPath = Join-Path $authorityRoot "receipts\local-control-safe-receipt-$([string]$request.nonce).json"
     & $runner -Mode Run -SourceCommit ([string]$request.source_commit) -BuildId ([string]$request.build_id) -Nonce ([string]$request.nonce) -RunnerSha256 ([string]$request.runner_sha256) -ProdAgentPath ([string]$request.prod_agent_path) -ProdAgentSha256 ([string]$request.prod_agent_sha256) -AgentCtlPath ([string]$request.agentctl_path) -AgentCtlSha256 ([string]$request.agentctl_sha256) -ProdEnvironmentPath ([string]$request.prod_environment_path) -ProdEnvironmentSha256 ([string]$request.prod_environment_sha256) -BuildReceiptPath ([string]$request.build_receipt_path) -BuildReceiptSha256 ([string]$request.build_receipt_sha256) -ReceiptPath $receiptPath -AuthorityRoot $authorityRoot -TimeoutSeconds ([int]$request.timeout_seconds)
     if ($LASTEXITCODE -ne 0) { throw "fixed authority runner failed with exit code $LASTEXITCODE" }
+    Remove-Item -Force -LiteralPath $claimPath
+    if (Test-Path -LiteralPath $claimPath) { throw 'authority claim cleanup failed' }
 }
 
 switch ($Mode) {
