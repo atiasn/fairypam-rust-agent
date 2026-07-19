@@ -508,6 +508,7 @@ fn register_authority_task(layout: &DevResourceLayout) -> Result<(), ProtocolErr
 fn protect_tree(root: &Path, developer_sid: &str) -> Result<(), ProtocolError> {
     let root = root.display().to_string();
     let developer = format!("*{developer_sid}:(OI)(CI)RX");
+    let descendants = Path::new(&root).join("*").display().to_string();
     run_system_tool(
         "icacls.exe",
         [
@@ -522,20 +523,9 @@ fn protect_tree(root: &Path, developer_sid: &str) -> Result<(), ProtocolError> {
         ],
     )?;
     // icacls removes inherited child ACEs before applying the root grant in
-    // the combined command above. Re-apply the allowlist recursively so every
-    // existing child receives an explicit protected ACL in the same operation.
-    run_system_tool(
-        "icacls.exe",
-        [
-            root.as_str(),
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)F",
-            "*S-1-5-32-544:(OI)(CI)F",
-            developer.as_str(),
-            "/T",
-            "/C",
-        ],
-    )
+    // the combined command above. Reset every existing descendant to the
+    // protected root's inherited allowlist, including directory propagation.
+    run_system_tool("icacls.exe", [descendants.as_str(), "/reset", "/T", "/C"])
 }
 
 fn run_system_tool<const N: usize>(tool: &str, arguments: [&str; N]) -> Result<(), ProtocolError> {
