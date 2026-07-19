@@ -18,8 +18,7 @@ const TASK_PREFIX: &str = r"\FairyPam\Dev\";
 const LOCAL_CONTROL_AUTHORITY_SUFFIX: &str = "-LocalControlAuthority";
 const MANIFEST_NAME: &str = "dev-provision.json";
 const DEV_BUILD_MARKER: &[u8] = b"FAIRYPAM_DEV_AUTOMATION_BUILD_V1";
-pub const ELEVATION_REQUIRED_MESSAGE: &str =
-    "dev provision requires one explicit elevated launch";
+pub const ELEVATION_REQUIRED_MESSAGE: &str = "dev provision requires one explicit elevated launch";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
