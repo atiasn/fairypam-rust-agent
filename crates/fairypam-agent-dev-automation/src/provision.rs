@@ -520,6 +520,21 @@ fn protect_tree(root: &Path, developer_sid: &str) -> Result<(), ProtocolError> {
             "/T",
             "/C",
         ],
+    )?;
+    // icacls removes inherited child ACEs before applying the root grant in
+    // the combined command above. Re-apply the allowlist recursively so every
+    // existing child receives an explicit protected ACL in the same operation.
+    run_system_tool(
+        "icacls.exe",
+        [
+            root.as_str(),
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            developer.as_str(),
+            "/T",
+            "/C",
+        ],
     )
 }
 
