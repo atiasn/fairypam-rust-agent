@@ -474,10 +474,11 @@ fn write_authority_task_xml(
 ) -> Result<(), ProtocolError> {
     let powershell = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
     let authority_root = layout.state.join("local-control");
+    // ponytail: Task Scheduler XML has no ServiceAccount literal; SYSTEM resolves it.
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Principals><Principal id="Authority"><UserId>S-1-5-18</UserId><LogonType>ServiceAccount</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Principals><Principal id="Authority"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
   <Actions Context="Authority"><Exec><Command>{}</Command><Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{}" -Mode Authority -AuthorityRoot "{}"</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>
 </Task>"#,
