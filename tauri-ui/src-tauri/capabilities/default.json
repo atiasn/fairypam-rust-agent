@@ -1,0 +1,24 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Least-privilege capability for FairyPam Agent UI",
+  "windows": ["main"],
+  "permissions": [
+    "core:app:default",
+    "core:window:default",
+    "core:menu:default",
+    "core:tray:default",
+    "allow-get-overview",
+    "allow-get-doctor",
+    "allow-list-profiles",
+    "allow-list-targets",
+    "allow-lock-target",
+    "allow-focus-target",
+    "allow-stop-capture",
+    "allow-release-all",
+    "allow-get-update-status",
+    "allow-get-startup-status",
+    "allow-export-diagnostics",
+    "allow-stop-agent-after-confirmation"
+  ]
+}

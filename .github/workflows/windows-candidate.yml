@@ -152,6 +152,108 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  tauri-ui:
+    name: Build non-promotable unprivileged Tauri UI artifact
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Node for the Tauri UI
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: tauri-ui/package-lock.json
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $toolchain = (Get-Content rust-toolchain.toml | Select-String 'channel = "([^"]+)"').Matches.Groups[1].Value
+          rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy
+          rustup override set $toolchain
+          rustc --version
+          cargo --version
+
+      - name: Test and build the unprivileged Tauri UI
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          Push-Location tauri-ui
+          try {
+            npm ci
+            npm run build
+            npm run check:security
+            npm run check:command-surface
+            npm test -- --run
+            npm run test:accessibility
+
+            Push-Location src-tauri
+            try {
+              cargo generate-lockfile
+              cargo fmt --all -- --check
+              cargo check --all-targets --locked
+              cargo test --all-targets --locked
+              cargo clippy --all-targets --locked -- -D warnings
+              cargo build --release --locked
+            }
+            finally {
+              Pop-Location
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+      - name: Package unprivileged Tauri UI build
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force -Path dist/tauri-ui | Out-Null
+          Copy-Item tauri-ui/src-tauri/target/release/fairypam-agent-tauri-ui.exe dist/tauri-ui/
+          Copy-Item tauri-ui/src-tauri/Cargo.lock dist/tauri-ui/
+          Compress-Archive -Path dist/tauri-ui/* -DestinationPath dist/fairypam-agent-tauri-ui-windows.zip
+          $ui = Get-Item dist/tauri-ui/fairypam-agent-tauri-ui.exe
+          $lock = Get-Item dist/tauri-ui/Cargo.lock
+          $zip = Get-Item dist/fairypam-agent-tauri-ui-windows.zip
+          [ordered]@{
+            schema_version = 1
+            artifact_class = 'tauri-ui-build-only'
+            promotable = $false
+            source_commit = (Get-Content SOURCE_COMMIT -Raw).Trim()
+            public_commit = '${{ github.sha }}'
+            build_id = 'tauri-ui-${{ github.run_id }}-${{ github.run_attempt }}'
+            run_id = '${{ github.run_id }}'
+            run_attempt = '${{ github.run_attempt }}'
+            ui_sha256 = (Get-FileHash $ui -Algorithm SHA256).Hash.ToLowerInvariant()
+            ui_size = $ui.Length
+            cargo_lock_sha256 = (Get-FileHash $lock -Algorithm SHA256).Hash.ToLowerInvariant()
+            cargo_lock_size = $lock.Length
+            zip_sha256 = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+            zip_size = $zip.Length
+          } | ConvertTo-Json | Set-Content -Encoding utf8 dist/tauri-ui-build-receipt.json
+
+      - name: Attest Tauri UI ZIP provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/fairypam-agent-tauri-ui-windows.zip
+
+      - name: Attest Tauri UI receipt provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/tauri-ui-build-receipt.json
+
+      - name: Upload non-promotable Tauri UI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: fairypam-agent-tauri-ui-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/fairypam-agent-tauri-ui-windows.zip
+            dist/tauri-ui-build-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+
   verify-dev-attestation:
     name: Verify Dev artifact attestation as a consumer
     needs: dev-automation
@@ -173,3 +275,25 @@ jobs:
           $signer = "$env:GITHUB_REPOSITORY/.github/workflows/windows-candidate.yml"
           gh attestation verify dist/verified-dev/fairypam-agent-dev-windows.zip --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
           gh attestation verify dist/verified-dev/dev-build-receipt.json --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
+
+  verify-tauri-ui-attestation:
+    name: Verify Tauri UI artifact attestation as a consumer
+    needs: tauri-ui
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download Tauri UI artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: fairypam-agent-tauri-ui-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/verified-tauri-ui
+
+      - name: Verify Tauri UI ZIP and receipt provenance
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $signer = "$env:GITHUB_REPOSITORY/.github/workflows/windows-candidate.yml"
+          gh attestation verify dist/verified-tauri-ui/fairypam-agent-tauri-ui-windows.zip --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
+          gh attestation verify dist/verified-tauri-ui/tauri-ui-build-receipt.json --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
