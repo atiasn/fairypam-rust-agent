@@ -192,6 +192,7 @@ jobs:
             Push-Location src-tauri
             try {
               cargo generate-lockfile
+              git diff --exit-code -- Cargo.lock
               cargo fmt --all -- --check
               cargo check --all-targets --locked
               cargo test --all-targets --locked
