@@ -74,7 +74,6 @@ struct RegistryEntry {
     source: RegistrySource,
     display_name: Option<String>,
     display_version: Option<String>,
-    publisher: Option<String>,
     install_location: Option<String>,
     uninstall_string: Option<String>,
 }
@@ -83,6 +82,7 @@ struct RegistryEntry {
 enum RegistrySource {
     #[default]
     Machine,
+    #[cfg(test)]
     CurrentUser,
 }
 
@@ -180,7 +180,7 @@ fn game_version(launcher_dir: &Path, executable: &Path) -> Option<String> {
         .flatten()
         .filter_map(|directory| std::fs::read_to_string(directory.join("config.ini")).ok())
         .filter_map(|content| ini_value(&content, "game_version"))
-        .last()
+        .next()
 }
 
 fn ini_value(content: &str, wanted_key: &str) -> Option<String> {
@@ -386,7 +386,6 @@ fn registry_entries() -> Result<Vec<RegistryEntry>, AgentError> {
                 source: RegistrySource::Machine,
                 display_name: string_value(key.0, "DisplayName"),
                 display_version: string_value(key.0, "DisplayVersion"),
-                publisher: string_value(key.0, "Publisher"),
                 install_location: string_value(key.0, "InstallLocation"),
                 uninstall_string: string_value(key.0, "UninstallString"),
             });
@@ -421,7 +420,9 @@ mod tests {
 
     #[test]
     fn discovery_id_is_stable_and_does_not_expose_the_install_path() {
-        let root = std::env::temp_dir().join(format!("fairypam-discovery-{}", std::process::id()));
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temporary directory is canonicalizable")
+            .join(format!("fairypam-discovery-{}", std::process::id()));
         let executable = root
             .join("games")
             .join("Genshin Impact Game")
@@ -433,7 +434,6 @@ mod tests {
             source: RegistrySource::Machine,
             display_name: Some("HoYoPlay".into()),
             display_version: Some("launcher-version".into()),
-            publisher: Some("miHoYo".into()),
             install_location: Some(root.display().to_string()),
             uninstall_string: Some("uninstall.exe --uninstall_game=hk4e_cn".into()),
         }];
@@ -490,7 +490,6 @@ mod tests {
             source: RegistrySource::CurrentUser,
             display_name: Some("HoYoPlay".into()),
             display_version: None,
-            publisher: Some("miHoYo".into()),
             install_location: Some(r"C:\\attacker".into()),
             uninstall_string: Some("uninstall.exe --uninstall_game=hk4e_cn".into()),
         }];
@@ -498,6 +497,7 @@ mod tests {
 
         let root = std::env::temp_dir().join(format!("fairypam-reparse-{}", std::process::id()));
         let target = root.join("target");
+        #[cfg(unix)]
         let link = root.join("link");
         std::fs::create_dir_all(target.join("games/Genshin Impact Game")).unwrap();
         std::fs::write(target.join("games/Genshin Impact Game/YuanShen.exe"), []).unwrap();
