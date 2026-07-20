@@ -13,4 +13,7 @@ fn tray_lifecycle_never_stops_the_agent_while_closing_or_exiting_the_ui() {
     assert!(!lifecycle.contains("release_all"));
     assert!(APP.contains("\"exit-ui\" => app.exit(0)"));
     assert!(APP.contains("\"show-main\" | \"stop-agent\" => show_main_window(app)"));
+    assert!(APP.contains("TrayIconEvent::DoubleClick"));
+    assert!(APP.contains("button: MouseButton::Left"));
+    assert!(APP.contains("show_main_window(tray.app_handle())"));
 }
