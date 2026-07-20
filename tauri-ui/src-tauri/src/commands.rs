@@ -71,7 +71,9 @@ pub async fn stop_capture(
     source_id: String,
     state: State<'_, ProductionGateway>,
 ) -> CommandResult<CaptureStateDto> {
-    state.stop_capture(identifier(source_id, "source_id")?).await
+    state
+        .stop_capture(identifier(source_id, "source_id")?)
+        .await
 }
 
 #[tauri::command]

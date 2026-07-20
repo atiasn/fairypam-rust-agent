@@ -18,16 +18,34 @@ fn registered_build_and_capability_surfaces_match() {
         "export_diagnostics",
         "stop_agent_after_confirmation",
     ] {
-        assert!(COMMANDS.contains(command), "missing command surface entry: {command}");
-        assert!(APP.contains(&format!("commands::{command}")), "missing handler: {command}");
-        assert!(CAPABILITY.contains(&format!("allow-{}", command.replace('_', "-"))), "missing capability: {command}");
+        assert!(
+            COMMANDS.contains(command),
+            "missing command surface entry: {command}"
+        );
+        assert!(
+            APP.contains(&format!("commands::{command}")),
+            "missing handler: {command}"
+        );
+        assert!(
+            CAPABILITY.contains(&format!("allow-{}", command.replace('_', "-"))),
+            "missing capability: {command}"
+        );
     }
 }
 
 #[test]
 fn command_surface_has_no_generic_bridge() {
     let source = include_str!("../src/commands.rs");
-    for forbidden in ["fn invoke", "fn exec", "fn spawn", "fn read_file", "serde_json::Value"] {
-        assert!(!source.contains(forbidden), "forbidden command surface: {forbidden}");
+    for forbidden in [
+        "fn invoke",
+        "fn exec",
+        "fn spawn",
+        "fn read_file",
+        "serde_json::Value",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "forbidden command surface: {forbidden}"
+        );
     }
 }

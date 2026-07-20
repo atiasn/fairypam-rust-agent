@@ -7,8 +7,19 @@ fn production_configuration_is_unprivileged_and_least_privilege() {
     assert!(MANIFEST.contains("level=\"asInvoker\""));
     assert!(MANIFEST.contains("uiAccess=\"false\""));
     assert!(!MANIFEST.contains("requireAdministrator"));
-    for forbidden in ["core:default", "shell:", "fs:", "http:", "process:", "registry", "input"] {
-        assert!(!CAPABILITY.contains(forbidden), "forbidden capability: {forbidden}");
+    for forbidden in [
+        "core:default",
+        "shell:",
+        "fs:",
+        "http:",
+        "process:",
+        "registry",
+        "input",
+    ] {
+        assert!(
+            !CAPABILITY.contains(forbidden),
+            "forbidden capability: {forbidden}"
+        );
     }
     assert!(TAURI_CONFIG.contains("script-src 'self'"));
     assert!(!TAURI_CONFIG.contains("script-src 'self' https://"));

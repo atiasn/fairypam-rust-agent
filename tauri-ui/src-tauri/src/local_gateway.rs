@@ -42,9 +42,11 @@ impl From<LocalClientError> for UiCommandError {
 
 pub struct ProductionGateway {
     #[cfg(windows)]
-    client: tokio::sync::Mutex<fairypam_agent_local_client::LocalClient<
-        fairypam_agent_local_client::WindowsNamedPipeClientTransport,
-    >>,
+    client: tokio::sync::Mutex<
+        fairypam_agent_local_client::LocalClient<
+            fairypam_agent_local_client::WindowsNamedPipeClientTransport,
+        >,
+    >,
 }
 
 impl ProductionGateway {
@@ -66,7 +68,10 @@ impl ProductionGateway {
         Self {}
     }
 
-    async fn request<T: DeserializeOwned>(&self, command: LocalCommand) -> Result<T, UiCommandError> {
+    async fn request<T: DeserializeOwned>(
+        &self,
+        command: LocalCommand,
+    ) -> Result<T, UiCommandError> {
         #[cfg(windows)]
         {
             let response = self
@@ -105,7 +110,8 @@ impl ProductionGateway {
     }
 
     pub async fn targets(&self, profile_id: String) -> Result<TargetsDto, UiCommandError> {
-        self.request(LocalCommand::EnumerateTargets { profile_id }).await
+        self.request(LocalCommand::EnumerateTargets { profile_id })
+            .await
     }
 
     pub async fn lock_target(
@@ -142,7 +148,8 @@ impl ProductionGateway {
 }
 
 fn decode_response<T: DeserializeOwned>(response: LocalResponse) -> Result<T, UiCommandError> {
-    serde_json::from_value(response.body).map_err(|error| UiCommandError::invalid_response(error.to_string()))
+    serde_json::from_value(response.body)
+        .map_err(|error| UiCommandError::invalid_response(error.to_string()))
 }
 
 #[cfg(test)]
