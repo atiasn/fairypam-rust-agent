@@ -417,9 +417,11 @@ mod tests {
 
     #[test]
     fn discovery_id_is_stable_and_does_not_expose_the_install_path() {
-        let root = std::fs::canonicalize(std::env::temp_dir())
-            .expect("temporary directory is canonicalizable")
-            .join(format!("fairypam-discovery-{}", std::process::id()));
+        let temporary = std::env::temp_dir();
+        #[cfg(unix)]
+        let temporary =
+            std::fs::canonicalize(temporary).expect("temporary directory is canonicalizable");
+        let root = temporary.join(format!("fairypam-discovery-{}", std::process::id()));
         let executable = root
             .join("games")
             .join("Genshin Impact Game")
