@@ -211,9 +211,9 @@ pub fn start_enrollment() -> CommandResult<SupportStatusDto> {
                 "the enrollment helper could not be started",
             ));
         }
-        return Ok(SupportStatusDto {
+        Ok(SupportStatusDto {
             status: "elevation_requested".into(),
-        });
+        })
     }
     #[cfg(not(windows))]
     Err(UiCommandError::unavailable(

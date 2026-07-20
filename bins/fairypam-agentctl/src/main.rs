@@ -82,10 +82,10 @@ mod enrollment {
         let instance = unsafe {
             ShellExecuteW(
                 None,
-                HSTRING::from("runas"),
-                HSTRING::from(executable.to_string_lossy().as_ref()),
-                HSTRING::from("--enrollment-helper"),
-                HSTRING::new(),
+                &HSTRING::from("runas"),
+                &HSTRING::from(executable.to_string_lossy().as_ref()),
+                &HSTRING::from("--enrollment-helper"),
+                &HSTRING::new(),
                 SW_SHOWNORMAL,
             )
         };
@@ -193,17 +193,17 @@ mod enrollment {
     fn claim(host: &str, port: u16, path: &str, code: &str) -> Result<Value, CliError> {
         let session = unsafe {
             WinHttpOpen(
-                HSTRING::from("FairyPam enrollment"),
+                &HSTRING::from("FairyPam enrollment"),
                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                HSTRING::new(),
-                HSTRING::new(),
+                &HSTRING::new(),
+                &HSTRING::new(),
                 0,
             )
         };
         if session.is_null() {
             return Err(client("enrollment.network_failed"));
         }
-        let connection = unsafe { WinHttpConnect(session, HSTRING::from(host), port, 0) };
+        let connection = unsafe { WinHttpConnect(session, &HSTRING::from(host), port, 0) };
         if connection.is_null() {
             let _ = unsafe { WinHttpCloseHandle(session) };
             return Err(client("enrollment.network_failed"));
@@ -211,10 +211,10 @@ mod enrollment {
         let request = unsafe {
             WinHttpOpenRequest(
                 connection,
-                HSTRING::from("POST"),
-                HSTRING::from(path),
-                HSTRING::new(),
-                HSTRING::new(),
+                &HSTRING::from("POST"),
+                &HSTRING::from(path),
+                &HSTRING::new(),
+                &HSTRING::new(),
                 std::ptr::null(),
                 WINHTTP_FLAG_SECURE,
             )
@@ -344,7 +344,7 @@ mod enrollment {
         let mut descriptor = Default::default();
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                HSTRING::from("D:P(A;;FA;;;SY)(A;;FA;;;BA)"),
+                &HSTRING::from("D:P(A;;FA;;;SY)(A;;FA;;;BA)"),
                 SDDL_REVISION_1,
                 &mut descriptor,
                 None,
@@ -353,7 +353,7 @@ mod enrollment {
         .map_err(client_error)?;
         let result = unsafe {
             SetFileSecurityW(
-                HSTRING::from(path.to_string_lossy().as_ref()),
+                &HSTRING::from(path.to_string_lossy().as_ref()),
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 descriptor,
             )

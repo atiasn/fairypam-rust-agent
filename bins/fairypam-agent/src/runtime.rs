@@ -626,15 +626,16 @@ impl SharedRuntime {
         };
         let (profiles_configured, certificate_ready) = {
             let config = self.config.lock().map_err(lock_error)?;
+            let certificate_paths = [
+                config.transport.ca_pem.clone(),
+                config.transport.identity_cert_pem.clone(),
+                config.transport.identity_key_pem.clone(),
+            ];
             (
                 !config.profiles.ids().is_empty(),
-                [
-                    &config.transport.ca_pem,
-                    &config.transport.identity_cert_pem,
-                    &config.transport.identity_key_pem,
-                ]
-                .into_iter()
-                .all(|path| regular_nonempty_file(path)),
+                certificate_paths
+                    .into_iter()
+                    .all(|path| regular_nonempty_file(&path)),
             )
         };
         let binary_ready = std::env::current_exe()
@@ -740,6 +741,7 @@ async fn run_local_control(
     runtime: SharedRuntime,
     config: LocalControlConfig,
 ) -> std::convert::Infallible {
+    #[cfg(all(windows, feature = "dev-automation"))]
     let execution = Arc::clone(&runtime.execution);
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[cfg(all(windows, feature = "dev-automation"))]
