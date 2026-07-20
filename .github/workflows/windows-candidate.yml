@@ -183,7 +183,6 @@ jobs:
           Push-Location tauri-ui
           try {
             npm ci
-            npm run build
             npm run check:security
             npm run check:command-surface
             npm test -- --run
@@ -197,11 +196,13 @@ jobs:
               cargo check --all-targets --locked
               cargo test --all-targets --locked
               cargo clippy --all-targets --locked -- -D warnings
-              cargo build --release --locked
             }
             finally {
               Pop-Location
             }
+
+            npm run tauri build -- --no-bundle
+            git diff --exit-code -- src-tauri/Cargo.lock
           }
           finally {
             Pop-Location

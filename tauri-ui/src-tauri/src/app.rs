@@ -1,6 +1,6 @@
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
-    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, WindowEvent,
 };
 
@@ -33,14 +33,16 @@ pub fn run() -> tauri::Result<()> {
                 .build()?;
             TrayIconBuilder::new()
                 .menu(&menu)
+                .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show-main" | "stop-agent" => show_main_window(app),
                     "exit-ui" => app.exit(0),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::DoubleClick {
+                    if let TrayIconEvent::Click {
                         button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
                         ..
                     } = event
                     {
