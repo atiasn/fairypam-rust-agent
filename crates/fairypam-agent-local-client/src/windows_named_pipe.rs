@@ -1,4 +1,4 @@
-use std::{ffi::c_void, fs, io, mem::size_of, os::windows::io::AsRawHandle, path::Path};
+use std::{fs, io, mem::size_of, os::windows::io::AsRawHandle, path::Path};
 
 use fairypam_agent_local_protocol::MAX_FRAME_BYTES;
 use tokio::{
@@ -146,7 +146,7 @@ fn verify_fixed_agent_server(
     expected_server_sibling: &str,
 ) -> Result<(), LocalClientError> {
     let mut pid = 0;
-    unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle() as *mut c_void), &mut pid) }
+    unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut pid) }
         .map_err(|_| LocalClientError::identity("server_pid_unavailable"))?;
     if pid == 0 {
         return Err(LocalClientError::identity("server_pid_invalid"));
