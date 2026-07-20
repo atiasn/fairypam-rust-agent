@@ -8,20 +8,18 @@ import { agentApi } from './agentApi';
 describe('agentApi', () => {
   beforeEach(() => invoke.mockReset());
 
-  it('uses only fixed command names and typed arguments', async () => {
-    await agentApi.listTargets('signed-profile');
-    await agentApi.lockTarget('signed-profile', 'candidate-1');
-    await agentApi.releaseAll();
+  it('uses fixed user-facing commands without command-line registration secrets', async () => {
+    await agentApi.ensureLocalAgent();
     await agentApi.getLogTail(100, 'warn');
     await agentApi.startEnrollment();
+    await agentApi.completeEnrollment('https://hub.test', 'one-time-code');
 
-    expect(invoke).toHaveBeenNthCalledWith(1, 'list_targets', { profileId: 'signed-profile' });
-    expect(invoke).toHaveBeenNthCalledWith(2, 'lock_target', {
-      profileId: 'signed-profile',
-      candidateId: 'candidate-1',
+    expect(invoke).toHaveBeenNthCalledWith(1, 'ensure_local_agent');
+    expect(invoke).toHaveBeenNthCalledWith(2, 'get_log_tail', { lines: 100, level: 'warn' });
+    expect(invoke).toHaveBeenNthCalledWith(3, 'start_enrollment');
+    expect(invoke).toHaveBeenNthCalledWith(4, 'complete_enrollment', {
+      hub: 'https://hub.test',
+      code: 'one-time-code',
     });
-    expect(invoke).toHaveBeenNthCalledWith(3, 'release_all');
-    expect(invoke).toHaveBeenNthCalledWith(4, 'get_log_tail', { lines: 100, level: 'warn' });
-    expect(invoke).toHaveBeenNthCalledWith(5, 'start_enrollment');
   });
 });

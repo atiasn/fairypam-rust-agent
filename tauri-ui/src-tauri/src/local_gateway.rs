@@ -1,15 +1,16 @@
 use std::time::Duration;
 
 use fairypam_agent_local_client::LocalClientError;
-use fairypam_agent_local_protocol::{LocalCommand, LocalResponse, LogLevel};
+use fairypam_agent_local_protocol::{LocalCommand, LogLevel};
+#[cfg(any(windows, test))]
+use fairypam_agent_local_protocol::LocalResponse;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::dto::{
-    CaptureStateDto, ConnectionStatusDto, DoctorDto, EnvironmentCheckDto, FocusedTargetDto,
-    InstalledGamesDto, LockedTargetDto, LogTailDto, OverviewDto, ProfilesDto, ReleaseAllDto,
-    SupportStatusDto, TargetsDto,
+    ConnectionStatusDto, EnvironmentCheckDto, InstalledGamesDto, LogTailDto, OverviewDto,
 };
 
+#[cfg(windows)]
 const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\FairyPam.Agent.v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -27,6 +28,7 @@ impl UiCommandError {
         }
     }
 
+    #[cfg(any(windows, test))]
     fn invalid_response(message: impl Into<String>) -> Self {
         Self::unavailable("local.protocol.invalid", message)
     }
@@ -70,18 +72,40 @@ impl ProductionGateway {
     }
 
     #[cfg(windows)]
-    async fn request<T: DeserializeOwned>(
+    async fn request_with_timeout<T: DeserializeOwned>(
         &self,
         command: LocalCommand,
+        timeout: Duration,
     ) -> Result<T, UiCommandError> {
         let response = self
             .client
             .lock()
             .await
-            .request(command, REQUEST_TIMEOUT)
+            .request(command, timeout)
             .await
             .map_err(UiCommandError::from)?;
         decode_response(response)
+    }
+
+    #[cfg(windows)]
+    async fn request<T: DeserializeOwned>(
+        &self,
+        command: LocalCommand,
+    ) -> Result<T, UiCommandError> {
+        self.request_with_timeout(command, REQUEST_TIMEOUT).await
+    }
+
+    #[cfg(not(windows))]
+    async fn request_with_timeout<T: DeserializeOwned>(
+        &self,
+        command: LocalCommand,
+        _timeout: Duration,
+    ) -> Result<T, UiCommandError> {
+        let _ = command;
+        Err(UiCommandError::unavailable(
+            "local.transport.platform_unsupported",
+            "FairyPam Agent UI local control requires Windows",
+        ))
     }
 
     #[cfg(not(windows))]
@@ -89,11 +113,7 @@ impl ProductionGateway {
         &self,
         command: LocalCommand,
     ) -> Result<T, UiCommandError> {
-        let _ = command;
-        Err(UiCommandError::unavailable(
-            "local.transport.platform_unsupported",
-            "FairyPam Agent UI local control requires Windows",
-        ))
+        self.request_with_timeout(command, REQUEST_TIMEOUT).await
     }
 
     pub async fn overview(&self) -> Result<OverviewDto, UiCommandError> {
@@ -103,53 +123,32 @@ impl ProductionGateway {
         })
     }
 
-    pub async fn doctor(&self) -> Result<DoctorDto, UiCommandError> {
-        self.request(LocalCommand::Doctor).await
-    }
-
-    pub async fn profiles(&self) -> Result<ProfilesDto, UiCommandError> {
-        self.request(LocalCommand::ListProfiles).await
-    }
-
-    pub async fn targets(&self, profile_id: String) -> Result<TargetsDto, UiCommandError> {
-        self.request(LocalCommand::EnumerateTargets { profile_id })
-            .await
-    }
-
-    pub async fn lock_target(
+    #[cfg(windows)]
+    pub async fn overview_with_timeout(
         &self,
-        profile_id: String,
-        candidate_id: String,
-    ) -> Result<LockedTargetDto, UiCommandError> {
-        self.request(LocalCommand::LockTarget {
-            profile_id,
-            candidate_id,
+        timeout: Duration,
+    ) -> Result<OverviewDto, UiCommandError> {
+        Ok(OverviewDto {
+            status: self
+                .request_with_timeout(LocalCommand::Status, timeout)
+                .await?,
+            doctor: self
+                .request_with_timeout(LocalCommand::Doctor, timeout)
+                .await?,
         })
-        .await
-    }
-
-    pub async fn focus_target(&self) -> Result<FocusedTargetDto, UiCommandError> {
-        self.request(LocalCommand::FocusTarget).await
-    }
-
-    pub async fn stop_capture(&self, source_id: String) -> Result<CaptureStateDto, UiCommandError> {
-        self.request(LocalCommand::StopCapture { source_id }).await
-    }
-
-    pub async fn release_all(&self) -> Result<ReleaseAllDto, UiCommandError> {
-        self.request(LocalCommand::ReleaseAll).await
-    }
-
-    pub async fn update_status(&self) -> Result<SupportStatusDto, UiCommandError> {
-        self.request(LocalCommand::UpdateStatus).await
-    }
-
-    pub async fn startup_status(&self) -> Result<SupportStatusDto, UiCommandError> {
-        self.request(LocalCommand::StartupStatus).await
     }
 
     pub async fn connection_status(&self) -> Result<ConnectionStatusDto, UiCommandError> {
         self.request(LocalCommand::GetConnectionStatus).await
+    }
+
+    #[cfg(windows)]
+    pub async fn connection_status_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ConnectionStatusDto, UiCommandError> {
+        self.request_with_timeout(LocalCommand::GetConnectionStatus, timeout)
+            .await
     }
 
     pub async fn environment_check(&self) -> Result<EnvironmentCheckDto, UiCommandError> {
@@ -170,6 +169,7 @@ impl ProductionGateway {
     }
 }
 
+#[cfg(any(windows, test))]
 fn decode_response<T: DeserializeOwned>(response: LocalResponse) -> Result<T, UiCommandError> {
     serde_json::from_value(response.body)
         .map_err(|error| UiCommandError::invalid_response(error.to_string()))

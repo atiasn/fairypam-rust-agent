@@ -1,52 +1,39 @@
 import { useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 
+import { agentApi } from './lib/agentApi';
 import { canMutate } from './lib/connectionReducer';
+import { queryKeys } from './lib/queryKeys';
 import { useAgentQueries } from './lib/useAgentQueries';
 import { useConnectionState } from './lib/useConnectionState';
 import { ConnectionPage } from './pages/ConnectionPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { DiagnosticsPage } from './pages/DiagnosticsPage';
+import { EnrollmentPage } from './pages/EnrollmentPage';
 import { GamesPage } from './pages/GamesPage';
-import { InputSafetyPage } from './pages/InputSafetyPage';
-import { OnboardingWizard } from './pages/OnboardingWizard';
-import { ProfilesPage } from './pages/ProfilesPage';
-import { StartupPage } from './pages/StartupPage';
-import { TargetsPage } from './pages/TargetsPage';
-import { UpdatePage } from './pages/UpdatePage';
+import { LogsPage } from './pages/LogsPage';
 
-type Page =
-  | 'dashboard'
-  | 'onboarding'
-  | 'profiles'
-  | 'targets'
-  | 'connection'
-  | 'safety'
-  | 'update'
-  | 'startup'
-  | 'diagnostics'
-  | 'games';
+type Page = 'dashboard' | 'connection' | 'environment' | 'logs' | 'games';
 
 const navigation: Array<{ id: Page; label: string }> = [
   { id: 'dashboard', label: '总览' },
-  { id: 'onboarding', label: '首次向导' },
-  { id: 'profiles', label: 'Profile' },
-  { id: 'targets', label: '目标与预览' },
-  { id: 'connection', label: '连接' },
-  { id: 'safety', label: '输入安全' },
-  { id: 'update', label: '更新' },
-  { id: 'startup', label: '自启动' },
-  { id: 'diagnostics', label: '诊断' },
+  { id: 'connection', label: '连接与注册' },
+  { id: 'environment', label: '环境检查' },
+  { id: 'logs', label: '日志' },
   { id: 'games', label: '游戏' },
 ];
 
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
-  const [profileId, setProfileId] = useState<string>();
-  const queries = useAgentQueries(profileId);
-  const { connection, dispatch } = useConnectionState(
-    queries.overview.isSuccess,
-    queries.overview.error,
-  );
+  const enrollmentMode = useQuery({ queryKey: queryKeys.enrollmentMode, queryFn: agentApi.getEnrollmentMode });
+  const startup = useQuery({
+    queryKey: queryKeys.startup,
+    queryFn: agentApi.ensureLocalAgent,
+    retry: false,
+    enabled: enrollmentMode.data?.status === 'standard',
+  });
+  const queries = useAgentQueries(startup.isSuccess);
+  const { connection, dispatch } = useConnectionState(queries.overview.isSuccess, queries.overview.error);
 
   useEffect(() => {
     if (queries.overview.data?.status.state.toLowerCase().includes('emergency')) {
@@ -54,23 +41,25 @@ export default function App() {
     }
   }, [dispatch, queries.overview.data?.status.state]);
 
+  if (enrollmentMode.data?.status === 'elevated') return <EnrollmentPage />;
+
   const common = {
     connection,
     canMutate: canMutate(connection),
     overview: queries.overview,
-    doctor: queries.doctor,
+    startup,
+    retryStartup: () => void startup.refetch(),
   };
 
   return (
     <div className="app-shell">
       <header className="app-header">
         <div>
-          <p className="eyebrow">FAIRYPAM / LOCAL CONTROL</p>
-          <h1>FairyPam Agent UI</h1>
+          <p className="eyebrow">FAIRYPAM // NIGHT OPS</p>
+          <h1>AGENT CONTROL</h1>
         </div>
         <p aria-live="polite" className={`connection ${connection.availability}`}>
-          连接状态：{connection.availability}
-          {connection.reasonCode ? `（${connection.reasonCode}）` : ''}
+          {startup.isPending ? '正在唤醒本地 Agent' : startup.isError ? 'Agent 启动需要处理' : 'Agent 已就绪'}
         </p>
       </header>
       <div className="app-layout">
@@ -89,29 +78,9 @@ export default function App() {
         </nav>
         <main>
           {page === 'dashboard' && <DashboardPage {...common} />}
-          {page === 'onboarding' && <OnboardingWizard {...common} />}
-          {page === 'profiles' && (
-            <ProfilesPage
-              onSelect={(id) => {
-                setProfileId(id);
-                setPage('targets');
-              }}
-              profiles={queries.profiles}
-              selectedProfileId={profileId}
-            />
-          )}
-          {page === 'targets' && (
-            <TargetsPage
-              canMutate={common.canMutate}
-              profileId={profileId}
-              targets={queries.targets}
-            />
-          )}
           {page === 'connection' && <ConnectionPage {...common} />}
-          {page === 'safety' && <InputSafetyPage {...common} />}
-          {page === 'update' && <UpdatePage />}
-          {page === 'startup' && <StartupPage />}
-          {page === 'diagnostics' && <DiagnosticsPage overview={queries.overview} />}
+          {page === 'environment' && <DiagnosticsPage overview={queries.overview} />}
+          {page === 'logs' && <LogsPage />}
           {page === 'games' && <GamesPage />}
         </main>
       </div>

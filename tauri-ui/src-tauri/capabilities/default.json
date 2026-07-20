@@ -9,21 +9,13 @@
     "core:menu:default",
     "core:tray:default",
     "allow-get-overview",
-    "allow-get-doctor",
-    "allow-list-profiles",
-    "allow-list-targets",
-    "allow-lock-target",
-    "allow-focus-target",
-    "allow-stop-capture",
-    "allow-release-all",
-    "allow-get-update-status",
-    "allow-get-startup-status",
     "allow-get-connection-status",
     "allow-run-environment-check",
     "allow-get-log-tail",
     "allow-scan-installed-games",
+    "allow-get-enrollment-mode",
     "allow-start-enrollment",
-    "allow-export-diagnostics",
-    "allow-stop-agent-after-confirmation"
+    "allow-complete-enrollment",
+    "allow-ensure-local-agent"
   ]
 }

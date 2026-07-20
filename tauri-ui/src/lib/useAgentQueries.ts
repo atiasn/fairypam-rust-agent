@@ -6,7 +6,7 @@ import { queryKeys } from './queryKeys';
 
 const foregroundInterval = () => (document.visibilityState === 'visible' ? 5_000 : false);
 
-export function useAgentQueries(profileId?: string) {
+export function useAgentQueries(enabled: boolean) {
   const queryClient = useQueryClient();
 
   useEffect(() => {
@@ -23,25 +23,7 @@ export function useAgentQueries(profileId?: string) {
     overview: useQuery({
       queryKey: queryKeys.overview,
       queryFn: agentApi.getOverview,
-      refetchInterval: foregroundInterval,
-      refetchIntervalInBackground: false,
-    }),
-    doctor: useQuery({
-      queryKey: queryKeys.doctor,
-      queryFn: agentApi.getDoctor,
-      refetchInterval: foregroundInterval,
-      refetchIntervalInBackground: false,
-    }),
-    profiles: useQuery({
-      queryKey: queryKeys.profiles,
-      queryFn: agentApi.listProfiles,
-      refetchInterval: foregroundInterval,
-      refetchIntervalInBackground: false,
-    }),
-    targets: useQuery({
-      queryKey: queryKeys.targets(profileId ?? ''),
-      queryFn: () => agentApi.listTargets(profileId ?? ''),
-      enabled: Boolean(profileId),
+      enabled,
       refetchInterval: foregroundInterval,
       refetchIntervalInBackground: false,
     }),

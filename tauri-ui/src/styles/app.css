@@ -1,168 +1,84 @@
 :root {
-  color: #f4f7ff;
-  background: #0b1020;
+  color: #eaf7ff;
+  background: #060612;
   font-family: "Microsoft YaHei UI", system-ui, sans-serif;
 }
 
-body {
-  margin: 0;
-}
+body { margin: 0; }
+button, input, select { font: inherit; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #22d3ee; outline-offset: 3px; }
 
-button,
-input,
-select {
-  font: inherit;
-}
-
-button:focus-visible,
-input:focus-visible,
-select:focus-visible {
-  outline: 3px solid #4fd1ff;
-  outline-offset: 3px;
-}
-
-.app-shell {
+.app-shell, .enrollment-shell {
+  box-sizing: border-box;
   min-height: 100vh;
-  padding: clamp(1.5rem, 5vw, 5rem);
-  background: radial-gradient(circle at top right, #243869, #0b1020 55%);
-}
-
-.app-header,
-.status-card {
-  max-width: 52rem;
+  padding: clamp(1.25rem, 4vw, 3.5rem);
+  background:
+    linear-gradient(rgb(6 6 18 / 90%), rgb(6 6 18 / 96%)),
+    radial-gradient(circle at 82% 4%, #35114c 0, transparent 38%),
+    repeating-linear-gradient(0deg, transparent 0 3px, rgb(34 211 238 / 3%) 4px);
 }
 
 .app-header {
   display: flex;
+  max-width: 72rem;
   justify-content: space-between;
-  gap: 1rem;
   align-items: start;
+  gap: 1rem;
+  border-bottom: 1px solid rgb(34 211 238 / 40%);
 }
+.eyebrow, dt, .connection { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .11em; }
+.eyebrow { color: #22d3ee; font-size: .78rem; }
+h1 { margin: .35rem 0 1rem; color: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .04em; }
+h2 { color: #f5eefe; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
-.app-layout {
-  display: grid;
-  grid-template-columns: minmax(10rem, 14rem) minmax(0, 1fr);
-  gap: 2rem;
-  margin-top: 2rem;
-}
+.connection { margin: .5rem 0; padding: .5rem .75rem; border: 1px solid #ff2ea6; color: #ffd3ed; }
+.connection.online { border-color: #5df2a2; color: #b8ffd8; }
+.connection.offline, .connection.emergency { border-color: #ff617d; }
+.connection.unknown { border-color: #f6c856; }
 
-.navigation {
-  display: grid;
-  align-content: start;
-  gap: 0.5rem;
-}
-
-.navigation button,
-.button-list button,
-.target-list button,
+.app-layout { display: grid; grid-template-columns: 12rem minmax(0, 1fr); gap: 2rem; margin-top: 1.5rem; max-width: 72rem; }
+.navigation { display: grid; align-content: start; gap: .45rem; }
 button {
-  min-height: 2.75rem;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid #6688d4;
-  border-radius: 0.5rem;
+  min-height: 2.6rem;
+  padding: .5rem .8rem;
+  border: 1px solid rgb(34 211 238 / 60%);
+  border-radius: 0;
   color: inherit;
-  background: #13234a;
+  background: rgb(12 16 39 / 92%);
+  box-shadow: inset 3px 0 #ff2ea6;
   cursor: pointer;
   text-align: left;
 }
+.navigation button { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.navigation button.active, button:hover:not(:disabled) { border-color: #ff2ea6; background: rgb(61 16 72 / 82%); }
+button:disabled { cursor: not-allowed; opacity: .55; }
 
-.navigation button.active,
-button:hover:not(:disabled) {
-  border-color: #7dd3fc;
-  background: #1d3974;
-}
-
-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.connection {
-  margin: 0.5rem 0;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid #6b7280;
-  border-radius: 999px;
-}
-
-.connection.online { border-color: #4ade80; }
-.connection.offline,
-.connection.emergency { border-color: #fb7185; }
-
-.eyebrow {
-  color: #7dd3fc;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  letter-spacing: 0.12em;
-}
-
-h1 {
-  margin: 0.25rem 0;
-  font-size: clamp(2rem, 6vw, 4.5rem);
-}
-
-.status-card {
-  margin-top: 2rem;
-  padding: 1.25rem;
-  border: 1px solid #5170b5;
-  border-radius: 0.75rem;
-  background: rgb(13 23 48 / 88%);
-}
-
-.recovery-card,
-.notice,
-.dialog {
+.status-card, .recovery-card, .notice {
+  position: relative;
   max-width: 52rem;
   margin-top: 1rem;
-  padding: 1rem;
-  border: 1px solid #d6a64d;
-  border-radius: 0.75rem;
-  background: rgb(70 47 16 / 48%);
+  padding: 1.2rem;
+  border: 1px solid rgb(34 211 238 / 55%);
+  background: linear-gradient(135deg, rgb(20 17 43 / 96%), rgb(8 10 28 / 93%));
+  box-shadow: inset 0 0 28px rgb(34 211 238 / 4%);
 }
-
-.button-list,
-.target-list {
-  display: grid;
-  gap: 0.75rem;
-  margin-block: 1rem;
-}
-
-.target-list article {
-  padding: 1rem;
-  border: 1px solid #5170b5;
-  border-radius: 0.5rem;
-}
-
-.wizard-list {
-  display: grid;
-  gap: 0.75rem;
-  padding-left: 1.5rem;
-}
-
-.wizard-step {
-  display: grid;
-  gap: 0.25rem;
-}
-
-.wizard-step.passed strong { color: #86efac; }
-.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-
-dl,
-.check-list,
-.log-list,
-.game-list {
-  display: grid;
-  gap: 0.5rem;
-}
-
-dl { grid-template-columns: max-content minmax(0, 1fr); }
-dt { font-weight: 700; }
+.status-card::before { position: absolute; top: -1px; right: 1.25rem; width: 3rem; border-top: 2px solid #ff2ea6; content: ""; }
+.recovery-card, .notice { border-color: rgb(246 200 86 / 70%); color: #fff0bc; }
+dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .55rem 1rem; }
 dd { margin: 0; overflow-wrap: anywhere; }
-.check-list,
-.log-list,
-.game-list { padding-left: 1.25rem; }
-.game-list li { display: grid; gap: 0.25rem; }
+.check-list, .log-list, .game-list { display: grid; gap: .6rem; padding-left: 1.25rem; }
+.game-list li { display: grid; gap: .25rem; }
+.log-list strong, .check-list strong { color: #22d3ee; }
+label { display: grid; gap: .4rem; margin-top: .8rem; color: #bfefff; }
+input, select { min-height: 2.5rem; border: 1px solid #22d3ee; border-radius: 0; color: #fff; background: #090b20; padding: .35rem .55rem; }
+.enrollment-shell { max-width: 44rem; }
+.enrollment-form { display: grid; gap: .6rem; }
 
+@media (prefers-reduced-motion: no-preference) {
+  .status-card { animation: panel-enter 180ms ease-out; }
+  @keyframes panel-enter { from { opacity: .78; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+}
 @media (max-width: 760px) {
-  .app-header,
-  .app-layout { display: block; }
-  .navigation { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 1.5rem; }
+  .app-header, .app-layout { display: block; }
+  .navigation { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 1.25rem; }
 }
