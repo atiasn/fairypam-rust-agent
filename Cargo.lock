@@ -413,6 +413,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]

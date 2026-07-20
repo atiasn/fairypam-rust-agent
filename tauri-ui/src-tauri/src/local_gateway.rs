@@ -156,8 +156,13 @@ impl ProductionGateway {
         self.request(LocalCommand::RunEnvironmentCheck).await
     }
 
-    pub async fn log_tail(&self, lines: u16, level: LogLevel) -> Result<LogTailDto, UiCommandError> {
-        self.request(LocalCommand::GetLogTail { lines, level }).await
+    pub async fn log_tail(
+        &self,
+        lines: u16,
+        level: LogLevel,
+    ) -> Result<LogTailDto, UiCommandError> {
+        self.request(LocalCommand::GetLogTail { lines, level })
+            .await
     }
 
     pub async fn installed_games(&self) -> Result<InstalledGamesDto, UiCommandError> {

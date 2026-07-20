@@ -20,9 +20,9 @@ use http::Uri;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::{CommandExecutor, CommandOutcome, ExecutionSession, FrameSink};
-use crate::observability::AgentLogRecord;
 #[cfg(windows)]
 use crate::observability;
+use crate::observability::AgentLogRecord;
 use crate::profile_store::ProfileStore;
 
 #[cfg(windows)]
@@ -34,11 +34,9 @@ use fairypam_agent_dev_automation::{
     AutomationCapability, AutomationTarget, DevSessionManager, DevSessionRequest,
     DevSessionRevocationReason,
 };
-#[cfg(windows)]
-use fairypam_agent_local_protocol::{
-    decode_request_or_error_response, encode_frame, LocalCommand,
-};
 use fairypam_agent_local_protocol::LogLevel;
+#[cfg(windows)]
+use fairypam_agent_local_protocol::{decode_request_or_error_response, encode_frame, LocalCommand};
 #[cfg(all(windows, feature = "dev-automation"))]
 use fairypam_agent_local_protocol::{LocalError, RequestEnvelope, ResponseEnvelope};
 #[cfg(windows)]
@@ -91,9 +89,14 @@ impl RuntimeConfig {
         let generation = enrollment_field(&pointer, "generation")?;
         if !generation.starts_with("g-")
             || generation.len() > 80
-            || generation.bytes().any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
+            || generation
+                .bytes()
+                .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
         {
-            return Err(AgentError::new("runtime.enrollment_invalid", "invalid enrollment generation"));
+            return Err(AgentError::new(
+                "runtime.enrollment_invalid",
+                "invalid enrollment generation",
+            ));
         }
         let directory = root.join(generation);
         let document = load_private_json(&directory.join("runtime.json"))?;
@@ -104,8 +107,22 @@ impl RuntimeConfig {
         let profiles = ProfileStore::load(&required_path("FAIRYPAM_PROFILE_DIR")?, &verifier)?;
         Ok(Self {
             transport: TransportConfig {
-                control_endpoint: enrollment_field(&document, "control_endpoint")?.parse().map_err(|error| AgentError::new("runtime.enrollment_invalid", format!("invalid control endpoint: {error}")))?,
-                frame_endpoint: enrollment_field(&document, "frame_endpoint")?.parse().map_err(|error| AgentError::new("runtime.enrollment_invalid", format!("invalid frame endpoint: {error}")))?,
+                control_endpoint: enrollment_field(&document, "control_endpoint")?
+                    .parse()
+                    .map_err(|error| {
+                        AgentError::new(
+                            "runtime.enrollment_invalid",
+                            format!("invalid control endpoint: {error}"),
+                        )
+                    })?,
+                frame_endpoint: enrollment_field(&document, "frame_endpoint")?
+                    .parse()
+                    .map_err(|error| {
+                        AgentError::new(
+                            "runtime.enrollment_invalid",
+                            format!("invalid frame endpoint: {error}"),
+                        )
+                    })?,
                 server_name: enrollment_field(&document, "hub_server_name")?,
                 agent_id: enrollment_field(&document, "agent_id")?,
                 ca_pem: private_file(&directory, "ca.pem")?,
@@ -114,7 +131,9 @@ impl RuntimeConfig {
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
-            build_commit: option_env!("FAIRYPAM_BUILD_COMMIT").unwrap_or("unknown").to_owned(),
+            build_commit: option_env!("FAIRYPAM_BUILD_COMMIT")
+                .unwrap_or("unknown")
+                .to_owned(),
             profiles,
         })
     }
@@ -127,26 +146,64 @@ fn enrollment_state_exists() -> bool {
 
 #[cfg(windows)]
 fn load_private_json(path: &Path) -> Result<serde_json::Value, AgentError> {
-    let metadata = path.symlink_metadata().map_err(|_| AgentError::new("runtime.enrollment_invalid", "enrollment state is unavailable"))?;
+    let metadata = path.symlink_metadata().map_err(|_| {
+        AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment state is unavailable",
+        )
+    })?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(AgentError::new("runtime.enrollment_invalid", "enrollment state is not a regular file"));
+        return Err(AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment state is not a regular file",
+        ));
     }
-    serde_json::from_slice(&std::fs::read(path).map_err(|_| AgentError::new("runtime.enrollment_invalid", "enrollment state cannot be read"))?)
-        .map_err(|_| AgentError::new("runtime.enrollment_invalid", "enrollment state is malformed"))
+    serde_json::from_slice(&std::fs::read(path).map_err(|_| {
+        AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment state cannot be read",
+        )
+    })?)
+    .map_err(|_| {
+        AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment state is malformed",
+        )
+    })
 }
 
 #[cfg(windows)]
-fn enrollment_field(document: &serde_json::Value, name: &'static str) -> Result<String, AgentError> {
-    document.get(name).and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()).map(str::to_owned)
-        .ok_or_else(|| AgentError::new("runtime.enrollment_invalid", format!("enrollment field {name} is missing")))
+fn enrollment_field(
+    document: &serde_json::Value,
+    name: &'static str,
+) -> Result<String, AgentError> {
+    document
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            AgentError::new(
+                "runtime.enrollment_invalid",
+                format!("enrollment field {name} is missing"),
+            )
+        })
 }
 
 #[cfg(windows)]
 fn private_file(directory: &Path, name: &'static str) -> Result<PathBuf, AgentError> {
     let path = directory.join(name);
-    let metadata = path.symlink_metadata().map_err(|_| AgentError::new("runtime.enrollment_invalid", "enrollment credential is unavailable"))?;
+    let metadata = path.symlink_metadata().map_err(|_| {
+        AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment credential is unavailable",
+        )
+    })?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(AgentError::new("runtime.enrollment_invalid", "enrollment credential is unsafe"));
+        return Err(AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment credential is unsafe",
+        ));
     }
     Ok(path)
 }
@@ -448,7 +505,10 @@ impl SupervisorHooks for RuntimeSafetyHooks {
                 Err(error) => {
                     if let Ok(mut state) = self.state.lock() {
                         state.last_error_code = "runtime.enrollment_refresh_failed".to_owned();
-                        state.record(LogLevel::Warn, "Enrollment refresh failed; reconnect remains fail-closed");
+                        state.record(
+                            LogLevel::Warn,
+                            "Enrollment refresh failed; reconnect remains fail-closed",
+                        );
                     }
                     tracing::warn!(code = error.code(), "enrollment refresh failed");
                 }
@@ -466,7 +526,10 @@ impl SupervisorHooks for RuntimeSafetyHooks {
                 logs,
                 ..RuntimeState::default()
             };
-            state.record(LogLevel::Warn, "Agent session was cleared and will reconnect");
+            state.record(
+                LogLevel::Warn,
+                "Agent session was cleared and will reconnect",
+            );
         }
         tracing::info!(effect = "clear_target_session");
     }
@@ -520,16 +583,17 @@ struct SharedRuntime {
 
 #[cfg(windows)]
 impl LocalControlRuntime for SharedRuntime {
-    fn execute(
-        &mut self,
-        command: &LocalCommand,
-    ) -> Result<serde_json::Value, AgentError> {
+    fn execute(&mut self, command: &LocalCommand) -> Result<serde_json::Value, AgentError> {
         match command {
             LocalCommand::GetConnectionStatus => self.connection_status(),
             LocalCommand::RunEnvironmentCheck => self.environment_check(),
             LocalCommand::GetLogTail { lines, level } => self.log_tail(*lines, level),
             LocalCommand::ScanInstalledGames => observability::scan_installed_games(),
-            _ => self.execution.lock().map_err(lock_error)?.execute_local(command),
+            _ => self
+                .execution
+                .lock()
+                .map_err(lock_error)?
+                .execute_local(command),
         }
     }
 }
@@ -581,12 +645,14 @@ impl SharedRuntime {
         } else {
             ("unavailable", "game.discovery_unavailable")
         };
-        let check = |id: &str, status: ConnectionState| serde_json::json!({
-            "id": id,
-            "status": status.as_str(),
-            "code": if matches!(status, ConnectionState::Connected) { "runtime.connected" } else { "runtime.connection_unavailable" },
-            "recovery": "Check Agent registration and Hub reachability",
-        });
+        let check = |id: &str, status: ConnectionState| {
+            serde_json::json!({
+                "id": id,
+                "status": status.as_str(),
+                "code": if matches!(status, ConnectionState::Connected) { "runtime.connected" } else { "runtime.connection_unavailable" },
+                "recovery": "Check Agent registration and Hub reachability",
+            })
+        };
         Ok(serde_json::json!({"checks": [
             {"id": "binary_or_task", "status": if binary_ready { "available" } else { "unavailable" }, "code": if binary_ready { "agent.binary_running_task_unchecked" } else { "agent.binary_unavailable" }, "recovery": "Verify the production scheduled task through the installer"},
             {"id": "agent", "status": "available", "code": "agent.running", "recovery": "No action required"},
@@ -601,13 +667,18 @@ impl SharedRuntime {
 
     fn log_tail(&self, lines: u16, level: &LogLevel) -> Result<serde_json::Value, AgentError> {
         let mut state = self.state.lock().map_err(lock_error)?;
-        Ok(observability::log_tail_json(state.logs.make_contiguous(), lines, level))
+        Ok(observability::log_tail_json(
+            state.logs.make_contiguous(),
+            lines,
+            level,
+        ))
     }
 }
 
 fn regular_nonempty_file(path: &Path) -> bool {
-    path.symlink_metadata()
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0)
+    path.symlink_metadata().is_ok_and(|metadata| {
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0
+    })
 }
 
 #[cfg(windows)]
@@ -1062,8 +1133,19 @@ pub async fn run_dev_local() -> Result<(), AgentError> {
             execution,
             state: Arc::new(Mutex::new(RuntimeState::default())),
             config: Arc::new(Mutex::new(RuntimeConfig {
-                transport: TransportConfig { control_endpoint: "https://unavailable".parse().expect("fixed URI"), frame_endpoint: "https://unavailable".parse().expect("fixed URI"), server_name: "unavailable".to_owned(), agent_id: "unavailable".to_owned(), ca_pem: PathBuf::new(), identity_cert_pem: PathBuf::new(), identity_key_pem: PathBuf::new(), connect_timeout: Duration::from_secs(10) },
-                agent_version: "dev".to_owned(), build_commit: "unknown".to_owned(), profiles,
+                transport: TransportConfig {
+                    control_endpoint: "https://unavailable".parse().expect("fixed URI"),
+                    frame_endpoint: "https://unavailable".parse().expect("fixed URI"),
+                    server_name: "unavailable".to_owned(),
+                    agent_id: "unavailable".to_owned(),
+                    ca_pem: PathBuf::new(),
+                    identity_cert_pem: PathBuf::new(),
+                    identity_key_pem: PathBuf::new(),
+                    connect_timeout: Duration::from_secs(10),
+                },
+                agent_version: "dev".to_owned(),
+                build_commit: "unknown".to_owned(),
+                profiles,
             })),
         },
         config,
@@ -1287,7 +1369,8 @@ mod tests {
 
     #[test]
     fn regular_nonempty_file_rejects_missing_and_empty_files() {
-        let root = std::env::temp_dir().join(format!("fairypam-runtime-file-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("fairypam-runtime-file-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let empty = root.join("empty");
         let populated = root.join("populated");

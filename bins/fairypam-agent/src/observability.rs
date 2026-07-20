@@ -243,7 +243,7 @@ fn contains_jwt(value: &str) -> bool {
     value
         .split(|character: char| !character.is_ascii_alphanumeric() && character != '.')
         .any(|compact| {
-        let mut segments = compact.split('.');
+            let mut segments = compact.split('.');
             let Some(header) = segments.next() else {
                 return false;
             };
@@ -268,8 +268,8 @@ fn registry_entries() -> Result<Vec<RegistryEntry>, AgentError> {
             Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS},
             System::Registry::{
                 RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY,
-                HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
-                REG_EXPAND_SZ, REG_SZ, REG_SAM_FLAGS, REG_VALUE_TYPE,
+                HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_EXPAND_SZ,
+                REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
             },
         },
     };
@@ -293,9 +293,8 @@ fn registry_entries() -> Result<Vec<RegistryEntry>, AgentError> {
     fn open_key(parent: HKEY, name: &str, access: REG_SAM_FLAGS) -> Result<OwnedKey, u32> {
         let name = wide(name);
         let mut key = HKEY(std::ptr::null_mut());
-        let status = unsafe {
-            RegOpenKeyExW(parent, PCWSTR(name.as_ptr()), None, access, &mut key)
-        };
+        let status =
+            unsafe { RegOpenKeyExW(parent, PCWSTR(name.as_ptr()), None, access, &mut key) };
         status.is_ok().then_some(OwnedKey(key)).ok_or(status.0)
     }
 
@@ -313,7 +312,11 @@ fn registry_entries() -> Result<Vec<RegistryEntry>, AgentError> {
                 Some(&mut bytes),
             )
         };
-        if !status.is_ok() || !matches!(kind, REG_SZ | REG_EXPAND_SZ) || bytes == 0 || bytes % 2 != 0 {
+        if !status.is_ok()
+            || !matches!(kind, REG_SZ | REG_EXPAND_SZ)
+            || bytes == 0
+            || bytes % 2 != 0
+        {
             return None;
         }
         let mut value = vec![0_u16; bytes as usize / 2];
@@ -341,7 +344,12 @@ fn registry_entries() -> Result<Vec<RegistryEntry>, AgentError> {
         let uninstall = match open_key(HKEY_LOCAL_MACHINE, UNINSTALL_KEY, KEY_READ | access) {
             Ok(key) => key,
             Err(code) if code == ERROR_FILE_NOT_FOUND.0 => return Ok(None),
-            Err(_) => return Err(AgentError::new("game.discovery_unavailable", "MiHoYo discovery is unavailable")),
+            Err(_) => {
+                return Err(AgentError::new(
+                    "game.discovery_unavailable",
+                    "MiHoYo discovery is unavailable",
+                ));
+            }
         };
         let mut entries = Vec::new();
         for index in 0.. {
@@ -363,7 +371,10 @@ fn registry_entries() -> Result<Vec<RegistryEntry>, AgentError> {
                 break;
             }
             if !status.is_ok() || length as usize > name.len() {
-                return Err(AgentError::new("game.discovery_unavailable", "MiHoYo discovery is unavailable"));
+                return Err(AgentError::new(
+                    "game.discovery_unavailable",
+                    "MiHoYo discovery is unavailable",
+                ));
             }
             let Ok(name) = String::from_utf16(&name[..length as usize]) else {
                 continue;
@@ -391,9 +402,12 @@ fn registry_entries() -> Result<Vec<RegistryEntry>, AgentError> {
             entries.extend(view_entries);
         }
     }
-    opened
-        .then_some(entries)
-        .ok_or_else(|| AgentError::new("game.discovery_unavailable", "MiHoYo discovery is unavailable"))
+    opened.then_some(entries).ok_or_else(|| {
+        AgentError::new(
+            "game.discovery_unavailable",
+            "MiHoYo discovery is unavailable",
+        )
+    })
 }
 
 #[cfg(not(windows))]
@@ -408,7 +422,10 @@ mod tests {
     #[test]
     fn discovery_id_is_stable_and_does_not_expose_the_install_path() {
         let root = std::env::temp_dir().join(format!("fairypam-discovery-{}", std::process::id()));
-        let executable = root.join("games").join("Genshin Impact Game").join("YuanShen.exe");
+        let executable = root
+            .join("games")
+            .join("Genshin Impact Game")
+            .join("YuanShen.exe");
         std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
         std::fs::write(&executable, []).unwrap();
         std::fs::write(root.join("config.ini"), "game_version = 5.8.0\n").unwrap();
@@ -422,7 +439,13 @@ mod tests {
         }];
         let games = scan_entries(&entries);
         let first = games.first().expect("known game is discovered");
-        assert_eq!(first["discovery_id"], stable_discovery_id(&format!("hk4e_cn:{}", root.display().to_string().to_ascii_lowercase())));
+        assert_eq!(
+            first["discovery_id"],
+            stable_discovery_id(&format!(
+                "hk4e_cn:{}",
+                root.display().to_string().to_ascii_lowercase()
+            ))
+        );
         assert_eq!(first["version"], "5.8.0");
         assert_eq!(first["installed"], true);
         assert_eq!(first["supported"], false);
@@ -440,7 +463,10 @@ mod tests {
             20,
             &LogLevel::Info,
         );
-        assert_eq!(tail["entries"][0]["message"], "[redacted agent log content]");
+        assert_eq!(
+            tail["entries"][0]["message"],
+            "[redacted agent log content]"
+        );
         assert!(!tail.to_string().contains("secret"));
         assert!(!tail.to_string().contains("ProgramData"));
     }
@@ -478,7 +504,9 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
         #[cfg(unix)]
-        assert!(!trusted_executable(&link.join("games/Genshin Impact Game/YuanShen.exe")));
+        assert!(!trusted_executable(
+            &link.join("games/Genshin Impact Game/YuanShen.exe")
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

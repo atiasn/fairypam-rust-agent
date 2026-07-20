@@ -14,7 +14,9 @@ pub enum EnrollmentInvocation {
 
 /// Enrollment is deliberately outside LocalCommand: it never crosses the
 /// same-user Named Pipe and it never accepts an URL or code as a CLI argument.
-pub fn parse_enrollment_invocation(arguments: &[String]) -> Result<Option<EnrollmentInvocation>, CliError> {
+pub fn parse_enrollment_invocation(
+    arguments: &[String],
+) -> Result<Option<EnrollmentInvocation>, CliError> {
     let values = arguments.iter().map(String::as_str).collect::<Vec<_>>();
     match values.as_slice() {
         ["enroll"] => Ok(Some(EnrollmentInvocation::LaunchElevatedHelper)),

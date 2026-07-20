@@ -362,9 +362,9 @@ fn request_from_value(value: Value) -> Result<RequestEnvelope, LocalProtocolErro
 
 fn validate_command(command: &LocalCommand) -> Result<(), LocalProtocolError> {
     match command {
-        LocalCommand::GetLogTail { lines, .. } if *lines == 0 || *lines > 200 => {
-            Err(LocalProtocolError::invalid("log lines must be within 1..=200"))
-        }
+        LocalCommand::GetLogTail { lines, .. } if *lines == 0 || *lines > 200 => Err(
+            LocalProtocolError::invalid("log lines must be within 1..=200"),
+        ),
         _ => Ok(()),
     }
 }
@@ -382,10 +382,21 @@ where
 
 fn is_supported_command(command: &str) -> bool {
     match command {
-        "status" | "doctor" | "list_profiles" | "enumerate_targets" | "lock_target"
-        | "focus_target" | "start_capture" | "stop_capture" | "release_all" | "update_status"
-        | "startup_status" | "get_connection_status" | "run_environment_check"
-        | "get_log_tail" | "scan_installed_games" => true,
+        "status"
+        | "doctor"
+        | "list_profiles"
+        | "enumerate_targets"
+        | "lock_target"
+        | "focus_target"
+        | "start_capture"
+        | "stop_capture"
+        | "release_all"
+        | "update_status"
+        | "startup_status"
+        | "get_connection_status"
+        | "run_environment_check"
+        | "get_log_tail"
+        | "scan_installed_games" => true,
         #[cfg(feature = "dev-automation")]
         "testbed_pulse" => true,
         _ => false,

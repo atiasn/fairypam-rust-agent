@@ -3,8 +3,8 @@ use tauri::State;
 use crate::{
     dto::{
         CaptureStateDto, ConnectionStatusDto, DoctorDto, EnvironmentCheckDto, ExportResultDto,
-        FocusedTargetDto, InstalledGamesDto, LockedTargetDto, LogTailDto, OverviewDto,
-        ProfilesDto, ReleaseAllDto, SupportStatusDto, TargetsDto,
+        FocusedTargetDto, InstalledGamesDto, LockedTargetDto, LogTailDto, OverviewDto, ProfilesDto,
+        ReleaseAllDto, SupportStatusDto, TargetsDto,
     },
     local_gateway::{ProductionGateway, UiCommandError},
 };
@@ -120,10 +120,18 @@ pub async fn get_log_tail(
         "error" => fairypam_agent_local_protocol::LogLevel::Error,
         "warn" => fairypam_agent_local_protocol::LogLevel::Warn,
         "info" => fairypam_agent_local_protocol::LogLevel::Info,
-        _ => return Err(UiCommandError::unavailable("local.command.invalid_argument", "level must be error, warn, or info")),
+        _ => {
+            return Err(UiCommandError::unavailable(
+                "local.command.invalid_argument",
+                "level must be error, warn, or info",
+            ))
+        }
     };
     if !(1..=200).contains(&lines) {
-        return Err(UiCommandError::unavailable("local.command.invalid_argument", "lines must be within 1..=200"));
+        return Err(UiCommandError::unavailable(
+            "local.command.invalid_argument",
+            "lines must be within 1..=200",
+        ));
     }
     state.log_tail(lines, level).await
 }

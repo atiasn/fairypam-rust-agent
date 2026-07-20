@@ -1,6 +1,8 @@
 use fairypam_agent_local_client::LocalClientError;
 use fairypam_agent_local_protocol::LocalCommand;
-use fairypam_agentctl::{parse_command, parse_enrollment_invocation, CliError, EnrollmentInvocation};
+use fairypam_agentctl::{
+    parse_command, parse_enrollment_invocation, CliError, EnrollmentInvocation,
+};
 
 fn arguments(values: &[&str]) -> Vec<String> {
     values.iter().map(ToString::to_string).collect()
