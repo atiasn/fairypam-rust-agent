@@ -375,3 +375,15 @@ fn replacement_registration_installs_the_new_config_before_requesting_reconnect(
     assert!(activate < reconnect);
     assert!(register[activate..reconnect].contains("if !was_waiting"));
 }
+
+#[test]
+fn dev_runtime_initializes_the_registration_gate() {
+    let runtime = include_str!("../src/runtime.rs");
+    let dev_runtime = runtime
+        .split_once("pub async fn run_dev_local()")
+        .and_then(|(_, source)| source.split_once("fn dev_local_control_config()"))
+        .map(|(source, _)| source)
+        .expect("Dev runtime construction must remain explicit");
+
+    assert!(dev_runtime.contains("registration_in_progress: Arc::new(AtomicBool::new(false))"));
+}

@@ -1598,6 +1598,7 @@ pub async fn run_dev_local() -> Result<(), AgentError> {
             })),
             enrollment_ready: Arc::new(tokio::sync::Notify::new()),
             reconnect_requested: Arc::new(tokio::sync::Notify::new()),
+            registration_in_progress: Arc::new(AtomicBool::new(false)),
         },
         config,
     )
