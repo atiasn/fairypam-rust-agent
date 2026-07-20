@@ -19,10 +19,35 @@ use tokio_stream::Stream;
 mod windows_named_pipe;
 
 #[cfg(windows)]
-pub use windows_named_pipe::WindowsNamedPipeClientTransport;
+pub use windows_named_pipe::{
+    verify_protected_program_files_path, WindowsNamedPipeClientTransport,
+};
 
 const CONNECT_ATTEMPTS: usize = 3;
 const INITIAL_CONNECT_BACKOFF: Duration = Duration::from_millis(10);
+
+#[cfg(any(windows, test))]
+fn normalize_windows_path(path: &str) -> Option<String> {
+    let path = path.trim().trim_matches('"').replace('/', "\\");
+    let path = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|suffix| format!(r"\\{suffix}"))
+        .or_else(|| path.strip_prefix(r"\\?\").map(str::to_owned))
+        .unwrap_or(path);
+    (!path.is_empty() && path.contains('\\')).then(|| path.trim_end_matches('\\').to_lowercase())
+}
+
+#[cfg(any(windows, test))]
+fn windows_path_is_within(path: &str, root: &str) -> bool {
+    let (Some(path), Some(root)) = (normalize_windows_path(path), normalize_windows_path(root))
+    else {
+        return false;
+    };
+    path == root
+        || path
+            .strip_prefix(&root)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
+}
 
 /// The errors exposed by every local-control caller, including the GUI and CLI.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -236,11 +261,18 @@ impl<T: LocalTransport> LocalClient<T> {
         request: RequestEnvelope,
         timeout: Duration,
     ) -> Result<LocalResponse, LocalClientError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         if self.take_cancelled(&request.request_id) {
             return Err(LocalClientError::cancelled());
         }
 
-        self.establish_connection().await?;
+        match tokio::time::timeout_at(deadline, self.establish_connection()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                self.transport.close().await;
+                return Err(LocalClientError::timeout());
+            }
+        }
 
         if self.take_cancelled(&request.request_id) {
             self.transport.close().await;
@@ -248,12 +280,19 @@ impl<T: LocalTransport> LocalClient<T> {
         }
 
         let frame = encode_frame(&request).map_err(LocalClientError::from)?;
-        if let Err(error) = self.transport.send(frame).await {
-            self.transport.close().await;
-            return Err(error);
+        match tokio::time::timeout_at(deadline, self.transport.send(frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.transport.close().await;
+                return Err(error);
+            }
+            Err(_) => {
+                self.transport.close().await;
+                return Err(LocalClientError::timeout());
+            }
         }
 
-        let frame = match tokio::time::timeout(timeout, self.transport.receive()).await {
+        let frame = match tokio::time::timeout_at(deadline, self.transport.receive()).await {
             Ok(Ok(frame)) => frame,
             Ok(Err(error)) => {
                 self.transport.close().await;
@@ -316,4 +355,26 @@ fn hex(bytes: &[u8]) -> String {
         output.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::windows_path_is_within;
+
+    #[test]
+    fn protected_root_check_rejects_prefix_confusion_and_appdata() {
+        let root = r"C:\Program Files";
+        assert!(windows_path_is_within(
+            r"\\?\C:\Program Files\FairyPam\fairypam-agent.exe",
+            root
+        ));
+        assert!(!windows_path_is_within(
+            r"C:\Program Files-Evil\FairyPam\fairypam-agent.exe",
+            root
+        ));
+        assert!(!windows_path_is_within(
+            r"C:\Users\clei\AppData\Local\FairyPam\fairypam-agent.exe",
+            root
+        ));
+    }
 }

@@ -13,9 +13,7 @@
     "allow-run-environment-check",
     "allow-get-log-tail",
     "allow-scan-installed-games",
-    "allow-get-enrollment-mode",
-    "allow-start-enrollment",
-    "allow-complete-enrollment",
+    "allow-register-hub",
     "allow-ensure-local-agent"
   ]
 }

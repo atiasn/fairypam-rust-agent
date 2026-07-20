@@ -2,6 +2,8 @@ use std::time::Instant;
 
 use fairypam_agent_core::platform::{AuthorizationState, DenyAllAuthorization, LocalAuthorization};
 
+#[cfg(windows)]
+pub mod enrollment;
 pub mod execution;
 pub mod local_control;
 mod observability;

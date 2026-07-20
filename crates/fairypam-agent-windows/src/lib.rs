@@ -16,14 +16,17 @@ pub use capture::{
 };
 pub use dpi::{physical_to_logical, validate_dpi};
 #[cfg(windows)]
+pub use local_pipe::verify_fixed_gui_caller;
+#[cfg(windows)]
 pub use local_pipe::{
     current_process_pipe_owner, WindowsNamedPipeServer, WindowsPipeIdentityProvider,
 };
 pub use local_pipe::{
-    default_production_pipe_name, explicit_owner_sddl, verify_pipe_caller, IntegrityLevel,
-    LocalIdentityError, PipeHandle, PipeIdentityProvider, PipeOwner, VerifiedPipeCaller,
+    default_production_pipe_name, explicit_owner_sddl, fixed_gui_image_matches, verify_pipe_caller,
+    IntegrityLevel, LocalIdentityError, PipeHandle, PipeIdentityProvider, PipeOwner,
+    VerifiedPipeCaller,
 };
-pub use process::{normalize_process_path, normalized_process_path_sha256};
+pub use process::{normalize_process_path, normalized_process_path_sha256, process_path_is_within};
 pub use window::{
     lock_unique, revalidate_identity, FakeWindows, Rect, TargetIdentity, WindowsApi, WindowsError,
     WindowsTargetCandidate, WindowsTargetPlatform,

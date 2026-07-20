@@ -1,8 +1,6 @@
 #[cfg(all(windows, feature = "dev-automation"))]
 use fairypam_agentctl::CliError;
 use fairypam_agentctl::{execute, parse_command};
-#[cfg(windows)]
-use fairypam_agentctl::{parse_enrollment_invocation, EnrollmentInvocation};
 
 #[tokio::main]
 async fn main() {
@@ -11,10 +9,10 @@ async fn main() {
     let result = if arguments.first().is_some_and(|value| value == "dev") {
         dev_result(&arguments)
     } else {
-        run_windows(&arguments).await
+        run_local(&arguments).await
     };
     #[cfg(all(windows, not(feature = "dev-automation")))]
-    let result = run_windows(&arguments).await;
+    let result = run_local(&arguments).await;
     #[cfg(not(windows))]
     let result = match parse_command(&arguments) {
         Ok(command) => execute(command).await,
@@ -30,22 +28,9 @@ async fn main() {
 }
 
 #[cfg(windows)]
-async fn run_windows(
-    arguments: &[String],
-) -> Result<serde_json::Value, fairypam_agentctl::CliError> {
-    match parse_enrollment_invocation(arguments) {
-        Ok(Some(EnrollmentInvocation::LaunchElevatedHelper)) => {
-            fairypam_agentctl::enrollment::launch_elevated_gui()?;
-            Ok(serde_json::json!({"status":"elevation_requested"}))
-        }
-        Ok(Some(EnrollmentInvocation::ElevatedHelper)) => {
-            let result = fairypam_agentctl::enrollment::enroll_from_console()?;
-            Ok(serde_json::json!({"status":"enrolled", "hub_address":result.hub_address}))
-        }
-        Ok(None) => match parse_command(arguments) {
-            Ok(command) => execute(command).await,
-            Err(error) => Err(error),
-        },
+async fn run_local(arguments: &[String]) -> Result<serde_json::Value, fairypam_agentctl::CliError> {
+    match parse_command(arguments) {
+        Ok(command) => execute(command).await,
         Err(error) => Err(error),
     }
 }

@@ -9,7 +9,6 @@ import { useConnectionState } from './lib/useConnectionState';
 import { ConnectionPage } from './pages/ConnectionPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { DiagnosticsPage } from './pages/DiagnosticsPage';
-import { EnrollmentPage } from './pages/EnrollmentPage';
 import { GamesPage } from './pages/GamesPage';
 import { LogsPage } from './pages/LogsPage';
 
@@ -23,14 +22,21 @@ const navigation: Array<{ id: Page; label: string }> = [
   { id: 'games', label: '游戏' },
 ];
 
+function startupLabel(status: string | undefined, isPending: boolean, isError: boolean) {
+  if (isPending) return '正在唤醒本地 Agent 并连接 Hub';
+  if (isError) return 'Agent 启动需要处理';
+  if (status === 'ready') return 'Agent 与 Hub 已连接';
+  if (status === 'hub_wait_timeout') return 'Agent 已就绪，Hub 正在重试连接';
+  if (status === 'agent_ready') return 'Agent 已就绪，等待 Hub 注册';
+  return 'Agent 已就绪';
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
-  const enrollmentMode = useQuery({ queryKey: queryKeys.enrollmentMode, queryFn: agentApi.getEnrollmentMode });
   const startup = useQuery({
     queryKey: queryKeys.startup,
     queryFn: agentApi.ensureLocalAgent,
     retry: false,
-    enabled: enrollmentMode.data?.status === 'standard',
   });
   const queries = useAgentQueries(startup.isSuccess);
   const { connection, dispatch } = useConnectionState(queries.overview.isSuccess, queries.overview.error);
@@ -40,8 +46,6 @@ export default function App() {
       dispatch({ type: 'ExplicitEmergency', code: 'agent.guardian.emergency' });
     }
   }, [dispatch, queries.overview.data?.status.state]);
-
-  if (enrollmentMode.data?.status === 'elevated') return <EnrollmentPage />;
 
   const common = {
     connection,
@@ -59,7 +63,7 @@ export default function App() {
           <h1>AGENT CONTROL</h1>
         </div>
         <p aria-live="polite" className={`connection ${connection.availability}`}>
-          {startup.isPending ? '正在唤醒本地 Agent' : startup.isError ? 'Agent 启动需要处理' : 'Agent 已就绪'}
+          {startupLabel(startup.data?.status, startup.isPending, startup.isError)}
         </p>
       </header>
       <div className="app-layout">

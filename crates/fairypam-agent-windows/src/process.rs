@@ -23,6 +23,18 @@ pub fn normalized_process_path_sha256(path: &str) -> Option<[u8; 32]> {
     Some(Sha256::digest(normalized.as_bytes()).into())
 }
 
+pub fn process_path_is_within(path: &str, root: &str) -> bool {
+    let (Some(path), Some(root)) = (normalize_process_path(path), normalize_process_path(root))
+    else {
+        return false;
+    };
+    let root = root.trim_end_matches('\\');
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +58,17 @@ mod tests {
             normalized_process_path_sha256(r"\\?\UNC\server\share\Testbed.exe"),
             normalized_process_path_sha256(r"\\server\share\testbed.exe")
         );
+    }
+
+    #[test]
+    fn protected_root_match_has_a_component_boundary() {
+        assert!(process_path_is_within(
+            r"C:\Program Files\FairyPam\fairypam-agent.exe",
+            r"c:\program files"
+        ));
+        assert!(!process_path_is_within(
+            r"C:\Program Files-Evil\FairyPam\fairypam-agent.exe",
+            r"C:\Program Files"
+        ));
     }
 }

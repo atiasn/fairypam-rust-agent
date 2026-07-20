@@ -8,12 +8,13 @@ publish.workspace = true
 fairypam-agent-protocol = { path = "../fairypam-agent-protocol" }
 fastrand = "2"
 http = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 thiserror.workspace = true
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tonic = { version = "0.14", features = ["tls-ring"] }
 uuid = "1"
-x509-parser = "0.18"
+x509-parser = { version = "0.18", features = ["verify"] }
 
 [dev-dependencies]
 rcgen = "0.14"

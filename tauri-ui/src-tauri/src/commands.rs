@@ -1,12 +1,20 @@
 #[cfg(windows)]
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use tauri::State;
+#[cfg(windows)]
+use windows::{
+    core::HSTRING,
+    Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_HIDE},
+};
 
 use crate::{
     dto::{
         ConnectionStatusDto, EnvironmentCheckDto, InstalledGamesDto, LogTailDto, OverviewDto,
-        SupportStatusDto,
+        RegistrationStatusDto, SupportStatusDto,
     },
     local_gateway::{ProductionGateway, UiCommandError},
 };
@@ -14,11 +22,13 @@ use crate::{
 type CommandResult<T> = Result<T, UiCommandError>;
 
 #[cfg(windows)]
-const PIPE_CHECK_LIMIT: u8 = 6;
-#[cfg(windows)]
 const PIPE_STARTUP_LIMIT: Duration = Duration::from_secs(20);
 #[cfg(windows)]
 const HUB_OBSERVATION_LIMIT: Duration = Duration::from_secs(20);
+#[cfg(windows)]
+const HUB_OBSERVATION_ATTEMPTS: u8 = 20;
+#[cfg(windows)]
+const HUB_OBSERVATION_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const PIPE_DELAYS_MS: [u64; 5] = [300, 600, 1_200, 2_400, 4_800];
 
@@ -75,63 +85,12 @@ pub async fn scan_installed_games(
 }
 
 #[tauri::command]
-pub fn get_enrollment_mode() -> SupportStatusDto {
-    #[cfg(windows)]
-    let status = if fairypam_agentctl::enrollment::is_elevated_ui_invocation(
-        &std::env::args().skip(1).collect::<Vec<_>>(),
-    ) {
-        "elevated"
-    } else {
-        "standard"
-    };
-    #[cfg(not(windows))]
-    let status = "unsupported";
-    SupportStatusDto {
-        status: status.into(),
-    }
-}
-
-#[tauri::command]
-pub fn start_enrollment() -> CommandResult<SupportStatusDto> {
-    #[cfg(windows)]
-    {
-        fairypam_agentctl::enrollment::launch_elevated_gui().map_err(enrollment_error)?;
-        Ok(SupportStatusDto {
-            status: "elevation_requested".into(),
-        })
-    }
-    #[cfg(not(windows))]
-    Err(UiCommandError::unavailable(
-        "local.transport.platform_unsupported",
-        "FairyPam Agent enrollment requires Windows",
-    ))
-}
-
-#[tauri::command]
-#[cfg_attr(not(windows), allow(dead_code))]
-pub fn complete_enrollment(hub: String, code: String) -> CommandResult<SupportStatusDto> {
-    #[cfg(windows)]
-    {
-        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-        if !fairypam_agentctl::enrollment::is_elevated_ui_invocation(&arguments) {
-            return Err(UiCommandError::unavailable(
-                "enrollment.elevation_required",
-                "registration must be completed in the elevated FairyPam window",
-            ));
-        }
-        fairypam_agentctl::enrollment::enroll(&hub, &code).map_err(enrollment_error)?;
-        Ok(SupportStatusDto {
-            status: "completed".into(),
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (hub, code);
-        Err(UiCommandError::unavailable(
-            "local.transport.platform_unsupported",
-            "FairyPam Agent enrollment requires Windows",
-        ))
-    }
+pub async fn register_hub(
+    hub_address: String,
+    registration_code: String,
+    state: State<'_, ProductionGateway>,
+) -> CommandResult<RegistrationStatusDto> {
+    state.register_hub(hub_address, registration_code).await
 }
 
 #[tauri::command]
@@ -141,28 +100,30 @@ pub async fn ensure_local_agent(
     #[cfg(windows)]
     {
         let deadline = Instant::now() + PIPE_STARTUP_LIMIT;
-        for attempt in 1..=PIPE_CHECK_LIMIT {
+        match state.status_with_timeout(Duration::from_secs(1)).await {
+            Ok(_) => return observe_hub(&state).await,
+            Err(error) if error.code == "local.transport.pipe_not_found" => {}
+            Err(error) => return Err(error),
+        }
+
+        launch_fixed_agent()?;
+        for delay in PIPE_DELAYS_MS {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            if state
-                .overview_with_timeout(remaining.min(Duration::from_secs(1)))
+            tokio::time::sleep(Duration::from_millis(delay).min(remaining)).await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match state
+                .status_with_timeout(remaining.min(Duration::from_secs(1)))
                 .await
-                .is_ok()
             {
-                return observe_hub(&state).await;
-            }
-            if attempt == 1 {
-                fairypam_agentctl::enrollment::start_fixed_agent_task()
-                    .map_err(enrollment_error)?;
-            }
-            if let Some(delay) = PIPE_DELAYS_MS.get((attempt - 1) as usize) {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(*delay).min(remaining)).await;
+                Ok(_) => return observe_hub(&state).await,
+                Err(error) if error.code == "local.transport.pipe_not_found" => {}
+                Err(error) => return Err(error),
             }
         }
         Err(UiCommandError::unavailable(
@@ -183,51 +144,107 @@ pub async fn ensure_local_agent(
 #[cfg(windows)]
 async fn observe_hub(state: &ProductionGateway) -> CommandResult<SupportStatusDto> {
     let deadline = Instant::now() + HUB_OBSERVATION_LIMIT;
-    loop {
+    for attempt in 0..HUB_OBSERVATION_ATTEMPTS {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(SupportStatusDto {
-                status: "hub_wait_timeout".into(),
-            });
+            break;
         }
-        if let Ok(status) = state
+        let status = match state
             .connection_status_with_timeout(remaining.min(Duration::from_secs(1)))
             .await
         {
-            if status.control.eq_ignore_ascii_case("connected")
-                && status.frame.eq_ignore_ascii_case("connected")
-            {
-                return Ok(SupportStatusDto {
-                    status: "ready".into(),
-                });
-            }
+            Ok(status) => status,
+            Err(error) => return Err(error),
+        };
+        if status.control.eq_ignore_ascii_case("connected")
+            && status.frame.eq_ignore_ascii_case("connected")
+        {
+            return Ok(SupportStatusDto {
+                status: "ready".into(),
+            });
         }
-        tokio::time::sleep(Duration::from_secs(1).min(remaining)).await;
+        if status.hub_address.trim().is_empty() {
+            return Ok(SupportStatusDto {
+                status: "agent_ready".into(),
+            });
+        }
+        if attempt + 1 < HUB_OBSERVATION_ATTEMPTS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(HUB_OBSERVATION_INTERVAL.min(remaining)).await;
+        }
     }
+    Ok(SupportStatusDto {
+        status: "hub_wait_timeout".into(),
+    })
 }
 
 #[cfg(windows)]
-fn enrollment_error(error: fairypam_agentctl::CliError) -> UiCommandError {
-    match error {
-        fairypam_agentctl::CliError::Client(error) => {
-            UiCommandError::unavailable(error.code(), error.to_string())
-        }
-        fairypam_agentctl::CliError::Usage(message) => {
-            UiCommandError::unavailable("enrollment.invalid", message)
-        }
+fn launch_fixed_agent() -> CommandResult<()> {
+    let (agent, directory) = fixed_agent_path()?;
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            &HSTRING::from("runas"),
+            &HSTRING::from(agent.to_string_lossy().as_ref()),
+            &HSTRING::new(),
+            &HSTRING::from(directory.to_string_lossy().as_ref()),
+            SW_HIDE,
+        )
+    };
+    if result.0 as usize <= 32 {
+        return Err(UiCommandError::unavailable(
+            "startup.elevation_denied",
+            "Windows did not authorize starting the FairyPam Agent",
+        ));
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn fixed_agent_path() -> CommandResult<(PathBuf, PathBuf)> {
+    let gui = std::env::current_exe().map_err(|_| {
+        UiCommandError::unavailable("startup.agent_unavailable", "FairyPam Agent is unavailable")
+    })?;
+    let directory = gui.parent().map(|path| path.to_path_buf()).ok_or_else(|| {
+        UiCommandError::unavailable("startup.agent_unavailable", "FairyPam Agent is unavailable")
+    })?;
+    let agent = directory.join("fairypam-agent.exe");
+    for path in [&gui, &agent] {
+        fairypam_agent_local_client::verify_protected_program_files_path(path)
+            .map_err(|_| untrusted_install_root())?;
+    }
+    Ok((agent, directory))
+}
+
+#[cfg(windows)]
+fn untrusted_install_root() -> UiCommandError {
+    UiCommandError::unavailable(
+        "startup.install_root_untrusted",
+        "FairyPam must be installed under Program Files before requesting administrator access",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]
-    use super::{PIPE_CHECK_LIMIT, PIPE_DELAYS_MS, PIPE_STARTUP_LIMIT};
+    use std::time::Duration;
+
+    #[cfg(windows)]
+    use super::{
+        HUB_OBSERVATION_ATTEMPTS, HUB_OBSERVATION_INTERVAL, HUB_OBSERVATION_LIMIT, PIPE_DELAYS_MS,
+        PIPE_STARTUP_LIMIT,
+    };
 
     #[cfg(windows)]
     #[test]
     fn startup_retry_budget_is_bounded() {
-        assert_eq!(PIPE_CHECK_LIMIT, 6);
-        assert_eq!(PIPE_DELAYS_MS.len(), (PIPE_CHECK_LIMIT - 1) as usize);
+        assert_eq!(PIPE_DELAYS_MS.len(), 5);
         assert!(PIPE_DELAYS_MS.iter().sum::<u64>() < PIPE_STARTUP_LIMIT.as_millis() as u64);
+        assert_eq!(HUB_OBSERVATION_ATTEMPTS, 20);
+        assert_eq!(HUB_OBSERVATION_INTERVAL, Duration::from_secs(1));
+        assert_eq!(HUB_OBSERVATION_LIMIT, Duration::from_secs(20));
     }
 }

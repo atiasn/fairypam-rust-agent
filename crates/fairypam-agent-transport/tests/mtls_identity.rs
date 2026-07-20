@@ -12,7 +12,8 @@ use fairypam_agent_transport::{
     connect_control, control_queue, open_control_tunnel, receive_hub_hello, TransportConfig,
 };
 use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    KeyUsagePurpose, SanType,
 };
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -149,6 +150,12 @@ impl Certificates {
                 .try_into()
                 .unwrap(),
         ));
+        client_params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
+        client_params
+            .key_usages
+            .push(KeyUsagePurpose::DigitalSignature);
         let client_cert = client_params.signed_by(&client_key, &ca).unwrap().pem();
 
         let directory = tempfile::tempdir().unwrap();

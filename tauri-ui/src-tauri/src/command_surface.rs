@@ -4,8 +4,6 @@ pub const COMMAND_NAMES: &[&str] = &[
     "run_environment_check",
     "get_log_tail",
     "scan_installed_games",
-    "get_enrollment_mode",
-    "start_enrollment",
-    "complete_enrollment",
+    "register_hub",
     "ensure_local_agent",
 ];

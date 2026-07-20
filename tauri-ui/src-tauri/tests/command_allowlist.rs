@@ -1,7 +1,7 @@
 const APP: &str = include_str!("../src/app.rs");
 const COMMANDS: &str = include_str!("../src/command_surface.rs");
 const CAPABILITY: &str = include_str!("../capabilities/default.json");
-const ENROLLMENT: &str = include_str!("../../../bins/fairypam-agentctl/src/enrollment.rs");
+const CARGO: &str = include_str!("../Cargo.toml");
 
 #[test]
 fn registered_build_and_capability_surfaces_match() {
@@ -11,9 +11,7 @@ fn registered_build_and_capability_surfaces_match() {
         "run_environment_check",
         "get_log_tail",
         "scan_installed_games",
-        "get_enrollment_mode",
-        "start_enrollment",
-        "complete_enrollment",
+        "register_hub",
         "ensure_local_agent",
     ] {
         assert!(
@@ -32,50 +30,6 @@ fn registered_build_and_capability_surfaces_match() {
 }
 
 #[test]
-fn elevated_enrollment_window_exposes_only_enrollment_commands() {
-    let elevated = APP
-        .split("fn run_elevated_enrollment")
-        .nth(1)
-        .and_then(|section| section.split("fn run_standard").next())
-        .expect("app must define the elevated enrollment window");
-
-    for command in ["get_enrollment_mode", "complete_enrollment"] {
-        assert!(
-            elevated.contains(&format!("commands::{command}")),
-            "elevated window missing required command: {command}"
-        );
-    }
-    for command in [
-        "get_overview",
-        "get_connection_status",
-        "run_environment_check",
-        "get_log_tail",
-        "scan_installed_games",
-        "start_enrollment",
-        "ensure_local_agent",
-    ] {
-        assert!(
-            !elevated.contains(&format!("commands::{command}")),
-            "elevated window must not expose regular command: {command}"
-        );
-    }
-    for forbidden in ["ProductionGateway", "TrayIconBuilder", ".on_window_event"] {
-        assert!(
-            !elevated.contains(forbidden),
-            "elevated window must not configure: {forbidden}"
-        );
-    }
-    assert!(
-        ENROLLMENT.contains("current_process_is_elevated().unwrap_or(false)"),
-        "elevated helper selection must fail closed when token verification fails"
-    );
-    assert!(
-        APP.contains("is_elevated_ui_invocation"),
-        "app must select the helper builder through the elevated-token check"
-    );
-}
-
-#[test]
 fn command_surface_has_no_generic_bridge_or_removed_runtime_controls() {
     let source = include_str!("../src/commands.rs");
     for forbidden in [
@@ -88,6 +42,8 @@ fn command_surface_has_no_generic_bridge_or_removed_runtime_controls() {
         "stop_capture",
         "release_all",
         "agentctl.exe",
+        "fairypam_agentctl",
+        "schtasks",
     ] {
         assert!(
             !source.contains(forbidden),
@@ -97,37 +53,41 @@ fn command_surface_has_no_generic_bridge_or_removed_runtime_controls() {
 }
 
 #[test]
-fn elevated_helper_exposes_only_the_registration_surface() {
-    let helper = APP
-        .split("fn run_elevated_enrollment()")
-        .nth(1)
-        .and_then(|source| source.split("fn run_standard()").next())
-        .expect("elevated enrollment builder must be isolated from the standard builder");
-
+fn product_gui_has_only_the_fixed_agent_uac_recovery_path() {
+    let source = include_str!("../src/commands.rs");
     for required in [
-        "commands::get_enrollment_mode",
-        "commands::complete_enrollment",
+        "ShellExecuteW",
+        "fixed_agent_path",
+        "fairypam-agent.exe",
+        "HSTRING::new()",
+        "SW_HIDE",
+        "error.code == \"local.transport.pipe_not_found\"",
+        "status: \"agent_ready\".into()",
+        "status: \"hub_wait_timeout\".into()",
+        "status.hub_address.trim().is_empty()",
+        "HUB_OBSERVATION_LIMIT",
     ] {
         assert!(
-            helper.contains(required),
-            "missing elevated helper command: {required}"
+            source.contains(required),
+            "missing fixed startup guard: {required}"
         );
     }
     for forbidden in [
-        "ProductionGateway",
-        "get_overview",
-        "get_connection_status",
-        "run_environment_check",
-        "get_log_tail",
-        "scan_installed_games",
+        "fairypam_agentctl",
+        "start_fixed_agent_task",
+        "run_elevated_enrollment",
+        "get_enrollment_mode",
         "start_enrollment",
-        "ensure_local_agent",
-        "TrayIconBuilder",
-        "on_window_event",
+        "complete_enrollment",
+        "schtasks",
+        "SW_SHOWNORMAL",
     ] {
         assert!(
-            !helper.contains(forbidden),
-            "elevated helper exposes ordinary UI capability: {forbidden}"
+            !source.contains(forbidden),
+            "product startup must not use developer enrollment path: {forbidden}"
         );
     }
+    assert!(!APP.contains("run_elevated_enrollment"));
+    assert!(!CARGO.contains("fairypam-agentctl"));
+    assert!(!source.contains("RegistrationResult"));
 }

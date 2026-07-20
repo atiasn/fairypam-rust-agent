@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use fairypam_agent::runtime;
 
 #[cfg(not(all(windows, feature = "dev-automation")))]
@@ -14,7 +16,7 @@ async fn main() {
     #[cfg(all(windows, feature = "dev-automation"))]
     let result = runtime::run_dev_local().await;
     #[cfg(not(all(windows, feature = "dev-automation")))]
-    let result = match RuntimeConfig::from_env() {
+    let result = match RuntimeConfig::from_production() {
         Ok(config) => runtime::run(config).await,
         Err(error) => Err(error),
     };

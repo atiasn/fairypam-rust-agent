@@ -3,7 +3,9 @@
 use std::collections::VecDeque;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use std::sync::atomic::Ordering;
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fairypam_agent_core::profile::Ed25519SignatureVerifier;
@@ -13,22 +15,33 @@ use fairypam_agent_protocol::v1::{
     agent_control_event, hub_control_command, AgentControlEvent, AgentHello, AgentStatus,
     CommandAck, CommandNack, CommandRef, Heartbeat, SessionRef,
 };
+#[cfg(windows)]
+use fairypam_agent_transport::validate_transport_config;
 use fairypam_agent_transport::{
     connect_control, connect_frame, control_queue, open_control_tunnel, open_frame_tunnel,
     receive_hub_hello, CappedBackoff, ControlSender, ControlSession, SessionFrameSlot,
     TransportConfig, TransportError, VerifiedSession,
 };
 use http::Uri;
+#[cfg(any(windows, test))]
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::{CommandExecutor, CommandOutcome, ExecutionSession, FrameSink};
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use crate::observability;
 use crate::observability::AgentLogRecord;
 use crate::profile_store::ProfileStore;
 
 #[cfg(windows)]
-use crate::local_control::{AuditEvent, AuditSink, LocalControlAdapter, LocalControlRuntime};
+const PRODUCTION_AUDIT_STATE_DIR: &str = r"C:\ProgramData\FairyPam\Agent\audit";
+#[cfg(windows)]
+const LOCAL_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(any(windows, test))]
+use crate::local_control::LocalControlRuntime;
+#[cfg(windows)]
+use crate::local_control::{AuditEvent, AuditSink, LocalControlAdapter};
 #[cfg(all(windows, feature = "dev-automation"))]
 use fairypam_agent_core::state::Effect;
 #[cfg(all(windows, feature = "dev-automation"))]
@@ -36,9 +49,11 @@ use fairypam_agent_dev_automation::{
     AutomationCapability, AutomationTarget, DevSessionManager, DevSessionRequest,
     DevSessionRevocationReason,
 };
+#[cfg(any(windows, test))]
+use fairypam_agent_local_protocol::LocalCommand;
 use fairypam_agent_local_protocol::LogLevel;
 #[cfg(windows)]
-use fairypam_agent_local_protocol::{decode_request_or_error_response, encode_frame, LocalCommand};
+use fairypam_agent_local_protocol::{decode_request_or_error_response, encode_frame};
 #[cfg(all(windows, feature = "dev-automation"))]
 use fairypam_agent_local_protocol::{LocalError, RequestEnvelope, ResponseEnvelope};
 #[cfg(windows)]
@@ -54,9 +69,79 @@ pub struct RuntimeConfig {
     pub build_commit: String,
     pub profiles: ProfileStore,
     enrollment_generation: Option<String>,
+    awaiting_enrollment: bool,
 }
 
 impl RuntimeConfig {
+    /// Production Agent instances are deliberately able to serve the local,
+    /// authenticated enrollment pipe before any Hub credentials exist.
+    #[cfg(windows)]
+    pub fn from_production() -> Result<Self, AgentError> {
+        if enrollment_state_exists() {
+            return match Self::from_enrollment_state() {
+                Ok(config) => Ok(config),
+                Err(error) => {
+                    tracing::warn!(
+                        code = error.code(),
+                        "invalid enrollment state ignored; local registration remains available"
+                    );
+                    Ok(Self::unregistered())
+                }
+            };
+        } else if [
+            "FAIRYPAM_PROFILE_ROOT_PUBLIC_KEY_HEX",
+            "FAIRYPAM_PROFILE_DIR",
+            "FAIRYPAM_CONTROL_ENDPOINT",
+            "FAIRYPAM_FRAME_ENDPOINT",
+            "FAIRYPAM_HUB_SERVER_NAME",
+            "FAIRYPAM_AGENT_ID",
+            "FAIRYPAM_CA_PEM",
+            "FAIRYPAM_AGENT_CERT_PEM",
+            "FAIRYPAM_AGENT_KEY_PEM",
+        ]
+        .into_iter()
+        .any(|name| env::var_os(name).is_some())
+        {
+            // Preserve the explicitly configured developer/test runtime; an
+            // unregistered production package has no such endpoint.
+            Self::from_env()
+        } else {
+            Ok(Self::unregistered())
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn from_production() -> Result<Self, AgentError> {
+        Self::from_env()
+    }
+
+    #[cfg(any(windows, test))]
+    fn unregistered() -> Self {
+        Self {
+            transport: TransportConfig {
+                control_endpoint: "https://unregistered.invalid"
+                    .parse()
+                    .expect("fixed unregistered URI"),
+                frame_endpoint: "https://unregistered.invalid"
+                    .parse()
+                    .expect("fixed unregistered URI"),
+                server_name: "unregistered".to_owned(),
+                agent_id: "unregistered".to_owned(),
+                ca_pem: PathBuf::new(),
+                identity_cert_pem: PathBuf::new(),
+                identity_key_pem: PathBuf::new(),
+                connect_timeout: Duration::from_secs(10),
+            },
+            agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+            build_commit: option_env!("FAIRYPAM_BUILD_COMMIT")
+                .unwrap_or("unknown")
+                .to_owned(),
+            profiles: ProfileStore::default(),
+            enrollment_generation: None,
+            awaiting_enrollment: true,
+        }
+    }
+
     pub fn from_env() -> Result<Self, AgentError> {
         #[cfg(windows)]
         if enrollment_state_exists() {
@@ -83,14 +168,21 @@ impl RuntimeConfig {
                 .to_owned(),
             profiles,
             enrollment_generation: None,
+            awaiting_enrollment: false,
         })
     }
 
     #[cfg(windows)]
     fn from_enrollment_state() -> Result<Self, AgentError> {
-        let root = PathBuf::from(r"C:\\ProgramData\\FairyPam\\Agent\\enrollment");
+        let root = PathBuf::from(r"C:\ProgramData\FairyPam\Agent\enrollment");
+        crate::enrollment::ensure_private_directory(&root)?;
         let pointer = load_private_json(&root.join("current.json"))?;
         let generation = enrollment_field(&pointer, "generation")?;
+        Self::from_enrollment_candidate(&root, generation)
+    }
+
+    #[cfg(windows)]
+    fn from_enrollment_candidate(root: &Path, generation: String) -> Result<Self, AgentError> {
         if !generation.starts_with("g-")
             || generation.len() > 80
             || generation
@@ -104,6 +196,7 @@ impl RuntimeConfig {
         }
         let directory = root.join(&generation);
         let document = load_private_json(&directory.join("runtime.json"))?;
+        validate_enrollment_expiry(&enrollment_field(&document, "expires_at")?)?;
         let verifier = Ed25519SignatureVerifier::from_public_key_hex(&enrollment_field(
             &document,
             "profile_root_public_key_hex",
@@ -140,13 +233,52 @@ impl RuntimeConfig {
                 .to_owned(),
             profiles,
             enrollment_generation: Some(generation),
+            awaiting_enrollment: false,
         })
     }
 }
 
+#[cfg(any(windows, test))]
+fn validate_enrollment_expiry(value: &str) -> Result<(), AgentError> {
+    let expires_at = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        AgentError::new(
+            "runtime.enrollment_invalid",
+            "invalid enrollment expiration",
+        )
+    })?;
+    (expires_at > OffsetDateTime::now_utc())
+        .then_some(())
+        .ok_or_else(|| {
+            AgentError::new(
+                "runtime.enrollment_invalid",
+                "enrollment credential has expired",
+            )
+        })
+}
+
+#[cfg(windows)]
+pub(crate) fn validate_enrollment_candidate(
+    root: &Path,
+    generation: &str,
+) -> Result<(), AgentError> {
+    crate::enrollment::ensure_private_directory(root)?;
+    let candidate = RuntimeConfig::from_enrollment_candidate(root, generation.to_owned())?;
+    validate_transport_config(&candidate.transport).map_err(|_| {
+        AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment transport identity is invalid",
+        )
+    })
+}
+
 #[cfg(windows)]
 fn enrollment_state_exists() -> bool {
-    Path::new(r"C:\\ProgramData\\FairyPam\\Agent\\enrollment\\current.json").exists()
+    let root = Path::new(r"C:\ProgramData\FairyPam\Agent\enrollment");
+    crate::enrollment::ensure_private_directory(root).is_ok()
+        && root
+            .join("current.json")
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
 #[cfg(windows)]
@@ -291,25 +423,67 @@ pub struct GrpcSessionDriver {
     config: Arc<Mutex<RuntimeConfig>>,
     state: Arc<Mutex<RuntimeState>>,
     execution: Arc<Mutex<CommandExecutor>>,
+    enrollment_ready: Arc<tokio::sync::Notify>,
+    reconnect_requested: Arc<tokio::sync::Notify>,
+    registration_in_progress: Arc<AtomicBool>,
 }
 
 impl GrpcSessionDriver {
     pub fn new(config: RuntimeConfig) -> Self {
         let execution = CommandExecutor::production(config.profiles.clone());
+        let state = if config.awaiting_enrollment {
+            let mut state = RuntimeState {
+                last_error_code: "runtime.not_registered".to_owned(),
+                ..RuntimeState::default()
+            };
+            state.record(
+                LogLevel::Info,
+                "Agent is awaiting authenticated Hub registration",
+            );
+            state
+        } else {
+            RuntimeState::default()
+        };
         Self {
             config: Arc::new(Mutex::new(config)),
-            state: Arc::new(Mutex::new(RuntimeState::default())),
+            state: Arc::new(Mutex::new(state)),
             execution: Arc::new(Mutex::new(execution)),
+            enrollment_ready: Arc::new(tokio::sync::Notify::new()),
+            reconnect_requested: Arc::new(tokio::sync::Notify::new()),
+            registration_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     fn local_runtime(&self) -> SharedRuntime {
         SharedRuntime {
             execution: Arc::clone(&self.execution),
             state: Arc::clone(&self.state),
             config: Arc::clone(&self.config),
+            enrollment_ready: Arc::clone(&self.enrollment_ready),
+            reconnect_requested: Arc::clone(&self.reconnect_requested),
+            registration_in_progress: Arc::clone(&self.registration_in_progress),
         }
+    }
+
+    fn is_registered(&self) -> Result<bool, AgentError> {
+        Ok(!self.config.lock().map_err(lock_error)?.awaiting_enrollment)
+    }
+
+    #[cfg(any(windows, test))]
+    async fn wait_until_registered(&self) -> Result<(), AgentError> {
+        while !self.is_registered()? {
+            self.wait_for_enrollment_ready().await;
+        }
+        Ok(())
+    }
+
+    async fn wait_for_enrollment_ready(&self) {
+        self.enrollment_ready.notified().await;
+    }
+
+    async fn wait_for_reconnect(&self) {
+        self.reconnect_requested.notified().await;
     }
 
     fn session_parts(
@@ -335,7 +509,8 @@ impl GrpcSessionDriver {
             let Some(expected) = expected else {
                 return Ok(false);
             };
-            let root = Path::new(r"C:\\ProgramData\\FairyPam\\Agent\\enrollment");
+            let root = Path::new(r"C:\ProgramData\FairyPam\Agent\enrollment");
+            crate::enrollment::ensure_private_directory(root)?;
             let pointer = load_private_json(&root.join("current.json"))?;
             Ok(enrollment_field(&pointer, "generation")? != expected)
         }
@@ -347,6 +522,13 @@ impl GrpcSessionDriver {
 impl SessionDriver for GrpcSessionDriver {
     async fn establish_session(&self, cancellation: CancellationToken) -> Result<(), AgentError> {
         let config = self.config.lock().map_err(lock_error)?.clone();
+        #[cfg(windows)]
+        if config.awaiting_enrollment {
+            return Err(AgentError::new(
+                "runtime.not_registered",
+                "Agent is awaiting authenticated Hub registration",
+            ));
+        }
         if let Ok(mut state) = self.state.lock() {
             state.control_state = ConnectionState::Connecting;
             state.frame_state = ConnectionState::Connecting;
@@ -421,6 +603,12 @@ impl SessionDriver for GrpcSessionDriver {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(cancelled()),
+                _ = self.wait_for_reconnect() => {
+                    return Err(AgentError::new(
+                        "runtime.enrollment_changed",
+                        "enrollment changed; reconnecting with current credentials",
+                    ));
+                }
                 _ = enrollment_watch.tick() => {
                     if self.enrollment_changed()? {
                         return Err(AgentError::new(
@@ -612,10 +800,20 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
         .map_err(map_transport)?;
     let mut supervisor = SessionSupervisor::new(hooks, backoff);
     #[cfg(windows)]
-    let local_control = tokio::spawn(run_local_control(
+    let mut local_control = tokio::spawn(run_local_control(
         driver.local_runtime(),
         production_local_control_config()?,
     ));
+    #[cfg(windows)]
+    if !driver.is_registered()? {
+        tokio::select! {
+            result = driver.wait_until_registered() => result?,
+            result = &mut local_control => return match result {
+                Ok(never) => match never {},
+                Err(error) => Err(AgentError::new("local.runtime_join_failed", error.to_string())),
+            },
+        }
+    }
     #[cfg(windows)]
     let result = tokio::select! {
         result = supervisor.run(&driver) => result,
@@ -669,14 +867,18 @@ impl Drop for AgentInstance {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+#[derive(Clone)]
 struct SharedRuntime {
     execution: Arc<Mutex<CommandExecutor>>,
     state: Arc<Mutex<RuntimeState>>,
     config: Arc<Mutex<RuntimeConfig>>,
+    enrollment_ready: Arc<tokio::sync::Notify>,
+    reconnect_requested: Arc<tokio::sync::Notify>,
+    registration_in_progress: Arc<AtomicBool>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 impl LocalControlRuntime for SharedRuntime {
     fn execute(&mut self, command: &LocalCommand) -> Result<serde_json::Value, AgentError> {
         match command {
@@ -684,6 +886,16 @@ impl LocalControlRuntime for SharedRuntime {
             LocalCommand::RunEnvironmentCheck => self.environment_check(),
             LocalCommand::GetLogTail { lines, level } => self.log_tail(*lines, level),
             LocalCommand::ScanInstalledGames => observability::scan_installed_games(),
+            #[cfg(windows)]
+            LocalCommand::RegisterHub {
+                hub_address,
+                registration_code,
+            } => self.register_hub(hub_address, registration_code),
+            #[cfg(all(test, not(windows)))]
+            LocalCommand::RegisterHub { .. } => Err(AgentError::new(
+                "enrollment.platform_unsupported",
+                "Hub registration requires Windows",
+            )),
             _ => self
                 .execution
                 .lock()
@@ -693,8 +905,114 @@ impl LocalControlRuntime for SharedRuntime {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 impl SharedRuntime {
+    #[cfg(windows)]
+    fn register_hub(
+        &self,
+        hub_address: &str,
+        registration_code: &str,
+    ) -> Result<serde_json::Value, AgentError> {
+        // Return before the elevated Agent dialogue is shown. This one pipe
+        // remains available for status and retry requests during the bounded
+        // human-confirmation window.
+        if self.registration_in_progress.swap(true, Ordering::AcqRel) {
+            return Err(AgentError::new(
+                "enrollment.registration_pending",
+                "a Hub registration confirmation is already pending",
+            ));
+        }
+        self.mark_registration_pending();
+        let runtime = self.clone();
+        let hub_address = hub_address.to_owned();
+        let registration_code = registration_code.to_owned();
+        if std::thread::Builder::new()
+            .name("fairypam-enrollment".to_owned())
+            .spawn(move || runtime.finish_registration(hub_address, registration_code))
+            .is_err()
+        {
+            self.registration_in_progress
+                .store(false, Ordering::Release);
+            return Err(AgentError::new(
+                "enrollment.unavailable",
+                "Hub registration could not be started",
+            ));
+        }
+        Ok(registration_pending())
+    }
+
+    #[cfg(windows)]
+    fn finish_registration(&self, hub_address: String, registration_code: String) {
+        let was_waiting = self
+            .config
+            .lock()
+            .map(|config| config.awaiting_enrollment)
+            .unwrap_or(true);
+        let result = crate::enrollment::register_with_confirmation(
+            &hub_address,
+            &registration_code,
+            !was_waiting,
+        )
+        .and_then(|_| RuntimeConfig::from_enrollment_state())
+        .and_then(|config| self.activate_enrollment(config))
+        .map(|_| {
+            if !was_waiting {
+                self.request_reconnect();
+            }
+        });
+        if let Err(error) = result {
+            if let Ok(mut state) = self.state.lock() {
+                state.last_error_code = error.code().to_owned();
+                state.record(LogLevel::Warn, "Hub registration was not completed");
+            }
+            tracing::warn!(code = error.code(), "Hub registration was not completed");
+        }
+        self.registration_in_progress
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(windows)]
+    fn mark_registration_pending(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_error_code = "runtime.enrollment_confirmation_pending".to_owned();
+            state.record(
+                LogLevel::Info,
+                "Hub registration is awaiting elevated Agent confirmation",
+            );
+        }
+    }
+
+    fn request_reconnect(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            // Leave the active generation in place; supervisor cleanup reloads
+            // the persisted replacement before reconnecting.
+            state.last_error_code = "runtime.enrollment_changed".to_owned();
+            state.record(
+                LogLevel::Info,
+                "Hub registration changed; reconnecting safely",
+            );
+        }
+        self.reconnect_requested.notify_one();
+    }
+
+    fn activate_enrollment(&self, config: RuntimeConfig) -> Result<(), AgentError> {
+        let mut execution = self.execution.lock().map_err(lock_error)?;
+        let mut state = self.state.lock().map_err(lock_error)?;
+        let mut current = self.config.lock().map_err(lock_error)?;
+        *execution = CommandExecutor::production(config.profiles.clone());
+        *current = config;
+        state.control_state = ConnectionState::Reconnecting;
+        state.frame_state = ConnectionState::Reconnecting;
+        state.last_error_code = "runtime.enrollment_registered".to_owned();
+        state.record(
+            LogLevel::Info,
+            "Hub registration completed; reconnecting safely",
+        );
+        drop((execution, state, current));
+        self.enrollment_ready.notify_one();
+        Ok(())
+    }
+
     fn connection_status(&self) -> Result<serde_json::Value, AgentError> {
         let capture_active = self
             .execution
@@ -706,7 +1024,7 @@ impl SharedRuntime {
         let state = self.state.lock().map_err(lock_error)?;
         let config = self.config.lock().map_err(lock_error)?;
         Ok(serde_json::json!({
-            "hub_address": display_hub_address(&config.transport.control_endpoint),
+            "hub_address": if config.awaiting_enrollment { String::new() } else { display_hub_address(&config.transport.control_endpoint) },
             "control": state.control_state.as_str(),
             "frame": state.frame_state.as_str(),
             "capture_active": capture_active,
@@ -776,6 +1094,19 @@ impl SharedRuntime {
     }
 }
 
+#[cfg(any(windows, test))]
+fn registration_pending() -> serde_json::Value {
+    serde_json::json!({"status": "pending"})
+}
+
+#[cfg(any(windows, test))]
+async fn before_local_request_deadline<T>(
+    deadline: tokio::time::Instant,
+    operation: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::time::timeout_at(deadline, operation).await.ok()
+}
+
 fn regular_nonempty_file(path: &Path) -> bool {
     path.symlink_metadata().is_ok_and(|metadata| {
         metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0
@@ -796,21 +1127,29 @@ impl RuntimeAudit {
 
 #[cfg(windows)]
 impl AuditSink for RuntimeAudit {
-    fn record(&mut self, event: AuditEvent) {
+    fn record(&mut self, event: AuditEvent) -> Result<(), AgentError> {
         tracing::info!(request_id = %event.request_id, caller_sid_hash = %event.caller_sid_hash, command = %event.command, result_code = %event.result_code, build_id = %event.build_id, "local control mutation audited");
         let Some(state_dir) = &self.state_dir else {
-            return;
+            return Ok(());
         };
         let path = state_dir.join("local-control-audit.jsonl");
-        let line = format!("{}\\n", event.to_json());
-        if let Err(error) = std::fs::OpenOptions::new()
+        let line = format!("{}\n", event.to_json());
+        std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()))
-        {
-            tracing::warn!(path = %path.display(), %error, "local control audit persistence failed");
-        }
+            .and_then(|mut file| {
+                crate::enrollment::restrict_path(&path).map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+                })?;
+                std::io::Write::write_all(&mut file, line.as_bytes())
+            })
+            .map_err(|_| {
+                AgentError::new(
+                    "local.audit_failed",
+                    "local control mutation audit could not be persisted",
+                )
+            })
     }
 }
 
@@ -819,6 +1158,7 @@ struct LocalControlConfig {
     owner: PipeOwner,
     pipe_name: String,
     audit_state_dir: Option<PathBuf>,
+    single_request_connections: bool,
     #[cfg(all(windows, feature = "dev-automation"))]
     dev_session_state_dir: Option<PathBuf>,
 }
@@ -827,10 +1167,13 @@ struct LocalControlConfig {
 fn production_local_control_config() -> Result<LocalControlConfig, AgentError> {
     let owner = current_process_pipe_owner(IntegrityLevel::Medium)
         .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+    let audit_state_dir = PathBuf::from(PRODUCTION_AUDIT_STATE_DIR);
+    crate::enrollment::ensure_private_directory(&audit_state_dir)?;
     Ok(LocalControlConfig {
         owner,
         pipe_name: default_production_pipe_name().to_owned(),
-        audit_state_dir: None,
+        audit_state_dir: Some(audit_state_dir),
+        single_request_connections: true,
         #[cfg(all(windows, feature = "dev-automation"))]
         dev_session_state_dir: None,
     })
@@ -844,6 +1187,7 @@ async fn run_local_control(
     #[cfg(all(windows, feature = "dev-automation"))]
     let execution = Arc::clone(&runtime.execution);
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let single_request_connections = config.single_request_connections;
     #[cfg(all(windows, feature = "dev-automation"))]
     let mut dev_session = config
         .dev_session_state_dir
@@ -893,32 +1237,32 @@ async fn run_local_control(
                 }
                 None => 0,
             };
+            let request_deadline = tokio::time::Instant::now() + LOCAL_CONTROL_REQUEST_TIMEOUT;
             #[cfg(all(windows, feature = "dev-automation"))]
-            let prefix_result = match dev_session
+            let request_deadline = dev_session
                 .as_ref()
                 .and_then(DevConnectionSession::expires_at)
+                .map(tokio::time::Instant::from_std)
+                .map_or(request_deadline, |deadline| request_deadline.min(deadline));
+            match before_local_request_deadline(
+                request_deadline,
+                pipe.read_exact(&mut prefix[prefix_start..]),
+            )
+            .await
             {
-                Some(deadline) => match tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    pipe.read_exact(&mut prefix[prefix_start..]),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        if let Some(session) = &mut dev_session {
-                            apply_dev_effects(&execution, session.expire());
-                        }
-                        continue;
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    tracing::debug!(%error, "local control client disconnected");
+                    break;
+                }
+                None => {
+                    tracing::warn!("local control request prefix exceeded deadline");
+                    #[cfg(all(windows, feature = "dev-automation"))]
+                    if let Some(session) = &mut dev_session {
+                        apply_dev_effects(&execution, session.expire());
                     }
-                },
-                None => pipe.read_exact(&mut prefix[prefix_start..]).await,
-            };
-            #[cfg(not(all(windows, feature = "dev-automation")))]
-            let prefix_result = pipe.read_exact(&mut prefix[prefix_start..]).await;
-            if let Err(error) = prefix_result {
-                tracing::debug!(%error, "local control client disconnected");
-                break;
+                    break;
+                }
             }
             let length = u32::from_le_bytes(prefix) as usize;
             if length > fairypam_agent_local_protocol::MAX_FRAME_BYTES {
@@ -927,32 +1271,22 @@ async fn run_local_control(
             }
             let mut frame = prefix.to_vec();
             frame.resize(4 + length, 0);
-            #[cfg(all(windows, feature = "dev-automation"))]
-            let body_result = match dev_session
-                .as_ref()
-                .and_then(DevConnectionSession::expires_at)
-            {
-                Some(deadline) => match tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    pipe.read_exact(&mut frame[4..]),
-                )
+            match before_local_request_deadline(request_deadline, pipe.read_exact(&mut frame[4..]))
                 .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        if let Some(session) = &mut dev_session {
-                            apply_dev_effects(&execution, session.expire());
-                        }
-                        continue;
+            {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    tracing::debug!(%error, "local control client disconnected before request completed");
+                    break;
+                }
+                None => {
+                    tracing::warn!("local control request body exceeded deadline");
+                    #[cfg(all(windows, feature = "dev-automation"))]
+                    if let Some(session) = &mut dev_session {
+                        apply_dev_effects(&execution, session.expire());
                     }
-                },
-                None => pipe.read_exact(&mut frame[4..]).await,
-            };
-            #[cfg(not(all(windows, feature = "dev-automation")))]
-            let body_result = pipe.read_exact(&mut frame[4..]).await;
-            if let Err(error) = body_result {
-                tracing::debug!(%error, "local control client disconnected before request completed");
-                break;
+                    break;
+                }
             }
             let response = match decode_request_or_error_response(&frame) {
                 Ok(request) => {
@@ -1009,8 +1343,19 @@ async fn run_local_control(
                     break;
                 }
             };
-            if let Err(error) = pipe.write_all(&frame).await {
-                tracing::debug!(%error, "local control response could not be delivered");
+            let response_deadline = tokio::time::Instant::now() + LOCAL_CONTROL_REQUEST_TIMEOUT;
+            match before_local_request_deadline(response_deadline, pipe.write_all(&frame)).await {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    tracing::debug!(%error, "local control response could not be delivered");
+                    break;
+                }
+                None => {
+                    tracing::warn!("local control response write exceeded deadline");
+                    break;
+                }
+            }
+            if single_request_connections {
                 break;
             }
         }
@@ -1159,7 +1504,7 @@ impl DevConnectionSession {
             .append(true)
             .open(&path)
             .and_then(|mut file| {
-                std::io::Write::write_all(&mut file, format!("{line}\\n").as_bytes())
+                std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes())
             })
         {
             tracing::warn!(path = %path.display(), %error, "Dev session audit persistence failed");
@@ -1180,7 +1525,7 @@ impl DevConnectionSession {
             .append(true)
             .open(&path)
             .and_then(|mut file| {
-                std::io::Write::write_all(&mut file, format!("{line}\\n").as_bytes())
+                std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes())
             })
         {
             tracing::warn!(path = %path.display(), %error, "Dev local control diagnostics persistence failed");
@@ -1249,7 +1594,10 @@ pub async fn run_dev_local() -> Result<(), AgentError> {
                 build_commit: "unknown".to_owned(),
                 profiles,
                 enrollment_generation: None,
+                awaiting_enrollment: false,
             })),
+            enrollment_ready: Arc::new(tokio::sync::Notify::new()),
+            reconnect_requested: Arc::new(tokio::sync::Notify::new()),
         },
         config,
     )
@@ -1300,6 +1648,7 @@ fn dev_local_control_config() -> Result<LocalControlConfig, AgentError> {
         owner,
         pipe_name,
         audit_state_dir: Some(PathBuf::from(state_dir)),
+        single_request_connections: false,
         dev_session_state_dir: Some(PathBuf::from(state_dir)),
     })
 }
@@ -1326,7 +1675,7 @@ fn required_path(name: &'static str) -> Result<PathBuf, AgentError> {
     Ok(PathBuf::from(required(name)?))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn display_hub_address(uri: &Uri) -> String {
     let Some(host) = uri.host() else {
         return "unavailable".to_owned();
@@ -1430,6 +1779,7 @@ fn now_unix_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use fairypam_agent_local_protocol::LocalCommand;
     use fairypam_agent_protocol::v1::{CloseTarget, FocusTarget, HubControlCommand};
 
     use super::*;
@@ -1485,6 +1835,84 @@ mod tests {
         assert!(regular_nonempty_file(&populated));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enrollment_expiration_must_be_valid_rfc3339_and_in_the_future() {
+        assert!(validate_enrollment_expiry("2999-01-01T00:00:00Z").is_ok());
+        assert_eq!(
+            validate_enrollment_expiry("2000-01-01T00:00:00Z")
+                .unwrap_err()
+                .code(),
+            "runtime.enrollment_invalid"
+        );
+        assert_eq!(
+            validate_enrollment_expiry("not-a-timestamp")
+                .unwrap_err()
+                .code(),
+            "runtime.enrollment_invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregistered_runtime_keeps_local_control_then_notifies_supervisor() {
+        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        let mut local = driver.local_runtime();
+
+        assert!(!driver.is_registered().unwrap());
+        assert_eq!(
+            local.execute(&LocalCommand::GetConnectionStatus).unwrap()["hub_address"],
+            ""
+        );
+
+        let mut enrolled = RuntimeConfig::unregistered();
+        enrolled.transport.control_endpoint = "https://hub.example/control".parse().unwrap();
+        enrolled.enrollment_generation = Some("g-test".to_owned());
+        enrolled.awaiting_enrollment = false;
+        let supervisor_gate = driver.wait_until_registered();
+        tokio::pin!(supervisor_gate);
+        local.activate_enrollment(enrolled).unwrap();
+
+        tokio::time::timeout(Duration::from_millis(10), supervisor_gate)
+            .await
+            .expect("registration must wake the supervisor")
+            .expect("registration state must remain readable");
+
+        assert!(driver.is_registered().unwrap());
+        assert_eq!(
+            local.execute(&LocalCommand::GetConnectionStatus).unwrap()["hub_address"],
+            "https://hub.example"
+        );
+
+        local.request_reconnect();
+        tokio::time::timeout(Duration::from_millis(10), driver.wait_for_reconnect())
+            .await
+            .expect("re-registration must wake the active supervisor");
+    }
+
+    #[test]
+    fn registration_pending_exposes_only_status() {
+        let response = registration_pending();
+
+        assert_eq!(response, serde_json::json!({"status": "pending"}));
+        assert_eq!(response.as_object().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_request_deadline_expires_without_poisoning_the_next_read() {
+        let expired = before_local_request_deadline(
+            tokio::time::Instant::now(),
+            std::future::pending::<()>(),
+        )
+        .await;
+        let recovered = before_local_request_deadline(
+            tokio::time::Instant::now() + Duration::from_millis(10),
+            std::future::ready(7_u8),
+        )
+        .await;
+
+        assert_eq!(expired, None);
+        assert_eq!(recovered, Some(7));
     }
 
     #[cfg(all(windows, feature = "dev-automation"))]

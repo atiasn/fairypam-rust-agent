@@ -6,13 +6,18 @@ use fairypam_agent_local_protocol::LocalResponse;
 use fairypam_agent_local_protocol::{LocalCommand, LogLevel};
 use serde::{de::DeserializeOwned, Serialize};
 
+#[cfg(windows)]
+use crate::dto::StatusDto;
 use crate::dto::{
     ConnectionStatusDto, EnvironmentCheckDto, InstalledGamesDto, LogTailDto, OverviewDto,
+    RegistrationStatusDto,
 };
 
 #[cfg(windows)]
 const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\FairyPam.Agent.v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct UiCommandError {
@@ -45,24 +50,14 @@ impl From<LocalClientError> for UiCommandError {
 
 pub struct ProductionGateway {
     #[cfg(windows)]
-    client: tokio::sync::Mutex<
-        fairypam_agent_local_client::LocalClient<
-            fairypam_agent_local_client::WindowsNamedPipeClientTransport,
-        >,
-    >,
+    pipe_name: &'static str,
 }
 
 impl ProductionGateway {
     #[cfg(windows)]
     pub fn new() -> Self {
-        use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
-
-        let pipe_name =
-            std::env::var("FAIRYPAM_AGENT_PIPE").unwrap_or_else(|_| DEFAULT_PIPE_NAME.to_owned());
         Self {
-            client: tokio::sync::Mutex::new(LocalClient::new(
-                WindowsNamedPipeClientTransport::new(pipe_name),
-            )),
+            pipe_name: DEFAULT_PIPE_NAME,
         }
     }
 
@@ -77,10 +72,15 @@ impl ProductionGateway {
         command: LocalCommand,
         timeout: Duration,
     ) -> Result<T, UiCommandError> {
-        let response = self
-            .client
-            .lock()
-            .await
+        use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
+
+        // Product requests use one authenticated connection each. This keeps a
+        // verified but idle client from owning the Agent's only Pipe instance.
+        let mut client = LocalClient::new(WindowsNamedPipeClientTransport::new_verified_sibling(
+            self.pipe_name,
+            "fairypam-agent.exe",
+        ));
+        let response = client
             .request(command, timeout)
             .await
             .map_err(UiCommandError::from)?;
@@ -138,6 +138,15 @@ impl ProductionGateway {
         })
     }
 
+    #[cfg(windows)]
+    pub async fn status_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<StatusDto, UiCommandError> {
+        self.request_with_timeout(LocalCommand::Status, timeout)
+            .await
+    }
+
     pub async fn connection_status(&self) -> Result<ConnectionStatusDto, UiCommandError> {
         self.request(LocalCommand::GetConnectionStatus).await
     }
@@ -166,6 +175,27 @@ impl ProductionGateway {
 
     pub async fn installed_games(&self) -> Result<InstalledGamesDto, UiCommandError> {
         self.request(LocalCommand::ScanInstalledGames).await
+    }
+
+    pub async fn register_hub(
+        &self,
+        hub_address: String,
+        registration_code: String,
+    ) -> Result<RegistrationStatusDto, UiCommandError> {
+        let command = LocalCommand::RegisterHub {
+            hub_address,
+            registration_code,
+        };
+        #[cfg(windows)]
+        {
+            return self
+                .request_with_timeout(command, REGISTRATION_TIMEOUT)
+                .await;
+        }
+        #[cfg(not(windows))]
+        {
+            self.request(command).await
+        }
     }
 }
 

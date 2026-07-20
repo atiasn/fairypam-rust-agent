@@ -7,13 +7,11 @@ vi.mock('./lib/agentApi', () => ({
   agentApi: {
     ensureLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
     getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false }, doctor: { profiles: [], runtime: 'dry_run' } }),
-    getEnrollmentMode: vi.fn().mockResolvedValue({ status: 'standard' }),
     getConnectionStatus: vi.fn().mockResolvedValue({ hub_address: '', control: 'offline', frame: 'offline', capture_active: false, recovery_code: '' }),
     runEnvironmentCheck: vi.fn().mockResolvedValue({ checks: [] }),
     getLogTail: vi.fn().mockResolvedValue({ entries: [] }),
     scanInstalledGames: vi.fn().mockResolvedValue({ games: [] }),
-    startEnrollment: vi.fn().mockResolvedValue({ status: 'elevation_requested' }),
-    completeEnrollment: vi.fn().mockResolvedValue({ status: 'completed' }),
+    registerHub: vi.fn().mockResolvedValue({ status: 'pending' }),
   },
 }));
 

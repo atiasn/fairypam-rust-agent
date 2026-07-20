@@ -1,6 +1,5 @@
 export const queryKeys = {
   startup: ['agent-ui', 'startup'] as const,
-  enrollmentMode: ['agent-ui', 'enrollment-mode'] as const,
   overview: ['agent-ui', 'overview'] as const,
   connection: ['agent-ui', 'connection'] as const,
   games: ['agent-ui', 'games'] as const,

@@ -4,6 +4,8 @@ use fairypam_agent_core::AgentError;
 use fairypam_agent_local_protocol::{
     LocalCommand, LocalError, LocalResponse, NonceReplayGuard, RequestEnvelope, ResponseEnvelope,
 };
+#[cfg(windows)]
+use fairypam_agent_windows::verify_fixed_gui_caller;
 use fairypam_agent_windows::{
     verify_pipe_caller, LocalIdentityError, PipeOwner, VerifiedPipeCaller,
 };
@@ -44,7 +46,7 @@ impl AuditEvent {
 }
 
 pub trait AuditSink {
-    fn record(&mut self, event: AuditEvent);
+    fn record(&mut self, event: AuditEvent) -> Result<(), AgentError>;
 }
 
 pub struct LocalControlAdapter<R, A> {
@@ -73,7 +75,40 @@ impl<R: LocalControlRuntime, A: AuditSink> LocalControlAdapter<R, A> {
     ) -> Result<ResponseEnvelope, LocalIdentityError> {
         verify_pipe_caller(&self.owner, caller.clone())?;
 
+        #[cfg(windows)]
+        if matches!(&request.command, LocalCommand::RegisterHub { .. }) {
+            if let Err(error) = verify_fixed_gui_caller(caller.pid) {
+                let _ = self.audit.record(AuditEvent {
+                    request_id: request.request_id.clone(),
+                    caller_sid_hash: sha256_hex(&caller.user_sid),
+                    command: "register_hub".to_owned(),
+                    result_code: error.code().to_owned(),
+                    build_id: self.build_id.clone(),
+                    occurred_at: SystemTime::now(),
+                });
+                return Err(error);
+            }
+        }
+
+        let mutation = is_mutation(&request.command);
+        let command = command_name(&request.command).to_owned();
         if let Err(error) = self.nonces.accept(request.nonce) {
+            if mutation {
+                if let Err(audit_error) = self.audit.record(AuditEvent {
+                    request_id: request.request_id.clone(),
+                    caller_sid_hash: sha256_hex(&caller.user_sid),
+                    command,
+                    result_code: error.code().to_owned(),
+                    build_id: self.build_id.clone(),
+                    occurred_at: SystemTime::now(),
+                }) {
+                    return Ok(error_response(
+                        request.request_id,
+                        audit_error.code(),
+                        audit_error.to_string(),
+                    ));
+                }
+            }
             return Ok(error_response(
                 request.request_id,
                 error.code(),
@@ -81,10 +116,24 @@ impl<R: LocalControlRuntime, A: AuditSink> LocalControlAdapter<R, A> {
             ));
         }
 
-        let mutation = is_mutation(&request.command);
-        let command = command_name(&request.command).to_owned();
+        if mutation {
+            if let Err(error) = self.audit.record(AuditEvent {
+                request_id: request.request_id.clone(),
+                caller_sid_hash: sha256_hex(&caller.user_sid),
+                command: command.clone(),
+                result_code: "attempt".to_owned(),
+                build_id: self.build_id.clone(),
+                occurred_at: SystemTime::now(),
+            }) {
+                return Ok(error_response(
+                    request.request_id,
+                    error.code(),
+                    error.to_string(),
+                ));
+            }
+        }
         let result = self.runtime.execute(&request.command).map_err(domain_error);
-        let response = match result {
+        let mut response = match result {
             Ok(body) => ResponseEnvelope {
                 request_id: request.request_id.clone(),
                 result: Ok(LocalResponse { body }),
@@ -93,17 +142,27 @@ impl<R: LocalControlRuntime, A: AuditSink> LocalControlAdapter<R, A> {
         };
         if mutation {
             let result_code = match &response.result {
+                Ok(response)
+                    if command == "register_hub"
+                        && response.body.get("status").and_then(Value::as_str)
+                            == Some("pending") =>
+                {
+                    "pending".to_owned()
+                }
                 Ok(_) => "ok".to_owned(),
                 Err(error) => error.code.clone(),
             };
-            self.audit.record(AuditEvent {
+            if let Err(error) = self.audit.record(AuditEvent {
                 request_id: request.request_id,
                 caller_sid_hash: sha256_hex(&caller.user_sid),
                 command,
                 result_code,
                 build_id: self.build_id.clone(),
                 occurred_at: SystemTime::now(),
-            });
+            }) {
+                response =
+                    error_response(response.request_id.clone(), error.code(), error.to_string());
+            }
         }
         Ok(response)
     }
@@ -145,7 +204,8 @@ fn is_mutation(command: &LocalCommand) -> bool {
         | LocalCommand::FocusTarget
         | LocalCommand::StartCapture { .. }
         | LocalCommand::StopCapture { .. }
-        | LocalCommand::ReleaseAll => true,
+        | LocalCommand::ReleaseAll
+        | LocalCommand::RegisterHub { .. } => true,
         #[cfg(feature = "dev-automation")]
         LocalCommand::TestbedPulse => true,
         _ => false,
@@ -171,6 +231,7 @@ fn command_name(command: &LocalCommand) -> &'static str {
         LocalCommand::RunEnvironmentCheck => "run_environment_check",
         LocalCommand::GetLogTail { .. } => "get_log_tail",
         LocalCommand::ScanInstalledGames => "scan_installed_games",
+        LocalCommand::RegisterHub { .. } => "register_hub",
     }
 }
 

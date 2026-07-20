@@ -729,12 +729,14 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
+ "windows 0.62.2",
 ]
 
 [[package]]
 name = "fairypam-agent-local-protocol"
 version = "0.1.0"
 dependencies = [
+ "http",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -746,21 +748,10 @@ version = "0.1.0"
 dependencies = [
  "fairypam-agent-local-client",
  "fairypam-agent-local-protocol",
- "fairypam-agentctl",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
- "tokio",
-]
-
-[[package]]
-name = "fairypam-agentctl"
-version = "0.1.0"
-dependencies = [
- "fairypam-agent-local-client",
- "fairypam-agent-local-protocol",
- "serde_json",
  "tokio",
  "windows 0.62.2",
 ]

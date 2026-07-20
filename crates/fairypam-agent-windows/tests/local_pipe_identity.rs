@@ -1,5 +1,6 @@
 use fairypam_agent_windows::{
-    explicit_owner_sddl, verify_pipe_caller, IntegrityLevel, PipeOwner, VerifiedPipeCaller,
+    explicit_owner_sddl, fixed_gui_image_matches, verify_pipe_caller, IntegrityLevel, PipeOwner,
+    VerifiedPipeCaller,
 };
 
 fn owner() -> PipeOwner {
@@ -65,4 +66,55 @@ fn dacl_is_owner_only_and_rejects_sddl_injection() {
             .code(),
         "local.identity.owner_sid_invalid"
     );
+}
+
+#[test]
+fn registration_rejects_same_user_non_gui_process_images() {
+    assert!(fixed_gui_image_matches(
+        r"C:\Program Files\FairyPam\fairypam-agent-tauri-ui.exe",
+        r"\\?\C:\Program Files\FairyPam\fairypam-agent-tauri-ui.exe"
+    ));
+    assert!(!fixed_gui_image_matches(
+        r"C:\Program Files\FairyPam\fairypam-agent-tauri-ui.exe",
+        r"C:\Program Files\FairyPam\not-the-gui.exe"
+    ));
+}
+
+#[test]
+fn register_hub_gui_proof_is_server_side_and_fails_closed_before_runtime_dispatch() {
+    let pipe = include_str!("../src/local_pipe.rs");
+    let adapter = include_str!("../../../bins/fairypam-agent/src/local_control.rs");
+
+    for required in [
+        "protected_program_files_path",
+        "protected_install_path",
+        "protected_install_chain",
+        "has_reparse_component",
+        "std::fs::canonicalize",
+        "FILE_ATTRIBUTE_REPARSE_POINT",
+        "target.strip_prefix(root)",
+        "ImpersonateLoggedOnUser",
+        "path_is_writable",
+        "FILE_ADD_FILE",
+        "FILE_WRITE_DATA",
+        "DELETE.0",
+        "RevertToSelf",
+        "std::process::abort()",
+    ] {
+        assert!(
+            pipe.contains(required),
+            "missing caller trust guard: {required}"
+        );
+    }
+    let caller_guard = adapter
+        .find("if let Err(error) = verify_fixed_gui_caller(caller.pid)")
+        .expect("RegisterHub must verify the fixed product GUI");
+    let nonce_guard = adapter
+        .find("self.nonces.accept(request.nonce)")
+        .expect("requests must pass replay protection");
+    let runtime_dispatch = adapter
+        .find("self.runtime.execute(&request.command)")
+        .expect("validated requests must reach the runtime");
+    assert!(caller_guard < nonce_guard);
+    assert!(caller_guard < runtime_dispatch);
 }

@@ -57,6 +57,10 @@ fn round_trips_all_supported_command_shapes() {
             level: LogLevel::Info,
         },
         LocalCommand::ScanInstalledGames,
+        LocalCommand::RegisterHub {
+            hub_address: "https://hub.example".to_owned(),
+            registration_code: "0123456789abcdef".to_owned(),
+        },
     ];
 
     for command in commands {
@@ -88,13 +92,64 @@ fn observability_commands_are_bounded_and_reject_path_or_secret_fields() {
 }
 
 #[test]
-fn local_control_never_accepts_enrollment_or_hub_credentials() {
+fn registration_is_strictly_bounded_and_rejects_secret_extensions() {
     let enrollment = frame(
         br#"{"protocol_version":1,"request_id":"r","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"command":"enroll_hub","hub_address":"https://hub.example","code":"one-time-code"}"#,
     );
     assert_eq!(
         decode_request(&enrollment).unwrap_err().code(),
         "local.protocol.unsupported_capability"
+    );
+
+    let valid = frame(
+        br#"{"protocol_version":1,"request_id":"r","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"command":"register_hub","hub_address":"https://hub.example","registration_code":"0123456789abcdef"}"#,
+    );
+    assert!(decode_request(&valid).is_ok());
+
+    let non_https = frame(
+        br#"{"protocol_version":1,"request_id":"r","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"command":"register_hub","hub_address":"http://hub.example","registration_code":"0123456789abcdef"}"#,
+    );
+    let error = decode_request(&non_https).unwrap_err();
+    assert_eq!(error.code(), "local.protocol.invalid");
+    assert!(!error.to_string().contains("http://hub.example"));
+    assert!(!error.to_string().contains("0123456789abcdef"));
+
+    for invalid in [
+        LocalCommand::RegisterHub {
+            hub_address: format!("https://{}.example", "a".repeat(2_048)),
+            registration_code: "0123456789abcdef".to_owned(),
+        },
+        LocalCommand::RegisterHub {
+            hub_address: "https://hub.example?redirect=https://other.example".to_owned(),
+            registration_code: "0123456789abcdef".to_owned(),
+        },
+        LocalCommand::RegisterHub {
+            hub_address: "https://hub.example".to_owned(),
+            registration_code: "01234567 9abcdef".to_owned(),
+        },
+        LocalCommand::RegisterHub {
+            hub_address: "https://hub.example:0".to_owned(),
+            registration_code: "0123456789abcdef".to_owned(),
+        },
+        LocalCommand::RegisterHub {
+            hub_address: "https://hub.example:99999".to_owned(),
+            registration_code: "0123456789abcdef".to_owned(),
+        },
+    ] {
+        assert_eq!(
+            decode_request(&encode_frame(&valid_request(invalid)).unwrap())
+                .unwrap_err()
+                .code(),
+            "local.protocol.invalid"
+        );
+    }
+
+    let secret_extension = frame(
+        br#"{"protocol_version":1,"request_id":"r","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"command":"register_hub","hub_address":"https://hub.example","registration_code":"0123456789abcdef","client_key":"must-not-be-accepted"}"#,
+    );
+    assert_eq!(
+        decode_request(&secret_extension).unwrap_err().code(),
+        "local.protocol.invalid"
     );
 }
 

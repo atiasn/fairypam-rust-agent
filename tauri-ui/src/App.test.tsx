@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, within } from '@testing-library/react';
+import { render, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -7,13 +7,11 @@ vi.mock('./lib/agentApi', () => ({
   agentApi: {
     ensureLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
     getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false }, doctor: { profiles: ['signed-profile'], runtime: 'dry_run' } }),
-    getEnrollmentMode: vi.fn().mockResolvedValue({ status: 'standard' }),
     getConnectionStatus: vi.fn().mockResolvedValue({ hub_address: 'https://hub.test', control: 'connected', frame: 'connected', capture_active: false, recovery_code: '' }),
     runEnvironmentCheck: vi.fn().mockResolvedValue({ checks: [] }),
     getLogTail: vi.fn().mockResolvedValue({ entries: [] }),
     scanInstalledGames: vi.fn().mockResolvedValue({ games: [] }),
-    startEnrollment: vi.fn().mockResolvedValue({ status: 'elevation_requested' }),
-    completeEnrollment: vi.fn().mockResolvedValue({ status: 'completed' }),
+    registerHub: vi.fn().mockResolvedValue({ status: 'pending' }),
   },
 }));
 
@@ -43,35 +41,32 @@ describe('App', () => {
     }
   });
 
-  it('shows non-sensitive Hub status and registration opens a protected window', async () => {
+  it('keeps the Agent usable when the bounded Hub observation times out', async () => {
+    vi.mocked(agentApi.ensureLocalAgent).mockResolvedValueOnce({ status: 'hub_wait_timeout' });
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByText('Agent 已就绪，Hub 正在重试连接')).toBeInTheDocument();
+    expect(await view.findByText('已等待 Hub 连接 20 秒，Agent 会继续在后台重试。')).toBeInTheDocument();
+    expect(view.queryByText('Agent 启动需要处理')).not.toBeInTheDocument();
+  });
+
+  it('shows non-sensitive Hub status and submits registration only through the local Gateway', async () => {
     const user = userEvent.setup();
     const app = renderApp();
     const view = within(app.container);
 
     await user.click(view.getByRole('button', { name: '连接与注册' }));
     expect(await view.findByText('https://hub.test')).toBeInTheDocument();
+    await user.clear(view.getByLabelText('Hub HTTPS 地址'));
+    await user.type(view.getByLabelText('Hub HTTPS 地址'), 'https://register.example');
+    await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
-    expect(agentApi.startEnrollment).toHaveBeenCalledOnce();
-    expect(view.getByText(/不会显示或写入命令行/)).toBeInTheDocument();
-  });
-
-  it('does not start the local Agent while the elevated registration window is loading', async () => {
-    vi.mocked(agentApi.ensureLocalAgent).mockClear();
-    vi.mocked(agentApi.getEnrollmentMode).mockResolvedValueOnce({ status: 'elevated' });
-    renderApp();
-
-    expect(await screen.findByRole('heading', { name: '连接 FairyPam Hub' })).toBeInTheDocument();
-    expect(agentApi.ensureLocalAgent).not.toHaveBeenCalled();
-  });
-
-  it('does not invoke normal local-control commands from the elevated registration window', async () => {
-    const initialCalls = vi.mocked(agentApi.ensureLocalAgent).mock.calls.length;
-    vi.mocked(agentApi.getEnrollmentMode).mockResolvedValueOnce({ status: 'elevated' });
-    const app = renderApp();
-    const view = within(app.container);
-
-    expect(await view.findByRole('heading', { name: '连接 FairyPam Hub' })).toBeInTheDocument();
-    expect(agentApi.ensureLocalAgent).toHaveBeenCalledTimes(initialCalls);
+    expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
+    expect(await view.findByText('请在高权限 FairyPam Agent 确认注册；确认前不会使用注册码。若未在短时间内确认，本次注册会失效。')).toBeInTheDocument();
+    expect(view.getByLabelText('一次性注册码')).toHaveValue('');
+    expect(view.getByText(/注册码只经已验证的本地 Agent 通道提交/)).toBeInTheDocument();
+    expect(view.queryByText(/UAC|注册窗口/)).not.toBeInTheDocument();
   });
 
   it('renders separate environment, log, and discovery-only game surfaces', async () => {

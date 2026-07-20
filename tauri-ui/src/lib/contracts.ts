@@ -22,6 +22,7 @@ export type FocusedTarget = {
 export type CaptureState = { capture_source_id: string; state: string };
 export type ReleaseAll = { state: string; holds: number };
 export type SupportStatus = { status: string };
+export type RegistrationStatus = { status: 'pending' };
 export type ExportResult = { saved: boolean; reasonCode?: string };
 export type PreviewDto = { mimeType: 'image/jpeg' | 'image/png'; bytes: number[] };
 export type ConnectionStatus = {

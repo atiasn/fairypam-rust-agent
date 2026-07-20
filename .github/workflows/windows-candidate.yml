@@ -53,14 +53,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/core | Out-Null
           Copy-Item target/release/fairypam-agent.exe dist/core/
           Copy-Item target/release/fairypam-agent-guardian.exe dist/core/
-          Copy-Item target/release/fairypam-agentctl.exe dist/core/
           Copy-Item -Recurse profiles dist/core/profiles
           Copy-Item test-profile-root-public-key.hex dist/core/
           Compress-Archive -Path dist/core/* -DestinationPath dist/fairypam-agent-core-windows.zip
           $sourceCommit = (Get-Content SOURCE_COMMIT -Raw).Trim()
           $agent = Get-Item dist/core/fairypam-agent.exe
           $guardian = Get-Item dist/core/fairypam-agent-guardian.exe
-          $agentctl = Get-Item dist/core/fairypam-agentctl.exe
           $zip = Get-Item dist/fairypam-agent-core-windows.zip
           $receipt = [ordered]@{
             schema_version = 1
@@ -75,8 +73,6 @@ jobs:
             agent_size = $agent.Length
             guardian_sha256 = (Get-FileHash $guardian -Algorithm SHA256).Hash.ToLowerInvariant()
             guardian_size = $guardian.Length
-            agentctl_sha256 = (Get-FileHash $agentctl -Algorithm SHA256).Hash.ToLowerInvariant()
-            agentctl_size = $agentctl.Length
             zip_sha256 = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
             zip_size = $zip.Length
           }

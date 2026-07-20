@@ -1,9 +1,6 @@
 use fairypam_agent_local_client::LocalClientError;
 use fairypam_agent_local_protocol::LocalCommand;
-use fairypam_agentctl::{
-    is_fixed_elevated_ui_invocation, is_fixed_interactive_task_xml, parse_command,
-    parse_enrollment_invocation, CliError, EnrollmentInvocation,
-};
+use fairypam_agentctl::{parse_command, CliError};
 
 fn arguments(values: &[&str]) -> Vec<String> {
     values.iter().map(ToString::to_string).collect()
@@ -77,61 +74,14 @@ fn error_prefixes_have_stable_process_exit_codes() {
 }
 
 #[test]
-fn enrollment_has_only_a_secret_free_uac_trigger() {
-    assert_eq!(
-        parse_enrollment_invocation(&arguments(&["enroll"])).unwrap(),
-        Some(EnrollmentInvocation::LaunchElevatedHelper)
-    );
-    assert_eq!(
-        parse_enrollment_invocation(&arguments(&["--enrollment-helper"])).unwrap(),
-        Some(EnrollmentInvocation::ElevatedHelper)
-    );
-    assert_eq!(
-        parse_enrollment_invocation(&arguments(&["enroll", "--code", "one-time-code"]))
-            .unwrap_err()
-            .exit_code(),
-        2
-    );
-}
+fn agentctl_has_no_product_enrollment_helper_or_agent_dependency() {
+    let library = include_str!("../src/lib.rs");
+    let main = include_str!("../src/main.rs");
+    let manifest = include_str!("../Cargo.toml");
 
-#[test]
-fn elevated_gui_route_requires_the_fixed_argument_and_an_elevated_token() {
-    assert!(is_fixed_elevated_ui_invocation(
-        &arguments(&["--enrollment-helper"]),
-        true,
-    ));
-    assert!(!is_fixed_elevated_ui_invocation(
-        &arguments(&["--enrollment-helper"]),
-        false,
-    ));
-    assert!(!is_fixed_elevated_ui_invocation(
-        &arguments(&["--enrollment-helper", "--extra"]),
-        true,
-    ));
-}
-
-#[test]
-fn production_task_accepts_only_the_fixed_interactive_agent_action() {
-    let action = r"C:\FairyPam\fairypam-agent.exe";
-    let fixed = r#"<Task><Triggers><LogonTrigger></LogonTrigger></Triggers><Principals><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principals><Actions><Exec><Command>C:\FairyPam\fairypam-agent.exe</Command></Exec></Actions></Task>"#;
-    assert!(is_fixed_interactive_task_xml(fixed, action));
-    assert!(!is_fixed_interactive_task_xml(
-        &fixed.replace("</Exec>", "<Arguments>--bad</Arguments></Exec>"),
-        action,
-    ));
-    assert!(!is_fixed_interactive_task_xml(
-        &fixed.replace("fairypam-agent.exe", "cmd.exe"),
-        action,
-    ));
-    assert!(!is_fixed_interactive_task_xml(
-        &fixed.replace("</Triggers>", "<BootTrigger></BootTrigger></Triggers>",),
-        action,
-    ));
-    assert!(!is_fixed_interactive_task_xml(
-        &fixed.replace(
-            "</Actions>",
-            "<Exec><Command>C:\\Windows\\System32\\cmd.exe</Command></Exec></Actions>",
-        ),
-        action,
-    ));
+    for forbidden in ["parse_enrollment", "--enrollment-helper", "schtasks"] {
+        assert!(!library.contains(forbidden));
+        assert!(!main.contains(forbidden));
+    }
+    assert!(!manifest.contains("path = \"../fairypam-agent\""));
 }

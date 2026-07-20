@@ -2,6 +2,7 @@
 
 use std::{collections::VecDeque, fmt};
 
+use http::Uri;
 use serde::{
     de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize, Serializer,
@@ -61,6 +62,10 @@ pub enum LocalCommand {
         level: LogLevel,
     },
     ScanInstalledGames,
+    RegisterHub {
+        hub_address: String,
+        registration_code: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,8 +370,54 @@ fn validate_command(command: &LocalCommand) -> Result<(), LocalProtocolError> {
         LocalCommand::GetLogTail { lines, .. } if *lines == 0 || *lines > 200 => Err(
             LocalProtocolError::invalid("log lines must be within 1..=200"),
         ),
+        LocalCommand::RegisterHub {
+            hub_address,
+            registration_code,
+        } => validate_registration_request(hub_address, registration_code),
         _ => Ok(()),
     }
+}
+
+/// Validates transient Hub registration material without ever copying either
+/// value into an error. The Agent repeats this check at its direct entrypoint.
+pub fn validate_registration_request(
+    hub_address: &str,
+    registration_code: &str,
+) -> Result<(), LocalProtocolError> {
+    let uri = hub_address.parse::<Uri>().ok();
+    let valid_hub = hub_address.len() <= 2_048
+        && uri.as_ref().is_some_and(|uri| {
+            uri.scheme_str()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+                && uri.authority().is_some_and(|authority| {
+                    !authority.as_str().contains('@')
+                        && !authority.host().is_empty()
+                        && authority.port_u16() != Some(0)
+                        && !has_unparseable_explicit_port(authority)
+                })
+                && uri.query().is_none()
+        });
+    let valid_code = (16..=256).contains(&registration_code.len())
+        && registration_code
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic());
+    if valid_hub && valid_code {
+        Ok(())
+    } else {
+        Err(LocalProtocolError::invalid("invalid registration request"))
+    }
+}
+
+fn has_unparseable_explicit_port(authority: &http::uri::Authority) -> bool {
+    let value = authority.as_str();
+    let has_explicit_port = if value.starts_with('[') {
+        value
+            .rsplit_once(']')
+            .is_some_and(|(_, suffix)| !suffix.is_empty())
+    } else {
+        value.contains(':')
+    };
+    has_explicit_port && authority.port().is_none()
 }
 
 fn required_field<T>(object: &Map<String, Value>, name: &str) -> Result<T, LocalProtocolError>
@@ -396,7 +447,8 @@ fn is_supported_command(command: &str) -> bool {
         | "get_connection_status"
         | "run_environment_check"
         | "get_log_tail"
-        | "scan_installed_games" => true,
+        | "scan_installed_games"
+        | "register_hub" => true,
         #[cfg(feature = "dev-automation")]
         "testbed_pulse" => true,
         _ => false,
@@ -412,6 +464,7 @@ fn is_allowed_command_field(command: &str, field: &str) -> bool {
             | ("start_capture", "source_id" | "fps" | "encoding")
             | ("stop_capture", "source_id")
             | ("get_log_tail", "lines" | "level")
+            | ("register_hub", "hub_address" | "registration_code")
     )
 }
 

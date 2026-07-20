@@ -1,7 +1,13 @@
 use thiserror::Error;
 
 #[cfg(windows)]
-use std::{ffi::c_void, mem::size_of, os::windows::io::AsRawHandle};
+use std::{
+    ffi::c_void,
+    mem::size_of,
+    os::windows::io::AsRawHandle,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[cfg(windows)]
 use tokio::{
@@ -11,28 +17,46 @@ use tokio::{
 
 #[cfg(windows)]
 use windows::{
-    core::{PCWSTR, PWSTR},
+    core::{GUID, HSTRING, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL},
+        Foundation::{CloseHandle, LocalFree, ERROR_ACCESS_DENIED, HANDLE, HLOCAL},
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
             },
-            GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf,
-            TokenIntegrityLevel, TokenSessionId, TokenStatistics, TokenUser, PSECURITY_DESCRIPTOR,
-            PSID, SECURITY_ATTRIBUTES, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_STATISTICS,
-            TOKEN_USER,
+            GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+            ImpersonateLoggedOnUser, RevertToSelf, TokenIntegrityLevel, TokenSessionId,
+            TokenStatistics, TokenUser, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+            TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_STATISTICS, TOKEN_USER,
+        },
+        Storage::FileSystem::{
+            CreateFileW, GetFileAttributesW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY,
+            FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_WRITE_DATA, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, WRITE_DAC,
+            WRITE_OWNER,
         },
         System::{
+            Com::CoTaskMemFree,
             Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient},
             SystemServices::{
                 SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID,
                 SECURITY_MANDATORY_MEDIUM_RID,
             },
-            Threading::{GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken},
+            Threading::{
+                GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
+                OpenThreadToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        },
+        UI::Shell::{
+            FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
         },
     },
 };
+
+#[cfg(windows)]
+const FIRST_PREFIX_BYTE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The production pipe namespace; Dev uses a separate feature-gated namespace.
 pub const fn default_production_pipe_name() -> &'static str {
@@ -145,6 +169,22 @@ impl LocalIdentityError {
             "client integrity level is below the pipe minimum",
         )
     }
+
+    #[cfg(windows)]
+    fn gui_image_mismatch() -> Self {
+        Self::new(
+            "local.identity.gui_image_mismatch",
+            "RegisterHub requires the fixed FairyPam GUI sibling",
+        )
+    }
+
+    #[cfg(windows)]
+    fn install_root_mismatch() -> Self {
+        Self::new(
+            "local.identity.install_root_mismatch",
+            "RegisterHub requires the protected FairyPam product installation",
+        )
+    }
 }
 
 /// Opaque native handle passed to the platform-specific identity provider.
@@ -182,6 +222,192 @@ pub fn verify_pipe_caller(
         return Err(LocalIdentityError::integrity_mismatch());
     }
     Ok(caller)
+}
+
+/// Confirms the process image is the fixed GUI sibling, not merely another
+/// process running under the same interactive user.
+pub fn fixed_gui_image_matches(expected: &str, actual: &str) -> bool {
+    crate::normalize_process_path(expected) == crate::normalize_process_path(actual)
+}
+
+/// RegisterHub is the only local command that carries a registration secret.
+/// Same-user pipe access is sufficient for normal read-only commands, but this
+/// command additionally requires the shipped GUI executable.
+#[cfg(windows)]
+pub fn verify_fixed_gui_caller(pid: u32) -> Result<(), LocalIdentityError> {
+    if pid == 0 {
+        return Err(LocalIdentityError::invalid_handle());
+    }
+    let agent = std::env::current_exe().map_err(|_| LocalIdentityError::gui_image_mismatch())?;
+    let expected = agent
+        .parent()
+        .map(|directory| directory.join("fairypam-agent-tauri-ui.exe"))
+        .ok_or_else(LocalIdentityError::gui_image_mismatch)?;
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(windows_identity_error)?;
+    let result = (|| {
+        let image = process_image(process)?;
+        if !fixed_gui_image_matches(&expected.to_string_lossy(), &image) {
+            return Err(LocalIdentityError::gui_image_mismatch());
+        }
+        if !protected_program_files_path(&image, process)? {
+            return Err(LocalIdentityError::install_root_mismatch());
+        }
+        Ok(())
+    })();
+    let _ = unsafe { CloseHandle(process) };
+    result
+}
+
+#[cfg(windows)]
+fn protected_program_files_path(path: &str, process: HANDLE) -> Result<bool, LocalIdentityError> {
+    let roots = [FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86]
+        .iter()
+        .filter_map(|folder| known_folder_path(folder).ok())
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Err(LocalIdentityError::install_root_mismatch());
+    }
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut token) }
+        .map_err(windows_identity_error)?;
+    let impersonated = unsafe { ImpersonateLoggedOnUser(token) }.map_err(windows_identity_error);
+    let result = impersonated.and_then(|_| {
+        for root in &roots {
+            if crate::process_path_is_within(path, root)
+                && protected_install_path(Path::new(path), Path::new(root))?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    });
+    revert_or_abort();
+    let _ = unsafe { CloseHandle(token) };
+    result
+}
+
+/// A Program Files prefix alone is not a trust proof: junctions could redirect
+/// the fixed GUI path outside the protected installation.
+#[cfg(windows)]
+fn protected_install_path(path: &Path, root: &Path) -> Result<bool, LocalIdentityError> {
+    // Resolve only after checking the supplied path's components: a junction
+    // must be rejected, never silently accepted because it resolves below a
+    // Program Files root.
+    if has_reparse_component(root) || has_reparse_component(path) {
+        return Ok(false);
+    }
+    let (Ok(final_root), Ok(final_path)) =
+        (std::fs::canonicalize(root), std::fs::canonicalize(path))
+    else {
+        return Ok(false);
+    };
+    Ok(
+        crate::process_path_is_within(&final_path.to_string_lossy(), &final_root.to_string_lossy())
+            && protected_install_chain(&final_root, &final_path)?,
+    )
+}
+
+#[cfg(windows)]
+fn protected_install_chain(root: &Path, target: &Path) -> Result<bool, LocalIdentityError> {
+    if has_reparse_component(root) {
+        return Ok(false);
+    }
+    let Ok(relative) = target.strip_prefix(root) else {
+        return Ok(false);
+    };
+    let mut current = root.to_path_buf();
+    if path_is_writable(&current)? {
+        return Ok(false);
+    }
+    for component in relative {
+        current.push(component);
+        if has_reparse_component(&current) || path_is_writable(&current)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn path_is_writable(path: &Path) -> Result<bool, LocalIdentityError> {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(true);
+    };
+    let (access, flags) = if metadata.is_dir() {
+        (
+            [
+                DELETE.0,
+                FILE_ADD_FILE.0,
+                FILE_ADD_SUBDIRECTORY.0,
+                FILE_DELETE_CHILD.0,
+                WRITE_DAC.0,
+                WRITE_OWNER.0,
+            ],
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    } else {
+        (
+            [
+                DELETE.0,
+                FILE_WRITE_DATA.0,
+                FILE_APPEND_DATA.0,
+                WRITE_DAC.0,
+                WRITE_OWNER.0,
+                0,
+            ],
+            FILE_ATTRIBUTE_NORMAL,
+        )
+    };
+    for access in access.into_iter().filter(|access| *access != 0) {
+        let handle = unsafe {
+            CreateFileW(
+                &HSTRING::from(path.to_string_lossy().as_ref()),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                flags,
+                None,
+            )
+        };
+        match handle {
+            Ok(handle) => {
+                let _ = unsafe { CloseHandle(handle) };
+                return Ok(true);
+            }
+            Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => {}
+            Err(_) => return Err(LocalIdentityError::install_root_mismatch()),
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn has_reparse_component(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if !matches!(component, std::path::Component::Normal(_)) {
+            continue;
+        }
+        let attributes =
+            unsafe { GetFileAttributesW(&HSTRING::from(current.to_string_lossy().as_ref())) };
+        if attributes == INVALID_FILE_ATTRIBUTES || attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn known_folder_path(folder: &GUID) -> Result<String, LocalIdentityError> {
+    let path = unsafe { SHGetKnownFolderPath(folder, KF_FLAG_DEFAULT, None) }
+        .map_err(windows_identity_error)?;
+    let result = unsafe { path.to_string() }.map_err(utf16_identity_error);
+    unsafe { CoTaskMemFree(Some(path.0.cast())) };
+    result
 }
 
 /// Produce the explicit, protected DACL used for a production server instance.
@@ -231,10 +457,18 @@ impl PipeIdentityProvider for WindowsPipeIdentityProvider {
             let _ = unsafe { CloseHandle(token) };
             claims
         })();
-        let revert = unsafe { RevertToSelf() }.map_err(windows_identity_error);
-        revert?;
+        revert_or_abort();
         let caller = result?;
         verify_pipe_caller(owner, caller)
+    }
+}
+
+#[cfg(windows)]
+fn revert_or_abort() {
+    if unsafe { RevertToSelf() }.is_err() {
+        // Continuing under an untrusted client token would corrupt every later
+        // authorization decision in this Agent process.
+        std::process::abort();
     }
 }
 
@@ -287,10 +521,13 @@ impl WindowsNamedPipeServer {
         self.server.connect().await.map_err(io_identity_error)?;
         // ponytail: Win32 impersonates the last read message; retain one unparsed prefix byte until identity verification.
         let mut first_prefix_byte = [0_u8; 1];
-        self.server
-            .read_exact(&mut first_prefix_byte)
-            .await
-            .map_err(io_identity_error)?;
+        tokio::time::timeout(
+            FIRST_PREFIX_BYTE_TIMEOUT,
+            self.server.read_exact(&mut first_prefix_byte),
+        )
+        .await
+        .map_err(|_| pipe_idle_timeout())?
+        .map_err(io_identity_error)?;
         let caller = WindowsPipeIdentityProvider.verify_client(
             PipeHandle(self.server.as_raw_handle() as usize),
             &self.owner,
@@ -357,6 +594,22 @@ fn token_information(
 }
 
 #[cfg(windows)]
+fn process_image(process: HANDLE) -> Result<String, LocalIdentityError> {
+    let mut buffer = vec![0_u16; 32_768];
+    let mut length = buffer.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    }
+    .map_err(windows_identity_error)?;
+    String::from_utf16(&buffer[..length as usize]).map_err(utf16_identity_error)
+}
+
+#[cfg(windows)]
 fn sid_to_string(sid: PSID) -> Result<String, LocalIdentityError> {
     let mut value = PWSTR::null();
     unsafe { ConvertSidToStringSidW(sid, &mut value) }.map_err(windows_identity_error)?;
@@ -399,6 +652,14 @@ fn io_identity_error(error: std::io::Error) -> LocalIdentityError {
 #[cfg(windows)]
 fn pipe_create_error(error: std::io::Error) -> LocalIdentityError {
     LocalIdentityError::new("local.identity.pipe_create_failed", error.to_string())
+}
+
+#[cfg(windows)]
+fn pipe_idle_timeout() -> LocalIdentityError {
+    LocalIdentityError::new(
+        "local.transport.pipe_idle_timeout",
+        "named-pipe client did not start a request before the idle deadline",
+    )
 }
 
 #[cfg(windows)]

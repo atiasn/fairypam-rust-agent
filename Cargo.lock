@@ -409,6 +409,7 @@ dependencies = [
  "http",
  "serde_json",
  "sha2",
+ "time",
  "tokio",
  "tokio-util",
  "tracing",
@@ -485,12 +486,14 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "windows",
 ]
 
 [[package]]
 name = "fairypam-agent-local-protocol"
 version = "0.1.0"
 dependencies = [
+ "http",
  "serde",
  "serde_json",
  "thiserror",
@@ -515,6 +518,7 @@ dependencies = [
  "fastrand",
  "http",
  "rcgen",
+ "rustls",
  "tempfile",
  "thiserror",
  "tokio",
@@ -549,7 +553,6 @@ dependencies = [
  "fairypam-agent-local-protocol",
  "serde_json",
  "tokio",
- "windows",
 ]
 
 [[package]]

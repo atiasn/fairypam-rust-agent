@@ -14,7 +14,10 @@ pub use control::{
 pub use frame::{
     open_frame_tunnel, FrameSession, LatestFrameSlot, SessionFrameSlot, VerifiedFrameDirective,
 };
-pub use tls::{connect_control, connect_frame, ControlChannel, FrameChannel, TransportConfig};
+pub use tls::{
+    connect_control, connect_frame, validate_transport_config, ControlChannel, FrameChannel,
+    TransportConfig,
+};
 
 use thiserror::Error;
 

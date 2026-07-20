@@ -7,29 +7,6 @@ use tauri::{
 use crate::{commands, local_gateway::ProductionGateway};
 
 pub fn run() -> tauri::Result<()> {
-    #[cfg(windows)]
-    if fairypam_agentctl::enrollment::is_elevated_ui_invocation(
-        &std::env::args().skip(1).collect::<Vec<_>>(),
-    ) {
-        return run_elevated_enrollment();
-    }
-
-    run_standard()
-}
-
-/// The UAC helper only receives the two commands needed to complete enrollment.
-/// It intentionally has no Agent gateway, tray icon, or close-to-tray lifecycle.
-#[cfg(windows)]
-fn run_elevated_enrollment() -> tauri::Result<()> {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            commands::get_enrollment_mode,
-            commands::complete_enrollment,
-        ])
-        .run(tauri::generate_context!())
-}
-
-fn run_standard() -> tauri::Result<()> {
     tauri::Builder::default()
         .manage(ProductionGateway::new())
         .invoke_handler(tauri::generate_handler![
@@ -38,8 +15,7 @@ fn run_standard() -> tauri::Result<()> {
             commands::run_environment_check,
             commands::get_log_tail,
             commands::scan_installed_games,
-            commands::get_enrollment_mode,
-            commands::start_enrollment,
+            commands::register_hub,
             commands::ensure_local_agent,
         ])
         .setup(|app| {

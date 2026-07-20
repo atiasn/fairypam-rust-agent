@@ -264,7 +264,8 @@ impl CommandExecutor {
             LocalCommand::GetConnectionStatus
             | LocalCommand::RunEnvironmentCheck
             | LocalCommand::GetLogTail { .. }
-            | LocalCommand::ScanInstalledGames => Err(AgentError::new(
+            | LocalCommand::ScanInstalledGames
+            | LocalCommand::RegisterHub { .. } => Err(AgentError::new(
                 "local.observability_runtime_required",
                 "local observability requires the Agent runtime state",
             )),
