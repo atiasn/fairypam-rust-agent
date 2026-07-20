@@ -6,7 +6,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::dto::{
     CaptureStateDto, DoctorDto, FocusedTargetDto, LockedTargetDto, OverviewDto, ProfilesDto,
-    ReleaseAllDto, StatusDto, SupportStatusDto, TargetsDto,
+    ReleaseAllDto, SupportStatusDto, TargetsDto,
 };
 
 const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\FairyPam.Agent.v1";

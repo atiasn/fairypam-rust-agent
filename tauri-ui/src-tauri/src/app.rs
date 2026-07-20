@@ -1,7 +1,7 @@
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    Manager, RunEvent, WindowEvent,
+    Manager, WindowEvent,
 };
 
 use crate::{commands, local_gateway::ProductionGateway};
@@ -41,21 +41,15 @@ pub fn run() -> tauri::Result<()> {
                 .build(app)?;
             Ok(())
         })
-        .run(tauri::generate_context!(), |app, event| {
-            if let RunEvent::WindowEvent {
-                label,
-                event: WindowEvent::CloseRequested { api, .. },
-                ..
-            } = event
-            {
-                if label == "main" {
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
                     api.prevent_close();
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.hide();
-                    }
+                    let _ = window.hide();
                 }
             }
         })
+        .run(tauri::generate_context!())
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
