@@ -53,6 +53,7 @@ pub struct RuntimeConfig {
     pub agent_version: String,
     pub build_commit: String,
     pub profiles: ProfileStore,
+    enrollment_generation: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -81,6 +82,7 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles,
+            enrollment_generation: None,
         })
     }
 
@@ -100,13 +102,13 @@ impl RuntimeConfig {
                 "invalid enrollment generation",
             ));
         }
-        let directory = root.join(generation);
+        let directory = root.join(&generation);
         let document = load_private_json(&directory.join("runtime.json"))?;
         let verifier = Ed25519SignatureVerifier::from_public_key_hex(&enrollment_field(
             &document,
             "profile_root_public_key_hex",
         )?)?;
-        let profiles = ProfileStore::load(&required_path("FAIRYPAM_PROFILE_DIR")?, &verifier)?;
+        let profiles = ProfileStore::load_optional(&enrollment_profile_directory()?, &verifier)?;
         Ok(Self {
             transport: TransportConfig {
                 control_endpoint: enrollment_field(&document, "control_endpoint")?
@@ -137,6 +139,7 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles,
+            enrollment_generation: Some(generation),
         })
     }
 }
@@ -144,6 +147,26 @@ impl RuntimeConfig {
 #[cfg(windows)]
 fn enrollment_state_exists() -> bool {
     Path::new(r"C:\\ProgramData\\FairyPam\\Agent\\enrollment\\current.json").exists()
+}
+
+#[cfg(windows)]
+fn enrollment_profile_directory() -> Result<PathBuf, AgentError> {
+    if let Some(path) = env::var_os("FAIRYPAM_PROFILE_DIR").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let executable = env::current_exe().map_err(|_| {
+        AgentError::new(
+            "runtime.profile_directory_unavailable",
+            "cannot determine the enrolled Agent directory",
+        )
+    })?;
+    let directory = executable.parent().ok_or_else(|| {
+        AgentError::new(
+            "runtime.profile_directory_unavailable",
+            "the enrolled Agent executable has no parent directory",
+        )
+    })?;
+    Ok(directory.join("profiles"))
 }
 
 #[cfg(windows)]
@@ -299,6 +322,26 @@ impl GrpcSessionDriver {
             state.sender.clone().ok_or_else(session_missing)?,
         ))
     }
+
+    fn enrollment_changed(&self) -> Result<bool, AgentError> {
+        #[cfg(windows)]
+        {
+            let expected = self
+                .config
+                .lock()
+                .map_err(lock_error)?
+                .enrollment_generation
+                .clone();
+            let Some(expected) = expected else {
+                return Ok(false);
+            };
+            let root = Path::new(r"C:\\ProgramData\\FairyPam\\Agent\\enrollment");
+            let pointer = load_private_json(&root.join("current.json"))?;
+            return Ok(enrollment_field(&pointer, "generation")? != expected);
+        }
+        #[cfg(not(windows))]
+        Ok(false)
+    }
 }
 
 impl SessionDriver for GrpcSessionDriver {
@@ -371,10 +414,21 @@ impl SessionDriver for GrpcSessionDriver {
         )));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await;
+        let mut enrollment_watch = tokio::time::interval(Duration::from_secs(1));
+        enrollment_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        enrollment_watch.tick().await;
         loop {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(cancelled()),
+                _ = enrollment_watch.tick() => {
+                    if self.enrollment_changed()? {
+                        return Err(AgentError::new(
+                            "runtime.enrollment_changed",
+                            "enrollment generation changed; reconnecting with current credentials",
+                        ));
+                    }
+                }
                 _ = heartbeat.tick() => {
                     sender.try_send(heartbeat_event(&session)).map_err(map_transport)?;
                 }
@@ -550,6 +604,8 @@ impl SupervisorHooks for RuntimeSafetyHooks {
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
+    #[cfg(windows)]
+    let _instance = AgentInstance::acquire()?;
     let driver = GrpcSessionDriver::new(config);
     let hooks = RuntimeSafetyHooks::for_driver(&driver);
     let backoff = CappedBackoff::new(Duration::from_millis(250), Duration::from_secs(30))
@@ -573,6 +629,43 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
     match result {
         Ok(never) => match never {},
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+struct AgentInstance(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl AgentInstance {
+    fn acquire() -> Result<Self, AgentError> {
+        use windows::{
+            core::HSTRING,
+            Win32::{
+                Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS},
+                System::Threading::CreateMutexW,
+            },
+        };
+
+        let handle =
+            unsafe { CreateMutexW(None, false, &HSTRING::from(r"Local\FairyPam.Agent.v1")) }
+                .map_err(|error| {
+                    AgentError::new("runtime.instance_unavailable", error.to_string())
+                })?;
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            let _ = unsafe { CloseHandle(handle) };
+            return Err(AgentError::new(
+                "runtime.instance_already_running",
+                "another FairyPam Agent instance is already running",
+            ));
+        }
+        Ok(Self(handle))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AgentInstance {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
     }
 }
 
@@ -1150,6 +1243,7 @@ pub async fn run_dev_local() -> Result<(), AgentError> {
                 agent_version: "dev".to_owned(),
                 build_commit: "unknown".to_owned(),
                 profiles,
+                enrollment_generation: None,
             })),
         },
         config,

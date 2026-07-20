@@ -12,12 +12,36 @@ pub struct ProfileStore {
 
 impl ProfileStore {
     pub fn load(root: &Path, verifier: &dyn SignatureVerifier) -> Result<Self, AgentError> {
-        let entries = fs::read_dir(root).map_err(|error| {
-            AgentError::new(
-                "profile.store_unavailable",
-                format!("cannot read Profile directory {}: {error}", root.display()),
-            )
-        })?;
+        Self::load_with_optional_empty(root, verifier, false)
+    }
+
+    /// Loads the signed Profile store while allowing an enrolled Agent to stay
+    /// online before Profiles have been delivered. Any present Profile remains
+    /// subject to the same strict layout and signature verification as `load`.
+    pub fn load_optional(
+        root: &Path,
+        verifier: &dyn SignatureVerifier,
+    ) -> Result<Self, AgentError> {
+        Self::load_with_optional_empty(root, verifier, true)
+    }
+
+    fn load_with_optional_empty(
+        root: &Path,
+        verifier: &dyn SignatureVerifier,
+        optional_empty: bool,
+    ) -> Result<Self, AgentError> {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if optional_empty && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(AgentError::new(
+                    "profile.store_unavailable",
+                    format!("cannot read Profile directory {}: {error}", root.display()),
+                ))
+            }
+        };
         let mut paths = entries
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<Vec<_>, _>>()
@@ -42,7 +66,7 @@ impl ProfileStore {
                 ));
             }
         }
-        if profiles.is_empty() {
+        if profiles.is_empty() && !optional_empty {
             return Err(AgentError::new(
                 "profile.store_empty",
                 "Profile directory contains no installed profiles",
@@ -223,5 +247,25 @@ mod tests {
 
         assert_eq!(error.code(), "profile.store_layout_invalid");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn optional_store_allows_missing_profiles_but_keeps_the_strict_loader() {
+        let root = temp_root();
+        struct Reject;
+        impl SignatureVerifier for Reject {
+            fn verify(&self, _digest: &[u8; 32], _signature: &str) -> bool {
+                false
+            }
+        }
+
+        assert!(ProfileStore::load_optional(&root, &Reject)
+            .unwrap()
+            .ids()
+            .is_empty());
+        assert_eq!(
+            ProfileStore::load(&root, &Reject).unwrap_err().code(),
+            "profile.store_unavailable"
+        );
     }
 }

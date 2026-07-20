@@ -55,7 +55,7 @@ mod enrollment {
     use fairypam_agentctl::CliError;
     use serde_json::{json, Value};
     use windows::core::HSTRING;
-    use windows::Win32::Foundation::{CloseHandle, HLOCAL};
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_FILE_NOT_FOUND, HLOCAL};
     use windows::Win32::Networking::WinHttp::{
         WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpReadData,
         WinHttpReceiveResponse, WinHttpSendRequest, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -71,11 +71,14 @@ mod enrollment {
     use windows::Win32::System::Console::{
         GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE,
     };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, OpenMutexW, OpenProcessToken, SYNCHRONIZATION_SYNCHRONIZE,
+    };
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     const STATE_ROOT: &str = r"C:\\ProgramData\\FairyPam\\Agent\\enrollment";
+    const AGENT_INSTANCE_MUTEX: &str = r"Local\FairyPam.Agent.v1";
 
     pub fn launch_elevated() -> Result<Value, CliError> {
         let executable = std::env::current_exe().map_err(client_error)?;
@@ -105,6 +108,7 @@ mod enrollment {
         }
         let response = claim(&host, port, &path, &code)?;
         persist(&response)?;
+        ensure_agent_is_running()?;
         Ok(json!({"status":"enrolled", "hub_address":display_address}))
     }
 
@@ -333,6 +337,59 @@ mod enrollment {
         }
         let _ = fs::remove_file(backup);
         Ok(())
+    }
+
+    fn ensure_agent_is_running() -> Result<(), CliError> {
+        let mutex = unsafe {
+            OpenMutexW(
+                SYNCHRONIZATION_SYNCHRONIZE,
+                false,
+                &HSTRING::from(AGENT_INSTANCE_MUTEX),
+            )
+        };
+        match mutex {
+            Ok(handle) => {
+                let _ = unsafe { CloseHandle(handle) };
+                return Ok(());
+            }
+            Err(_) if unsafe { GetLastError() } != ERROR_FILE_NOT_FOUND => {
+                return Err(client("enrollment.agent_state_unavailable"));
+            }
+            Err(_) => {}
+        }
+
+        let helper = std::env::current_exe().map_err(client_error)?;
+        let directory = helper
+            .parent()
+            .ok_or_else(|| client("enrollment.agent_unavailable"))?;
+        let agent = directory.join("fairypam-agent.exe");
+        let metadata =
+            fs::symlink_metadata(&agent).map_err(|_| client("enrollment.agent_unavailable"))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(client("enrollment.agent_unavailable"));
+        }
+        let mut child = std::process::Command::new(&agent)
+            .current_dir(directory)
+            .spawn()
+            .map_err(|_| client("enrollment.agent_start_failed"))?;
+        for _ in 0..25 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let handle = unsafe {
+                OpenMutexW(
+                    SYNCHRONIZATION_SYNCHRONIZE,
+                    false,
+                    &HSTRING::from(AGENT_INSTANCE_MUTEX),
+                )
+            };
+            if let Ok(handle) = handle {
+                let _ = unsafe { CloseHandle(handle) };
+                return Ok(());
+            }
+            if child.try_wait().map_err(client_error)?.is_some() {
+                return Err(client("enrollment.agent_start_failed"));
+            }
+        }
+        Err(client("enrollment.agent_start_timeout"))
     }
 
     fn write_private(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
