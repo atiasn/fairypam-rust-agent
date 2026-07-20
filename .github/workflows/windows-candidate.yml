@@ -184,7 +184,6 @@ jobs:
           try {
             npm ci
             npm run check:security
-            npm run check:command-surface
             npm test -- --run
             npm run test:accessibility
 
@@ -202,6 +201,7 @@ jobs:
             }
 
             npm run tauri build -- --no-bundle
+            npm run check:command-surface
             git diff --exit-code -- src-tauri/Cargo.lock
           }
           finally {
