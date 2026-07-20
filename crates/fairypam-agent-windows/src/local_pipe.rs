@@ -65,6 +65,7 @@ pub struct VerifiedPipeCaller {
     pub integrity: IntegrityLevel,
 }
 
+#[cfg(windows)]
 fn logon_sid_from_luid(high_part: i32, low_part: u32) -> String {
     format!("S-1-5-5-{}-{low_part}", high_part as u32)
 }
@@ -405,7 +406,7 @@ fn utf16_identity_error(error: std::string::FromUtf16Error) -> LocalIdentityErro
     LocalIdentityError::new("local.identity.sid_string_invalid", error.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::logon_sid_from_luid;
 

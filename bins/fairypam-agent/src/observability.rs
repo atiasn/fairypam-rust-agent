@@ -1,7 +1,6 @@
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+#![cfg_attr(not(windows), allow(dead_code))]
+
+use std::{collections::HashSet, path::Path};
 
 use fairypam_agent_core::AgentError;
 use fairypam_agent_local_protocol::LogLevel;
@@ -161,9 +160,7 @@ fn trusted_executable(executable: &Path) -> bool {
     {
         return false;
     }
-    let mut component = PathBuf::new();
-    for part in executable.components() {
-        component.push(part);
+    for component in executable.ancestors() {
         let Ok(metadata) = component.symlink_metadata() else {
             return false;
         };

@@ -1,8 +1,8 @@
 #[cfg(all(windows, feature = "dev-automation"))]
 use fairypam_agentctl::CliError;
-use fairypam_agentctl::{
-    execute, parse_command, parse_enrollment_invocation, EnrollmentInvocation,
-};
+use fairypam_agentctl::{execute, parse_command};
+#[cfg(windows)]
+use fairypam_agentctl::{parse_enrollment_invocation, EnrollmentInvocation};
 
 #[tokio::main]
 async fn main() {

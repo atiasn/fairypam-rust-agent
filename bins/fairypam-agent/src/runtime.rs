@@ -1,3 +1,5 @@
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::collections::VecDeque;
 use std::env;
 use std::path::{Path, PathBuf};
