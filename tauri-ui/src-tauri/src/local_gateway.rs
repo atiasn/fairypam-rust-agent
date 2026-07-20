@@ -54,8 +54,8 @@ impl ProductionGateway {
     pub fn new() -> Self {
         use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
 
-        let pipe_name = std::env::var("FAIRYPAM_AGENT_PIPE")
-            .unwrap_or_else(|_| DEFAULT_PIPE_NAME.to_owned());
+        let pipe_name =
+            std::env::var("FAIRYPAM_AGENT_PIPE").unwrap_or_else(|_| DEFAULT_PIPE_NAME.to_owned());
         Self {
             client: tokio::sync::Mutex::new(LocalClient::new(
                 WindowsNamedPipeClientTransport::new(pipe_name),
