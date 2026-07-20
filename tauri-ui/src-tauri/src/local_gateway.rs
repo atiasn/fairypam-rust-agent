@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use fairypam_agent_local_client::LocalClientError;
-use fairypam_agent_local_protocol::{LocalCommand, LogLevel};
 #[cfg(any(windows, test))]
 use fairypam_agent_local_protocol::LocalResponse;
+use fairypam_agent_local_protocol::{LocalCommand, LogLevel};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::dto::{

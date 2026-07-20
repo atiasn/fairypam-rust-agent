@@ -124,10 +124,7 @@ fn production_task_accepts_only_the_fixed_interactive_agent_action() {
         action,
     ));
     assert!(!is_fixed_interactive_task_xml(
-        &fixed.replace(
-            "</Triggers>",
-            "<BootTrigger></BootTrigger></Triggers>",
-        ),
+        &fixed.replace("</Triggers>", "<BootTrigger></BootTrigger></Triggers>",),
         action,
     ));
     assert!(!is_fixed_interactive_task_xml(

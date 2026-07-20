@@ -104,8 +104,14 @@ fn elevated_helper_exposes_only_the_registration_surface() {
         .and_then(|source| source.split("fn run_standard()").next())
         .expect("elevated enrollment builder must be isolated from the standard builder");
 
-    for required in ["commands::get_enrollment_mode", "commands::complete_enrollment"] {
-        assert!(helper.contains(required), "missing elevated helper command: {required}");
+    for required in [
+        "commands::get_enrollment_mode",
+        "commands::complete_enrollment",
+    ] {
+        assert!(
+            helper.contains(required),
+            "missing elevated helper command: {required}"
+        );
     }
     for forbidden in [
         "ProductionGateway",

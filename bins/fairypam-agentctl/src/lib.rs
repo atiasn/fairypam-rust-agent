@@ -60,9 +60,9 @@ fn opening_element_names(xml: &str) -> Option<Vec<&str>> {
             .unwrap_or(tag.len());
         let name = &tag[..end];
         if name.is_empty()
-            || !name
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+            || !name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || character == '_' || character == '-'
+            })
         {
             return None;
         }
@@ -87,8 +87,7 @@ fn element_body<'a>(xml: &'a str, name: &str, count: usize) -> Option<&'a str> {
     let opening_end = start + xml[start..].find('>')? + 1;
     let closing = format!("</{name}>");
     let end = opening_end + xml[opening_end..].find(&closing)?;
-    (xml[end + closing.len()..].matches(&closing).count() == 0)
-        .then_some(&xml[opening_end..end])
+    (xml[end + closing.len()..].matches(&closing).count() == 0).then_some(&xml[opening_end..end])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
