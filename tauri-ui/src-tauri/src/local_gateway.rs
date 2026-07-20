@@ -50,48 +50,49 @@ pub struct ProductionGateway {
 }
 
 impl ProductionGateway {
+    #[cfg(windows)]
     pub fn new() -> Self {
-        #[cfg(windows)]
-        {
-            use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
+        use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
 
-            let pipe_name = std::env::var("FAIRYPAM_AGENT_PIPE")
-                .unwrap_or_else(|_| DEFAULT_PIPE_NAME.to_owned());
-            return Self {
-                client: tokio::sync::Mutex::new(LocalClient::new(
-                    WindowsNamedPipeClientTransport::new(pipe_name),
-                )),
-            };
+        let pipe_name = std::env::var("FAIRYPAM_AGENT_PIPE")
+            .unwrap_or_else(|_| DEFAULT_PIPE_NAME.to_owned());
+        Self {
+            client: tokio::sync::Mutex::new(LocalClient::new(
+                WindowsNamedPipeClientTransport::new(pipe_name),
+            )),
         }
+    }
 
-        #[cfg(not(windows))]
+    #[cfg(not(windows))]
+    pub fn new() -> Self {
         Self {}
     }
 
+    #[cfg(windows)]
     async fn request<T: DeserializeOwned>(
         &self,
         command: LocalCommand,
     ) -> Result<T, UiCommandError> {
-        #[cfg(windows)]
-        {
-            let response = self
-                .client
-                .lock()
-                .await
-                .request(command, REQUEST_TIMEOUT)
-                .await
-                .map_err(UiCommandError::from)?;
-            return decode_response(response);
-        }
+        let response = self
+            .client
+            .lock()
+            .await
+            .request(command, REQUEST_TIMEOUT)
+            .await
+            .map_err(UiCommandError::from)?;
+        decode_response(response)
+    }
 
-        #[cfg(not(windows))]
-        {
-            let _ = command;
-            Err(UiCommandError::unavailable(
-                "local.transport.platform_unsupported",
-                "FairyPam Agent UI local control requires Windows",
-            ))
-        }
+    #[cfg(not(windows))]
+    async fn request<T: DeserializeOwned>(
+        &self,
+        command: LocalCommand,
+    ) -> Result<T, UiCommandError> {
+        let _ = command;
+        Err(UiCommandError::unavailable(
+            "local.transport.platform_unsupported",
+            "FairyPam Agent UI local control requires Windows",
+        ))
     }
 
     pub async fn overview(&self) -> Result<OverviewDto, UiCommandError> {
