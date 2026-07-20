@@ -78,7 +78,7 @@ impl RuntimeConfig {
     #[cfg(windows)]
     pub fn from_production() -> Result<Self, AgentError> {
         if enrollment_state_exists() {
-            return match Self::from_enrollment_state() {
+            match Self::from_enrollment_state() {
                 Ok(config) => Ok(config),
                 Err(error) => {
                     tracing::warn!(
@@ -87,7 +87,7 @@ impl RuntimeConfig {
                     );
                     Ok(Self::unregistered())
                 }
-            };
+            }
         } else if [
             "FAIRYPAM_PROFILE_ROOT_PUBLIC_KEY_HEX",
             "FAIRYPAM_PROFILE_DIR",
