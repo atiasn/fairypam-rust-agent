@@ -12,6 +12,11 @@ vi.mock('./lib/agentApi', () => ({
     lockTarget: vi.fn(), focusTarget: vi.fn(), stopCapture: vi.fn(), releaseAll: vi.fn(),
     getUpdateStatus: vi.fn().mockResolvedValue({ status: 'unsupported' }),
     getStartupStatus: vi.fn().mockResolvedValue({ status: 'unsupported' }),
+    getConnectionStatus: vi.fn().mockResolvedValue({ hub_address: '', control: 'offline', frame: 'offline', capture_active: false, recovery_code: '' }),
+    runEnvironmentCheck: vi.fn().mockResolvedValue({ checks: [] }),
+    getLogTail: vi.fn().mockResolvedValue({ entries: [] }),
+    scanInstalledGames: vi.fn().mockResolvedValue({ games: [] }),
+    startEnrollment: vi.fn().mockResolvedValue({ status: 'elevation_requested' }),
     exportDiagnostics: vi.fn(), stopAgentAfterConfirmation: vi.fn(),
   },
 }));

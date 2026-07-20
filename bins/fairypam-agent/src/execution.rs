@@ -261,6 +261,13 @@ impl CommandExecutor {
             LocalCommand::UpdateStatus | LocalCommand::StartupStatus => {
                 Ok(json!({"status": "unsupported"}))
             }
+            LocalCommand::GetConnectionStatus
+            | LocalCommand::RunEnvironmentCheck
+            | LocalCommand::GetLogTail { .. }
+            | LocalCommand::ScanInstalledGames => Err(AgentError::new(
+                "local.observability_runtime_required",
+                "local observability requires the Agent runtime state",
+            )),
         }
     }
 

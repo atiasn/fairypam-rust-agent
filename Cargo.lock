@@ -548,6 +548,7 @@ dependencies = [
  "fairypam-agent-local-protocol",
  "serde_json",
  "tokio",
+ "windows",
 ]
 
 [[package]]

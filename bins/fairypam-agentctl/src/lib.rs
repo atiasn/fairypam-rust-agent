@@ -6,6 +6,26 @@ use fairypam_agent_local_protocol::{CaptureEncoding, LocalCommand};
 pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\FairyPam.Agent.v1";
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollmentInvocation {
+    LaunchElevatedHelper,
+    ElevatedHelper,
+}
+
+/// Enrollment is deliberately outside LocalCommand: it never crosses the
+/// same-user Named Pipe and it never accepts an URL or code as a CLI argument.
+pub fn parse_enrollment_invocation(arguments: &[String]) -> Result<Option<EnrollmentInvocation>, CliError> {
+    let values = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    match values.as_slice() {
+        ["enroll"] => Ok(Some(EnrollmentInvocation::LaunchElevatedHelper)),
+        ["--enrollment-helper"] => Ok(Some(EnrollmentInvocation::ElevatedHelper)),
+        [command, ..] if *command == "enroll" || *command == "--enrollment-helper" => {
+            Err(usage("enrollment accepts no arguments"))
+        }
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliError {
     Usage(String),

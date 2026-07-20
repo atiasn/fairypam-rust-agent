@@ -145,6 +145,22 @@ h1 {
 .wizard-step.passed strong { color: #86efac; }
 .code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
+dl,
+.check-list,
+.log-list,
+.game-list {
+  display: grid;
+  gap: 0.5rem;
+}
+
+dl { grid-template-columns: max-content minmax(0, 1fr); }
+dt { font-weight: 700; }
+dd { margin: 0; overflow-wrap: anywhere; }
+.check-list,
+.log-list,
+.game-list { padding-left: 1.25rem; }
+.game-list li { display: grid; gap: 0.25rem; }
+
 @media (max-width: 760px) {
   .app-header,
   .app-layout { display: block; }

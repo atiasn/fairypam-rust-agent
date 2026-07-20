@@ -2,15 +2,19 @@ import { invoke } from '@tauri-apps/api/core';
 
 import type {
   CaptureState,
+  ConnectionStatus,
   Doctor,
+  EnvironmentCheck,
   ExportResult,
   FocusedTarget,
   LockedTarget,
+  LogTail,
   Overview,
   Profiles,
   ReleaseAll,
   SupportStatus,
   Targets,
+  InstalledGames,
 } from './contracts';
 
 export const agentApi = {
@@ -25,6 +29,12 @@ export const agentApi = {
   releaseAll: () => invoke<ReleaseAll>('release_all'),
   getUpdateStatus: () => invoke<SupportStatus>('get_update_status'),
   getStartupStatus: () => invoke<SupportStatus>('get_startup_status'),
+  getConnectionStatus: () => invoke<ConnectionStatus>('get_connection_status'),
+  runEnvironmentCheck: () => invoke<EnvironmentCheck>('run_environment_check'),
+  getLogTail: (lines: number, level: 'error' | 'warn' | 'info') =>
+    invoke<LogTail>('get_log_tail', { lines, level }),
+  scanInstalledGames: () => invoke<InstalledGames>('scan_installed_games'),
+  startEnrollment: () => invoke<SupportStatus>('start_enrollment'),
   exportDiagnostics: () => invoke<ExportResult>('export_diagnostics'),
   stopAgentAfterConfirmation: () =>
     invoke<SupportStatus>('stop_agent_after_confirmation', { confirmation: 'STOP_AGENT' }),

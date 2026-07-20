@@ -20,6 +20,14 @@ pub enum CaptureEncoding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LocalCommand {
     Status,
@@ -46,6 +54,13 @@ pub enum LocalCommand {
     ReleaseAll,
     UpdateStatus,
     StartupStatus,
+    GetConnectionStatus,
+    RunEnvironmentCheck,
+    GetLogTail {
+        lines: u16,
+        level: LogLevel,
+    },
+    ScanInstalledGames,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,7 +338,7 @@ fn request_from_value(value: Value) -> Result<RequestEnvelope, LocalProtocolErro
         return Err(LocalProtocolError::invalid("unknown command field"));
     }
 
-    let command = serde_json::from_value(Value::Object(
+    let command: LocalCommand = serde_json::from_value(Value::Object(
         object
             .iter()
             .filter(|(key, _)| !matches!(key.as_str(), "protocol_version" | "request_id" | "nonce"))
@@ -335,6 +350,7 @@ fn request_from_value(value: Value) -> Result<RequestEnvelope, LocalProtocolErro
     if protocol_version != PROTOCOL_VERSION {
         return Err(LocalProtocolError::UnsupportedVersion);
     }
+    validate_command(&command)?;
 
     Ok(RequestEnvelope {
         protocol_version,
@@ -342,6 +358,15 @@ fn request_from_value(value: Value) -> Result<RequestEnvelope, LocalProtocolErro
         nonce,
         command,
     })
+}
+
+fn validate_command(command: &LocalCommand) -> Result<(), LocalProtocolError> {
+    match command {
+        LocalCommand::GetLogTail { lines, .. } if *lines == 0 || *lines > 200 => {
+            Err(LocalProtocolError::invalid("log lines must be within 1..=200"))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn required_field<T>(object: &Map<String, Value>, name: &str) -> Result<T, LocalProtocolError>
@@ -359,7 +384,8 @@ fn is_supported_command(command: &str) -> bool {
     match command {
         "status" | "doctor" | "list_profiles" | "enumerate_targets" | "lock_target"
         | "focus_target" | "start_capture" | "stop_capture" | "release_all" | "update_status"
-        | "startup_status" => true,
+        | "startup_status" | "get_connection_status" | "run_environment_check"
+        | "get_log_tail" | "scan_installed_games" => true,
         #[cfg(feature = "dev-automation")]
         "testbed_pulse" => true,
         _ => false,
@@ -374,6 +400,7 @@ fn is_allowed_command_field(command: &str, field: &str) -> bool {
             | ("lock_target", "profile_id" | "candidate_id")
             | ("start_capture", "source_id" | "fps" | "encoding")
             | ("stop_capture", "source_id")
+            | ("get_log_tail", "lines" | "level")
     )
 }
 

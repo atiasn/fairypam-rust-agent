@@ -1,6 +1,6 @@
 use fairypam_agent_local_protocol::{
     decode_request, decode_request_or_error_response, decode_response, encode_frame,
-    CaptureEncoding, LocalCommand, LocalResponse, NonceReplayGuard, RequestEnvelope,
+    CaptureEncoding, LocalCommand, LocalResponse, LogLevel, NonceReplayGuard, RequestEnvelope,
     ResponseEnvelope, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::json;
@@ -50,6 +50,13 @@ fn round_trips_all_supported_command_shapes() {
         LocalCommand::ReleaseAll,
         LocalCommand::UpdateStatus,
         LocalCommand::StartupStatus,
+        LocalCommand::GetConnectionStatus,
+        LocalCommand::RunEnvironmentCheck,
+        LocalCommand::GetLogTail {
+            lines: 20,
+            level: LogLevel::Info,
+        },
+        LocalCommand::ScanInstalledGames,
     ];
 
     for command in commands {
@@ -59,6 +66,36 @@ fn round_trips_all_supported_command_shapes() {
             request
         );
     }
+}
+
+#[test]
+fn observability_commands_are_bounded_and_reject_path_or_secret_fields() {
+    let invalid_lines = frame(
+        br#"{"protocol_version":1,"request_id":"r","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"command":"get_log_tail","lines":201,"level":"info"}"#,
+    );
+    assert_eq!(
+        decode_request(&invalid_lines).unwrap_err().code(),
+        "local.protocol.invalid"
+    );
+
+    let arbitrary_path = frame(
+        br#"{"protocol_version":1,"request_id":"r","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"command":"get_log_tail","lines":20,"level":"info","path":"C:\\secrets\\agent.log"}"#,
+    );
+    assert_eq!(
+        decode_request(&arbitrary_path).unwrap_err().code(),
+        "local.protocol.invalid"
+    );
+}
+
+#[test]
+fn local_control_never_accepts_enrollment_or_hub_credentials() {
+    let enrollment = frame(
+        br#"{"protocol_version":1,"request_id":"r","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"command":"enroll_hub","hub_address":"https://hub.example","code":"one-time-code"}"#,
+    );
+    assert_eq!(
+        decode_request(&enrollment).unwrap_err().code(),
+        "local.protocol.unsupported_capability"
+    );
 }
 
 #[test]

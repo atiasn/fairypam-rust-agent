@@ -2,8 +2,9 @@ use tauri::State;
 
 use crate::{
     dto::{
-        CaptureStateDto, DoctorDto, ExportResultDto, FocusedTargetDto, LockedTargetDto,
-        OverviewDto, ProfilesDto, ReleaseAllDto, SupportStatusDto, TargetsDto,
+        CaptureStateDto, ConnectionStatusDto, DoctorDto, EnvironmentCheckDto, ExportResultDto,
+        FocusedTargetDto, InstalledGamesDto, LockedTargetDto, LogTailDto, OverviewDto,
+        ProfilesDto, ReleaseAllDto, SupportStatusDto, TargetsDto,
     },
     local_gateway::{ProductionGateway, UiCommandError},
 };
@@ -96,6 +97,45 @@ pub async fn get_startup_status(
 }
 
 #[tauri::command]
+pub async fn get_connection_status(
+    state: State<'_, ProductionGateway>,
+) -> CommandResult<ConnectionStatusDto> {
+    state.connection_status().await
+}
+
+#[tauri::command]
+pub async fn run_environment_check(
+    state: State<'_, ProductionGateway>,
+) -> CommandResult<EnvironmentCheckDto> {
+    state.environment_check().await
+}
+
+#[tauri::command]
+pub async fn get_log_tail(
+    lines: u16,
+    level: String,
+    state: State<'_, ProductionGateway>,
+) -> CommandResult<LogTailDto> {
+    let level = match level.as_str() {
+        "error" => fairypam_agent_local_protocol::LogLevel::Error,
+        "warn" => fairypam_agent_local_protocol::LogLevel::Warn,
+        "info" => fairypam_agent_local_protocol::LogLevel::Info,
+        _ => return Err(UiCommandError::unavailable("local.command.invalid_argument", "level must be error, warn, or info")),
+    };
+    if !(1..=200).contains(&lines) {
+        return Err(UiCommandError::unavailable("local.command.invalid_argument", "lines must be within 1..=200"));
+    }
+    state.log_tail(lines, level).await
+}
+
+#[tauri::command]
+pub async fn scan_installed_games(
+    state: State<'_, ProductionGateway>,
+) -> CommandResult<InstalledGamesDto> {
+    state.installed_games().await
+}
+
+#[tauri::command]
 pub fn export_diagnostics() -> CommandResult<ExportResultDto> {
     Ok(ExportResultDto {
         saved: false,
@@ -114,5 +154,62 @@ pub fn stop_agent_after_confirmation(confirmation: String) -> CommandResult<Supp
     Err(UiCommandError::unavailable(
         "local.command.agent_stop_unavailable",
         "the local protocol does not expose an Agent stop command",
+    ))
+}
+
+#[tauri::command]
+pub fn start_enrollment() -> CommandResult<SupportStatusDto> {
+    #[cfg(windows)]
+    {
+        let ui_executable = std::env::current_exe().map_err(|_| {
+            UiCommandError::unavailable(
+                "enrollment.helper_unavailable",
+                "the enrolled Agent helper is unavailable",
+            )
+        })?;
+        let helper = ui_executable
+            .parent()
+            .map(|directory| directory.join("fairypam-agentctl.exe"))
+            .ok_or_else(|| {
+                UiCommandError::unavailable(
+                    "enrollment.helper_unavailable",
+                    "the enrolled Agent helper is unavailable",
+                )
+            })?;
+        let metadata = std::fs::symlink_metadata(&helper).map_err(|_| {
+            UiCommandError::unavailable(
+                "enrollment.helper_unavailable",
+                "the enrolled Agent helper is unavailable",
+            )
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(UiCommandError::unavailable(
+                "enrollment.helper_unavailable",
+                "the enrolled Agent helper is unavailable",
+            ));
+        }
+        let status = std::process::Command::new(helper)
+            .arg("enroll")
+            .status()
+            .map_err(|_| {
+                UiCommandError::unavailable(
+                    "enrollment.launch_failed",
+                    "the enrollment helper could not be started",
+                )
+            })?;
+        if !status.success() {
+            return Err(UiCommandError::unavailable(
+                "enrollment.launch_failed",
+                "the enrollment helper could not be started",
+            ));
+        }
+        return Ok(SupportStatusDto {
+            status: "elevation_requested".into(),
+        });
+    }
+    #[cfg(not(windows))]
+    Err(UiCommandError::unavailable(
+        "local.transport.platform_unsupported",
+        "FairyPam Agent enrollment requires Windows",
     ))
 }

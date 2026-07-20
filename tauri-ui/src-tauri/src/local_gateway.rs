@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use fairypam_agent_local_client::LocalClientError;
-use fairypam_agent_local_protocol::{LocalCommand, LocalResponse};
+use fairypam_agent_local_protocol::{LocalCommand, LocalResponse, LogLevel};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::dto::{
-    CaptureStateDto, DoctorDto, FocusedTargetDto, LockedTargetDto, OverviewDto, ProfilesDto,
-    ReleaseAllDto, SupportStatusDto, TargetsDto,
+    CaptureStateDto, ConnectionStatusDto, DoctorDto, EnvironmentCheckDto, FocusedTargetDto,
+    InstalledGamesDto, LockedTargetDto, LogTailDto, OverviewDto, ProfilesDto, ReleaseAllDto,
+    SupportStatusDto, TargetsDto,
 };
 
 const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\FairyPam.Agent.v1";
@@ -145,6 +146,22 @@ impl ProductionGateway {
 
     pub async fn startup_status(&self) -> Result<SupportStatusDto, UiCommandError> {
         self.request(LocalCommand::StartupStatus).await
+    }
+
+    pub async fn connection_status(&self) -> Result<ConnectionStatusDto, UiCommandError> {
+        self.request(LocalCommand::GetConnectionStatus).await
+    }
+
+    pub async fn environment_check(&self) -> Result<EnvironmentCheckDto, UiCommandError> {
+        self.request(LocalCommand::RunEnvironmentCheck).await
+    }
+
+    pub async fn log_tail(&self, lines: u16, level: LogLevel) -> Result<LogTailDto, UiCommandError> {
+        self.request(LocalCommand::GetLogTail { lines, level }).await
+    }
+
+    pub async fn installed_games(&self) -> Result<InstalledGamesDto, UiCommandError> {
+        self.request(LocalCommand::ScanInstalledGames).await
     }
 }
 

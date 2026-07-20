@@ -10,15 +10,17 @@ use sha2::{Digest, Sha256};
 
 use crate::protocol::AgentUpdateRequest;
 
-const PACKAGE_MEMBERS: [&str; 4] = [
+const PACKAGE_MEMBERS: [&str; 5] = [
     "BUILD-MANIFEST.json",
     "README.txt",
     "fairypam-agent.exe",
+    "fairypam-agentctl.exe",
     "fairypam-agent-tauri-ui.exe",
 ];
-const PAYLOAD_MEMBERS: [&str; 3] = [
+const PAYLOAD_MEMBERS: [&str; 4] = [
     "README.txt",
     "fairypam-agent.exe",
+    "fairypam-agentctl.exe",
     "fairypam-agent-tauri-ui.exe",
 ];
 const MAX_MEMBER_BYTES: u64 = 128 * 1024 * 1024;
@@ -699,6 +701,7 @@ mod tests {
         let payloads = [
             ("README.txt", b"readme".as_slice()),
             ("fairypam-agent.exe", b"cli".as_slice()),
+            ("fairypam-agentctl.exe", b"agentctl".as_slice()),
             ("fairypam-agent-tauri-ui.exe", b"gui".as_slice()),
         ];
         let members: HashMap<_, _> = payloads

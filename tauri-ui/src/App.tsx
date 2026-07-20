@@ -6,6 +6,7 @@ import { useConnectionState } from './lib/useConnectionState';
 import { ConnectionPage } from './pages/ConnectionPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { DiagnosticsPage } from './pages/DiagnosticsPage';
+import { GamesPage } from './pages/GamesPage';
 import { InputSafetyPage } from './pages/InputSafetyPage';
 import { OnboardingWizard } from './pages/OnboardingWizard';
 import { ProfilesPage } from './pages/ProfilesPage';
@@ -22,7 +23,8 @@ type Page =
   | 'safety'
   | 'update'
   | 'startup'
-  | 'diagnostics';
+  | 'diagnostics'
+  | 'games';
 
 const navigation: Array<{ id: Page; label: string }> = [
   { id: 'dashboard', label: '总览' },
@@ -34,6 +36,7 @@ const navigation: Array<{ id: Page; label: string }> = [
   { id: 'update', label: '更新' },
   { id: 'startup', label: '自启动' },
   { id: 'diagnostics', label: '诊断' },
+  { id: 'games', label: '游戏' },
 ];
 
 export default function App() {
@@ -109,6 +112,7 @@ export default function App() {
           {page === 'update' && <UpdatePage />}
           {page === 'startup' && <StartupPage />}
           {page === 'diagnostics' && <DiagnosticsPage overview={queries.overview} />}
+          {page === 'games' && <GamesPage />}
         </main>
       </div>
     </div>

@@ -167,6 +167,10 @@ fn command_name(command: &LocalCommand) -> &'static str {
         LocalCommand::ReleaseAll => "release_all",
         LocalCommand::UpdateStatus => "update_status",
         LocalCommand::StartupStatus => "startup_status",
+        LocalCommand::GetConnectionStatus => "get_connection_status",
+        LocalCommand::RunEnvironmentCheck => "run_environment_check",
+        LocalCommand::GetLogTail { .. } => "get_log_tail",
+        LocalCommand::ScanInstalledGames => "scan_installed_games",
     }
 }
 

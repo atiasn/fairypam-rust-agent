@@ -1,6 +1,6 @@
 use fairypam_agent_local_client::LocalClientError;
 use fairypam_agent_local_protocol::LocalCommand;
-use fairypam_agentctl::{parse_command, CliError};
+use fairypam_agentctl::{parse_command, parse_enrollment_invocation, CliError, EnrollmentInvocation};
 
 fn arguments(values: &[&str]) -> Vec<String> {
     values.iter().map(ToString::to_string).collect()
@@ -26,6 +26,18 @@ fn cli_uses_shared_domain_commands_and_rejects_process_or_input_arguments() {
         parse_command(&arguments(&["run", "cmd.exe"]))
             .unwrap_err()
             .exit_code(),
+        2
+    );
+    assert_eq!(
+        parse_command(&arguments(&[
+            "enroll",
+            "--hub",
+            "https://hub.example",
+            "--code",
+            "one-time-code",
+        ]))
+        .unwrap_err()
+        .exit_code(),
         2
     );
     #[cfg(not(feature = "dev-automation"))]
@@ -58,5 +70,23 @@ fn error_prefixes_have_stable_process_exit_codes() {
         ))
         .exit_code(),
         5
+    );
+}
+
+#[test]
+fn enrollment_has_only_a_secret_free_uac_trigger() {
+    assert_eq!(
+        parse_enrollment_invocation(&arguments(&["enroll"])).unwrap(),
+        Some(EnrollmentInvocation::LaunchElevatedHelper)
+    );
+    assert_eq!(
+        parse_enrollment_invocation(&arguments(&["--enrollment-helper"])).unwrap(),
+        Some(EnrollmentInvocation::ElevatedHelper)
+    );
+    assert_eq!(
+        parse_enrollment_invocation(&arguments(&["enroll", "--code", "one-time-code"]))
+            .unwrap_err()
+            .exit_code(),
+        2
     );
 }

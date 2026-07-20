@@ -4,6 +4,7 @@ use fairypam_agent_core::platform::{AuthorizationState, DenyAllAuthorization, Lo
 
 pub mod execution;
 pub mod local_control;
+mod observability;
 pub mod profile_store;
 pub mod runtime;
 #[cfg(feature = "e2e-live-input")]

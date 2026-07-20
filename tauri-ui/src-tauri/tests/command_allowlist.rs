@@ -15,6 +15,11 @@ fn registered_build_and_capability_surfaces_match() {
         "release_all",
         "get_update_status",
         "get_startup_status",
+        "get_connection_status",
+        "run_environment_check",
+        "get_log_tail",
+        "scan_installed_games",
+        "start_enrollment",
         "export_diagnostics",
         "stop_agent_after_confirmation",
     ] {

@@ -18,6 +18,11 @@
     "allow-release-all",
     "allow-get-update-status",
     "allow-get-startup-status",
+    "allow-get-connection-status",
+    "allow-run-environment-check",
+    "allow-get-log-tail",
+    "allow-scan-installed-games",
+    "allow-start-enrollment",
     "allow-export-diagnostics",
     "allow-stop-agent-after-confirmation"
   ]

@@ -12,6 +12,8 @@ describe('agentApi', () => {
     await agentApi.listTargets('signed-profile');
     await agentApi.lockTarget('signed-profile', 'candidate-1');
     await agentApi.releaseAll();
+    await agentApi.getLogTail(100, 'warn');
+    await agentApi.startEnrollment();
 
     expect(invoke).toHaveBeenNthCalledWith(1, 'list_targets', { profileId: 'signed-profile' });
     expect(invoke).toHaveBeenNthCalledWith(2, 'lock_target', {
@@ -19,5 +21,7 @@ describe('agentApi', () => {
       candidateId: 'candidate-1',
     });
     expect(invoke).toHaveBeenNthCalledWith(3, 'release_all');
+    expect(invoke).toHaveBeenNthCalledWith(4, 'get_log_tail', { lines: 100, level: 'warn' });
+    expect(invoke).toHaveBeenNthCalledWith(5, 'start_enrollment');
   });
 });

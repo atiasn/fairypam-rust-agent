@@ -24,3 +24,27 @@ export type ReleaseAll = { state: string; holds: number };
 export type SupportStatus = { status: string };
 export type ExportResult = { saved: boolean; reasonCode?: string };
 export type PreviewDto = { mimeType: 'image/jpeg' | 'image/png'; bytes: number[] };
+export type ConnectionStatus = {
+  hub_address: string;
+  control: string;
+  frame: string;
+  capture_active: boolean;
+  recovery_code: string;
+};
+export type EnvironmentCheckItem = {
+  id: string;
+  status: string;
+  code: string;
+  recovery: string;
+};
+export type EnvironmentCheck = { checks: EnvironmentCheckItem[] };
+export type LogEntry = { level: 'error' | 'warn' | 'info'; message: string };
+export type LogTail = { entries: LogEntry[] };
+export type InstalledGame = {
+  discovery_id: string;
+  name: string;
+  version: string | null;
+  installed: boolean;
+  supported: boolean;
+};
+export type InstalledGames = { games: InstalledGame[] };

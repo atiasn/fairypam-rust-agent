@@ -73,6 +73,60 @@ pub struct SupportStatusDto {
     pub status: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionStatusDto {
+    pub hub_address: String,
+    pub control: String,
+    pub frame: String,
+    pub capture_active: bool,
+    pub recovery_code: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentCheckItemDto {
+    pub id: String,
+    pub status: String,
+    pub code: String,
+    pub recovery: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentCheckDto {
+    pub checks: Vec<EnvironmentCheckItemDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogEntryDto {
+    pub level: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogTailDto {
+    pub entries: Vec<LogEntryDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledGameDto {
+    pub discovery_id: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub installed: bool,
+    pub supported: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledGamesDto {
+    pub games: Vec<InstalledGameDto>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverviewDto {

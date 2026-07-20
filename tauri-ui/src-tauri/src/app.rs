@@ -20,6 +20,11 @@ pub fn run() -> tauri::Result<()> {
             commands::release_all,
             commands::get_update_status,
             commands::get_startup_status,
+            commands::get_connection_status,
+            commands::run_environment_check,
+            commands::get_log_tail,
+            commands::scan_installed_games,
+            commands::start_enrollment,
             commands::export_diagnostics,
             commands::stop_agent_after_confirmation,
         ])

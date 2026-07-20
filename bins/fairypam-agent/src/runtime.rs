@@ -1,5 +1,6 @@
+use std::collections::VecDeque;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,9 @@ use http::Uri;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::{CommandExecutor, CommandOutcome, ExecutionSession, FrameSink};
+use crate::observability::AgentLogRecord;
+#[cfg(windows)]
+use crate::observability;
 use crate::profile_store::ProfileStore;
 
 #[cfg(windows)]
@@ -31,9 +35,12 @@ use fairypam_agent_dev_automation::{
     DevSessionRevocationReason,
 };
 #[cfg(windows)]
-use fairypam_agent_local_protocol::{decode_request_or_error_response, encode_frame};
+use fairypam_agent_local_protocol::{
+    decode_request_or_error_response, encode_frame, LocalCommand,
+};
+use fairypam_agent_local_protocol::LogLevel;
 #[cfg(all(windows, feature = "dev-automation"))]
-use fairypam_agent_local_protocol::{LocalCommand, LocalError, RequestEnvelope, ResponseEnvelope};
+use fairypam_agent_local_protocol::{LocalError, RequestEnvelope, ResponseEnvelope};
 #[cfg(windows)]
 use fairypam_agent_windows::{
     current_process_pipe_owner, default_production_pipe_name, IntegrityLevel, PipeOwner,
@@ -50,6 +57,10 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn from_env() -> Result<Self, AgentError> {
+        #[cfg(windows)]
+        if enrollment_state_exists() {
+            return Self::from_enrollment_state();
+        }
         let verifier = Ed25519SignatureVerifier::from_public_key_hex(&required(
             "FAIRYPAM_PROFILE_ROOT_PUBLIC_KEY_HEX",
         )?)?;
@@ -72,18 +83,130 @@ impl RuntimeConfig {
             profiles,
         })
     }
+
+    #[cfg(windows)]
+    fn from_enrollment_state() -> Result<Self, AgentError> {
+        let root = PathBuf::from(r"C:\\ProgramData\\FairyPam\\Agent\\enrollment");
+        let pointer = load_private_json(&root.join("current.json"))?;
+        let generation = enrollment_field(&pointer, "generation")?;
+        if !generation.starts_with("g-")
+            || generation.len() > 80
+            || generation.bytes().any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
+        {
+            return Err(AgentError::new("runtime.enrollment_invalid", "invalid enrollment generation"));
+        }
+        let directory = root.join(generation);
+        let document = load_private_json(&directory.join("runtime.json"))?;
+        let verifier = Ed25519SignatureVerifier::from_public_key_hex(&enrollment_field(
+            &document,
+            "profile_root_public_key_hex",
+        )?)?;
+        let profiles = ProfileStore::load(&required_path("FAIRYPAM_PROFILE_DIR")?, &verifier)?;
+        Ok(Self {
+            transport: TransportConfig {
+                control_endpoint: enrollment_field(&document, "control_endpoint")?.parse().map_err(|error| AgentError::new("runtime.enrollment_invalid", format!("invalid control endpoint: {error}")))?,
+                frame_endpoint: enrollment_field(&document, "frame_endpoint")?.parse().map_err(|error| AgentError::new("runtime.enrollment_invalid", format!("invalid frame endpoint: {error}")))?,
+                server_name: enrollment_field(&document, "hub_server_name")?,
+                agent_id: enrollment_field(&document, "agent_id")?,
+                ca_pem: private_file(&directory, "ca.pem")?,
+                identity_cert_pem: private_file(&directory, "client-cert.pem")?,
+                identity_key_pem: private_file(&directory, "client-key.pem")?,
+                connect_timeout: Duration::from_secs(10),
+            },
+            agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+            build_commit: option_env!("FAIRYPAM_BUILD_COMMIT").unwrap_or("unknown").to_owned(),
+            profiles,
+        })
+    }
 }
 
-#[derive(Default)]
+#[cfg(windows)]
+fn enrollment_state_exists() -> bool {
+    Path::new(r"C:\\ProgramData\\FairyPam\\Agent\\enrollment\\current.json").exists()
+}
+
+#[cfg(windows)]
+fn load_private_json(path: &Path) -> Result<serde_json::Value, AgentError> {
+    let metadata = path.symlink_metadata().map_err(|_| AgentError::new("runtime.enrollment_invalid", "enrollment state is unavailable"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(AgentError::new("runtime.enrollment_invalid", "enrollment state is not a regular file"));
+    }
+    serde_json::from_slice(&std::fs::read(path).map_err(|_| AgentError::new("runtime.enrollment_invalid", "enrollment state cannot be read"))?)
+        .map_err(|_| AgentError::new("runtime.enrollment_invalid", "enrollment state is malformed"))
+}
+
+#[cfg(windows)]
+fn enrollment_field(document: &serde_json::Value, name: &'static str) -> Result<String, AgentError> {
+    document.get(name).and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()).map(str::to_owned)
+        .ok_or_else(|| AgentError::new("runtime.enrollment_invalid", format!("enrollment field {name} is missing")))
+}
+
+#[cfg(windows)]
+fn private_file(directory: &Path, name: &'static str) -> Result<PathBuf, AgentError> {
+    let path = directory.join(name);
+    let metadata = path.symlink_metadata().map_err(|_| AgentError::new("runtime.enrollment_invalid", "enrollment credential is unavailable"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(AgentError::new("runtime.enrollment_invalid", "enrollment credential is unsafe"));
+    }
+    Ok(path)
+}
+
 struct RuntimeState {
     control: Option<ControlSession>,
     sender: Option<ControlSender>,
     session: Option<VerifiedSession>,
     frames: Option<SessionFrameSlot>,
+    control_state: ConnectionState,
+    frame_state: ConnectionState,
+    last_error_code: String,
+    logs: VecDeque<AgentLogRecord>,
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionState {
+    Offline,
+    Connecting,
+    Connected,
+    Reconnecting,
+}
+
+impl ConnectionState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Reconnecting => "reconnecting",
+        }
+    }
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            control: None,
+            sender: None,
+            session: None,
+            frames: None,
+            control_state: ConnectionState::Offline,
+            frame_state: ConnectionState::Offline,
+            last_error_code: "runtime.offline".to_owned(),
+            logs: VecDeque::new(),
+        }
+    }
+}
+
+impl RuntimeState {
+    fn record(&mut self, level: LogLevel, message: &'static str) {
+        if self.logs.len() == 200 {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(AgentLogRecord::new(level, message));
+    }
 }
 
 pub struct GrpcSessionDriver {
-    config: RuntimeConfig,
+    config: Arc<Mutex<RuntimeConfig>>,
     state: Arc<Mutex<RuntimeState>>,
     execution: Arc<Mutex<CommandExecutor>>,
 }
@@ -92,9 +215,18 @@ impl GrpcSessionDriver {
     pub fn new(config: RuntimeConfig) -> Self {
         let execution = CommandExecutor::production(config.profiles.clone());
         Self {
-            config,
+            config: Arc::new(Mutex::new(config)),
             state: Arc::new(Mutex::new(RuntimeState::default())),
             execution: Arc::new(Mutex::new(execution)),
+        }
+    }
+
+    #[cfg(windows)]
+    fn local_runtime(&self) -> SharedRuntime {
+        SharedRuntime {
+            execution: Arc::clone(&self.execution),
+            state: Arc::clone(&self.state),
+            config: Arc::clone(&self.config),
         }
     }
 
@@ -112,20 +244,27 @@ impl GrpcSessionDriver {
 
 impl SessionDriver for GrpcSessionDriver {
     async fn establish_session(&self, cancellation: CancellationToken) -> Result<(), AgentError> {
+        let config = self.config.lock().map_err(lock_error)?.clone();
+        if let Ok(mut state) = self.state.lock() {
+            state.control_state = ConnectionState::Connecting;
+            state.frame_state = ConnectionState::Connecting;
+            state.last_error_code = "runtime.connecting".to_owned();
+            state.record(LogLevel::Info, "Agent Control connection is starting");
+        }
         let connection = tokio::select! {
             _ = cancellation.cancelled() => return Err(cancelled()),
-            result = connect_control(&self.config.transport) => result.map_err(map_transport)?,
+            result = connect_control(&config.transport) => result.map_err(map_transport)?,
         };
         let (sender, receiver) = control_queue();
         sender
             .send(AgentControlEvent {
                 payload: Some(agent_control_event::Payload::Hello(AgentHello {
-                    agent_id: self.config.transport.agent_id.clone(),
-                    agent_version: self.config.agent_version.clone(),
+                    agent_id: config.transport.agent_id.clone(),
+                    agent_version: config.agent_version.clone(),
                     protocol_major: 1,
                     protocol_minor: 0,
-                    build_commit: self.config.build_commit.clone(),
-                    installed_profile_ids: self.config.profiles.ids(),
+                    build_commit: config.build_commit.clone(),
+                    installed_profile_ids: config.profiles.ids(),
                 })),
             })
             .await
@@ -144,12 +283,18 @@ impl SessionDriver for GrpcSessionDriver {
             .try_send(status_event(&session, "ConnectedIdle"))
             .map_err(map_transport)?;
         let mut state = self.state.lock().map_err(lock_error)?;
+        let logs = std::mem::take(&mut state.logs);
         *state = RuntimeState {
             control: Some(control),
             sender: Some(sender),
             session: Some(session),
             frames: Some(frames),
+            control_state: ConnectionState::Connected,
+            frame_state: ConnectionState::Connecting,
+            last_error_code: "runtime.frame_connecting".to_owned(),
+            logs,
         };
+        state.record(LogLevel::Info, "Agent Control connection is established");
         Ok(())
     }
 
@@ -207,15 +352,21 @@ impl SessionDriver for GrpcSessionDriver {
     }
 
     async fn run_frame_session(&self, cancellation: CancellationToken) -> Result<(), AgentError> {
+        let config = self.config.lock().map_err(lock_error)?.clone();
         let (_session, frames, _sender) = self.session_parts()?;
         let connection = tokio::select! {
             _ = cancellation.cancelled() => return Err(cancelled()),
-            result = connect_frame(&self.config.transport) => result.map_err(map_transport)?,
+            result = connect_frame(&config.transport) => result.map_err(map_transport)?,
         };
         let mut frame = tokio::select! {
             _ = cancellation.cancelled() => return Err(cancelled()),
             result = open_frame_tunnel(&connection, &frames) => result.map_err(map_transport)?,
         };
+        if let Ok(mut state) = self.state.lock() {
+            state.frame_state = ConnectionState::Connected;
+            state.last_error_code = "runtime.connected".to_owned();
+            state.record(LogLevel::Info, "Agent Frame connection is established");
+        }
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => return Ok(()),
@@ -243,6 +394,7 @@ impl SessionDriver for GrpcSessionDriver {
 }
 
 pub struct RuntimeSafetyHooks {
+    config: Arc<Mutex<RuntimeConfig>>,
     state: Arc<Mutex<RuntimeState>>,
     execution: Arc<Mutex<CommandExecutor>>,
 }
@@ -250,6 +402,7 @@ pub struct RuntimeSafetyHooks {
 impl RuntimeSafetyHooks {
     pub fn for_driver(driver: &GrpcSessionDriver) -> Self {
         Self {
+            config: Arc::clone(&driver.config),
             state: Arc::clone(&driver.state),
             execution: Arc::clone(&driver.execution),
         }
@@ -281,11 +434,39 @@ impl SupervisorHooks for RuntimeSafetyHooks {
     }
 
     fn clear_target_session(&mut self) {
+        #[cfg(windows)]
+        if enrollment_state_exists() {
+            match RuntimeConfig::from_enrollment_state() {
+                Ok(config) => {
+                    if let Ok(mut execution) = self.execution.lock() {
+                        *execution = CommandExecutor::production(config.profiles.clone());
+                    }
+                    if let Ok(mut current) = self.config.lock() {
+                        *current = config;
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.last_error_code = "runtime.enrollment_refresh_failed".to_owned();
+                        state.record(LogLevel::Warn, "Enrollment refresh failed; reconnect remains fail-closed");
+                    }
+                    tracing::warn!(code = error.code(), "enrollment refresh failed");
+                }
+            }
+        }
         if let Ok(mut execution) = self.execution.lock() {
             let _ = execution.reset();
         }
         if let Ok(mut state) = self.state.lock() {
-            *state = RuntimeState::default();
+            let logs = std::mem::take(&mut state.logs);
+            *state = RuntimeState {
+                control_state: ConnectionState::Reconnecting,
+                frame_state: ConnectionState::Reconnecting,
+                last_error_code: "runtime.reconnecting".to_owned(),
+                logs,
+                ..RuntimeState::default()
+            };
+            state.record(LogLevel::Warn, "Agent session was cleared and will reconnect");
         }
         tracing::info!(effect = "clear_target_session");
     }
@@ -311,7 +492,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
     let mut supervisor = SessionSupervisor::new(hooks, backoff);
     #[cfg(windows)]
     let local_control = tokio::spawn(run_local_control(
-        Arc::clone(&driver.execution),
+        driver.local_runtime(),
         production_local_control_config()?,
     ));
     #[cfg(windows)]
@@ -331,16 +512,102 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
 }
 
 #[cfg(windows)]
-struct SharedExecutor(Arc<Mutex<CommandExecutor>>);
+struct SharedRuntime {
+    execution: Arc<Mutex<CommandExecutor>>,
+    state: Arc<Mutex<RuntimeState>>,
+    config: Arc<Mutex<RuntimeConfig>>,
+}
 
 #[cfg(windows)]
-impl LocalControlRuntime for SharedExecutor {
+impl LocalControlRuntime for SharedRuntime {
     fn execute(
         &mut self,
-        command: &fairypam_agent_local_protocol::LocalCommand,
+        command: &LocalCommand,
     ) -> Result<serde_json::Value, AgentError> {
-        self.0.lock().map_err(lock_error)?.execute_local(command)
+        match command {
+            LocalCommand::GetConnectionStatus => self.connection_status(),
+            LocalCommand::RunEnvironmentCheck => self.environment_check(),
+            LocalCommand::GetLogTail { lines, level } => self.log_tail(*lines, level),
+            LocalCommand::ScanInstalledGames => observability::scan_installed_games(),
+            _ => self.execution.lock().map_err(lock_error)?.execute_local(command),
+        }
     }
+}
+
+#[cfg(windows)]
+impl SharedRuntime {
+    fn connection_status(&self) -> Result<serde_json::Value, AgentError> {
+        let capture_active = self
+            .execution
+            .lock()
+            .map_err(lock_error)?
+            .execute_local(&LocalCommand::Status)?["capture_active"]
+            .as_bool()
+            .unwrap_or(false);
+        let state = self.state.lock().map_err(lock_error)?;
+        let config = self.config.lock().map_err(lock_error)?;
+        Ok(serde_json::json!({
+            "hub_address": display_hub_address(&config.transport.control_endpoint),
+            "control": state.control_state.as_str(),
+            "frame": state.frame_state.as_str(),
+            "capture_active": capture_active,
+            "recovery_code": state.last_error_code,
+        }))
+    }
+
+    fn environment_check(&self) -> Result<serde_json::Value, AgentError> {
+        let (control_state, frame_state) = {
+            let state = self.state.lock().map_err(lock_error)?;
+            (state.control_state, state.frame_state)
+        };
+        let (profiles_configured, certificate_ready) = {
+            let config = self.config.lock().map_err(lock_error)?;
+            (
+                !config.profiles.ids().is_empty(),
+                [
+                    &config.transport.ca_pem,
+                    &config.transport.identity_cert_pem,
+                    &config.transport.identity_key_pem,
+                ]
+                .into_iter()
+                .all(|path| regular_nonempty_file(path)),
+            )
+        };
+        let binary_ready = std::env::current_exe()
+            .ok()
+            .is_some_and(|path| regular_nonempty_file(&path));
+        let (game_status, game_code) = if observability::scan_installed_games().is_ok() {
+            ("available", "game.discovery_ready")
+        } else {
+            ("unavailable", "game.discovery_unavailable")
+        };
+        let check = |id: &str, status: ConnectionState| serde_json::json!({
+            "id": id,
+            "status": status.as_str(),
+            "code": if matches!(status, ConnectionState::Connected) { "runtime.connected" } else { "runtime.connection_unavailable" },
+            "recovery": "Check Agent registration and Hub reachability",
+        });
+        Ok(serde_json::json!({"checks": [
+            {"id": "binary_or_task", "status": if binary_ready { "available" } else { "unavailable" }, "code": if binary_ready { "agent.binary_running_task_unchecked" } else { "agent.binary_unavailable" }, "recovery": "Verify the production scheduled task through the installer"},
+            {"id": "agent", "status": "available", "code": "agent.running", "recovery": "No action required"},
+            {"id": "certificate", "status": if certificate_ready { "available" } else { "unavailable" }, "code": if certificate_ready { "runtime.certificate_files_available" } else { "runtime.certificate_unavailable" }, "recovery": "Re-enroll if the Agent cannot connect"},
+            check("control", control_state),
+            check("frame", frame_state),
+            {"id": "guardian", "status": "unavailable", "code": "guardian.status_unavailable", "recovery": "Guardian status is not available in this build"},
+            {"id": "profiles", "status": if profiles_configured { "available" } else { "unavailable" }, "code": if profiles_configured { "profile.available" } else { "profile.unavailable" }, "recovery": "Install a signed Profile before selecting a target"},
+            {"id": "game_discovery", "status": game_status, "code": game_code, "recovery": "Rescan installed games if the launcher was updated"}
+        ]}))
+    }
+
+    fn log_tail(&self, lines: u16, level: &LogLevel) -> Result<serde_json::Value, AgentError> {
+        let mut state = self.state.lock().map_err(lock_error)?;
+        Ok(observability::log_tail_json(state.logs.make_contiguous(), lines, level))
+    }
+}
+
+fn regular_nonempty_file(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0)
 }
 
 #[cfg(windows)]
@@ -399,9 +666,10 @@ fn production_local_control_config() -> Result<LocalControlConfig, AgentError> {
 
 #[cfg(windows)]
 async fn run_local_control(
-    execution: Arc<Mutex<CommandExecutor>>,
+    runtime: SharedRuntime,
     config: LocalControlConfig,
 ) -> std::convert::Infallible {
+    let execution = Arc::clone(&runtime.execution);
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[cfg(all(windows, feature = "dev-automation"))]
     let mut dev_session = config
@@ -410,7 +678,7 @@ async fn run_local_control(
         .map(|state_dir| DevConnectionSession::new(state_dir.clone()));
     let mut adapter = LocalControlAdapter::new(
         config.owner.clone(),
-        SharedExecutor(Arc::clone(&execution)),
+        runtime,
         RuntimeAudit::new(config.audit_state_dir),
         option_env!("FAIRYPAM_BUILD_ID").unwrap_or("unknown"),
     );
@@ -788,8 +1056,16 @@ pub async fn run_dev_local() -> Result<(), AgentError> {
     let verifier = Ed25519SignatureVerifier::from_public_key_hex(key.trim())?;
     let profiles = ProfileStore::load(&root.join("profiles"), &verifier)?;
     let config = dev_local_control_config()?;
+    let execution = Arc::new(Mutex::new(CommandExecutor::production(profiles.clone())));
     let never = run_local_control(
-        Arc::new(Mutex::new(CommandExecutor::production(profiles))),
+        SharedRuntime {
+            execution,
+            state: Arc::new(Mutex::new(RuntimeState::default())),
+            config: Arc::new(Mutex::new(RuntimeConfig {
+                transport: TransportConfig { control_endpoint: "https://unavailable".parse().expect("fixed URI"), frame_endpoint: "https://unavailable".parse().expect("fixed URI"), server_name: "unavailable".to_owned(), agent_id: "unavailable".to_owned(), ca_pem: PathBuf::new(), identity_cert_pem: PathBuf::new(), identity_key_pem: PathBuf::new(), connect_timeout: Duration::from_secs(10) },
+                agent_version: "dev".to_owned(), build_commit: "unknown".to_owned(), profiles,
+            })),
+        },
         config,
     )
     .await;
@@ -863,6 +1139,17 @@ fn required_uri(name: &'static str) -> Result<Uri, AgentError> {
 
 fn required_path(name: &'static str) -> Result<PathBuf, AgentError> {
     Ok(PathBuf::from(required(name)?))
+}
+
+#[cfg(windows)]
+fn display_hub_address(uri: &Uri) -> String {
+    let Some(host) = uri.host() else {
+        return "unavailable".to_owned();
+    };
+    match uri.port_u16() {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    }
 }
 
 fn map_transport(error: TransportError) -> AgentError {
@@ -996,6 +1283,22 @@ mod tests {
             };
             assert_eq!(command_reference(&command), Some(reference.clone()));
         }
+    }
+
+    #[test]
+    fn regular_nonempty_file_rejects_missing_and_empty_files() {
+        let root = std::env::temp_dir().join(format!("fairypam-runtime-file-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let empty = root.join("empty");
+        let populated = root.join("populated");
+        std::fs::write(&empty, []).unwrap();
+        std::fs::write(&populated, [1]).unwrap();
+
+        assert!(!regular_nonempty_file(&root.join("missing")));
+        assert!(!regular_nonempty_file(&empty));
+        assert!(regular_nonempty_file(&populated));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(all(windows, feature = "dev-automation"))]
