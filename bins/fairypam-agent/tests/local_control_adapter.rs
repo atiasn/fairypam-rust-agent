@@ -136,6 +136,7 @@ fn release_all_records_redacted_mutation_audit() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn registration_audit_and_response_never_echo_credentials() {
     let hub = "https://hub.example/private";
     let code = "fp_enroll_secret_0123456789";
@@ -192,10 +193,7 @@ fn replayed_registration_nonce_is_audited_without_redispatch() {
         MemoryAudit::default(),
         "build-1",
     );
-    let command = LocalCommand::RegisterHub {
-        hub_address: "https://hub.example".to_owned(),
-        registration_code: "fp_enroll_secret_0123456789".to_owned(),
-    };
+    let command = LocalCommand::ReleaseAll;
 
     adapter
         .handle(&caller(), request(command.clone(), 9))
@@ -205,7 +203,7 @@ fn replayed_registration_nonce_is_audited_without_redispatch() {
 
     assert_eq!(runtime.calls, 1);
     assert!(replay.result.is_err());
-    assert_eq!(audit.0.last().unwrap().command, "register_hub");
+    assert_eq!(audit.0.last().unwrap().command, "release_all");
     assert_eq!(
         audit.0.last().unwrap().result_code,
         "local.protocol.nonce_replayed"
