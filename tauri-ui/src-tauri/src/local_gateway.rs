@@ -124,21 +124,6 @@ impl ProductionGateway {
     }
 
     #[cfg(windows)]
-    pub async fn overview_with_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<OverviewDto, UiCommandError> {
-        Ok(OverviewDto {
-            status: self
-                .request_with_timeout(LocalCommand::Status, timeout)
-                .await?,
-            doctor: self
-                .request_with_timeout(LocalCommand::Doctor, timeout)
-                .await?,
-        })
-    }
-
-    #[cfg(windows)]
     pub async fn status_with_timeout(
         &self,
         timeout: Duration,
