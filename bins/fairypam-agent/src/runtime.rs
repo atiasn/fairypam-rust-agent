@@ -736,6 +736,11 @@ impl SharedRuntime {
         let binary_ready = std::env::current_exe()
             .ok()
             .is_some_and(|path| regular_nonempty_file(&path));
+        let guardian_ready = std::env::current_exe().ok().is_some_and(|path| {
+            path.parent().is_some_and(|directory| {
+                regular_nonempty_file(&directory.join("fairypam-agent-guardian.exe"))
+            })
+        });
         let (game_status, game_code) = if observability::scan_installed_games().is_ok() {
             ("available", "game.discovery_ready")
         } else {
@@ -750,12 +755,12 @@ impl SharedRuntime {
             })
         };
         Ok(serde_json::json!({"checks": [
-            {"id": "binary_or_task", "status": if binary_ready { "available" } else { "unavailable" }, "code": if binary_ready { "agent.binary_running_task_unchecked" } else { "agent.binary_unavailable" }, "recovery": "Verify the production scheduled task through the installer"},
+            {"id": "binary_or_task", "status": if binary_ready { "available" } else { "unavailable" }, "code": if binary_ready { "agent.binary_available" } else { "agent.binary_unavailable" }, "recovery": "Repair the Agent installation if the production binary is unavailable"},
             {"id": "agent", "status": "available", "code": "agent.running", "recovery": "No action required"},
             {"id": "certificate", "status": if certificate_ready { "available" } else { "unavailable" }, "code": if certificate_ready { "runtime.certificate_files_available" } else { "runtime.certificate_unavailable" }, "recovery": "Re-enroll if the Agent cannot connect"},
             check("control", control_state),
             check("frame", frame_state),
-            {"id": "guardian", "status": "unavailable", "code": "guardian.status_unavailable", "recovery": "Guardian status is not available in this build"},
+            {"id": "guardian", "status": if guardian_ready { "available" } else { "unavailable" }, "code": if guardian_ready { "guardian.binary_available" } else { "guardian.binary_unavailable" }, "recovery": "Repair the Agent installation if the Guardian binary is unavailable"},
             {"id": "profiles", "status": if profiles_configured { "available" } else { "unavailable" }, "code": if profiles_configured { "profile.available" } else { "profile.unavailable" }, "recovery": "Install a signed Profile before selecting a target"},
             {"id": "game_discovery", "status": game_status, "code": game_code, "recovery": "Rescan installed games if the launcher was updated"}
         ]}))
