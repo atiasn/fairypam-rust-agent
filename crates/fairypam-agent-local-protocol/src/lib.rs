@@ -1,920 +1,404 @@
-#[cfg(feature = "dev-automation")]
-use std::collections::BTreeSet;
-use std::collections::HashMap;
-#[cfg(unix)]
-use std::fs::File;
-#[cfg(unix)]
-use std::io::Read;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+//! Strict, framed local-control protocol shared by privileged Agent callers.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha2::{Digest, Sha256};
+use std::{collections::VecDeque, fmt};
+
+use serde::{
+    de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
+use serde_json::{Map, Value};
 use thiserror::Error;
 
-pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
-pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
-pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-pub const MAX_NONCE_ENTRIES: usize = 1_024;
-pub const REPLAY_WINDOW: Duration = Duration::from_secs(120);
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const MAX_FRAME_BYTES: usize = 65_536;
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LocalRequest {
-    pub protocol_major: u16,
-    pub protocol_minor: u16,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "encoding", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CaptureEncoding {
+    Jpeg { quality: u8 },
+    Png,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LocalCommand {
+    Status,
+    Doctor,
+    ListProfiles,
+    EnumerateTargets {
+        profile_id: String,
+    },
+    LockTarget {
+        profile_id: String,
+        candidate_id: String,
+    },
+    FocusTarget,
+    StartCapture {
+        source_id: String,
+        fps: u8,
+        encoding: CaptureEncoding,
+    },
+    StopCapture {
+        source_id: String,
+    },
+    #[cfg(feature = "dev-automation")]
+    TestbedPulse,
+    ReleaseAll,
+    UpdateStatus,
+    StartupStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestEnvelope {
+    pub protocol_version: u16,
     pub request_id: String,
-    pub nonce: String,
+    pub nonce: [u8; 32],
     pub command: LocalCommand,
 }
 
-impl LocalRequest {
-    pub fn new(request_id: String, nonce: String, command: LocalCommand) -> Self {
-        Self {
-            protocol_major: PROTOCOL_MAJOR,
-            protocol_minor: PROTOCOL_MINOR,
-            request_id,
-            nonce,
-            command,
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.protocol_major != PROTOCOL_MAJOR || self.protocol_minor > PROTOCOL_MINOR {
-            return Err(ProtocolError::new(
-                LocalErrorCode::ProtocolVersionMismatch,
-                "local protocol version is unsupported",
-            ));
-        }
-        validate_request_id(&self.request_id)?;
-        validate_nonce(&self.nonce)?;
-        self.command.validate()
-    }
+#[derive(Serialize)]
+struct RequestWire<'a> {
+    protocol_version: u16,
+    request_id: &'a str,
+    nonce: [u8; 32],
+    #[serde(flatten)]
+    command: &'a LocalCommand,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
-pub enum LocalCommand {
-    Hello {
-        client_name: String,
-        client_version: String,
-    },
-    Status {},
-    Doctor {},
-    ListProfiles {},
-    ListTargets {
-        profile_id: String,
-    },
-    SelectTarget {
-        profile_id: String,
-        target_id: String,
-    },
-    FocusTarget {},
-    CloseTarget {
-        timeout_ms: u32,
-    },
-    Diagnostics {},
-    SuiteStatus {},
-    CapturePreview {
-        quality: u8,
-    },
-    RequestUpdate {},
-    SetAutostart {
-        enabled: bool,
-    },
-    ReleaseAll {},
-    PrepareUpdate {
-        timeout_ms: u32,
-    },
-    ResumeAfterUpdateFailure {},
-    #[cfg(feature = "dev-automation")]
-    DevStatus {},
-    #[cfg(feature = "dev-automation")]
-    DevStartAutomation {
-        target: AutomationTarget,
-        capabilities: BTreeSet<AutomationCapability>,
-        ttl_ms: u32,
-    },
-    #[cfg(feature = "dev-automation")]
-    DevPulseTestbed {
-        session_id: String,
-    },
-    #[cfg(feature = "dev-automation")]
-    DevHoldTestbed {
-        session_id: String,
-        duration_ms: u32,
-    },
-    #[cfg(feature = "dev-automation")]
-    DevStopAutomation {},
-    #[cfg(feature = "dev-automation")]
-    DevEmergencyStop {},
-}
-
-impl LocalCommand {
-    pub const fn name(&self) -> &'static str {
-        match self {
-            Self::Hello { .. } => "hello",
-            Self::Status {} => "status",
-            Self::Doctor {} => "doctor",
-            Self::ListProfiles {} => "list_profiles",
-            Self::ListTargets { .. } => "list_targets",
-            Self::SelectTarget { .. } => "select_target",
-            Self::FocusTarget {} => "focus_target",
-            Self::CloseTarget { .. } => "close_target",
-            Self::Diagnostics {} => "diagnostics",
-            Self::SuiteStatus {} => "suite_status",
-            Self::CapturePreview { .. } => "capture_preview",
-            Self::RequestUpdate {} => "request_update",
-            Self::SetAutostart { .. } => "set_autostart",
-            Self::ReleaseAll {} => "release_all",
-            Self::PrepareUpdate { .. } => "prepare_update",
-            Self::ResumeAfterUpdateFailure {} => "resume_after_update_failure",
-            #[cfg(feature = "dev-automation")]
-            Self::DevStatus {} => "dev_status",
-            #[cfg(feature = "dev-automation")]
-            Self::DevStartAutomation { .. } => "dev_start_automation",
-            #[cfg(feature = "dev-automation")]
-            Self::DevPulseTestbed { .. } => "dev_pulse_testbed",
-            #[cfg(feature = "dev-automation")]
-            Self::DevHoldTestbed { .. } => "dev_hold_testbed",
-            #[cfg(feature = "dev-automation")]
-            Self::DevStopAutomation {} => "dev_stop_automation",
-            #[cfg(feature = "dev-automation")]
-            Self::DevEmergencyStop {} => "dev_emergency_stop",
+impl Serialize for RequestEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        RequestWire {
+            protocol_version: self.protocol_version,
+            request_id: &self.request_id,
+            nonce: self.nonce,
+            command: &self.command,
         }
-    }
-
-    pub const fn mutates_state(&self) -> bool {
-        match self {
-            Self::SelectTarget { .. }
-            | Self::FocusTarget {}
-            | Self::CloseTarget { .. }
-            | Self::RequestUpdate {}
-            | Self::SetAutostart { .. }
-            | Self::ReleaseAll {} => true,
-            Self::PrepareUpdate { .. } | Self::ResumeAfterUpdateFailure {} => true,
-            #[cfg(feature = "dev-automation")]
-            Self::DevStartAutomation { .. }
-            | Self::DevPulseTestbed { .. }
-            | Self::DevHoldTestbed { .. }
-            | Self::DevStopAutomation {}
-            | Self::DevEmergencyStop {} => true,
-            _ => false,
-        }
-    }
-
-    fn validate(&self) -> Result<(), ProtocolError> {
-        match self {
-            Self::Hello {
-                client_name,
-                client_version,
-            } => {
-                validate_label(client_name, "client name", 64)?;
-                validate_label(client_version, "client version", 32)
-            }
-            Self::ListTargets { profile_id } | Self::SelectTarget { profile_id, .. } => {
-                validate_profile_id(profile_id)?;
-                if let Self::SelectTarget { target_id, .. } = self {
-                    validate_opaque_id(target_id, "target id")?;
-                }
-                Ok(())
-            }
-            Self::CloseTarget { timeout_ms } if !(1..=5_000).contains(timeout_ms) => {
-                Err(ProtocolError::new(
-                    LocalErrorCode::InvalidArgument,
-                    "close timeout must be between 1 and 5000 ms",
-                ))
-            }
-            Self::PrepareUpdate { timeout_ms } if !(1..=30_000).contains(timeout_ms) => {
-                Err(ProtocolError::new(
-                    LocalErrorCode::InvalidArgument,
-                    "update quiesce timeout must be between 1 and 30000 ms",
-                ))
-            }
-            Self::CapturePreview { quality } if !(1..=100).contains(quality) => {
-                Err(ProtocolError::new(
-                    LocalErrorCode::InvalidArgument,
-                    "preview quality must be between 1 and 100",
-                ))
-            }
-            #[cfg(feature = "dev-automation")]
-            Self::DevStartAutomation {
-                target,
-                capabilities,
-                ttl_ms,
-            } => {
-                target.validate()?;
-                if capabilities.is_empty() || capabilities.len() > 3 {
-                    return Err(ProtocolError::new(
-                        LocalErrorCode::InvalidArgument,
-                        "automation capabilities must be a non-empty fixed set",
-                    ));
-                }
-                if !(1_000..=30_000).contains(ttl_ms) {
-                    return Err(ProtocolError::new(
-                        LocalErrorCode::InvalidArgument,
-                        "automation TTL must be between 1000 and 30000 ms",
-                    ));
-                }
-                Ok(())
-            }
-            #[cfg(feature = "dev-automation")]
-            Self::DevPulseTestbed { session_id } => {
-                validate_opaque_id(session_id, "automation session id")
-            }
-            #[cfg(feature = "dev-automation")]
-            Self::DevHoldTestbed {
-                session_id,
-                duration_ms,
-            } => {
-                validate_opaque_id(session_id, "automation session id")?;
-                if !(1..=30_000).contains(duration_ms) {
-                    return Err(ProtocolError::new(
-                        LocalErrorCode::InvalidArgument,
-                        "testbed hold duration must be between 1 and 30000 ms",
-                    ));
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+        .serialize(serializer)
     }
 }
 
-#[cfg(feature = "dev-automation")]
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "target", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AutomationTarget {
-    TestbedNormal {},
-    TestbedHigh {},
-    LiveGame { profile_id: String },
-}
-
-#[cfg(feature = "dev-automation")]
-impl AutomationTarget {
-    fn validate(&self) -> Result<(), ProtocolError> {
-        match self {
-            Self::TestbedNormal {} | Self::TestbedHigh {} => Ok(()),
-            Self::LiveGame { profile_id } => validate_profile_id(profile_id),
-        }
+impl<'de> Deserialize<'de> for RequestEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        request_from_value(value).map_err(serde::de::Error::custom)
     }
 }
 
-#[cfg(feature = "dev-automation")]
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum AutomationCapability {
-    CaptureScreenshot,
-    PulseTestAction,
-    HoldTestAction,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalResponse {
-    pub protocol_major: u16,
-    pub protocol_minor: u16,
-    pub request_id: String,
-    pub result: LocalResult,
+    pub body: Value,
 }
 
-impl LocalResponse {
-    pub fn ok(request_id: impl Into<String>, payload: LocalPayload) -> Self {
-        Self {
-            protocol_major: PROTOCOL_MAJOR,
-            protocol_minor: PROTOCOL_MINOR,
-            request_id: request_id.into(),
-            result: LocalResult::Ok { payload },
-        }
-    }
-
-    pub fn error(request_id: impl Into<String>, error: ProtocolError) -> Self {
-        Self {
-            protocol_major: PROTOCOL_MAJOR,
-            protocol_minor: PROTOCOL_MINOR,
-            request_id: request_id.into(),
-            result: LocalResult::Error {
-                code: error.code,
-                message: error.message,
-                retryable: error.retryable,
-            },
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
-pub enum LocalResult {
-    Ok {
-        payload: LocalPayload,
-    },
-    Error {
-        code: LocalErrorCode,
-        message: String,
-        retryable: bool,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum LocalPayload {
-    Hello {
-        server_version: String,
-        protocol_major: u16,
-        protocol_minor: u16,
-    },
-    Status {
-        lifecycle: AgentLifecycle,
-        active_profile_id: Option<String>,
-        target_locked: bool,
-        capture_active: bool,
-    },
-    Doctor {
-        checks: Vec<DoctorCheck>,
-    },
-    Profiles {
-        profile_ids: Vec<String>,
-    },
-    Targets {
-        profile_id: String,
-        targets: Vec<TargetSummary>,
-    },
-    Target {
-        profile_id: String,
-        target_id: String,
-        title: String,
-        process_name: String,
-        foreground: Option<bool>,
-        capturable: Option<bool>,
-    },
-    Diagnostics {
-        agent_version: String,
-        build_commit: String,
-        protocol: String,
-        control_connected: bool,
-        audit_enabled: bool,
-    },
-    SuiteStatus {
-        installation: InstallationState,
-        guardian: GuardianState,
-        control_mode: ControlMode,
-        update: UpdateState,
-        autostart: AutostartState,
-        can_request_update: bool,
-    },
-    Preview {
-        mime_type: String,
-        data_base64: String,
-        width: u32,
-        height: u32,
-    },
-    Maintenance {
-        action: String,
-        accepted: bool,
-    },
-    Released {
-        holds: u32,
-        state: String,
-    },
-    #[cfg(feature = "dev-automation")]
-    DevStatus {
-        provisioned_build_id: Option<String>,
-        build_commit: String,
-        active_session_id: Option<String>,
-        expires_at_unix_ms: Option<u64>,
-    },
-    #[cfg(feature = "dev-automation")]
-    AutomationSession {
-        session_id: String,
-        expires_at_unix_ms: u64,
-    },
-    #[cfg(feature = "dev-automation")]
-    TestbedAction {
-        session_id: String,
-        action: String,
-        accepted: bool,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentLifecycle {
-    Starting,
-    Connected,
-    Disconnected,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum InstallationState {
-    Healthy,
-    Incomplete,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardianState {
-    Installed,
-    Missing,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlMode {
-    Unknown,
-    DryRun,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum UpdateState {
-    Idle,
-    Quiesced,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AutostartState {
-    Enabled,
-    Disabled,
-    Missing,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DoctorCheck {
-    pub component: String,
-    pub status: CheckStatus,
-    pub summary: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckStatus {
-    Ok,
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TargetSummary {
-    pub target_id: String,
-    pub title: String,
-    pub process_name: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum LocalErrorCode {
-    InvalidArgument,
-    ProtocolViolation,
-    ProtocolVersionMismatch,
-    MessageTooLarge,
-    ReplayDetected,
-    PermissionDenied,
-    AgentUnavailable,
-    TargetUnavailable,
-    OperationFailed,
-    UnsupportedCapability,
-}
-
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-#[error("{code:?}: {message}")]
-pub struct ProtocolError {
-    pub code: LocalErrorCode,
+pub struct LocalError {
+    pub code: String,
     pub message: String,
-    pub retryable: bool,
-    pub request_id: Option<String>,
 }
 
-impl ProtocolError {
-    pub fn new(code: LocalErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            retryable: false,
-            request_id: None,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseEnvelope {
+    pub request_id: String,
+    pub result: Result<LocalResponse, LocalError>,
+}
+
+#[derive(Debug, Error)]
+pub enum LocalProtocolError {
+    #[error("local.protocol.frame_too_large")]
+    FrameTooLarge,
+    #[error("local.protocol.invalid: {0}")]
+    Invalid(String),
+    #[error("local.protocol.unsupported_capability")]
+    UnsupportedCapability,
+    #[error("local.protocol.unsupported_version")]
+    UnsupportedVersion,
+    #[error("local.protocol.nonce_replayed")]
+    NonceReplayed,
+}
+
+impl LocalProtocolError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::FrameTooLarge => "local.protocol.frame_too_large",
+            Self::Invalid(_) => "local.protocol.invalid",
+            Self::UnsupportedCapability => "local.protocol.unsupported_capability",
+            Self::UnsupportedVersion => "local.protocol.unsupported_version",
+            Self::NonceReplayed => "local.protocol.nonce_replayed",
         }
     }
 
-    pub fn retryable(mut self, retryable: bool) -> Self {
-        self.retryable = retryable;
-        self
-    }
-
-    pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
-        self.request_id = request_id;
-        self
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(message.into())
     }
 }
 
-pub fn encode_request(request: &LocalRequest) -> Result<Vec<u8>, ProtocolError> {
-    request.validate()?;
-    encode(request, MAX_MESSAGE_BYTES)
+pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, LocalProtocolError> {
+    let json = serde_json::to_vec(value)
+        .map_err(|error| LocalProtocolError::invalid(error.to_string()))?;
+    if json.len() > MAX_FRAME_BYTES {
+        return Err(LocalProtocolError::FrameTooLarge);
+    }
+
+    let mut frame = Vec::with_capacity(4 + json.len());
+    frame.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&json);
+    Ok(frame)
 }
 
-pub fn decode_request(bytes: &[u8]) -> Result<LocalRequest, ProtocolError> {
-    check_message_size(bytes)?;
-    match serde_json::from_slice::<LocalRequest>(bytes) {
-        Ok(request) => {
-            request.validate()?;
-            Ok(request)
+pub fn decode_request(frame: &[u8]) -> Result<RequestEnvelope, LocalProtocolError> {
+    request_from_value(decode_frame_value(frame)?)
+}
+
+/// Decodes a request while preserving the caller correlation id for a stable
+/// protocol error response.  A server uses this at its framing boundary so an
+/// unknown (including Dev-only) command is rejected without terminating the
+/// privileged pipe listener or reaching a domain handler.
+pub fn decode_request_or_error_response(frame: &[u8]) -> Result<RequestEnvelope, ResponseEnvelope> {
+    let value = match decode_frame_value(frame) {
+        Ok(value) => value,
+        Err(error) => return Err(protocol_error_response("invalid".to_owned(), error)),
+    };
+    let request_id = value
+        .as_object()
+        .and_then(|object| object.get("request_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("invalid")
+        .to_owned();
+    request_from_value(value).map_err(|error| protocol_error_response(request_id, error))
+}
+
+pub fn decode_response(frame: &[u8]) -> Result<ResponseEnvelope, LocalProtocolError> {
+    serde_json::from_value(decode_frame_value(frame)?)
+        .map_err(|error| LocalProtocolError::invalid(error.to_string()))
+}
+
+fn decode_frame_value(frame: &[u8]) -> Result<Value, LocalProtocolError> {
+    if frame.len() > MAX_FRAME_BYTES + 4 {
+        return Err(LocalProtocolError::FrameTooLarge);
+    }
+    if frame.len() < 4 {
+        return Err(LocalProtocolError::invalid("missing frame length prefix"));
+    }
+
+    let payload_length =
+        u32::from_le_bytes(frame[..4].try_into().expect("prefix length checked")) as usize;
+    if payload_length > MAX_FRAME_BYTES {
+        return Err(LocalProtocolError::FrameTooLarge);
+    }
+    if frame.len() != payload_length + 4 {
+        return Err(LocalProtocolError::invalid(
+            "frame length does not match prefix",
+        ));
+    }
+
+    parse_unique_json(&frame[4..])
+}
+
+fn protocol_error_response(request_id: String, error: LocalProtocolError) -> ResponseEnvelope {
+    ResponseEnvelope {
+        request_id,
+        result: Err(LocalError {
+            code: error.code().to_owned(),
+            message: error.to_string(),
+        }),
+    }
+}
+
+fn parse_unique_json(payload: &[u8]) -> Result<Value, LocalProtocolError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(payload);
+    let value = UniqueJson::deserialize(&mut deserializer)
+        .map_err(|error| LocalProtocolError::invalid(error.to_string()))?;
+    deserializer
+        .end()
+        .map_err(|error| LocalProtocolError::invalid(error.to_string()))?;
+    Ok(value.0)
+}
+
+struct UniqueJson(Value);
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = UniqueJson;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| E::custom("JSON numbers must be finite"))?;
+        Ok(UniqueJson(Value::Number(number)))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::String(value)))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJson(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJson>()? {
+            values.push(value.0);
         }
-        Err(error) => {
-            let value = serde_json::from_slice::<Value>(bytes).ok();
-            let request_id = value
-                .as_ref()
-                .and_then(|value| value.get("request_id"))
-                .and_then(Value::as_str)
-                .filter(|value| value.len() <= 64)
-                .map(str::to_owned);
-            let is_dev = value
-                .as_ref()
-                .and_then(|value| value.get("command"))
-                .and_then(Value::as_object)
-                .and_then(|command| command.get("command"))
-                .and_then(Value::as_str)
-                .is_some_and(|command| command.starts_with("dev_"));
-            let code = if is_dev {
-                LocalErrorCode::UnsupportedCapability
-            } else {
-                LocalErrorCode::ProtocolViolation
-            };
-            Err(
-                ProtocolError::new(code, format!("invalid local request: {error}"))
-                    .with_request_id(request_id),
-            )
+        Ok(UniqueJson(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(de::Error::custom(format!("duplicate JSON key: {key}")));
+            }
+            let value = map.next_value::<UniqueJson>()?;
+            object.insert(key, value.0);
         }
+        Ok(UniqueJson(Value::Object(object)))
     }
 }
 
-pub fn encode_response(response: &LocalResponse) -> Result<Vec<u8>, ProtocolError> {
-    encode(response, MAX_RESPONSE_BYTES)
-}
+fn request_from_value(value: Value) -> Result<RequestEnvelope, LocalProtocolError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| LocalProtocolError::invalid("request must be an object"))?;
+    let protocol_version = required_field(object, "protocol_version")?;
+    let request_id = required_field(object, "request_id")?;
+    let nonce = required_field(object, "nonce")?;
+    let command_name: String = required_field(object, "command")?;
 
-pub fn decode_response(bytes: &[u8]) -> Result<LocalResponse, ProtocolError> {
-    check_size(bytes, MAX_RESPONSE_BYTES, "local response exceeds 2 MiB")?;
-    serde_json::from_slice(bytes).map_err(|error| {
-        ProtocolError::new(
-            LocalErrorCode::ProtocolViolation,
-            format!("invalid local response: {error}"),
-        )
+    if !is_supported_command(&command_name) {
+        return Err(LocalProtocolError::UnsupportedCapability);
+    }
+    if object
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "protocol_version" | "request_id" | "nonce"))
+        .any(|key| !is_allowed_command_field(&command_name, key))
+    {
+        return Err(LocalProtocolError::invalid("unknown command field"));
+    }
+
+    let command = serde_json::from_value(Value::Object(
+        object
+            .iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "protocol_version" | "request_id" | "nonce"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    ))
+    .map_err(|error| LocalProtocolError::invalid(error.to_string()))?;
+
+    if protocol_version != PROTOCOL_VERSION {
+        return Err(LocalProtocolError::UnsupportedVersion);
+    }
+
+    Ok(RequestEnvelope {
+        protocol_version,
+        request_id,
+        nonce,
+        command,
     })
 }
 
-fn encode<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>, ProtocolError> {
-    let bytes = serde_json::to_vec(value).map_err(|error| {
-        ProtocolError::new(
-            LocalErrorCode::ProtocolViolation,
-            format!("cannot encode local protocol message: {error}"),
-        )
-    })?;
-    check_size(
-        &bytes,
-        maximum,
-        "local protocol message exceeds its size limit",
-    )?;
-    Ok(bytes)
+fn required_field<T>(object: &Map<String, Value>, name: &str) -> Result<T, LocalProtocolError>
+where
+    T: DeserializeOwned,
+{
+    let value = object
+        .get(name)
+        .cloned()
+        .ok_or_else(|| LocalProtocolError::invalid(format!("missing {name}")))?;
+    serde_json::from_value(value).map_err(|error| LocalProtocolError::invalid(error.to_string()))
 }
 
-fn check_message_size(bytes: &[u8]) -> Result<(), ProtocolError> {
-    check_size(bytes, MAX_MESSAGE_BYTES, "local request exceeds 64 KiB")
-}
-
-fn check_size(bytes: &[u8], maximum: usize, message: &str) -> Result<(), ProtocolError> {
-    if bytes.len() > maximum {
-        return Err(ProtocolError::new(LocalErrorCode::MessageTooLarge, message));
+fn is_supported_command(command: &str) -> bool {
+    match command {
+        "status" | "doctor" | "list_profiles" | "enumerate_targets" | "lock_target"
+        | "focus_target" | "start_capture" | "stop_capture" | "release_all" | "update_status"
+        | "startup_status" => true,
+        #[cfg(feature = "dev-automation")]
+        "testbed_pulse" => true,
+        _ => false,
     }
-    Ok(())
 }
 
-#[derive(Default)]
-pub struct ReplayGuard {
-    seen: HashMap<String, Instant>,
+fn is_allowed_command_field(command: &str, field: &str) -> bool {
+    matches!(
+        (command, field),
+        (_, "command")
+            | ("enumerate_targets", "profile_id")
+            | ("lock_target", "profile_id" | "candidate_id")
+            | ("start_capture", "source_id" | "fps" | "encoding")
+            | ("stop_capture", "source_id")
+    )
 }
 
-impl ReplayGuard {
-    pub fn accept(&mut self, nonce: &str, now: Instant) -> Result<(), ProtocolError> {
-        self.accept_with_capacity(nonce, now, MAX_NONCE_ENTRIES)
+#[derive(Debug)]
+pub struct NonceReplayGuard {
+    capacity: usize,
+    accepted: VecDeque<[u8; 32]>,
+}
+
+impl NonceReplayGuard {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            accepted: VecDeque::with_capacity(capacity.max(1)),
+        }
     }
 
-    pub fn accept_with_capacity(
-        &mut self,
-        nonce: &str,
-        now: Instant,
-        capacity: usize,
-    ) -> Result<(), ProtocolError> {
-        self.seen
-            .retain(|_, accepted_at| now.saturating_duration_since(*accepted_at) < REPLAY_WINDOW);
-        if self.seen.contains_key(nonce) {
-            return Err(ProtocolError::new(
-                LocalErrorCode::ReplayDetected,
-                "request nonce was already accepted",
-            ));
+    pub fn accept(&mut self, nonce: [u8; 32]) -> Result<(), LocalProtocolError> {
+        if self.accepted.contains(&nonce) {
+            return Err(LocalProtocolError::NonceReplayed);
         }
-        if self.seen.len() >= capacity.min(MAX_NONCE_ENTRIES) {
-            return Err(ProtocolError::new(
-                LocalErrorCode::OperationFailed,
-                "nonce replay cache is at capacity",
-            )
-            .retryable(true));
+        if self.accepted.len() == self.capacity {
+            self.accepted.pop_front();
         }
-        self.seen.insert(nonce.to_owned(), now);
+        self.accepted.push_back(nonce);
         Ok(())
-    }
-}
-
-pub fn random_nonce() -> Result<String, ProtocolError> {
-    let mut bytes = [0_u8; 32];
-    fill_random(&mut bytes)?;
-    Ok(hex(&bytes))
-}
-
-pub fn new_request_id() -> Result<String, ProtocolError> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut seed = [0_u8; 32];
-    fill_random(&mut seed)?;
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let digest = Sha256::new()
-        .chain_update(seed)
-        .chain_update(counter.to_le_bytes())
-        .chain_update(now.to_le_bytes())
-        .finalize();
-    Ok(format!("req-{}", &hex(&digest)[..32]))
-}
-
-fn fill_random(bytes: &mut [u8]) -> Result<(), ProtocolError> {
-    #[cfg(unix)]
-    {
-        File::open("/dev/urandom")
-            .and_then(|mut source| source.read_exact(bytes))
-            .map_err(|error| {
-                ProtocolError::new(
-                    LocalErrorCode::OperationFailed,
-                    format!("OS randomness unavailable: {error}"),
-                )
-            })
-    }
-    #[cfg(windows)]
-    {
-        windows_random(bytes)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = bytes;
-        Err(ProtocolError::new(
-            LocalErrorCode::UnsupportedCapability,
-            "OS randomness is unsupported on this platform",
-        ))
-    }
-}
-
-#[cfg(windows)]
-fn windows_random(bytes: &mut [u8]) -> Result<(), ProtocolError> {
-    #[link(name = "bcrypt")]
-    extern "system" {
-        fn BCryptGenRandom(
-            algorithm: *mut core::ffi::c_void,
-            buffer: *mut u8,
-            length: u32,
-            flags: u32,
-        ) -> i32;
-    }
-    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 2;
-    let length = u32::try_from(bytes.len()).map_err(|_| {
-        ProtocolError::new(
-            LocalErrorCode::OperationFailed,
-            "random request is too large",
-        )
-    })?;
-    // SAFETY: the OS writes exactly `length` bytes into the live mutable slice.
-    let status = unsafe {
-        BCryptGenRandom(
-            std::ptr::null_mut(),
-            bytes.as_mut_ptr(),
-            length,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status < 0 {
-        return Err(ProtocolError::new(
-            LocalErrorCode::OperationFailed,
-            format!("BCryptGenRandom failed with NTSTATUS {status:#x}"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_request_id(value: &str) -> Result<(), ProtocolError> {
-    let valid = (8..=64).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
-    if !valid {
-        return Err(ProtocolError::new(
-            LocalErrorCode::InvalidArgument,
-            "request id is invalid",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_nonce(value: &str) -> Result<(), ProtocolError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(ProtocolError::new(
-            LocalErrorCode::InvalidArgument,
-            "nonce must be 32 bytes encoded as lowercase hex",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_profile_id(value: &str) -> Result<(), ProtocolError> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
-        return Err(ProtocolError::new(
-            LocalErrorCode::InvalidArgument,
-            "profile id is invalid",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_opaque_id(value: &str, label: &str) -> Result<(), ProtocolError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(ProtocolError::new(
-            LocalErrorCode::InvalidArgument,
-            format!("{label} is invalid"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_label(value: &str, label: &str, maximum: usize) -> Result<(), ProtocolError> {
-    if value.trim().is_empty()
-        || value.len() > maximum
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b" ._+-".contains(&byte))
-    {
-        return Err(ProtocolError::new(
-            LocalErrorCode::InvalidArgument,
-            format!("{label} is invalid"),
-        ));
-    }
-    Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn request(command: LocalCommand) -> LocalRequest {
-        LocalRequest::new("req-0123456789abcdef".into(), "01".repeat(32), command)
-    }
-
-    #[test]
-    fn strict_domain_request_rejects_unknown_fields_and_methods() {
-        let arbitrary = br#"{"protocol_major":1,"protocol_minor":0,"request_id":"req-0123456789abcdef","nonce":"0101010101010101010101010101010101010101010101010101010101010101","command":{"command":"invoke","method":"shell","json":{}}}"#;
-        assert_eq!(
-            decode_request(arbitrary).unwrap_err().code,
-            LocalErrorCode::ProtocolViolation
-        );
-
-        let mut value = serde_json::to_value(request(LocalCommand::Status {})).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .insert("extra".into(), true.into());
-        assert_eq!(
-            decode_request(&serde_json::to_vec(&value).unwrap())
-                .unwrap_err()
-                .code,
-            LocalErrorCode::ProtocolViolation
-        );
-    }
-
-    #[test]
-    #[cfg(not(feature = "dev-automation"))]
-    fn production_parser_classifies_dev_messages_without_linking_dev_handlers() {
-        let probe = br#"{"protocol_major":1,"protocol_minor":0,"request_id":"req-0123456789abcdef","nonce":"0101010101010101010101010101010101010101010101010101010101010101","command":{"command":"dev_start_automation"}}"#;
-        assert_eq!(
-            decode_request(probe).unwrap_err().code,
-            LocalErrorCode::UnsupportedCapability
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "dev-automation")]
-    fn dev_protocol_has_fixed_testbed_actions_but_no_remote_live_arm_creation() {
-        let request = request(LocalCommand::DevPulseTestbed {
-            session_id: "ab".repeat(32),
-        });
-        assert!(encode_request(&request).is_ok());
-        let remote_arm = br#"{"protocol_major":1,"protocol_minor":0,"request_id":"req-0123456789abcdef","nonce":"0101010101010101010101010101010101010101010101010101010101010101","command":{"command":"dev_create_live_game_arm","profile_id":"genshin-impact"}}"#;
-        assert_eq!(
-            decode_request(remote_arm).unwrap_err().code,
-            LocalErrorCode::UnsupportedCapability
-        );
-    }
-
-    #[test]
-    fn replay_and_message_size_fail_closed() {
-        let mut guard = ReplayGuard::default();
-        let now = Instant::now();
-        guard.accept(&"ab".repeat(32), now).unwrap();
-        assert_eq!(
-            guard.accept(&"ab".repeat(32), now).unwrap_err().code,
-            LocalErrorCode::ReplayDetected
-        );
-        assert_eq!(
-            decode_request(&vec![b' '; MAX_MESSAGE_BYTES + 1])
-                .unwrap_err()
-                .code,
-            LocalErrorCode::MessageTooLarge
-        );
-    }
-
-    #[test]
-    fn replay_capacity_can_reserve_entries_without_weakening_duplicate_detection() {
-        let mut guard = ReplayGuard::default();
-        let now = Instant::now();
-        guard.accept_with_capacity("first", now, 1).unwrap();
-        assert_eq!(
-            guard
-                .accept_with_capacity("first", now, 1)
-                .unwrap_err()
-                .code,
-            LocalErrorCode::ReplayDetected
-        );
-        let capacity = guard.accept_with_capacity("second", now, 1).unwrap_err();
-        assert_eq!(capacity.code, LocalErrorCode::OperationFailed);
-        assert!(capacity.retryable);
-    }
-
-    #[test]
-    fn bounded_preview_response_does_not_expand_request_limit() {
-        assert_eq!(
-            encode_request(&request(LocalCommand::CapturePreview { quality: 0 }))
-                .unwrap_err()
-                .code,
-            LocalErrorCode::InvalidArgument
-        );
-        let response = LocalResponse::ok(
-            "req-0123456789abcdef",
-            LocalPayload::Preview {
-                mime_type: "image/jpeg".into(),
-                data_base64: "a".repeat(MAX_MESSAGE_BYTES),
-                width: 640,
-                height: 360,
-            },
-        );
-        assert!(encode_response(&response).is_ok());
-        assert!(decode_request(&vec![b' '; MAX_MESSAGE_BYTES + 1]).is_err());
-    }
-
-    #[test]
-    fn command_surface_has_no_raw_execution_coordinates_or_handles() {
-        let wire = encode_request(&request(LocalCommand::SelectTarget {
-            profile_id: "fairypam-test-window".into(),
-            target_id: "ab".repeat(32),
-        }))
-        .unwrap();
-        let wire = String::from_utf8(wire).unwrap();
-        for forbidden in ["method", "shell", "path", "hwnd", "keycode", "coordinate"] {
-            assert!(!wire.contains(forbidden));
-        }
-    }
-
-    #[test]
-    fn maintenance_command_is_a_fixed_domain_enum() {
-        let wire = encode_request(&request(LocalCommand::SetAutostart { enabled: true })).unwrap();
-        assert_eq!(
-            decode_request(&wire).unwrap().command,
-            LocalCommand::SetAutostart { enabled: true }
-        );
     }
 }

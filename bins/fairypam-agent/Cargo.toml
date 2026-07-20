@@ -7,29 +7,22 @@ build = "build.rs"
 
 [features]
 default = []
-dev-automation = [
-    "dep:fairypam-agent-dev-automation",
-    "fairypam-agent-local-client/dev-automation",
-    "fairypam-agent-local-protocol/dev-automation",
-    "fairypam-agent-windows/dev-automation",
-]
-e2e-live-input = ["dev-automation"]
+e2e-live-input = []
+dev-automation = ["dep:fairypam-agent-dev-automation", "fairypam-agent-local-protocol/dev-automation", "fairypam-agent-windows/testbed"]
 
 [dependencies]
-base64.workspace = true
 fairypam-agent-core = { path = "../../crates/fairypam-agent-core" }
-fairypam-agent-dev-automation = { path = "../../crates/fairypam-agent-dev-automation", optional = true }
 fairypam-agent-input = { path = "../../crates/fairypam-agent-input" }
-fairypam-agent-local-client = { path = "../../crates/fairypam-agent-local-client" }
+fairypam-agent-dev-automation = { path = "../../crates/fairypam-agent-dev-automation", optional = true }
 fairypam-agent-local-protocol = { path = "../../crates/fairypam-agent-local-protocol" }
 fairypam-agent-protocol = { path = "../../crates/fairypam-agent-protocol" }
-fairypam-agent-suite = { path = "../../crates/fairypam-agent-suite" }
 fairypam-agent-transport = { path = "../../crates/fairypam-agent-transport" }
 fairypam-agent-windows = { path = "../../crates/fairypam-agent-windows" }
 http = "1"
 serde_json.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
+sha2.workspace = true
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 

@@ -14,12 +14,12 @@ const PACKAGE_MEMBERS: [&str; 4] = [
     "BUILD-MANIFEST.json",
     "README.txt",
     "fairypam-agent.exe",
-    "fairypam-agent-ui.exe",
+    "fairypam-agent-tauri-ui.exe",
 ];
 const PAYLOAD_MEMBERS: [&str; 3] = [
     "README.txt",
     "fairypam-agent.exe",
-    "fairypam-agent-ui.exe",
+    "fairypam-agent-tauri-ui.exe",
 ];
 const MAX_MEMBER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -699,7 +699,7 @@ mod tests {
         let payloads = [
             ("README.txt", b"readme".as_slice()),
             ("fairypam-agent.exe", b"cli".as_slice()),
-            ("fairypam-agent-ui.exe", b"gui".as_slice()),
+            ("fairypam-agent-tauri-ui.exe", b"gui".as_slice()),
         ];
         let members: HashMap<_, _> = payloads
             .iter()
@@ -742,7 +742,7 @@ mod tests {
         std::fs::write(&executable, b"cli").unwrap();
         std::fs::write(
             temp.join("BUILD-MANIFEST.json"),
-            r#"{"schema_version":1,"kind":"fairypam-windows-agent-candidate","built_at":"2026-07-15T12:07:21.1265436Z","build_id":"build-new","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","public_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signed":false,"tauri_gui_changed":false,"attestation_identity":"actions:1.1","workflow_run_id":"1","workflow_run_attempt":"1","validated_base_public_commit":null,"requires_gui_smoke":false,"gates":{"WINDOWS-BUILD":"passed","RUST-CLI-SAFE":"pending","TAURI-GUI-SMOKE":"not_required"},"members":{"README.txt":{"sha256":"a","size_bytes":1},"fairypam-agent.exe":{"sha256":"b","size_bytes":1},"fairypam-agent-ui.exe":{"sha256":"c","size_bytes":1}}}"#,
+            r#"{"schema_version":1,"kind":"fairypam-windows-agent-candidate","built_at":"2026-07-15T12:07:21.1265436Z","build_id":"build-new","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","public_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signed":false,"tauri_gui_changed":false,"attestation_identity":"actions:1.1","workflow_run_id":"1","workflow_run_attempt":"1","validated_base_public_commit":null,"requires_gui_smoke":false,"gates":{"WINDOWS-BUILD":"passed","RUST-CLI-SAFE":"pending","TAURI-GUI-SMOKE":"not_required"},"members":{"README.txt":{"sha256":"a","size_bytes":1},"fairypam-agent.exe":{"sha256":"b","size_bytes":1},"fairypam-agent-tauri-ui.exe":{"sha256":"c","size_bytes":1}}}"#,
         )
         .unwrap();
         assert_eq!(running_build_id(&executable).unwrap(), "build-new");
@@ -781,7 +781,7 @@ mod tests {
         std::fs::write(&old_executable, b"old-cli").unwrap();
         std::fs::write(
             root.join("BUILD-MANIFEST.json"),
-            r#"{"build_id":"build-old","source_commit":"abc","tauri_gui_changed":false,"attestation_identity":"actions","members":{"README.txt":{"sha256":"a","size_bytes":1},"fairypam-agent.exe":{"sha256":"b","size_bytes":1},"fairypam-agent-ui.exe":{"sha256":"c","size_bytes":1}}}"#,
+            r#"{"build_id":"build-old","source_commit":"abc","tauri_gui_changed":false,"attestation_identity":"actions","members":{"README.txt":{"sha256":"a","size_bytes":1},"fairypam-agent.exe":{"sha256":"b","size_bytes":1},"fairypam-agent-tauri-ui.exe":{"sha256":"c","size_bytes":1}}}"#,
         )
         .unwrap();
         let plan = prepare_helper_plan(&staged, &request, &old_executable, "cli").unwrap();

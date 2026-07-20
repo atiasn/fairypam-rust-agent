@@ -3,8 +3,6 @@ members = [
     "bins/fairypam-agent",
     "bins/fairypam-agentctl",
     "bins/fairypam-agent-guardian",
-    "bins/fairypam-agent-installer",
-    "bins/fairypam-agent-updater",
     "crates/fairypam-agent-core",
     "crates/fairypam-agent-dev-automation",
     "crates/fairypam-agent-guardian-protocol",
@@ -12,7 +10,6 @@ members = [
     "crates/fairypam-agent-local-client",
     "crates/fairypam-agent-local-protocol",
     "crates/fairypam-agent-protocol",
-    "crates/fairypam-agent-suite",
     "crates/fairypam-agent-transport",
     "crates/fairypam-agent-windows",
 ]
@@ -20,24 +17,16 @@ default-members = [
     "bins/fairypam-agent",
     "bins/fairypam-agentctl",
     "bins/fairypam-agent-guardian",
-    "bins/fairypam-agent-installer",
-    "bins/fairypam-agent-updater",
     "crates/fairypam-agent-core",
     "crates/fairypam-agent-guardian-protocol",
     "crates/fairypam-agent-input",
     "crates/fairypam-agent-local-client",
     "crates/fairypam-agent-local-protocol",
     "crates/fairypam-agent-protocol",
-    "crates/fairypam-agent-suite",
     "crates/fairypam-agent-transport",
     "crates/fairypam-agent-windows",
 ]
 resolver = "2"
-
-[profile.dev-automation]
-inherits = "dev"
-debug = 1
-incremental = false
 
 [workspace.package]
 version = "0.1.0"
@@ -45,13 +34,11 @@ edition = "2021"
 publish = false
 
 [workspace.dependencies]
-base64 = "0.22"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ed25519-dalek = "2.2"

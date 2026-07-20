@@ -25,66 +25,29 @@ impl KeyEvent {
 }
 
 #[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExpectedIntegrity {
-    Normal,
-    High,
-}
-
-#[cfg(any(windows, test))]
-impl ExpectedIntegrity {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::High => "high",
-        }
-    }
-}
-
-#[cfg(any(windows, test))]
-#[derive(Debug, PartialEq, Eq)]
-struct Arguments {
-    telemetry_nonce: Option<String>,
-    expected_integrity: ExpectedIntegrity,
-}
-
-#[cfg(any(windows, test))]
-fn parse_arguments<I, S>(values: I) -> Result<Arguments, String>
+fn parse_arguments<I, S>(values: I) -> Result<Option<String>, String>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
     let mut nonce = None;
-    let mut expected_integrity = ExpectedIntegrity::Normal;
     let mut values = values.into_iter().map(Into::into);
     while let Some(flag) = values.next() {
         let value = values
             .next()
             .ok_or_else(|| format!("missing value for {flag}"))?;
-        match flag.as_str() {
-            "--telemetry-nonce" => {
-                if nonce.is_some() {
-                    return Err("--telemetry-nonce may only be provided once".to_owned());
-                }
-                if !valid_nonce(&value) {
-                    return Err("telemetry nonce must be 64 lowercase hex characters".to_owned());
-                }
-                nonce = Some(value);
-            }
-            "--expected-integrity" => {
-                expected_integrity = match value.as_str() {
-                    "normal" => ExpectedIntegrity::Normal,
-                    "high" => ExpectedIntegrity::High,
-                    _ => return Err("expected integrity must be normal or high".to_owned()),
-                };
-            }
-            _ => return Err(format!("unknown argument: {flag}")),
+        if flag != "--telemetry-nonce" {
+            return Err(format!("unknown argument: {flag}"));
         }
+        if nonce.is_some() {
+            return Err("--telemetry-nonce may only be provided once".to_owned());
+        }
+        if !valid_nonce(&value) {
+            return Err("telemetry nonce must be 64 lowercase hex characters".to_owned());
+        }
+        nonce = Some(value);
     }
-    Ok(Arguments {
-        telemetry_nonce: nonce,
-        expected_integrity,
-    })
+    Ok(nonce)
 }
 
 #[cfg(any(windows, test))]
@@ -110,14 +73,6 @@ fn key_event_line(
     )
 }
 
-#[cfg(any(windows, test))]
-fn ready_line(integrity: ExpectedIntegrity, process_id: u32) -> String {
-    format!(
-        "FAIRYPAM_TESTBED_READY={{\"schema_version\":1,\"integrity\":\"{}\",\"process_id\":{process_id},\"window_class\":\"FairyPamTestWindow\",\"animation_interval_ms\":{ANIMATION_INTERVAL_MS},\"frame_colors\":[\"window\",\"highlight\"]}}",
-        integrity.label()
-    )
-}
-
 #[cfg(windows)]
 fn main() {
     if let Err(error) = windows::run() {
@@ -134,8 +89,8 @@ mod windows {
     use std::sync::OnceLock;
 
     use super::{
-        key_event_line, parse_arguments, ready_line, ExpectedIntegrity, KeyEvent,
-        ANIMATION_INTERVAL_MS, ANIMATION_TIMER_ID, W_SCAN_CODE,
+        key_event_line, parse_arguments, KeyEvent, ANIMATION_INTERVAL_MS, ANIMATION_TIMER_ID,
+        W_SCAN_CODE,
     };
     use windows::core::w;
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -143,14 +98,8 @@ mod windows {
         BeginPaint, EndPaint, FillRect, GetSysColorBrush, InvalidateRect, COLOR_HIGHLIGHT,
         COLOR_WINDOW, PAINTSTRUCT,
     };
-    use windows::Win32::Security::{
-        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
-        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-    use windows::Win32::System::SystemServices::SECURITY_MANDATORY_HIGH_RID;
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostQuitMessage,
         RegisterClassW, SetTimer, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, MSG,
@@ -216,18 +165,9 @@ mod windows {
     }
 
     pub fn run() -> Result<(), Box<dyn Error>> {
-        let arguments = parse_arguments(std::env::args().skip(1))
-            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-        let actual_integrity = current_integrity()?;
-        if actual_integrity != arguments.expected_integrity {
-            return Err(format!(
-                "testbed integrity mismatch: expected={} actual={}",
-                arguments.expected_integrity.label(),
-                actual_integrity.label()
-            )
-            .into());
-        }
-        if let Some(nonce) = arguments.telemetry_nonce {
+        if let Some(nonce) = parse_arguments(std::env::args().skip(1))
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
+        {
             TELEMETRY
                 .set(TelemetryState {
                     nonce,
@@ -269,8 +209,6 @@ mod windows {
         if unsafe { SetTimer(Some(hwnd), ANIMATION_TIMER_ID, ANIMATION_INTERVAL_MS, None) } == 0 {
             return Err(windows::core::Error::from_thread().into());
         }
-        println!("{}", ready_line(actual_integrity, std::process::id()));
-        io::stdout().flush()?;
 
         let mut message = MSG::default();
         while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
@@ -280,39 +218,6 @@ mod windows {
             }
         }
         Ok(())
-    }
-
-    fn current_integrity() -> Result<ExpectedIntegrity, Box<dyn Error>> {
-        let mut token = windows::Win32::Foundation::HANDLE::default();
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }?;
-        let mut length = 0_u32;
-        let _ = unsafe { GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut length) };
-        let words = (length as usize).div_ceil(std::mem::size_of::<usize>());
-        let mut buffer = vec![0_usize; words];
-        let result = unsafe {
-            GetTokenInformation(
-                token,
-                TokenIntegrityLevel,
-                Some(buffer.as_mut_ptr().cast()),
-                length,
-                &mut length,
-            )
-        };
-        unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(token);
-        }
-        result?;
-        let label = unsafe { &*buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
-        let count = unsafe { *GetSidSubAuthorityCount(label.Label.Sid) } as u32;
-        if count == 0 {
-            return Err("testbed token integrity SID is invalid".into());
-        }
-        let rid = unsafe { *GetSidSubAuthority(label.Label.Sid, count - 1) };
-        Ok(if rid >= SECURITY_MANDATORY_HIGH_RID as u32 {
-            ExpectedIntegrity::High
-        } else {
-            ExpectedIntegrity::Normal
-        })
     }
 
     fn emit_key_event(event: KeyEvent) -> Result<(), Box<dyn Error>> {
@@ -367,34 +272,13 @@ mod tests {
 
     #[test]
     fn telemetry_nonce_is_optional_but_strict_when_present() {
+        assert_eq!(parse_arguments(std::iter::empty::<&str>()).unwrap(), None);
         assert_eq!(
-            parse_arguments(std::iter::empty::<&str>()).unwrap(),
-            Arguments {
-                telemetry_nonce: None,
-                expected_integrity: ExpectedIntegrity::Normal,
-            }
-        );
-        assert_eq!(
-            parse_arguments(["--telemetry-nonce", NONCE, "--expected-integrity", "high"]).unwrap(),
-            Arguments {
-                telemetry_nonce: Some(NONCE.to_owned()),
-                expected_integrity: ExpectedIntegrity::High,
-            }
+            parse_arguments(["--telemetry-nonce", NONCE]).unwrap(),
+            Some(NONCE.to_owned())
         );
         assert!(parse_arguments(["--telemetry-nonce", "reusable"]).is_err());
         assert!(parse_arguments(["--output", "C:\\temp\\events.json"]).is_err());
-    }
-
-    #[test]
-    fn ready_marker_makes_integrity_and_frame_expectations_machine_decidable() {
-        let marker = ready_line(ExpectedIntegrity::High, 99);
-        let payload = marker.strip_prefix("FAIRYPAM_TESTBED_READY=").unwrap();
-        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(value["integrity"], "high");
-        assert_eq!(value["process_id"], 99);
-        assert_eq!(value["animation_interval_ms"], 50);
-        assert_eq!(value["frame_colors"][0], "window");
-        assert_eq!(value["frame_colors"][1], "highlight");
     }
 
     #[test]

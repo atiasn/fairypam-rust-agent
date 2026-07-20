@@ -1,6 +1,4 @@
-#[cfg(not(feature = "dev-automation"))]
 use std::env;
-#[cfg(not(feature = "dev-automation"))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,121 +15,71 @@ use fairypam_agent_transport::{
     receive_hub_hello, CappedBackoff, ControlSender, ControlSession, SessionFrameSlot,
     TransportConfig, TransportError, VerifiedSession,
 };
-#[cfg(not(feature = "dev-automation"))]
 use http::Uri;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::{CommandExecutor, CommandOutcome, ExecutionSession, FrameSink};
 use crate::profile_store::ProfileStore;
 
+#[cfg(windows)]
+use crate::local_control::{AuditEvent, AuditSink, LocalControlAdapter, LocalControlRuntime};
+#[cfg(all(windows, feature = "dev-automation"))]
+use fairypam_agent_core::state::Effect;
+#[cfg(all(windows, feature = "dev-automation"))]
+use fairypam_agent_dev_automation::{
+    AutomationCapability, AutomationTarget, DevSessionManager, DevSessionRequest,
+    DevSessionRevocationReason,
+};
+#[cfg(windows)]
+use fairypam_agent_local_protocol::{decode_request_or_error_response, encode_frame};
+#[cfg(all(windows, feature = "dev-automation"))]
+use fairypam_agent_local_protocol::{LocalCommand, LocalError, RequestEnvelope, ResponseEnvelope};
+#[cfg(windows)]
+use fairypam_agent_windows::{
+    current_process_pipe_owner, default_production_pipe_name, IntegrityLevel, PipeOwner,
+    WindowsNamedPipeServer,
+};
+
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub transport: TransportConfig,
     pub agent_version: String,
     pub build_commit: String,
-    #[cfg(feature = "dev-automation")]
-    pub build_id: String,
     pub profiles: ProfileStore,
 }
 
 impl RuntimeConfig {
     pub fn from_env() -> Result<Self, AgentError> {
-        #[cfg(feature = "dev-automation")]
-        {
-            return Self::from_dev_slot();
-        }
-        #[cfg(not(feature = "dev-automation"))]
-        {
-            let verifier = Ed25519SignatureVerifier::from_public_key_hex(&required(
-                "FAIRYPAM_PROFILE_ROOT_PUBLIC_KEY_HEX",
-            )?)?;
-            let profiles = ProfileStore::load(&required_path("FAIRYPAM_PROFILE_DIR")?, &verifier)?;
-            Ok(Self {
-                transport: TransportConfig {
-                    control_endpoint: required_uri("FAIRYPAM_CONTROL_ENDPOINT")?,
-                    frame_endpoint: required_uri("FAIRYPAM_FRAME_ENDPOINT")?,
-                    server_name: required("FAIRYPAM_HUB_SERVER_NAME")?,
-                    agent_id: required("FAIRYPAM_AGENT_ID")?,
-                    ca_pem: required_path("FAIRYPAM_CA_PEM")?,
-                    identity_cert_pem: required_path("FAIRYPAM_AGENT_CERT_PEM")?,
-                    identity_key_pem: required_path("FAIRYPAM_AGENT_KEY_PEM")?,
-                    connect_timeout: Duration::from_secs(10),
-                },
-                agent_version: env!("CARGO_PKG_VERSION").to_owned(),
-                build_commit: option_env!("FAIRYPAM_BUILD_COMMIT")
-                    .unwrap_or("unknown")
-                    .to_owned(),
-                profiles,
-            })
-        }
-    }
-
-    #[cfg(feature = "dev-automation")]
-    fn from_dev_slot() -> Result<Self, AgentError> {
-        let (manifest, runtime) =
-            fairypam_agent_dev_automation::provision::load_runtime_environment().map_err(
-                |error| AgentError::new("runtime.dev_config_invalid", error.to_string()),
-            )?;
-        let verifier =
-            Ed25519SignatureVerifier::from_public_key_hex(&runtime.profile_root_public_key_hex)?;
-        let profiles = ProfileStore::load(&manifest.profile_dir, &verifier)?;
-        let build_id = option_env!("FAIRYPAM_BUILD_ID").ok_or_else(|| {
-            AgentError::new(
-                "runtime.dev_build_identity_missing",
-                "dev-automation build is missing compile-time FAIRYPAM_BUILD_ID",
-            )
-        })?;
-        let build_commit = option_env!("FAIRYPAM_BUILD_COMMIT").ok_or_else(|| {
-            AgentError::new(
-                "runtime.dev_build_identity_missing",
-                "dev-automation build is missing compile-time FAIRYPAM_BUILD_COMMIT",
-            )
-        })?;
-        if manifest.build_id != build_id
-            || build_commit.len() != 40
-            || !build_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(AgentError::new(
-                "runtime.dev_build_identity_mismatch",
-                "canonical dev slot does not match the compile-time build identity",
-            ));
-        }
+        let verifier = Ed25519SignatureVerifier::from_public_key_hex(&required(
+            "FAIRYPAM_PROFILE_ROOT_PUBLIC_KEY_HEX",
+        )?)?;
+        let profiles = ProfileStore::load(&required_path("FAIRYPAM_PROFILE_DIR")?, &verifier)?;
         Ok(Self {
             transport: TransportConfig {
-                control_endpoint: runtime.control_endpoint.parse().map_err(|error| {
-                    AgentError::new(
-                        "runtime.dev_config_invalid",
-                        format!("dev control endpoint is invalid: {error}"),
-                    )
-                })?,
-                frame_endpoint: runtime.frame_endpoint.parse().map_err(|error| {
-                    AgentError::new(
-                        "runtime.dev_config_invalid",
-                        format!("dev frame endpoint is invalid: {error}"),
-                    )
-                })?,
-                server_name: runtime.server_name,
-                agent_id: runtime.agent_id,
-                ca_pem: manifest.ca_path,
-                identity_cert_pem: manifest.certificate_path,
-                identity_key_pem: manifest.private_key_path,
+                control_endpoint: required_uri("FAIRYPAM_CONTROL_ENDPOINT")?,
+                frame_endpoint: required_uri("FAIRYPAM_FRAME_ENDPOINT")?,
+                server_name: required("FAIRYPAM_HUB_SERVER_NAME")?,
+                agent_id: required("FAIRYPAM_AGENT_ID")?,
+                ca_pem: required_path("FAIRYPAM_CA_PEM")?,
+                identity_cert_pem: required_path("FAIRYPAM_AGENT_CERT_PEM")?,
+                identity_key_pem: required_path("FAIRYPAM_AGENT_KEY_PEM")?,
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
-            build_commit: build_commit.to_owned(),
-            build_id: build_id.to_owned(),
+            build_commit: option_env!("FAIRYPAM_BUILD_COMMIT")
+                .unwrap_or("unknown")
+                .to_owned(),
             profiles,
         })
     }
 }
 
 #[derive(Default)]
-pub(crate) struct RuntimeState {
-    pub(crate) control: Option<ControlSession>,
-    pub(crate) sender: Option<ControlSender>,
-    pub(crate) session: Option<VerifiedSession>,
-    pub(crate) frames: Option<SessionFrameSlot>,
-    pub(crate) accepting_commands: bool,
+struct RuntimeState {
+    control: Option<ControlSession>,
+    sender: Option<ControlSender>,
+    session: Option<VerifiedSession>,
+    frames: Option<SessionFrameSlot>,
 }
 
 pub struct GrpcSessionDriver {
@@ -201,7 +149,6 @@ impl SessionDriver for GrpcSessionDriver {
             sender: Some(sender),
             session: Some(session),
             frames: Some(frames),
-            accepting_commands: true,
         };
         Ok(())
     }
@@ -234,11 +181,6 @@ impl SessionDriver for GrpcSessionDriver {
                     let reference = command_reference(&command).ok_or_else(|| {
                         AgentError::new("runtime.command_invalid", "verified command lost CommandRef")
                     })?;
-                    let accepting_commands = self.state.lock().map_err(lock_error)?.accepting_commands;
-                    if !accepting_commands {
-                        sender.try_send(nack_event(reference, "runtime.update_quiesced", "Agent is not accepting work during a suite transaction")).map_err(map_transport)?;
-                        continue;
-                    }
                     let frames = {
                         let state = self.state.lock().map_err(lock_error)?;
                         state.frames.clone().ok_or_else(session_missing)?
@@ -303,22 +245,13 @@ impl SessionDriver for GrpcSessionDriver {
 pub struct RuntimeSafetyHooks {
     state: Arc<Mutex<RuntimeState>>,
     execution: Arc<Mutex<CommandExecutor>>,
-    #[cfg(feature = "dev-automation")]
-    dev_input: Arc<Mutex<crate::dev_input::DevInputController>>,
 }
 
 impl RuntimeSafetyHooks {
-    pub fn for_driver(
-        driver: &GrpcSessionDriver,
-        #[cfg(feature = "dev-automation")] dev_input: Arc<
-            Mutex<crate::dev_input::DevInputController>,
-        >,
-    ) -> Self {
+    pub fn for_driver(driver: &GrpcSessionDriver) -> Self {
         Self {
             state: Arc::clone(&driver.state),
             execution: Arc::clone(&driver.execution),
-            #[cfg(feature = "dev-automation")]
-            dev_input,
         }
     }
 }
@@ -330,18 +263,11 @@ impl SupervisorHooks for RuntimeSafetyHooks {
     }
 
     fn guardian_release_all(&mut self) -> Result<(), String> {
-        #[cfg(feature = "dev-automation")]
-        self.dev_input
-            .lock()
-            .map_err(|_| "dev input state is poisoned".to_owned())?
-            .release_all();
-        #[cfg(not(feature = "dev-automation"))]
+        // The production binary never arms without a separate local authority.
+        // Thus no physical holds can exist in this DryRun runtime. The hook is
+        // still explicit so the full Windows input owner can replace it in the
+        // Task 9 harness without changing supervisor ordering.
         tracing::info!(effect = "guardian_release_all", state = "dry_run_no_holds");
-        #[cfg(feature = "dev-automation")]
-        tracing::info!(
-            effect = "guardian_release_all",
-            state = "dev_input_released"
-        );
         Ok(())
     }
 
@@ -378,158 +304,545 @@ impl SupervisorHooks for RuntimeSafetyHooks {
 }
 
 pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
-    #[cfg(feature = "dev-automation")]
-    tracing::info!(
-        build_flavor = crate::DEV_BUILD_MARKER,
-        "starting isolated dev-automation Agent"
-    );
     let driver = GrpcSessionDriver::new(config);
-    #[cfg(feature = "dev-automation")]
-    let dev_input = Arc::new(Mutex::new(crate::dev_input::DevInputController::default()));
-    #[cfg(windows)]
-    let local_cancellation = CancellationToken::new();
-    #[cfg(windows)]
-    let local_server = {
-        use crate::local_control::AgentLocalControl;
-        use fairypam_agent_local_client::{serve, LocalRequestHandler, PipeFlavor, PipeIdentity};
-
-        #[cfg(feature = "dev-automation")]
-        let flavor = PipeFlavor::Development;
-        #[cfg(not(feature = "dev-automation"))]
-        let flavor = PipeFlavor::Production;
-        let identity = PipeIdentity::current(flavor)
-            .map_err(|error| AgentError::new("local_control.identity_failed", error.to_string()))?;
-        let handler = Arc::new(AgentLocalControl::new(
-            Arc::clone(&driver.state),
-            Arc::clone(&driver.execution),
-            driver.config.profiles.clone(),
-            driver.config.agent_version.clone(),
-            driver.config.build_commit.clone(),
-            false,
-            #[cfg(feature = "dev-automation")]
-            driver.config.build_id.clone(),
-            #[cfg(feature = "dev-automation")]
-            Arc::clone(&dev_input),
-        ));
-        let cancellation = local_cancellation.clone();
-        #[cfg(feature = "dev-automation")]
-        {
-            let handler = Arc::clone(&handler);
-            let cancellation = cancellation.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(100));
-                loop {
-                    tokio::select! {
-                        _ = cancellation.cancelled() => break,
-                        _ = interval.tick() => {
-                            if let Err(error) = handler.tick_automation() {
-                                tracing::error!(error = %error, "dev automation cleanup tick failed");
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        let handler: Arc<dyn LocalRequestHandler> = handler;
-        tokio::spawn(async move { serve(identity, handler, cancellation).await })
-    };
-    let hooks = RuntimeSafetyHooks::for_driver(
-        &driver,
-        #[cfg(feature = "dev-automation")]
-        dev_input,
-    );
+    let hooks = RuntimeSafetyHooks::for_driver(&driver);
     let backoff = CappedBackoff::new(Duration::from_millis(250), Duration::from_secs(30))
         .map_err(map_transport)?;
     let mut supervisor = SessionSupervisor::new(hooks, backoff);
     #[cfg(windows)]
-    {
-        tokio::select! {
-            result = supervisor.run(&driver) => match result {
-                Ok(never) => match never {},
-                Err(error) => Err(error),
-            },
-            result = local_server => {
-                local_cancellation.cancel();
-                match result {
-                    Ok(Ok(())) => Err(AgentError::new(
-                        "local_control.stopped",
-                        "local control server stopped unexpectedly",
-                    )),
-                    Ok(Err(error)) => Err(AgentError::new(
-                        "local_control.failed",
-                        error.to_string(),
-                    )),
-                    Err(error) => Err(AgentError::new(
-                        "local_control.join_failed",
-                        error.to_string(),
-                    )),
-                }
-            }
-        }
-    }
+    let local_control = tokio::spawn(run_local_control(
+        Arc::clone(&driver.execution),
+        production_local_control_config()?,
+    ));
+    #[cfg(windows)]
+    let result = tokio::select! {
+        result = supervisor.run(&driver) => result,
+        result = local_control => match result {
+            Ok(never) => match never {},
+            Err(error) => Err(AgentError::new("local.runtime_join_failed", error.to_string())),
+        },
+    };
     #[cfg(not(windows))]
-    match supervisor.run(&driver).await {
+    let result = supervisor.run(&driver).await;
+    match result {
         Ok(never) => match never {},
         Err(error) => Err(error),
     }
 }
 
 #[cfg(windows)]
-pub async fn run_local_control_only(config: RuntimeConfig) -> Result<(), AgentError> {
-    if config.build_commit.len() != 40
-        || !config
-            .build_commit
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(AgentError::new(
-            "runtime.build_identity_missing",
-            "local-control-only mode requires an exact compile-time source commit",
-        ));
-    }
-    let driver = GrpcSessionDriver::new(config);
-    use crate::local_control::AgentLocalControl;
-    use fairypam_agent_local_client::{serve, LocalRequestHandler, PipeFlavor, PipeIdentity};
+struct SharedExecutor(Arc<Mutex<CommandExecutor>>);
 
-    #[cfg(feature = "dev-automation")]
-    let flavor = PipeFlavor::Development;
-    #[cfg(not(feature = "dev-automation"))]
-    let flavor = PipeFlavor::Production;
-    let identity = PipeIdentity::current(flavor)
-        .map_err(|error| AgentError::new("local_control.identity_failed", error.to_string()))?;
-    #[cfg(feature = "dev-automation")]
-    let dev_input = Arc::new(Mutex::new(crate::dev_input::DevInputController::default()));
-    let handler: Arc<dyn LocalRequestHandler> = Arc::new(AgentLocalControl::new(
-        Arc::clone(&driver.state),
-        Arc::clone(&driver.execution),
-        driver.config.profiles.clone(),
-        driver.config.agent_version.clone(),
-        driver.config.build_commit.clone(),
-        true,
-        #[cfg(feature = "dev-automation")]
-        driver.config.build_id.clone(),
-        #[cfg(feature = "dev-automation")]
-        dev_input,
-    ));
-    let cancellation = CancellationToken::new();
-    match serve(identity, handler, cancellation).await {
-        Ok(()) => Err(AgentError::new(
-            "local_control.stopped",
-            "local-control-only server stopped unexpectedly",
-        )),
-        Err(error) => Err(AgentError::new("local_control.failed", error.to_string())),
+#[cfg(windows)]
+impl LocalControlRuntime for SharedExecutor {
+    fn execute(
+        &mut self,
+        command: &fairypam_agent_local_protocol::LocalCommand,
+    ) -> Result<serde_json::Value, AgentError> {
+        self.0.lock().map_err(lock_error)?.execute_local(command)
     }
 }
 
-#[cfg(not(windows))]
-pub async fn run_local_control_only(_config: RuntimeConfig) -> Result<(), AgentError> {
-    Err(AgentError::new(
-        "local_control.unsupported_platform",
-        "local-control-only mode is available on Windows only",
-    ))
+#[cfg(windows)]
+struct RuntimeAudit {
+    state_dir: Option<PathBuf>,
 }
 
-#[cfg(not(feature = "dev-automation"))]
+#[cfg(windows)]
+impl RuntimeAudit {
+    fn new(state_dir: Option<PathBuf>) -> Self {
+        Self { state_dir }
+    }
+}
+
+#[cfg(windows)]
+impl AuditSink for RuntimeAudit {
+    fn record(&mut self, event: AuditEvent) {
+        tracing::info!(request_id = %event.request_id, caller_sid_hash = %event.caller_sid_hash, command = %event.command, result_code = %event.result_code, build_id = %event.build_id, "local control mutation audited");
+        let Some(state_dir) = &self.state_dir else {
+            return;
+        };
+        let path = state_dir.join("local-control-audit.jsonl");
+        let line = format!("{}\\n", event.to_json());
+        if let Err(error) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()))
+        {
+            tracing::warn!(path = %path.display(), %error, "local control audit persistence failed");
+        }
+    }
+}
+
+#[cfg(windows)]
+struct LocalControlConfig {
+    owner: PipeOwner,
+    pipe_name: String,
+    audit_state_dir: Option<PathBuf>,
+    #[cfg(all(windows, feature = "dev-automation"))]
+    dev_session_state_dir: Option<PathBuf>,
+}
+
+#[cfg(windows)]
+fn production_local_control_config() -> Result<LocalControlConfig, AgentError> {
+    let owner = current_process_pipe_owner(IntegrityLevel::Medium)
+        .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+    Ok(LocalControlConfig {
+        owner,
+        pipe_name: default_production_pipe_name().to_owned(),
+        audit_state_dir: None,
+        #[cfg(all(windows, feature = "dev-automation"))]
+        dev_session_state_dir: None,
+    })
+}
+
+#[cfg(windows)]
+async fn run_local_control(
+    execution: Arc<Mutex<CommandExecutor>>,
+    config: LocalControlConfig,
+) -> std::convert::Infallible {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(all(windows, feature = "dev-automation"))]
+    let mut dev_session = config
+        .dev_session_state_dir
+        .as_ref()
+        .map(|state_dir| DevConnectionSession::new(state_dir.clone()));
+    let mut adapter = LocalControlAdapter::new(
+        config.owner.clone(),
+        SharedExecutor(Arc::clone(&execution)),
+        RuntimeAudit::new(config.audit_state_dir),
+        option_env!("FAIRYPAM_BUILD_ID").unwrap_or("unknown"),
+    );
+    loop {
+        let mut server = match WindowsNamedPipeServer::create(
+            &config.pipe_name,
+            config.owner.clone(),
+        ) {
+            Ok(server) => server,
+            Err(error) => {
+                tracing::warn!(code = error.code(), error = %error, "local control pipe creation failed");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let (caller, first_prefix_byte) = match server.connect_and_verify().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::warn!(code = error.code(), error = %error, "local control client rejected");
+                #[cfg(all(windows, feature = "dev-automation"))]
+                if let Some(session) = &dev_session {
+                    session.record_connection_rejection(error.code());
+                }
+                continue;
+            }
+        };
+        let pipe = server.pipe_mut();
+        let mut first_prefix_byte = Some(first_prefix_byte);
+        loop {
+            #[cfg(all(windows, feature = "dev-automation"))]
+            if let Some(session) = &mut dev_session {
+                apply_dev_effects(&execution, session.expire());
+            }
+            let mut prefix = [0_u8; 4];
+            let prefix_start = match first_prefix_byte.take() {
+                Some(byte) => {
+                    prefix[0] = byte;
+                    1
+                }
+                None => 0,
+            };
+            #[cfg(all(windows, feature = "dev-automation"))]
+            let prefix_result = match dev_session
+                .as_ref()
+                .and_then(DevConnectionSession::expires_at)
+            {
+                Some(deadline) => match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    pipe.read_exact(&mut prefix[prefix_start..]),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if let Some(session) = &mut dev_session {
+                            apply_dev_effects(&execution, session.expire());
+                        }
+                        continue;
+                    }
+                },
+                None => pipe.read_exact(&mut prefix[prefix_start..]).await,
+            };
+            #[cfg(not(all(windows, feature = "dev-automation")))]
+            let prefix_result = pipe.read_exact(&mut prefix[prefix_start..]).await;
+            if let Err(error) = prefix_result {
+                tracing::debug!(%error, "local control client disconnected");
+                break;
+            }
+            let length = u32::from_le_bytes(prefix) as usize;
+            if length > fairypam_agent_local_protocol::MAX_FRAME_BYTES {
+                tracing::warn!(length, "local control frame exceeded protocol limit");
+                break;
+            }
+            let mut frame = prefix.to_vec();
+            frame.resize(4 + length, 0);
+            #[cfg(all(windows, feature = "dev-automation"))]
+            let body_result = match dev_session
+                .as_ref()
+                .and_then(DevConnectionSession::expires_at)
+            {
+                Some(deadline) => match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    pipe.read_exact(&mut frame[4..]),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if let Some(session) = &mut dev_session {
+                            apply_dev_effects(&execution, session.expire());
+                        }
+                        continue;
+                    }
+                },
+                None => pipe.read_exact(&mut frame[4..]).await,
+            };
+            #[cfg(not(all(windows, feature = "dev-automation")))]
+            let body_result = pipe.read_exact(&mut frame[4..]).await;
+            if let Err(error) = body_result {
+                tracing::debug!(%error, "local control client disconnected before request completed");
+                break;
+            }
+            let response = match decode_request_or_error_response(&frame) {
+                Ok(request) => {
+                    #[cfg(all(windows, feature = "dev-automation"))]
+                    let (dev_effects, dev_authorization) = dev_session
+                        .as_mut()
+                        .map(|session| session.authorize(&caller, &request))
+                        .unwrap_or_else(|| (Vec::new(), Ok(())));
+                    #[cfg(all(windows, feature = "dev-automation"))]
+                    {
+                        apply_dev_effects(&execution, dev_effects);
+                        match dev_authorization {
+                            Err(error) => ResponseEnvelope {
+                                request_id: request.request_id,
+                                result: Err(LocalError {
+                                    code: error.code().to_owned(),
+                                    message: error.to_string(),
+                                }),
+                            },
+                            Ok(()) => {
+                                let is_emergency_stop =
+                                    matches!(&request.command, LocalCommand::ReleaseAll);
+                                let response = match adapter.handle(&caller, request) {
+                                    Ok(response) => response,
+                                    Err(error) => {
+                                        tracing::warn!(code = error.code(), error = %error, "local control identity changed after connection");
+                                        break;
+                                    }
+                                };
+                                if is_emergency_stop {
+                                    if let Some(session) = &mut dev_session {
+                                        apply_dev_effects(&execution, session.emergency_stop());
+                                    }
+                                }
+                                response
+                            }
+                        }
+                    }
+                    #[cfg(not(all(windows, feature = "dev-automation")))]
+                    match adapter.handle(&caller, request) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::warn!(code = error.code(), error = %error, "local control identity changed after connection");
+                            break;
+                        }
+                    }
+                }
+                Err(response) => response,
+            };
+            let frame = match encode_frame(&response) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    tracing::warn!(code = error.code(), error = %error, "local control response encoding failed");
+                    break;
+                }
+            };
+            if let Err(error) = pipe.write_all(&frame).await {
+                tracing::debug!(%error, "local control response could not be delivered");
+                break;
+            }
+        }
+        #[cfg(all(windows, feature = "dev-automation"))]
+        if let Some(session) = &mut dev_session {
+            apply_dev_effects(&execution, session.client_disconnected());
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "dev-automation"))]
+struct DevConnectionSession {
+    sessions: DevSessionManager,
+    state_dir: PathBuf,
+    build_id: String,
+    requires_reconnect: bool,
+}
+
+#[cfg(all(windows, feature = "dev-automation"))]
+impl DevConnectionSession {
+    fn new(state_dir: PathBuf) -> Self {
+        Self {
+            sessions: DevSessionManager::default(),
+            state_dir,
+            build_id: option_env!("FAIRYPAM_BUILD_ID")
+                .unwrap_or("unknown")
+                .to_owned(),
+            requires_reconnect: false,
+        }
+    }
+
+    fn authorize(
+        &mut self,
+        caller: &fairypam_agent_windows::VerifiedPipeCaller,
+        request: &RequestEnvelope,
+    ) -> (
+        Vec<Effect>,
+        Result<(), fairypam_agent_dev_automation::DevSessionError>,
+    ) {
+        self.authorize_at(caller, request, std::time::Instant::now())
+    }
+
+    fn authorize_at(
+        &mut self,
+        caller: &fairypam_agent_windows::VerifiedPipeCaller,
+        request: &RequestEnvelope,
+        now: std::time::Instant,
+    ) -> (
+        Vec<Effect>,
+        Result<(), fairypam_agent_dev_automation::DevSessionError>,
+    ) {
+        let Some(capability) = dev_capability(&request.command) else {
+            return (Vec::new(), Ok(()));
+        };
+        let had_active = self.sessions.active_nonce().is_some();
+        let expired = self.sessions.expire_active(now);
+        self.record_revocation(had_active);
+        if had_active && self.sessions.active_nonce().is_none() {
+            self.requires_reconnect = true;
+        }
+        if self.requires_reconnect {
+            return (
+                expired,
+                Err(fairypam_agent_dev_automation::DevSessionError::expired()),
+            );
+        }
+        let session = self.sessions.create_with_nonce(
+            request.nonce,
+            DevSessionRequest {
+                caller_sid: caller.user_sid.clone(),
+                target: AutomationTarget::Testbed,
+                capabilities: std::collections::BTreeSet::from([capability]),
+                expires_at: now + Duration::from_secs(10),
+                build_id: self.build_id.clone(),
+            },
+            now,
+        );
+        let result =
+            session.and_then(|session| self.sessions.authorize(session.nonce, capability, now));
+        (expired, result)
+    }
+
+    fn expire(&mut self) -> Vec<Effect> {
+        let had_active = self.sessions.active_nonce().is_some();
+        let effects = self.sessions.expire_active(std::time::Instant::now());
+        self.record_revocation(had_active);
+        if had_active && self.sessions.active_nonce().is_none() {
+            self.requires_reconnect = true;
+        }
+        effects
+    }
+
+    fn expires_at(&self) -> Option<std::time::Instant> {
+        self.sessions.active_expires_at()
+    }
+
+    fn client_disconnected(&mut self) -> Vec<Effect> {
+        let had_active = self.sessions.active_nonce().is_some();
+        let effects = self
+            .sessions
+            .active_nonce()
+            .map(|nonce| self.sessions.on_client_disconnect(nonce))
+            .unwrap_or_default();
+        self.record_revocation(had_active);
+        self.requires_reconnect = false;
+        effects
+    }
+
+    fn emergency_stop(&mut self) -> Vec<Effect> {
+        let had_active = self.sessions.active_nonce().is_some();
+        let effects = self.sessions.emergency_stop();
+        self.record_revocation(had_active);
+        if had_active {
+            self.requires_reconnect = true;
+        }
+        effects
+    }
+
+    fn record_revocation(&self, revoked: bool) {
+        if !revoked {
+            return;
+        }
+        let Some(revocation) = self.sessions.last_revocation() else {
+            return;
+        };
+        let reason = match revocation.reason {
+            DevSessionRevocationReason::ClientDisconnected => "client_disconnected",
+            DevSessionRevocationReason::Expired => "expired",
+            DevSessionRevocationReason::EmergencyStop => "emergency_stop",
+        };
+        let audit_id = revocation
+            .audit_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let line = serde_json::json!({
+            "event": "dev_session_revoked",
+            "audit_id": audit_id,
+            "reason": reason,
+            "build_id": self.build_id,
+        })
+        .to_string();
+        let path = self.state_dir.join("dev-session-audit.jsonl");
+        if let Err(error) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                std::io::Write::write_all(&mut file, format!("{line}\\n").as_bytes())
+            })
+        {
+            tracing::warn!(path = %path.display(), %error, "Dev session audit persistence failed");
+        }
+    }
+
+    fn record_connection_rejection(&self, code: &str) {
+        let line = serde_json::json!({
+            "event": "local_control_rejected",
+            "stage": "connect_and_verify",
+            "code": code,
+            "build_id": self.build_id,
+        })
+        .to_string();
+        let path = self.state_dir.join("dev-local-control-diagnostics.jsonl");
+        if let Err(error) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                std::io::Write::write_all(&mut file, format!("{line}\\n").as_bytes())
+            })
+        {
+            tracing::warn!(path = %path.display(), %error, "Dev local control diagnostics persistence failed");
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "dev-automation"))]
+fn dev_capability(command: &LocalCommand) -> Option<AutomationCapability> {
+    match command {
+        LocalCommand::StartCapture { .. } | LocalCommand::StopCapture { .. } => {
+            Some(AutomationCapability::Capture)
+        }
+        LocalCommand::TestbedPulse => Some(AutomationCapability::Input),
+        _ => None,
+    }
+}
+
+#[cfg(all(windows, feature = "dev-automation"))]
+fn apply_dev_effects(execution: &Arc<Mutex<CommandExecutor>>, effects: Vec<Effect>) {
+    if !effects.contains(&Effect::ReleaseAll) {
+        return;
+    }
+    match execution
+        .lock()
+        .map_err(lock_error)
+        .and_then(|mut execution| {
+            execution
+                .execute_local(&LocalCommand::ReleaseAll)
+                .map(|_| ())
+        }) {
+        Ok(()) => tracing::info!(
+            effect = "release_all",
+            "Dev session revocation released input"
+        ),
+        Err(error) => tracing::error!(%error, "Dev session release-all failed"),
+    }
+}
+
+#[cfg(all(windows, feature = "dev-automation"))]
+pub async fn run_dev_local() -> Result<(), AgentError> {
+    let root = std::env::current_dir()
+        .map_err(|error| AgentError::new("local.config_missing", error.to_string()))?;
+    let key = std::fs::read_to_string(root.join("test-profile-root-public-key.hex"))
+        .map_err(|error| AgentError::new("local.config_missing", error.to_string()))?;
+    let verifier = Ed25519SignatureVerifier::from_public_key_hex(key.trim())?;
+    let profiles = ProfileStore::load(&root.join("profiles"), &verifier)?;
+    let config = dev_local_control_config()?;
+    let never = run_local_control(
+        Arc::new(Mutex::new(CommandExecutor::production(profiles))),
+        config,
+    )
+    .await;
+    match never {}
+}
+
+#[cfg(all(windows, feature = "dev-automation"))]
+fn dev_local_control_config() -> Result<LocalControlConfig, AgentError> {
+    let local_app_data = env::var("LOCALAPPDATA").map_err(|_| {
+        AgentError::new(
+            "local.config_missing",
+            "LOCALAPPDATA is required for Dev provision receipt",
+        )
+    })?;
+    let receipt = std::fs::read_to_string(
+        std::path::Path::new(&local_app_data).join("FairyPam/dev/provision.json"),
+    )
+    .map_err(|error| AgentError::new("local.config_missing", error.to_string()))?;
+    let receipt: serde_json::Value = serde_json::from_str(&receipt)
+        .map_err(|error| AgentError::new("local.config_invalid", error.to_string()))?;
+    let owner = PipeOwner {
+        user_sid: receipt["owner_sid"]
+            .as_str()
+            .ok_or_else(|| {
+                AgentError::new("local.config_invalid", "provision owner_sid is missing")
+            })?
+            .to_owned(),
+        logon_sid: receipt["logon_sid"]
+            .as_str()
+            .ok_or_else(|| {
+                AgentError::new("local.config_invalid", "provision logon_sid is missing")
+            })?
+            .to_owned(),
+        session_id: receipt["session_id"].as_u64().ok_or_else(|| {
+            AgentError::new("local.config_invalid", "provision session_id is missing")
+        })? as u32,
+        minimum_integrity: IntegrityLevel::Medium,
+    };
+    let pipe_name = receipt["pipe_name"]
+        .as_str()
+        .ok_or_else(|| AgentError::new("local.config_invalid", "provision pipe_name is missing"))?
+        .to_owned();
+    let state_dir = receipt["state_dir"]
+        .as_str()
+        .ok_or_else(|| AgentError::new("local.config_invalid", "provision state_dir is missing"))?;
+    Ok(LocalControlConfig {
+        owner,
+        pipe_name,
+        audit_state_dir: Some(PathBuf::from(state_dir)),
+        dev_session_state_dir: Some(PathBuf::from(state_dir)),
+    })
+}
+
 fn required(name: &'static str) -> Result<String, AgentError> {
     env::var(name).map_err(|_| {
         AgentError::new(
@@ -539,7 +852,6 @@ fn required(name: &'static str) -> Result<String, AgentError> {
     })
 }
 
-#[cfg(not(feature = "dev-automation"))]
 fn required_uri(name: &'static str) -> Result<Uri, AgentError> {
     required(name)?.parse().map_err(|error| {
         AgentError::new(
@@ -549,7 +861,6 @@ fn required_uri(name: &'static str) -> Result<Uri, AgentError> {
     })
 }
 
-#[cfg(not(feature = "dev-automation"))]
 fn required_path(name: &'static str) -> Result<PathBuf, AgentError> {
     Ok(PathBuf::from(required(name)?))
 }
@@ -685,5 +996,53 @@ mod tests {
             };
             assert_eq!(command_reference(&command), Some(reference.clone()));
         }
+    }
+
+    #[cfg(all(windows, feature = "dev-automation"))]
+    #[test]
+    fn expired_dev_connection_requires_reconnect_and_releases_input() {
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        use fairypam_agent_core::state::Effect;
+        use fairypam_agent_local_protocol::{RequestEnvelope, PROTOCOL_VERSION};
+        use fairypam_agent_windows::{IntegrityLevel, VerifiedPipeCaller};
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "fairypam-dev-session-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is after Unix epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create Dev session state directory");
+        let mut session = DevConnectionSession::new(state_dir.clone());
+        let caller = VerifiedPipeCaller {
+            pid: 42,
+            user_sid: "S-1-5-21-owner".to_owned(),
+            logon_sid: "S-1-5-5-owner".to_owned(),
+            session_id: 1,
+            integrity: IntegrityLevel::Medium,
+        };
+        let request = |nonce| RequestEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: format!("request-{nonce}"),
+            nonce: [nonce; 32],
+            command: LocalCommand::TestbedPulse,
+        };
+        let now = Instant::now();
+
+        assert!(session.authorize_at(&caller, &request(1), now).1.is_ok());
+        let (effects, error) =
+            session.authorize_at(&caller, &request(2), now + Duration::from_secs(11));
+
+        assert_eq!(effects, vec![Effect::ReleaseAll]);
+        assert_eq!(error.unwrap_err().code(), "dev.session.expired");
+        assert!(session.client_disconnected().is_empty());
+        assert!(session
+            .authorize_at(&caller, &request(3), now + Duration::from_secs(12))
+            .1
+            .is_ok());
+        std::fs::remove_dir_all(state_dir).expect("remove Dev session state directory");
     }
 }
