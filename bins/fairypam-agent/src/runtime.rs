@@ -337,7 +337,7 @@ impl GrpcSessionDriver {
             };
             let root = Path::new(r"C:\\ProgramData\\FairyPam\\Agent\\enrollment");
             let pointer = load_private_json(&root.join("current.json"))?;
-            return Ok(enrollment_field(&pointer, "generation")? != expected);
+            Ok(enrollment_field(&pointer, "generation")? != expected)
         }
         #[cfg(not(windows))]
         Ok(false)
