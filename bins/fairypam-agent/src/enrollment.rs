@@ -411,9 +411,9 @@ fn private_dacl(path: &Path) -> bool {
             None,
         )
     };
-    let result = converted
-        .and_then(|_| unsafe { text.to_string() })
-        .is_ok_and(|value| value == PRIVATE_DACL || value == "D:P(A;;FA;;;BA)(A;;FA;;;SY)");
+    let result = converted.is_ok()
+        && unsafe { text.to_string() }
+            .is_ok_and(|value| value == PRIVATE_DACL || value == "D:P(A;;FA;;;BA)(A;;FA;;;SY)");
     let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(text.0.cast()))) };
     let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
     result
