@@ -436,7 +436,11 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     );
     assert!(descriptor < security_attributes && security_attributes < create_stage);
     assert!(descriptor < create_stage && create_stage < create_error && create_error < pin_stage);
-    assert!(pin_stage < pin_error && pin_error < pin_invalid_handle && pin_invalid_handle < verify_stage);
+    assert!(
+        pin_stage < pin_error
+            && pin_error < pin_invalid_handle
+            && pin_invalid_handle < verify_stage
+    );
     assert!(verify_stage < invalid_attributes && invalid_attributes < stage_handle);
     assert!(invalid_attributes < reject_reparse && reject_reparse < stage_handle);
     assert!(pin_stage < verify_stage && verify_stage < stage_handle);
@@ -445,7 +449,11 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         .lines()
         .map(str::trim)
         .filter_map(|line| line.strip_prefix("Goto "))
-        .map(|line| line.split_whitespace().next().expect("Goto must name a label"))
+        .map(|line| {
+            line.split_whitespace()
+                .next()
+                .expect("Goto must name a label")
+        })
     {
         assert!(
             nsis_hooks
@@ -457,9 +465,8 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     }
     assert!(preinstall_hook.contains("IfFileExists \"$FairyPamBackupDir\" fairypam_stale_backup 0"));
     assert!(preinstall_hook.contains("IfFileExists \"$FairyPamStageDir\" fairypam_stale_stage 0"));
-    assert!(preinstall_hook.contains(
-        "${If} $R5 = ${ERROR_ALREADY_EXISTS}\n      Goto fairypam_stale_stage"
-    ));
+    assert!(preinstall_hook
+        .contains("${If} $R5 = ${ERROR_ALREADY_EXISTS}\n      Goto fairypam_stale_stage"));
     assert!(!preinstall_hook.contains("RMDir \"$FairyPamStageDir\""));
     assert!(!preinstall_hook.contains("RMDir /r \"$FairyPamStageDir\""));
     assert!(!preinstall_hook.contains("GetLastError()"));
