@@ -157,7 +157,7 @@ jobs:
           retention-days: 14
 
   tauri-ui:
-    name: Build non-promotable unprivileged Tauri UI artifact
+    name: Build non-promotable Windows product installer
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -180,10 +180,11 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Test and build the unprivileged Tauri UI
+      - name: Test and build the product installer
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
+          cargo build --release --locked -p fairypam-agent -p fairypam-agent-guardian -p fairypam-agent-installer
           Push-Location tauri-ui
           try {
             npm ci
@@ -204,7 +205,7 @@ jobs:
               Pop-Location
             }
 
-            npm run tauri build -- --no-bundle
+            npm run tauri build -- --bundles nsis
             npm run check:command-surface
             git diff --exit-code -- src-tauri/Cargo.lock
           }
@@ -212,51 +213,48 @@ jobs:
             Pop-Location
           }
 
-      - name: Package unprivileged Tauri UI build
+      - name: Package product installer receipt
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          New-Item -ItemType Directory -Force -Path dist/tauri-ui | Out-Null
-          Copy-Item tauri-ui/src-tauri/target/release/fairypam-agent-tauri-ui.exe dist/tauri-ui/
-          Copy-Item tauri-ui/src-tauri/Cargo.lock dist/tauri-ui/
-          Compress-Archive -Path dist/tauri-ui/* -DestinationPath dist/fairypam-agent-tauri-ui-windows.zip
-          $ui = Get-Item dist/tauri-ui/fairypam-agent-tauri-ui.exe
-          $lock = Get-Item dist/tauri-ui/Cargo.lock
-          $zip = Get-Item dist/fairypam-agent-tauri-ui-windows.zip
+          $setup = @(Get-ChildItem tauri-ui/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
+          if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item $setup[0] dist/fairypam-agent-setup-windows.exe
+          $artifact = Get-Item dist/fairypam-agent-setup-windows.exe
           [ordered]@{
             schema_version = 1
-            artifact_class = 'tauri-ui-build-only'
+            artifact_class = 'product-installer'
             promotable = $false
             source_commit = (Get-Content SOURCE_COMMIT -Raw).Trim()
             public_commit = '${{ github.sha }}'
-            build_id = 'tauri-ui-${{ github.run_id }}-${{ github.run_attempt }}'
+            build_id = 'product-installer-${{ github.run_id }}-${{ github.run_attempt }}'
             run_id = '${{ github.run_id }}'
             run_attempt = '${{ github.run_attempt }}'
-            ui_sha256 = (Get-FileHash $ui -Algorithm SHA256).Hash.ToLowerInvariant()
-            ui_size = $ui.Length
-            cargo_lock_sha256 = (Get-FileHash $lock -Algorithm SHA256).Hash.ToLowerInvariant()
-            cargo_lock_size = $lock.Length
-            zip_sha256 = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-            zip_size = $zip.Length
-          } | ConvertTo-Json | Set-Content -Encoding utf8 dist/tauri-ui-build-receipt.json
+            setup_sha256 = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+            setup_size = $artifact.Length
+            install_mode = 'perMachine'
+            state_root = 'C:\ProgramData\FairyPam.Agent\Agent'
+            layout = @('fairypam-agent-tauri-ui.exe', 'fairypam-agent.exe', 'fairypam-agent-guardian.exe', 'fairypam-agent-installer.exe', 'profiles/')
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 dist/product-installer-receipt.json
 
-      - name: Attest Tauri UI ZIP provenance
+      - name: Attest product setup provenance
         uses: actions/attest@v4
         with:
-          subject-path: dist/fairypam-agent-tauri-ui-windows.zip
+          subject-path: dist/fairypam-agent-setup-windows.exe
 
-      - name: Attest Tauri UI receipt provenance
+      - name: Attest product installer receipt provenance
         uses: actions/attest@v4
         with:
-          subject-path: dist/tauri-ui-build-receipt.json
+          subject-path: dist/product-installer-receipt.json
 
-      - name: Upload non-promotable Tauri UI artifact
+      - name: Upload non-promotable product installer
         uses: actions/upload-artifact@v7
         with:
-          name: fairypam-agent-tauri-ui-${{ github.run_id }}-${{ github.run_attempt }}
+          name: fairypam-agent-setup-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            dist/fairypam-agent-tauri-ui-windows.zip
-            dist/tauri-ui-build-receipt.json
+            dist/fairypam-agent-setup-windows.exe
+            dist/product-installer-receipt.json
           if-no-files-found: error
           retention-days: 14
 
@@ -282,24 +280,24 @@ jobs:
           gh attestation verify dist/verified-dev/fairypam-agent-dev-windows.zip --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
           gh attestation verify dist/verified-dev/dev-build-receipt.json --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
 
-  verify-tauri-ui-attestation:
-    name: Verify Tauri UI artifact attestation as a consumer
+  verify-product-installer-attestation:
+    name: Verify product installer attestation as a consumer
     needs: tauri-ui
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - name: Download Tauri UI artifact
+      - name: Download product installer
         uses: actions/download-artifact@v5
         with:
-          name: fairypam-agent-tauri-ui-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist/verified-tauri-ui
+          name: fairypam-agent-setup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/verified-product-installer
 
-      - name: Verify Tauri UI ZIP and receipt provenance
+      - name: Verify product installer provenance as a consumer
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $signer = "$env:GITHUB_REPOSITORY/.github/workflows/windows-candidate.yml"
-          gh attestation verify dist/verified-tauri-ui/fairypam-agent-tauri-ui-windows.zip --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
-          gh attestation verify dist/verified-tauri-ui/tauri-ui-build-receipt.json --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
+          gh attestation verify dist/verified-product-installer/fairypam-agent-setup-windows.exe --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
+          gh attestation verify dist/verified-product-installer/product-installer-receipt.json --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners

@@ -8,7 +8,13 @@ const WINDOWS_PIPE_CLIENT: &str =
 const WINDOWS_PIPE_SERVER: &str =
     include_str!("../../../crates/fairypam-agent-windows/src/local_pipe.rs");
 const AGENT_ENROLLMENT: &str = include_str!("../../../bins/fairypam-agent/src/enrollment.rs");
+const AGENT_OBSERVABILITY: &str = include_str!("../../../bins/fairypam-agent/src/observability.rs");
 const AGENT_RUNTIME: &str = include_str!("../../../bins/fairypam-agent/src/runtime.rs");
+const INSTALLER_PROVISIONER: &str =
+    include_str!("../../../bins/fairypam-agent-installer/src/main.rs");
+const TAURI_CONFIG: &str = include_str!("../tauri.conf.json");
+const NSIS_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
+const NSIS_TEMPLATE: &str = include_str!("../windows/installer.nsi");
 
 #[test]
 fn production_ui_cannot_arm_inject_or_reset_emergency() {
@@ -123,7 +129,7 @@ fn product_uac_and_enrollment_publication_fail_closed() {
         "CLAIM_OPERATION_TIMEOUT_MS",
         "PRODUCTION_AUDIT_STATE_DIR",
         "ensure_private_directory",
-        "restrict_path(&path)",
+        "append_private(&path",
     ] {
         assert!(
             AGENT_ENROLLMENT.contains(required) || AGENT_RUNTIME.contains(required),
@@ -135,6 +141,7 @@ fn product_uac_and_enrollment_publication_fail_closed() {
         "FILE_ATTRIBUTE_REPARSE_POINT",
         "GetNamedSecurityInfoW",
         "STATE_PARENT",
+        "PRODUCT_STATE_ROOT",
         "AUDIT_ROOT",
         "register_with_confirmation",
         "ensure_elevated()?",
@@ -148,6 +155,260 @@ fn product_uac_and_enrollment_publication_fail_closed() {
     assert!(!AGENT_ENROLLMENT.contains("fs::create_dir_all(path)"));
     assert!(AGENT_RUNTIME.contains("registration_pending"));
     assert!(GATEWAY.contains("RegistrationStatusDto"));
+}
+
+#[test]
+fn product_installer_provisions_new_private_state_before_runtime_launch() {
+    for required in [
+        "C:\\ProgramData\\FairyPam.Agent",
+        "CreateDirectoryW",
+        "Some(&attributes)",
+        "PRIVATE_SDDL",
+        "ensure_elevated()?",
+        "fn verify_trusted_install_entry",
+        "FOLDERID_ProgramFilesX64",
+        "let expected_stage = program_files.join(\"FairyPam Agent UI.installing\");",
+        "let expected_active = program_files.join(\"FairyPam Agent UI\");",
+        "roots.is_none_or(|(stage, active)|",
+        "verify_install_tree(stage_root)?",
+        "verify_install_tree(active_root)?",
+        "verify_nonreparse_directory",
+        "verify_private_directory",
+    ] {
+        assert!(
+            INSTALLER_PROVISIONER.contains(required),
+            "missing installer state-root invariant: {required}"
+        );
+    }
+    assert!(
+        !INSTALLER_PROVISIONER.contains("SetFileSecurityW"),
+        "the provisioner must never repair an existing path DACL"
+    );
+    assert!(
+        !INSTALLER_PROVISIONER.contains("create_dir_all"),
+        "the provisioner must create each trusted path with its DACL"
+    );
+    for source in [INSTALLER_PROVISIONER, AGENT_ENROLLMENT] {
+        assert!(
+            source.contains("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"),
+            "private state must be owned by Builtin Administrators"
+        );
+        assert!(
+            source.contains("OWNER_SECURITY_INFORMATION"),
+            "private state owner must be set and verified with its DACL"
+        );
+    }
+    let runtime_writes = &AGENT_ENROLLMENT[AGENT_ENROLLMENT
+        .find("fn write_private")
+        .expect("runtime must use one private-object creation path")..];
+    for required in [
+        "CreateDirectoryW(",
+        "CreateFileW(",
+        "Some(attributes)",
+        "CREATE_NEW",
+        "FILE_FLAG_OPEN_REPARSE_POINT",
+        "PRIVATE_SDDL",
+        "OWNER_SECURITY_INFORMATION",
+        "verify_private_file(path)",
+        "private_security(path)",
+    ] {
+        assert!(
+            runtime_writes.contains(required),
+            "runtime private objects must be created and verified with owner plus DACL: {required}"
+        );
+    }
+    for forbidden in [
+        "fs::write(path",
+        "SetFileSecurityW",
+        "fs::create_dir(&directory)",
+    ] {
+        assert!(
+            !AGENT_ENROLLMENT.contains(forbidden),
+            "runtime must not create a private object before applying its security: {forbidden}"
+        );
+    }
+    assert!(AGENT_OBSERVABILITY.contains("append_private(&self.path(0)"));
+    assert!(AGENT_RUNTIME.contains("open_private_read(path)"));
+    assert!(AGENT_RUNTIME.contains("verify_private_file(&path)"));
+    for required in [
+        "\"installMode\": \"perMachine\"",
+        "\"installerHooks\": \"./windows/installer-hooks.nsh\"",
+        "\"template\": \"./windows/installer.nsi\"",
+        "\"../../target/release/fairypam-agent.exe\": \"fairypam-agent.exe\"",
+        "\"../../target/release/fairypam-agent-guardian.exe\": \"fairypam-agent-guardian.exe\"",
+        "\"../../target/release/fairypam-agent-installer.exe\": \"resources/runtime/fairypam-agent-installer.exe\"",
+        "\"../../profiles\": \"profiles\"",
+    ] {
+        assert!(
+            TAURI_CONFIG.contains(required),
+            "missing installer bundle member: {required}"
+        );
+    }
+    for required in [
+        "!define FIXED_INSTALL_DIR \"$PROGRAMFILES64\\${PRODUCTNAME}\"",
+        "!error \"FairyPam requires a per-machine installer\"",
+        "!error \"FairyPam product installer currently supports x64 only\"",
+    ] {
+        assert!(
+            NSIS_TEMPLATE.contains(required),
+            "missing fixed-root template rule: {required}"
+        );
+    }
+    assert!(!NSIS_TEMPLATE.contains("MUI_PAGE_DIRECTORY"));
+    let init_start = NSIS_TEMPLATE
+        .find("Function .onInit")
+        .expect("installer must define .onInit");
+    let init_end = NSIS_TEMPLATE[init_start..]
+        .find("FunctionEnd")
+        .map(|offset| init_start + offset)
+        .expect("installer .onInit must terminate");
+    let init = &NSIS_TEMPLATE[init_start..init_end];
+    assert!(init.contains("StrCpy $INSTDIR \"${FIXED_INSTALL_DIR}\""));
+    assert!(!init.contains("RestorePreviousInstallLocation"));
+    let install = &NSIS_TEMPLATE[NSIS_TEMPLATE
+        .find("Section Install\n")
+        .expect("installer must define its install section")..];
+    let fixed_dir = install
+        .find("StrCpy $INSTDIR \"${FIXED_INSTALL_DIR}\"")
+        .expect("install section must restore the fixed install directory");
+    let preinstall = install
+        .find("!insertmacro NSIS_HOOK_PREINSTALL")
+        .expect("install section must invoke the preinstall hook");
+    let app_check = install
+        .find("!insertmacro CheckIfAppIsRunning")
+        .expect("active UI must be closed before staging");
+    let first_file = install
+        .find("File \"${MAINBINARYSRCPATH}\"")
+        .expect("install section must extract the main binary");
+    let uninstaller = install
+        .find("WriteUninstaller \"$INSTDIR\\uninstall.exe\"")
+        .expect("the staged slot must include its uninstaller");
+    let activate = install
+        .find("!insertmacro NSIS_HOOK_ACTIVATE")
+        .expect("the complete staged slot must be activated once");
+    assert!(
+        fixed_dir < app_check
+            && app_check < preinstall
+            && preinstall < first_file
+            && first_file < uninstaller
+            && uninstaller < activate
+    );
+    assert!(
+        !install[..preinstall].contains("SetOutPath"),
+        "no product output directory may be selected before the protected stage exists"
+    );
+    assert!(
+        !install[..preinstall]
+            .lines()
+            .any(|line| line.trim_start().starts_with("File ")),
+        "no product file may be extracted before the protected stage is pinned"
+    );
+    for forbidden in [
+        "$PLUGINSDIR\\fairypam-preflight",
+        "fairypam-agent-installer.exe\" \"${FIXED_INSTALL_DIR}",
+    ] {
+        assert!(
+            !NSIS_TEMPLATE.contains(forbidden),
+            "installer helper must not be staged or launched from a temporary path: {forbidden}"
+        );
+    }
+    assert!(!NSIS_TEMPLATE.contains("$PLUGINSDIR"));
+    assert!(!NSIS_TEMPLATE.contains("fairypam-agent-installer.exe"));
+
+    let preinstall_hook = &NSIS_HOOKS[..NSIS_HOOKS
+        .find("!macro NSIS_HOOK_ACTIVATE")
+        .expect("installer must define its activation hook")];
+    let descriptor = preinstall_hook
+        .find("ConvertStringSecurityDescriptorToSecurityDescriptorW")
+        .expect("the protected staging DACL must be built before directory creation");
+    let create_stage = preinstall_hook
+        .find("CreateDirectoryW")
+        .expect("the staging directory must be created with its final DACL");
+    let pin_stage = preinstall_hook
+        .find("CreateFileW")
+        .expect("the staging directory must be pinned against replacement");
+    let staged_inst_dir = preinstall_hook
+        .find("StrCpy $INSTDIR \"$FairyPamStageDir\"")
+        .expect("payload extraction must target the fixed staging directory");
+    let staged_out_dir = preinstall_hook
+        .find("SetOutPath $INSTDIR")
+        .expect("NSIS OUTDIR must follow the fixed staging directory");
+    assert!(descriptor < create_stage && create_stage < pin_stage);
+    assert!(pin_stage < staged_inst_dir && staged_inst_dir < staged_out_dir);
+    assert!(preinstall_hook.contains("IfFileExists \"$FairyPamStageDir\" fairypam_stale_stage 0"));
+    assert!(!preinstall_hook.contains("RMDir /r \"$FairyPamStageDir\""));
+    for required in [
+        "FAIRYPAM_INSTALL_SDDL",
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)",
+        "CreateDirectoryW(w \"$FairyPamStageDir\"",
+        "CreateFileW(w \"$FairyPamStageDir\"",
+        "i 0x80, i 3, p 0, i 3",
+        "FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT",
+        "FILE_FLAG_OPEN_REPARSE_POINT",
+        "Var FairyPamStageHandle",
+        "StrCpy $INSTDIR \"$FairyPamStageDir\"",
+        "SetOutPath $INSTDIR",
+    ] {
+        assert!(
+            preinstall_hook.contains(required),
+            "staging must be created, pinned, and selected before extraction: {required}"
+        );
+    }
+
+    for required in [
+        "${FIXED_INSTALL_DIR}.installing",
+        "${FIXED_INSTALL_DIR}.previous",
+        "IfFileExists \"$FairyPamStageDir\\resources\\runtime\\fairypam-agent-installer.exe\" 0 fairypam_stage_failed",
+        "IfFileExists \"$FairyPamStageDir\\fairypam-agent.exe\"",
+        "IfFileExists \"$FairyPamStageDir\\fairypam-agent-guardian.exe\"",
+        "IfFileExists \"$FairyPamStageDir\\profiles\\*.*\"",
+        "Rename \"$FairyPamFinalDir\" \"$FairyPamBackupDir\"",
+        "Rename \"$FairyPamStageDir\" \"$FairyPamFinalDir\"",
+        "Rename \"$FairyPamBackupDir\" \"$FairyPamFinalDir\"",
+        "ExecWait '\"$FairyPamStageDir\\resources\\runtime\\fairypam-agent-installer.exe\" \"$FairyPamStageDir\" \"$FairyPamFinalDir\"' $0",
+        "IfFileExists \"$FairyPamFinalDir\" 0 fairypam_activate_fresh",
+    ] {
+        assert!(
+            NSIS_HOOKS.contains(required),
+            "missing atomic slot rule: {required}"
+        );
+    }
+    let verify = NSIS_HOOKS
+        .find("ExecWait '\"$FairyPamStageDir\\resources\\runtime\\fairypam-agent-installer.exe\"")
+        .expect("the staged helper must verify the complete slot");
+    let close_stage = NSIS_HOOKS[verify..]
+        .find("CloseHandle")
+        .map(|offset| verify + offset)
+        .expect("the staging directory must remain pinned through helper verification");
+    let preserve = NSIS_HOOKS
+        .find("Rename \"$FairyPamFinalDir\" \"$FairyPamBackupDir\"")
+        .expect("the previous slot must be preserved");
+    let activate_slot = NSIS_HOOKS
+        .find("Rename \"$FairyPamStageDir\" \"$FairyPamFinalDir\"")
+        .expect("the complete staged slot must be activated");
+    assert!(verify < close_stage && close_stage < preserve && preserve < activate_slot);
+    for forbidden in ["$PLUGINSDIR", "$TEMP", "ExecShell"] {
+        assert!(
+            !NSIS_HOOKS.contains(forbidden),
+            "product helper must never execute from a temporary path: {forbidden}"
+        );
+    }
+    assert!(!NSIS_HOOKS.contains("fairypam-agent.exe.new"));
+    for required in [
+        "verify_install_tree(stage_root)?",
+        ".join(\"resources\")",
+        ".join(\"runtime\")",
+        ".join(\"fairypam-agent-installer.exe\")",
+        "std::env::current_exe()",
+        "verify_trusted_install_entry(&program_files, true)?",
+        "verify_trusted_install_entry(&helper, false)?",
+        "Ok(_) => verify_install_tree(active_root)?",
+    ] {
+        assert!(
+            INSTALLER_PROVISIONER.contains(required),
+            "installer helper must verify the staged/active slot: {required}"
+        );
+    }
 }
 
 #[test]

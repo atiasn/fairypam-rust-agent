@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use std::sync::atomic::Ordering;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,7 +35,7 @@ use crate::observability::AgentLogRecord;
 use crate::profile_store::ProfileStore;
 
 #[cfg(windows)]
-const PRODUCTION_AUDIT_STATE_DIR: &str = r"C:\ProgramData\FairyPam\Agent\audit";
+const PRODUCTION_AUDIT_STATE_DIR: &str = crate::enrollment::AUDIT_ROOT;
 #[cfg(windows)]
 const LOCAL_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -175,7 +175,7 @@ impl RuntimeConfig {
 
     #[cfg(windows)]
     fn from_enrollment_state() -> Result<Self, AgentError> {
-        let root = PathBuf::from(r"C:\ProgramData\FairyPam\Agent\enrollment");
+        let root = PathBuf::from(crate::enrollment::STATE_ROOT);
         crate::enrollment::ensure_private_directory(&root)?;
         let pointer = load_private_json(&root.join("current.json"))?;
         let generation = enrollment_field(&pointer, "generation")?;
@@ -274,12 +274,9 @@ pub(crate) fn validate_enrollment_candidate(
 
 #[cfg(windows)]
 fn enrollment_state_exists() -> bool {
-    let root = Path::new(r"C:\ProgramData\FairyPam\Agent\enrollment");
+    let root = Path::new(crate::enrollment::STATE_ROOT);
     crate::enrollment::ensure_private_directory(root).is_ok()
-        && root
-            .join("current.json")
-            .symlink_metadata()
-            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        && crate::enrollment::verify_private_file(&root.join("current.json")).is_ok()
 }
 
 #[cfg(windows)]
@@ -304,25 +301,26 @@ fn enrollment_profile_directory() -> Result<PathBuf, AgentError> {
 
 #[cfg(windows)]
 fn load_private_json(path: &Path) -> Result<serde_json::Value, AgentError> {
-    let metadata = path.symlink_metadata().map_err(|_| {
+    let mut file = crate::enrollment::open_private_read(path).map_err(|_| {
         AgentError::new(
             "runtime.enrollment_invalid",
-            "enrollment state is unavailable",
+            "enrollment state is unavailable or unsafe",
         )
     })?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(AgentError::new(
-            "runtime.enrollment_invalid",
-            "enrollment state is not a regular file",
-        ));
-    }
-    serde_json::from_slice(&std::fs::read(path).map_err(|_| {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|_| {
         AgentError::new(
             "runtime.enrollment_invalid",
             "enrollment state cannot be read",
         )
-    })?)
-    .map_err(|_| {
+    })?;
+    crate::enrollment::verify_private_file(path).map_err(|_| {
+        AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment state changed during read",
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|_| {
         AgentError::new(
             "runtime.enrollment_invalid",
             "enrollment state is malformed",
@@ -351,18 +349,12 @@ fn enrollment_field(
 #[cfg(windows)]
 fn private_file(directory: &Path, name: &'static str) -> Result<PathBuf, AgentError> {
     let path = directory.join(name);
-    let metadata = path.symlink_metadata().map_err(|_| {
+    crate::enrollment::verify_private_file(&path).map_err(|_| {
         AgentError::new(
             "runtime.enrollment_invalid",
-            "enrollment credential is unavailable",
+            "enrollment credential is unsafe",
         )
     })?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(AgentError::new(
-            "runtime.enrollment_invalid",
-            "enrollment credential is unsafe",
-        ));
-    }
     Ok(path)
 }
 
@@ -588,7 +580,7 @@ impl GrpcSessionDriver {
             let Some(expected) = expected else {
                 return Ok(false);
             };
-            let root = Path::new(r"C:\ProgramData\FairyPam\Agent\enrollment");
+            let root = Path::new(crate::enrollment::STATE_ROOT);
             crate::enrollment::ensure_private_directory(root)?;
             let pointer = load_private_json(&root.join("current.json"))?;
             Ok(enrollment_field(&pointer, "generation")? != expected)
@@ -1292,22 +1284,12 @@ impl AuditSink for RuntimeAudit {
         };
         let path = state_dir.join("local-control-audit.jsonl");
         let line = format!("{}\n", event.to_json());
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut file| {
-                crate::enrollment::restrict_path(&path).map_err(|error| {
-                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
-                })?;
-                std::io::Write::write_all(&mut file, line.as_bytes())
-            })
-            .map_err(|_| {
-                AgentError::new(
-                    "local.audit_failed",
-                    "local control mutation audit could not be persisted",
-                )
-            })
+        crate::enrollment::append_private(&path, line.as_bytes()).map_err(|_| {
+            AgentError::new(
+                "local.audit_failed",
+                "local control mutation audit could not be persisted",
+            )
+        })
     }
 }
 

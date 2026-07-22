@@ -20,6 +20,7 @@ const LOG_FILE: &str = "agent.log";
 
 pub struct FixedLog {
     root: PathBuf,
+    private: bool,
 }
 
 impl FixedLog {
@@ -29,22 +30,41 @@ impl FixedLog {
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(log_root_unavailable());
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            private: false,
+        })
+    }
+
+    #[cfg(windows)]
+    fn open_private(root: PathBuf) -> Result<Self, AgentError> {
+        crate::enrollment::ensure_private_directory(&root)?;
+        Ok(Self {
+            root,
+            private: true,
+        })
     }
 
     pub fn append(&self, level: LogLevel, message: &str) -> Result<(), AgentError> {
         let record = AgentLogRecord::new(level, redact_log_line(message));
-        let line = serde_json::to_string(&json!({
+        let mut line = serde_json::to_string(&json!({
             "level": log_level_name(&record.level),
             "message": record.message,
         }))
         .map_err(|_| AgentError::new("local.log_write_failed", "Agent log cannot be encoded"))?;
         self.rotate_if_needed(line.len() as u64 + 1)?;
+        line.push('\n');
+        if self.private {
+            #[cfg(windows)]
+            return crate::enrollment::append_private(&self.path(0), line.as_bytes()).map_err(
+                |_| AgentError::new("local.log_write_failed", "Agent log cannot be persisted"),
+            );
+        }
         fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.path(0))
-            .and_then(|mut file| writeln!(file, "{line}"))
+            .and_then(|mut file| file.write_all(line.as_bytes()))
             .map_err(|_| AgentError::new("local.log_write_failed", "Agent log cannot be persisted"))
     }
 
@@ -52,8 +72,23 @@ impl FixedLog {
         let mut records = Vec::new();
         for index in (0..MAX_LOG_FILES).rev() {
             let path = self.path(index);
-            let Ok(file) = fs::File::open(&path) else {
-                continue;
+            let file = if self.private {
+                #[cfg(windows)]
+                {
+                    match path.symlink_metadata() {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => return Err(log_root_unavailable()),
+                        Ok(_) => crate::enrollment::open_private_read(&path)
+                            .map_err(|_| log_root_unavailable())?,
+                    }
+                }
+                #[cfg(not(windows))]
+                unreachable!("private logs are Windows-only")
+            } else {
+                let Ok(file) = fs::File::open(&path) else {
+                    continue;
+                };
+                file
             };
             for line in BufReader::new(file).lines().map_while(Result::ok) {
                 let value = serde_json::from_str::<Value>(&line).ok();
@@ -69,6 +104,11 @@ impl FixedLog {
                     continue;
                 };
                 records.push(AgentLogRecord::new(level, message));
+            }
+            if self.private {
+                #[cfg(windows)]
+                crate::enrollment::verify_private_file(&path)
+                    .map_err(|_| log_root_unavailable())?;
             }
         }
         Ok(log_tail_json(&records, lines, level))
@@ -108,9 +148,8 @@ impl FixedLog {
 
 #[cfg(windows)]
 pub fn production_log() -> Result<FixedLog, AgentError> {
-    let root = PathBuf::from(r"C:\ProgramData\FairyPam\Agent\logs");
-    crate::enrollment::ensure_private_directory(&root)?;
-    FixedLog::open(root)
+    let root = PathBuf::from(crate::enrollment::LOG_ROOT);
+    FixedLog::open_private(root)
 }
 
 fn log_root_error(_: std::io::Error) -> AgentError {

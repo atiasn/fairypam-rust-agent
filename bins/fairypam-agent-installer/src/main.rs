@@ -1,0 +1,342 @@
+//! Fixed-path, installer-only validation and production state provisioning.
+
+#[cfg(not(windows))]
+fn main() {
+    panic!("fairypam-agent-installer is Windows-only");
+}
+
+#[cfg(windows)]
+fn main() {
+    let mut arguments = std::env::args_os().skip(1);
+    let roots = arguments.next().zip(arguments.next());
+    if roots.is_none_or(|(stage, active)| {
+        arguments.next().is_some()
+            || provision(std::path::Path::new(&stage), std::path::Path::new(&active)).is_err()
+    }) {
+        std::process::exit(1);
+    }
+}
+
+#[cfg(windows)]
+const PROGRAM_DATA: &str = r"C:\ProgramData";
+#[cfg(windows)]
+const PRODUCT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent";
+#[cfg(windows)]
+const AGENT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent";
+#[cfg(windows)]
+const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+#[cfg(windows)]
+fn provision(stage_root: &std::path::Path, active_root: &std::path::Path) -> Result<(), ()> {
+    ensure_elevated()?;
+    verify_install_roots(stage_root, active_root)?;
+    verify_nonreparse_directory(std::path::Path::new(PROGRAM_DATA))?;
+    for path in [
+        PRODUCT_ROOT,
+        AGENT_ROOT,
+        r"C:\ProgramData\FairyPam.Agent\Agent\enrollment",
+        r"C:\ProgramData\FairyPam.Agent\Agent\audit",
+        r"C:\ProgramData\FairyPam.Agent\Agent\logs",
+    ] {
+        create_or_verify_private_directory(std::path::Path::new(path))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_install_roots(
+    stage_root: &std::path::Path,
+    active_root: &std::path::Path,
+) -> Result<(), ()> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        FOLDERID_ProgramFilesX64, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+    };
+
+    let known = unsafe {
+        SHGetKnownFolderPath(&FOLDERID_ProgramFilesX64, KF_FLAG_DEFAULT, None).map_err(|_| ())?
+    };
+    let program_files = unsafe { known.to_string().map_err(|_| ())? };
+    unsafe { CoTaskMemFree(Some(known.0.cast())) };
+    let program_files = std::path::PathBuf::from(program_files);
+    let expected_stage = program_files.join("FairyPam Agent UI.installing");
+    let expected_active = program_files.join("FairyPam Agent UI");
+    if !same_windows_path(stage_root, &expected_stage)
+        || !same_windows_path(active_root, &expected_active)
+    {
+        return Err(());
+    }
+
+    verify_trusted_install_entry(&program_files, true)?;
+    verify_install_tree(stage_root)?;
+    let helper = stage_root
+        .join("resources")
+        .join("runtime")
+        .join("fairypam-agent-installer.exe");
+    if !same_windows_path(&std::env::current_exe().map_err(|_| ())?, &helper) {
+        return Err(());
+    }
+    verify_trusted_install_entry(&helper, false)?;
+    match active_root.symlink_metadata() {
+        Ok(_) => verify_install_tree(active_root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(()),
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_install_tree(root: &std::path::Path) -> Result<(), ()> {
+    verify_trusted_install_entry(root, true)?;
+    for entry in std::fs::read_dir(root).map_err(|_| ())? {
+        let path = entry.map_err(|_| ())?.path();
+        let metadata = path.symlink_metadata().map_err(|_| ())?;
+        verify_trusted_install_entry(&path, metadata.is_dir())?;
+        if metadata.is_dir() {
+            verify_install_tree(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn same_windows_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left.to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .eq_ignore_ascii_case(right.to_string_lossy().trim_end_matches(['\\', '/']))
+}
+
+#[cfg(windows)]
+fn create_or_verify_private_directory(path: &std::path::Path) -> Result<(), ()> {
+    match path.symlink_metadata() {
+        Ok(_) => verify_private_directory(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_private_directory(path)
+        }
+        Err(_) => Err(()),
+    }
+}
+
+#[cfg(windows)]
+fn create_private_directory(path: &std::path::Path) -> Result<(), ()> {
+    create_directory_with_sddl(path, PRIVATE_SDDL)?;
+    verify_private_directory(path)
+}
+
+#[cfg(windows)]
+fn create_directory_with_sddl(path: &std::path::Path, sddl: &str) -> Result<(), ()> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::HLOCAL;
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            &HSTRING::from(sddl),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(|_| ())?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    // SAFETY: the descriptor remains allocated until CreateDirectoryW returns.
+    let result = unsafe {
+        CreateDirectoryW(
+            &HSTRING::from(path.to_string_lossy().as_ref()),
+            Some(&attributes),
+        )
+    }
+    .map_err(|_| ());
+    let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
+    result.map_err(|_| ())
+}
+
+#[cfg(windows)]
+fn verify_private_directory(path: &std::path::Path) -> Result<(), ()> {
+    verify_nonreparse_directory(path)?;
+    security_sddl(path)
+        .is_ok_and(|value| value == PRIVATE_SDDL || value == "O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)")
+        .then_some(())
+        .ok_or(())
+}
+
+#[cfg(windows)]
+fn verify_nonreparse_directory(path: &std::path::Path) -> Result<(), ()> {
+    let metadata = path.symlink_metadata().map_err(|_| ())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(());
+    }
+    verify_nonreparse_attributes(path)
+}
+
+#[cfg(windows)]
+fn verify_trusted_install_entry(path: &std::path::Path, directory: bool) -> Result<(), ()> {
+    let metadata = path.symlink_metadata().map_err(|_| ())?;
+    if metadata.file_type().is_symlink()
+        || (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+    {
+        return Err(());
+    }
+    verify_nonreparse_attributes(path)?;
+    trusted_program_files_security(&security_sddl(path)?)
+        .then_some(())
+        .ok_or(())
+}
+
+#[cfg(windows)]
+fn verify_nonreparse_attributes(path: &std::path::Path) -> Result<(), ()> {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
+    };
+
+    let attributes = unsafe { GetFileAttributesW(&HSTRING::from(path.to_string_lossy().as_ref())) };
+    if attributes == INVALID_FILE_ATTRIBUTES || attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn security_sddl(path: &std::path::Path) -> Result<String, ()> {
+    use windows::core::{HSTRING, PWSTR};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR,
+    };
+
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            &HSTRING::from(path.to_string_lossy().as_ref()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+    };
+    if status.0 != 0 {
+        return Err(());
+    }
+    let mut text = PWSTR::null();
+    let converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            &mut text,
+            None,
+        )
+    };
+    let result = converted
+        .map_err(|_| ())
+        .and_then(|_| unsafe { text.to_string().map_err(|_| ()) });
+    let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
+    result
+}
+
+fn trusted_program_files_security(sddl: &str) -> bool {
+    let trusted_owner = sddl.starts_with("O:BA")
+        || sddl.starts_with("O:SY")
+        || sddl.starts_with("O:TI")
+        || sddl.starts_with(&format!("O:{TRUSTED_INSTALLER_SID}"));
+    trusted_owner && !dacl_grants_untrusted_write(sddl)
+}
+
+fn dacl_grants_untrusted_write(sddl: &str) -> bool {
+    let Some(dacl) = sddl.split_once("D:").map(|(_, dacl)| dacl) else {
+        return true;
+    };
+    dacl.split('(').skip(1).any(|raw| {
+        let ace = raw.split(')').next().unwrap_or_default();
+        let fields = ace.split(';').collect::<Vec<_>>();
+        if fields.len() < 6 || !fields[0].ends_with('A') {
+            return false;
+        }
+        let trustee = fields[5];
+        if matches!(trustee, "SY" | "BA" | "CO") || trustee == TRUSTED_INSTALLER_SID {
+            return false;
+        }
+        write_capable_rights(fields[2])
+    })
+}
+
+fn write_capable_rights(rights: &str) -> bool {
+    if let Some(mask) = rights.strip_prefix("0x") {
+        return u32::from_str_radix(mask, 16).map_or(true, |mask| mask & 0x500D_0156 != 0);
+    }
+    let allowed = ["GR", "GX", "RC", "FR", "FX", "KR", "KX", "NR", "NX"];
+    rights
+        .as_bytes()
+        .chunks_exact(2)
+        .any(|right| !allowed.iter().any(|allowed| allowed.as_bytes() == right))
+}
+
+#[cfg(windows)]
+fn ensure_elevated() -> Result<(), ()> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = Default::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.map_err(|_| ())?;
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut length = 0;
+    let result = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut length,
+        )
+    };
+    let _ = unsafe { CloseHandle(token) };
+    result.map_err(|_| ())?;
+    (elevation.TokenIsElevated != 0).then_some(()).ok_or(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn program_files_acl_rejects_untrusted_owner_or_write() {
+        assert!(trusted_program_files_security(
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
+        ));
+        assert!(!trusted_program_files_security(
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FW;;;BU)"
+        ));
+        assert!(!trusted_program_files_security(
+            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        ));
+    }
+}
