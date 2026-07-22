@@ -98,24 +98,6 @@ fn allows_application_navigation(url: &tauri::Url) -> bool {
         || (cfg!(debug_assertions) && url.scheme() == "http" && url.host_str() == Some("127.0.0.1"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::allows_application_navigation;
-
-    #[test]
-    fn allows_the_bundled_windows_tauri_frontend_but_not_external_navigation() {
-        assert!(allows_application_navigation(
-            &tauri::Url::parse("http://tauri.localhost/").unwrap()
-        ));
-        assert!(!allows_application_navigation(
-            &tauri::Url::parse("https://example.com/").unwrap()
-        ));
-        assert!(!allows_application_navigation(
-            &tauri::Url::parse("http://tauri.localhost:8080/").unwrap()
-        ));
-    }
-}
-
 fn disable_default_context_menu(window: &tauri::WebviewWindow) {
     let _ = window.with_webview(|webview| {
         #[cfg(windows)]
@@ -144,5 +126,23 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allows_application_navigation;
+
+    #[test]
+    fn allows_the_bundled_windows_tauri_frontend_but_not_external_navigation() {
+        assert!(allows_application_navigation(
+            &tauri::Url::parse("http://tauri.localhost/").unwrap()
+        ));
+        assert!(!allows_application_navigation(
+            &tauri::Url::parse("https://example.com/").unwrap()
+        ));
+        assert!(!allows_application_navigation(
+            &tauri::Url::parse("http://tauri.localhost:8080/").unwrap()
+        ));
     }
 }
