@@ -213,6 +213,26 @@ jobs:
             Pop-Location
           }
 
+      - name: Smoke fresh NSIS product install
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $setup = @(Get-ChildItem tauri-ui/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
+          if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
+          & $setup[0].FullName /S
+          if ($LASTEXITCODE -ne 0) { throw "NSIS setup failed with exit code $LASTEXITCODE" }
+          $installRoot = 'C:\Program Files\FairyPam Agent UI'
+          foreach ($path in @(
+            (Join-Path $installRoot 'fairypam-agent-tauri-ui.exe'),
+            (Join-Path $installRoot 'fairypam-agent.exe'),
+            (Join-Path $installRoot 'fairypam-agent-guardian.exe'),
+            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe')
+          )) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "missing installed product file: $path" }
+          }
+          $profiles = Join-Path $installRoot 'profiles'
+          if (-not (Test-Path -LiteralPath $profiles -PathType Container)) { throw "missing installed profiles directory: $profiles" }
+
       - name: Package product installer receipt
         shell: pwsh
         run: |
