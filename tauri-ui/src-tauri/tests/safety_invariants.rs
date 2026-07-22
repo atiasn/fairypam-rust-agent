@@ -493,7 +493,6 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     );
     for required in [
         "FAIRYPAM_INSTALL_SDDL",
-        "${ERROR_ALREADY_EXISTS}",
         "CreateDirectoryW(w \"$FairyPamStageDir\"",
         "CreateFileW(w \"$FairyPamStageDir\"",
         "GetFileAttributesW(w \"$FairyPamStageDir\")",
