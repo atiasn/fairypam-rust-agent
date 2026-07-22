@@ -282,6 +282,20 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
             && maintenance.contains("ExecWait '$R1' $0"),
         "only the disabled upstream maintenance block may retain pre-install uninstall code"
     );
+    for line in NSIS_TEMPLATE
+        .lines()
+        .filter(|line| line.contains("UninstallString"))
+    {
+        assert!(
+            maintenance.contains(line) || line.contains("WriteRegStr"),
+            "UninstallString must only be read in the disabled maintenance block: {line}"
+        );
+    }
+    assert_eq!(
+        NSIS_TEMPLATE.matches("ExecWait '$R1' $0").count(),
+        maintenance.matches("ExecWait '$R1' $0").count(),
+        "legacy uninstaller ExecWait must only exist in the disabled maintenance block"
+    );
     assert!(!NSIS_TEMPLATE.contains("MUI_PAGE_DIRECTORY"));
     let init_start = NSIS_TEMPLATE
         .find("Function .onInit")
@@ -293,6 +307,21 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     let init = &NSIS_TEMPLATE[init_start..init_end];
     assert!(init.contains("StrCpy $INSTDIR \"${FIXED_INSTALL_DIR}\""));
     assert!(!init.contains("RestorePreviousInstallLocation"));
+    let uninstall_init_start = NSIS_TEMPLATE
+        .find("Function un.onInit")
+        .expect("installer must define uninstaller initialization");
+    let uninstall_init_end = NSIS_TEMPLATE[uninstall_init_start..]
+        .find("FunctionEnd")
+        .map(|offset| uninstall_init_start + offset)
+        .expect("uninstaller initialization must terminate");
+    let uninstall_init = &NSIS_TEMPLATE[uninstall_init_start..uninstall_init_end];
+    let fixed_uninstall_root = uninstall_init
+        .find("StrCmp \"$EXEDIR\" \"${FIXED_INSTALL_DIR}\"")
+        .expect("uninstaller must reject a caller-controlled installation root");
+    let fixed_uninstall_dir = uninstall_init
+        .find("StrCpy $INSTDIR \"${FIXED_INSTALL_DIR}\"")
+        .expect("uninstaller must restore the fixed installation root");
+    assert!(fixed_uninstall_root < fixed_uninstall_dir);
     let install = &NSIS_TEMPLATE[NSIS_TEMPLATE
         .find("Section Install\n")
         .expect("installer must define its install section")..];
@@ -373,7 +402,21 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         .expect("NSIS OUTDIR must follow the fixed staging directory");
     assert!(descriptor < create_stage && create_stage < pin_stage);
     assert!(pin_stage < staged_inst_dir && staged_inst_dir < staged_out_dir);
-    assert!(preinstall_hook.contains("IfFileExists \"$FairyPamStageDir\" fairypam_stale_stage 0"));
+    let existing_active = preinstall_hook
+        .find("IfFileExists \"$FairyPamFinalDir\" fairypam_existing_active 0")
+        .expect("an existing active slot must stop installation before staging");
+    let existing_previous = preinstall_hook
+        .find("IfFileExists \"$FairyPamBackupDir\" fairypam_existing_previous 0")
+        .expect("an existing previous slot must stop installation before staging");
+    let existing_stage = preinstall_hook
+        .find("IfFileExists \"$FairyPamStageDir\" fairypam_existing_stage 0")
+        .expect("an existing staging slot must stop installation before staging");
+    assert!(
+        existing_active < descriptor
+            && existing_previous < descriptor
+            && existing_stage < descriptor
+    );
+    assert!(!preinstall_hook.contains("RMDir \"$FairyPamStageDir\""));
     assert!(!preinstall_hook.contains("RMDir /r \"$FairyPamStageDir\""));
     for required in [
         "FAIRYPAM_INSTALL_SDDL",
@@ -400,11 +443,8 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "IfFileExists \"$FairyPamStageDir\\fairypam-agent.exe\"",
         "IfFileExists \"$FairyPamStageDir\\fairypam-agent-guardian.exe\"",
         "IfFileExists \"$FairyPamStageDir\\profiles\\*.*\"",
-        "Rename \"$FairyPamFinalDir\" \"$FairyPamBackupDir\"",
         "Rename \"$FairyPamStageDir\" \"$FairyPamFinalDir\"",
-        "Rename \"$FairyPamBackupDir\" \"$FairyPamFinalDir\"",
         "ExecWait '\"$FairyPamStageDir\\resources\\runtime\\fairypam-agent-installer.exe\" \"$FairyPamStageDir\" \"$FairyPamFinalDir\"' $0",
-        "IfFileExists \"$FairyPamFinalDir\" 0 fairypam_activate_fresh",
     ] {
         assert!(
             NSIS_HOOKS.contains(required),
@@ -418,44 +458,41 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         .find("CloseHandle")
         .map(|offset| verify + offset)
         .expect("the staging directory must remain pinned through helper verification");
-    let preserve = NSIS_HOOKS
-        .find("Rename \"$FairyPamFinalDir\" \"$FairyPamBackupDir\"")
-        .expect("the previous slot must be preserved");
     let activate_slot = NSIS_HOOKS
         .find("Rename \"$FairyPamStageDir\" \"$FairyPamFinalDir\"")
         .expect("the complete staged slot must be activated");
-    assert!(verify < close_stage && close_stage < preserve && preserve < activate_slot);
-    let cleanup_start = NSIS_HOOKS
-        .find("fairypam_activate_complete:")
-        .expect("activated slot cleanup must be defined");
-    let cleanup_end = NSIS_HOOKS[cleanup_start..]
-        .find("fairypam_restore_previous:")
-        .map(|offset| cleanup_start + offset)
-        .expect("activated slot cleanup must finish before rollback");
-    let cleanup = &NSIS_HOOKS[cleanup_start..cleanup_end];
-    let cleanup_clear = cleanup
-        .find("ClearErrors")
-        .expect("previous-slot cleanup must reset its error state");
-    let cleanup_remove = cleanup
-        .find("RMDir /r \"$FairyPamBackupDir\"")
-        .expect("previous slot must be removed after activation");
-    let cleanup_error = cleanup
-        .find("IfErrors fairypam_backup_cleanup_failed 0")
-        .expect("previous-slot cleanup errors must fail closed");
-    let cleanup_present = cleanup
-        .find("IfFileExists \"$FairyPamBackupDir\" fairypam_backup_cleanup_failed 0")
-        .expect("a retained previous slot must fail closed");
-    assert!(cleanup_clear < cleanup_remove && cleanup_remove < cleanup_error);
-    assert!(cleanup_error < cleanup_present);
-    assert!(NSIS_HOOKS.contains(
-        "fairypam_backup_cleanup_failed:\n  Abort \"FairyPam could not remove the preserved previous installation. Installation was stopped without reporting success.\""
-    ));
+    assert!(verify < close_stage && close_stage < activate_slot);
+    assert_eq!(
+        NSIS_HOOKS
+            .matches("Rename \"$FairyPamStageDir\" \"$FairyPamFinalDir\"")
+            .count(),
+        1,
+        "clean-first activation must have exactly one stage-to-active rename"
+    );
+    for forbidden in [
+        "Rename \"$FairyPamFinalDir\" \"$FairyPamBackupDir\"",
+        "Rename \"$FairyPamBackupDir\" \"$FairyPamFinalDir\"",
+        "fairypam_restore_previous",
+        "fairypam_rollback_failed",
+        "RMDir /r \"$FairyPamStageDir\"",
+        "RMDir /r \"$FairyPamBackupDir\"",
+    ] {
+        assert!(
+            !NSIS_HOOKS.contains(forbidden),
+            "clean-first installation must not migrate, roll back, or delete a slot: {forbidden}"
+        );
+    }
     for forbidden in ["$PLUGINSDIR", "$TEMP", "ExecShell"] {
         assert!(
             !NSIS_HOOKS.contains(forbidden),
             "product helper must never execute from a temporary path: {forbidden}"
         );
     }
+    assert_eq!(
+        NSIS_HOOKS.matches("ExecWait").count(),
+        1,
+        "only the protected staged helper may be executed"
+    );
     assert!(!NSIS_HOOKS.contains("fairypam-agent.exe.new"));
     for required in [
         "verify_install_tree(stage_root)?",
@@ -470,6 +507,48 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         assert!(
             INSTALLER_PROVISIONER.contains(required),
             "installer helper must verify the staged/active slot: {required}"
+        );
+    }
+}
+
+#[test]
+fn product_installer_rejects_existing_slots_before_extracting_payload() {
+    let preinstall = &NSIS_HOOKS[..NSIS_HOOKS
+        .find("!macro NSIS_HOOK_ACTIVATE")
+        .expect("installer must define its activation hook")];
+    for required in [
+        "fairypam_existing_active:",
+        "fairypam_existing_previous:",
+        "fairypam_existing_stage:",
+        "This installer only supports a clean first installation.",
+    ] {
+        assert!(
+            preinstall.contains(required),
+            "missing clean-install guard: {required}"
+        );
+    }
+    assert!(preinstall.find("fairypam_existing_active:") > preinstall.find("CreateDirectoryW"));
+    assert_eq!(
+        NSIS_HOOKS.matches("ExecWait").count(),
+        1,
+        "only the protected staged helper may be executed"
+    );
+}
+
+#[test]
+fn product_installer_never_bootstraps_webview2() {
+    assert!(TAURI_CONFIG.contains("\"type\": \"skip\""));
+    assert!(NSIS_TEMPLATE.contains("!if \"${INSTALLWEBVIEW2MODE}\" != \"skip\""));
+    for forbidden in [
+        "downloadBootstrapper",
+        "NSISdl::download",
+        "$TEMP",
+        "WEBVIEW2BOOTSTRAPPERPATH}",
+        "WEBVIEW2INSTALLERPATH}",
+    ] {
+        assert!(
+            !NSIS_TEMPLATE.contains(forbidden),
+            "WebView2 skip mode must not retain a download or temporary execution path: {forbidden}"
         );
     }
 }

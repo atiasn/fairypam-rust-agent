@@ -235,7 +235,7 @@ jobs:
             setup_size = $artifact.Length
             install_mode = 'perMachine'
             state_root = 'C:\ProgramData\FairyPam.Agent\Agent'
-            layout = @('fairypam-agent-tauri-ui.exe', 'fairypam-agent.exe', 'fairypam-agent-guardian.exe', 'fairypam-agent-installer.exe', 'profiles/')
+            layout = @('fairypam-agent-tauri-ui.exe', 'fairypam-agent.exe', 'fairypam-agent-guardian.exe', 'resources/runtime/fairypam-agent-installer.exe', 'profiles/')
           } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 dist/product-installer-receipt.json
 
       - name: Attest product setup provenance
