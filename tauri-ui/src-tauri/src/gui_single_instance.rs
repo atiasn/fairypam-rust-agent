@@ -36,7 +36,7 @@ impl GuiSingleInstance {
             }
             Ok(GuiInstance::Primary(Self {
                 handle: handle.0 as usize,
-            }));
+            }))
         }
 
         #[cfg(not(windows))]
