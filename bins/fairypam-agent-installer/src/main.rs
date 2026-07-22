@@ -257,7 +257,9 @@ fn security_sddl(path: &std::path::Path) -> Result<String, ()> {
 
     security_sddl_with_information(
         path,
-        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | PROTECTED_DACL_SECURITY_INFORMATION,
     )
 }
 
@@ -334,15 +336,18 @@ fn mandatory_label_is_high_no_write_up(sddl: &str) -> bool {
     let mut labels = sacl.split('(').skip(1).filter_map(|raw| {
         let ace = raw.split(')').next().unwrap_or_default();
         let fields = ace.split(';').collect::<Vec<_>>();
-        (fields.len() >= 6 && fields[0] == "ML" && !fields[1].contains("IO"))
-            .then_some(fields)
+        (fields.len() >= 6 && fields[0] == "ML").then_some(fields)
     });
     let Some(fields) = labels.next() else {
         return false;
     };
     labels.next().is_none()
+        && !fields[1].contains("IO")
         && mandatory_label_is_high_or_higher(fields[5])
-        && fields[2].as_bytes().chunks_exact(2).any(|right| right == b"NW")
+        && fields[2]
+            .as_bytes()
+            .chunks_exact(2)
+            .any(|right| right == b"NW")
 }
 
 fn mandatory_label_is_high_or_higher(label: &str) -> bool {
@@ -471,12 +476,17 @@ mod tests {
         assert!(!mandatory_label_is_high_no_write_up("S:(ML;OICI;NW;;;ME)"));
         assert!(!mandatory_label_is_high_no_write_up(""));
         assert!(!mandatory_label_is_high_no_write_up("S:(ML;OICI;;;HI)"));
-        assert!(!mandatory_label_is_high_no_write_up("S:(ML;OICIIO;NW;;;HI)"));
+        assert!(!mandatory_label_is_high_no_write_up(
+            "S:(ML;OICIIO;NW;;;HI)"
+        ));
         assert!(!mandatory_label_is_high_no_write_up(
             "S:(ML;OICI;NW;;;ME)(ML;OICI;NW;;;HI)"
         ));
         assert!(!mandatory_label_is_high_no_write_up(
             "S:(ML;OICI;NW;;;HI)(ML;OICI;NW;;;HI)"
+        ));
+        assert!(!mandatory_label_is_high_no_write_up(
+            "S:(ML;IO;NW;;;ME)(ML;OICI;NW;;;HI)"
         ));
     }
 }
