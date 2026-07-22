@@ -824,7 +824,8 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     );
     let legacy_active_verifier = &INSTALLER_PROVISIONER[INSTALLER_PROVISIONER
         .find("fn verify_legacy_active_tree")
-        .expect("installer helper must define a legacy active-slot verifier")..INSTALLER_PROVISIONER
+        .expect("installer helper must define a legacy active-slot verifier")
+        ..INSTALLER_PROVISIONER
             .find("fn same_windows_path")
             .expect("legacy active-slot verifier must precede shared path comparison")];
     for required in [
@@ -844,7 +845,8 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     );
     let security_descriptor_reader = &INSTALLER_PROVISIONER[INSTALLER_PROVISIONER
         .find("fn mandatory_label_sddl")
-        .expect("installer helper must read security descriptors")..INSTALLER_PROVISIONER
+        .expect("installer helper must read security descriptors")
+        ..INSTALLER_PROVISIONER
             .find("fn trusted_program_files_security")
             .expect("security descriptor reader must precede security predicates")];
     for required in [
@@ -874,7 +876,8 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     );
     let trusted_entry_verifier = &INSTALLER_PROVISIONER[INSTALLER_PROVISIONER
         .find("fn verify_trusted_install_entry")
-        .expect("installer helper must define a trusted-entry verifier")..INSTALLER_PROVISIONER
+        .expect("installer helper must define a trusted-entry verifier")
+        ..INSTALLER_PROVISIONER
             .find("fn verify_staged_payload_entry")
             .expect("trusted-entry verifier must precede staged payload verification")];
     for required in [
