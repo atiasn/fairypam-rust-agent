@@ -31,7 +31,7 @@ impl LocalControlRuntime for FakeRuntime {
 }
 
 #[test]
-fn gui_lifecycle_commands_are_mutations_and_replay_is_rejected() {
+fn mutations_are_audited_and_replay_is_rejected() {
     let mut adapter = LocalControlAdapter::new(
         owner(),
         FakeRuntime::default(),
@@ -40,12 +40,12 @@ fn gui_lifecycle_commands_are_mutations_and_replay_is_rejected() {
     );
 
     let response = adapter
-        .handle(&caller(), request(LocalCommand::BindUiLifetime, 31))
+        .handle(&caller(), request(LocalCommand::ReleaseAll, 31))
         .unwrap();
     assert!(response.result.is_ok());
 
     let replay = adapter
-        .handle(&caller(), request(LocalCommand::BindUiLifetime, 31))
+        .handle(&caller(), request(LocalCommand::ReleaseAll, 31))
         .unwrap();
     assert_eq!(
         replay.result.unwrap_err().code,
@@ -53,10 +53,20 @@ fn gui_lifecycle_commands_are_mutations_and_replay_is_rejected() {
     );
 
     let (_, audit) = adapter.into_parts();
-    assert_eq!(audit.0[0].command, "bind_ui_lifetime");
+    assert_eq!(audit.0[0].command, "release_all");
     assert_eq!(audit.0[0].result_code, "attempt");
     assert_eq!(audit.0[1].result_code, "ok");
     assert_eq!(audit.0[2].result_code, "local.protocol.nonce_replayed");
+}
+
+#[test]
+fn gui_lifecycle_commands_remain_privileged_mutations() {
+    let source = include_str!("../src/local_control.rs");
+
+    assert!(source.contains("| LocalCommand::BindUiLifetime"));
+    assert!(source.contains("| LocalCommand::ShutdownAgent"));
+    assert!(source.contains("| LocalCommand::RegisterHub { .. }"));
+    assert!(source.contains("if requires_fixed_gui(&request.command)"));
 }
 
 #[test]
