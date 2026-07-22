@@ -665,10 +665,7 @@ mod tests {
             20,
             &LogLevel::Info,
         );
-        assert_eq!(
-            tail["entries"][0]["message"],
-            "[已隐藏敏感日志内容]"
-        );
+        assert_eq!(tail["entries"][0]["message"], "[已隐藏敏感日志内容]");
         assert!(!tail.to_string().contains("secret"));
         assert!(!tail.to_string().contains("ProgramData"));
     }
@@ -685,11 +682,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let log = FixedLog::open(&root).unwrap();
-        log.append(LogLevel::Info, "后台服务已启动，正在准备本地连接")
+        log.append(LogLevel::Info, "后台服务已启动，正在准备连接")
             .unwrap();
         assert_eq!(
             log.tail(10, &LogLevel::Info).unwrap()["entries"][0]["message"],
-            "后台服务已启动，正在准备本地连接"
+            "后台服务已启动，正在准备连接"
         );
         log.append(LogLevel::Info, "token=must-not-appear").unwrap();
         let tail = log.tail(10, &LogLevel::Info).unwrap();

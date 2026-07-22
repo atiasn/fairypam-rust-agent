@@ -456,18 +456,18 @@ impl RuntimeLogMessage {
     const fn text(self) -> &'static str {
         match self {
             Self::AwaitingRegistration => "后台服务正在等待完成安全注册",
-            Self::Started => "后台服务已启动，正在准备本地连接",
-            Self::ControlConnectionStarting => "正在建立本地服务控制连接",
-            Self::ControlConnectionEstablished => "本地服务控制连接已建立",
-            Self::FrameConnectionEstablished => "本地服务画面传输连接已建立",
+            Self::Started => "后台服务已启动，正在准备连接",
+            Self::ControlConnectionStarting => "正在建立服务连接",
+            Self::ControlConnectionEstablished => "服务连接已建立",
+            Self::FrameConnectionEstablished => "画面服务已准备就绪",
             Self::EnrollmentRefreshFailed => "注册信息刷新失败，连接将保持安全关闭",
-            Self::SessionCleared => "本地服务会话已清除，正在重新连接",
+            Self::SessionCleared => "连接已重置，正在重新连接",
             Self::GuiSessionEnded => "界面会话结束，后台服务正在安全停止",
-            Self::LocalUiBound => "本地界面已连接到后台服务",
-            Self::LocalUiShutdownRequested => "本地界面请求安全停止后台服务",
-            Self::LocalEnvironmentCheckRequested => "本地界面请求环境检查",
-            Self::LocalGameScanRequested => "本地界面请求扫描已安装游戏",
-            Self::LocalRegistrationRequested => "本地界面请求注册服务",
+            Self::LocalUiBound => "界面已连接到后台服务",
+            Self::LocalUiShutdownRequested => "界面请求安全停止后台服务",
+            Self::LocalEnvironmentCheckRequested => "界面请求环境检查",
+            Self::LocalGameScanRequested => "界面请求扫描已安装游戏",
+            Self::LocalRegistrationRequested => "界面请求注册服务",
             Self::RegistrationFailed => "服务注册未完成",
             Self::RegistrationAwaitingConfirmation => "服务注册正在等待以管理员权限确认",
             Self::RegistrationChanged => "服务注册信息已变更，正在安全重连",
@@ -512,10 +512,7 @@ impl GrpcSessionDriver {
                 last_error_code: "runtime.not_registered".to_owned(),
                 ..RuntimeState::default()
             };
-            state.record(
-                LogLevel::Info,
-                RuntimeLogMessage::AwaitingRegistration,
-            );
+            state.record(LogLevel::Info, RuntimeLogMessage::AwaitingRegistration);
             state
         } else {
             RuntimeState::default()
@@ -659,7 +656,10 @@ impl SessionDriver for GrpcSessionDriver {
             last_error_code: "runtime.frame_connecting".to_owned(),
             logs,
         };
-        state.record(LogLevel::Info, RuntimeLogMessage::ControlConnectionEstablished);
+        state.record(
+            LogLevel::Info,
+            RuntimeLogMessage::ControlConnectionEstablished,
+        );
         Ok(())
     }
 
@@ -747,7 +747,10 @@ impl SessionDriver for GrpcSessionDriver {
         if let Ok(mut state) = self.state.lock() {
             state.frame_state = ConnectionState::Connected;
             state.last_error_code = "runtime.connected".to_owned();
-            state.record(LogLevel::Info, RuntimeLogMessage::FrameConnectionEstablished);
+            state.record(
+                LogLevel::Info,
+                RuntimeLogMessage::FrameConnectionEstablished,
+            );
         }
         loop {
             tokio::select! {
@@ -830,10 +833,7 @@ impl SupervisorHooks for RuntimeSafetyHooks {
                 Err(error) => {
                     if let Ok(mut state) = self.state.lock() {
                         state.last_error_code = "runtime.enrollment_refresh_failed".to_owned();
-                        state.record(
-                            LogLevel::Warn,
-                            RuntimeLogMessage::EnrollmentRefreshFailed,
-                        );
+                        state.record(LogLevel::Warn, RuntimeLogMessage::EnrollmentRefreshFailed);
                     }
                     tracing::warn!(code = error.code(), "enrollment refresh failed");
                 }
@@ -851,10 +851,7 @@ impl SupervisorHooks for RuntimeSafetyHooks {
                 logs,
                 ..RuntimeState::default()
             };
-            state.record(
-                LogLevel::Warn,
-                RuntimeLogMessage::SessionCleared,
-            );
+            state.record(LogLevel::Warn, RuntimeLogMessage::SessionCleared);
         }
         tracing::info!(effect = "clear_target_session");
     }
@@ -935,10 +932,7 @@ fn shutdown_from_gui_lifecycle(
         )
     })?;
     if let Ok(mut state) = driver.state.lock() {
-        state.record(
-            LogLevel::Info,
-            RuntimeLogMessage::GuiSessionEnded,
-        );
+        state.record(LogLevel::Info, RuntimeLogMessage::GuiSessionEnded);
     }
     tracing::info!(?reason, "GUI lifecycle requested safe Agent shutdown");
     let _ = supervisor.handle_control_failure()?;
@@ -1044,9 +1038,7 @@ impl SharedRuntime {
                 Some(RuntimeLogMessage::LocalEnvironmentCheckRequested)
             }
             LocalCommand::ScanInstalledGames => Some(RuntimeLogMessage::LocalGameScanRequested),
-            LocalCommand::RegisterHub { .. } => {
-                Some(RuntimeLogMessage::LocalRegistrationRequested)
-            }
+            LocalCommand::RegisterHub { .. } => Some(RuntimeLogMessage::LocalRegistrationRequested),
             // The log page reads this same source; recording each tail request
             // would create a feedback loop during polling.
             LocalCommand::GetLogTail { .. } => None,
@@ -1139,10 +1131,7 @@ impl SharedRuntime {
             // Leave the active generation in place; supervisor cleanup reloads
             // the persisted replacement before reconnecting.
             state.last_error_code = "runtime.enrollment_changed".to_owned();
-            state.record(
-                LogLevel::Info,
-                RuntimeLogMessage::RegistrationChanged,
-            );
+            state.record(LogLevel::Info, RuntimeLogMessage::RegistrationChanged);
         }
         self.reconnect_requested.notify_one();
     }
@@ -1156,10 +1145,7 @@ impl SharedRuntime {
         state.control_state = ConnectionState::Reconnecting;
         state.frame_state = ConnectionState::Reconnecting;
         state.last_error_code = "runtime.enrollment_registered".to_owned();
-        state.record(
-            LogLevel::Info,
-            RuntimeLogMessage::RegistrationCompleted,
-        );
+        state.record(LogLevel::Info, RuntimeLogMessage::RegistrationCompleted);
         drop((execution, state, current));
         self.enrollment_ready.notify_one();
         Ok(())
@@ -2053,13 +2039,10 @@ mod tests {
             state.record(LogLevel::Info, *message);
         }
 
-        let output = observability::log_tail_json(
-            state.logs.make_contiguous(),
-            200,
-            &LogLevel::Info,
-        )
-        .to_string()
-        .to_ascii_lowercase();
+        let output =
+            observability::log_tail_json(state.logs.make_contiguous(), 200, &LogLevel::Info)
+                .to_string()
+                .to_ascii_lowercase();
         for forbidden in ["agent", "hub", "control", "frame", "grpc"] {
             assert!(!output.contains(forbidden), "log tail exposed {forbidden}");
         }
@@ -2092,15 +2075,17 @@ mod tests {
                 "pending"
             );
         }
-        assert!(diagnostics["checks"].as_array().unwrap().iter().all(|check| {
-            check["recovery"]
-                .as_str()
-                .is_some_and(|message| {
+        assert!(diagnostics["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| {
+                check["recovery"].as_str().is_some_and(|message| {
                     message
                         .chars()
                         .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character))
                 })
-        }));
+            }));
         let log_tail = local
             .execute(
                 &local_caller(),
