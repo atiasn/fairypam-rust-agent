@@ -171,7 +171,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "CreateDirectoryW",
         "Some(&attributes)",
         "PRIVATE_SDDL",
-        "ensure_elevated()?",
+        "ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?",
         "fn verify_trusted_install_entry",
         "FOLDERID_ProgramFilesX64",
         "let expected_stage = program_files.join(\"FairyPam Agent UI.installing\");",
