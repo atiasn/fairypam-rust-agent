@@ -721,16 +721,8 @@ mod tests {
         let log = FixedLog::open(&root).unwrap();
 
         std::fs::write(log.path(0), vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
-        std::fs::write(
-            log.path(1),
-            "{\"level\":\"info\",\"message\":\"middle\"}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            log.path(2),
-            "{\"level\":\"info\",\"message\":\"oldest\"}\n",
-        )
-        .unwrap();
+        std::fs::write(log.path(1), "{\"level\":\"info\",\"message\":\"middle\"}\n").unwrap();
+        std::fs::write(log.path(2), "{\"level\":\"info\",\"message\":\"oldest\"}\n").unwrap();
         log.append(LogLevel::Info, "newest").unwrap();
 
         let files = std::fs::read_dir(&root)
