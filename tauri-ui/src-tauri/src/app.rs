@@ -92,7 +92,28 @@ pub fn run() -> tauri::Result<()> {
 
 fn allows_application_navigation(url: &tauri::Url) -> bool {
     url.scheme() == "tauri"
+        || (matches!(url.scheme(), "http" | "https")
+            && url.host_str() == Some("tauri.localhost")
+            && url.port().is_none())
         || (cfg!(debug_assertions) && url.scheme() == "http" && url.host_str() == Some("127.0.0.1"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allows_application_navigation;
+
+    #[test]
+    fn allows_the_bundled_windows_tauri_frontend_but_not_external_navigation() {
+        assert!(allows_application_navigation(
+            &tauri::Url::parse("http://tauri.localhost/").unwrap()
+        ));
+        assert!(!allows_application_navigation(
+            &tauri::Url::parse("https://example.com/").unwrap()
+        ));
+        assert!(!allows_application_navigation(
+            &tauri::Url::parse("http://tauri.localhost:8080/").unwrap()
+        ));
+    }
 }
 
 fn disable_default_context_menu(window: &tauri::WebviewWindow) {
