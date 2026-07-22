@@ -126,7 +126,10 @@ describe('App', () => {
     await waitFor(() => expect(agentApi.runEnvironmentCheck).toHaveBeenCalledTimes(3), { timeout: 3_000 });
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
     expect(await view.findByText('已提交，正在完成注册；结果见运行日志。')).toBeInTheDocument();
+    expect(view.getByLabelText('服务地址')).toHaveValue('');
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
+    expect(view.getByLabelText('服务地址')).toHaveAttribute('autocomplete', 'off');
+    expect(view.getByLabelText('一次性注册码')).toHaveAttribute('autocomplete', 'off');
     expect(view.getByText(/注册码只会通过受保护的通道提交/)).toBeInTheDocument();
     expect(view.queryByText(/UAC|注册窗口|系统确认/)).not.toBeInTheDocument();
 
@@ -145,6 +148,7 @@ describe('App', () => {
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
 
     expect(await view.findByText('注册请求未提交。请确认后台服务已就绪后重试。')).toBeInTheDocument();
+    expect(view.getByLabelText('服务地址')).toHaveValue('');
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
     expect(view.queryByText('registration-code=not-for-display')).not.toBeInTheDocument();
   });

@@ -53,15 +53,17 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
     const hubAddress = data.get('hubAddress');
     const registrationCode = data.get('registrationCode');
     if (typeof hubAddress !== 'string' || typeof registrationCode !== 'string') return;
-    const clearRegistrationCode = () => {
-      const input = form.elements.namedItem('registrationCode');
-      if (input instanceof HTMLInputElement) input.value = '';
+    const clearRegistrationFields = () => {
+      for (const name of ['hubAddress', 'registrationCode']) {
+        const input = form.elements.namedItem(name);
+        if (input instanceof HTMLInputElement) input.value = '';
+      }
     };
 
     setRegistrationStatus('submitting');
     void agentApi.registerHub(hubAddress.trim(), registrationCode).then(
       () => {
-        form.reset();
+        clearRegistrationFields();
         setRegistrationStatus('submitted');
         void Promise.all([
           queryClient.invalidateQueries({ queryKey: queryKeys.connection }),
@@ -70,7 +72,7 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
         ]);
       },
       () => {
-        clearRegistrationCode();
+        clearRegistrationFields();
         setRegistrationStatus('error');
       },
     );
@@ -100,11 +102,11 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
         >
           <label>
             服务地址
-            <input autoComplete="url" defaultValue="https://" name="hubAddress" required type="url" />
+            <input autoComplete="off" name="hubAddress" placeholder="https://" required type="url" />
           </label>
           <label>
             一次性注册码
-            <input autoComplete="one-time-code" name="registrationCode" required type="password" />
+            <input autoComplete="off" name="registrationCode" required type="password" />
           </label>
           <button disabled={registrationStatus === 'submitting' || !registrationEnabled} type="submit">注册或重新注册</button>
         </form>
