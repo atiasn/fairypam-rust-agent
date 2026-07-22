@@ -24,6 +24,7 @@ pub struct FixedLog {
 }
 
 impl FixedLog {
+    #[cfg(any(test, not(windows)))]
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, AgentError> {
         let root = root.into();
         let metadata = root.symlink_metadata().map_err(log_root_error)?;
@@ -152,6 +153,7 @@ pub fn production_log() -> Result<FixedLog, AgentError> {
     FixedLog::open_private(root)
 }
 
+#[cfg(any(test, not(windows)))]
 fn log_root_error(_: std::io::Error) -> AgentError {
     log_root_unavailable()
 }
