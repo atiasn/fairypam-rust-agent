@@ -73,7 +73,8 @@ fn registration_proves_the_elevated_pipe_server_before_dispatch() {
         "server_session_mismatch",
         "SECURITY_MANDATORY_HIGH_RID",
         "server_image_mismatch",
-        "UAC `runas` produces a split token",
+        "Logon SID is intentionally not part of this check",
+        "legitimate product flow",
     ] {
         assert!(
             WINDOWS_PIPE_CLIENT.contains(required),
