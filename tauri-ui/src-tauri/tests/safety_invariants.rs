@@ -159,6 +159,11 @@ fn product_uac_and_enrollment_publication_fail_closed() {
 
 #[test]
 fn product_installer_provisions_new_private_state_before_runtime_launch() {
+    // GitHub's Windows checkout may materialize this NSIS source with CRLF.
+    // Keep the source-order assertions platform-neutral: they test the
+    // template semantics, not a checkout-specific line-ending convention.
+    let normalized_nsis_template = NSIS_TEMPLATE.replace("\r\n", "\n");
+    let nsis_template = normalized_nsis_template.as_str();
     for required in [
         "C:\\ProgramData\\FairyPam.Agent",
         "CreateDirectoryW",
@@ -253,7 +258,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "!error \"FairyPam requires WebView2 skip mode\"",
     ] {
         assert!(
-            NSIS_TEMPLATE.contains(required),
+            nsis_template.contains(required),
             "missing fixed-root template rule: {required}"
         );
     }
@@ -264,43 +269,43 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "needsadmin=true",
     ] {
         assert!(
-            !NSIS_TEMPLATE.contains(forbidden),
+            !nsis_template.contains(forbidden),
             "the elevated installer must not execute a downloaded WebView2 payload: {forbidden}"
         );
     }
-    let maintenance_start = NSIS_TEMPLATE
+    let maintenance_start = nsis_template
         .find("!if 0\n; 4. Custom page to ask user if he wants to reinstall/uninstall")
         .expect("the upstream pre-install maintenance flow must be disabled");
-    let maintenance_end = NSIS_TEMPLATE[maintenance_start..]
+    let maintenance_end = nsis_template[maintenance_start..]
         .find("!endif\n\n; 5. Start menu shortcut page")
         .map(|offset| maintenance_start + offset)
         .expect("the disabled maintenance flow must end before normal installation pages");
-    let maintenance = &NSIS_TEMPLATE[maintenance_start..maintenance_end];
+    let maintenance = &nsis_template[maintenance_start..maintenance_end];
     assert!(
         maintenance.contains("Page custom PageReinstall PageLeaveReinstall")
             && maintenance.contains("reinst_uninstall:")
             && maintenance.contains("ExecWait '$R1' $0"),
         "only the disabled upstream maintenance block may retain pre-install uninstall code"
     );
-    assert!(!NSIS_TEMPLATE.contains("MUI_PAGE_DIRECTORY"));
-    let init_start = NSIS_TEMPLATE
+    assert!(!nsis_template.contains("MUI_PAGE_DIRECTORY"));
+    let init_start = nsis_template
         .find("Function .onInit")
         .expect("installer must define .onInit");
-    let init_end = NSIS_TEMPLATE[init_start..]
+    let init_end = nsis_template[init_start..]
         .find("FunctionEnd")
         .map(|offset| init_start + offset)
         .expect("installer .onInit must terminate");
-    let init = &NSIS_TEMPLATE[init_start..init_end];
+    let init = &nsis_template[init_start..init_end];
     assert!(init.contains("StrCpy $INSTDIR \"${FIXED_INSTALL_DIR}\""));
     assert!(!init.contains("RestorePreviousInstallLocation"));
-    let uninstall_init_start = NSIS_TEMPLATE
+    let uninstall_init_start = nsis_template
         .find("Function un.onInit")
         .expect("installer must define uninstaller initialization");
-    let uninstall_init_end = NSIS_TEMPLATE[uninstall_init_start..]
+    let uninstall_init_end = nsis_template[uninstall_init_start..]
         .find("FunctionEnd")
         .map(|offset| uninstall_init_start + offset)
         .expect("uninstaller initialization must terminate");
-    let uninstall_init = &NSIS_TEMPLATE[uninstall_init_start..uninstall_init_end];
+    let uninstall_init = &nsis_template[uninstall_init_start..uninstall_init_end];
     let fixed_uninstall_root = uninstall_init
         .find("StrCmp \"$EXEDIR\" \"${FIXED_INSTALL_DIR}\"")
         .expect("uninstaller must reject a caller-controlled installation root");
@@ -308,7 +313,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         .find("StrCpy $INSTDIR \"${FIXED_INSTALL_DIR}\"")
         .expect("uninstaller must restore the fixed installation root");
     assert!(fixed_uninstall_root < fixed_uninstall_dir);
-    let install = &NSIS_TEMPLATE[NSIS_TEMPLATE
+    let install = &nsis_template[nsis_template
         .find("Section Install\n")
         .expect("installer must define its install section")..];
     let fixed_dir = install
@@ -361,12 +366,12 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "fairypam-agent-installer.exe\" \"${FIXED_INSTALL_DIR}",
     ] {
         assert!(
-            !NSIS_TEMPLATE.contains(forbidden),
+            !nsis_template.contains(forbidden),
             "installer helper must not be staged or launched from a temporary path: {forbidden}"
         );
     }
-    assert!(!NSIS_TEMPLATE.contains("$PLUGINSDIR"));
-    assert!(!NSIS_TEMPLATE.contains("fairypam-agent-installer.exe"));
+    assert!(!nsis_template.contains("$PLUGINSDIR"));
+    assert!(!nsis_template.contains("fairypam-agent-installer.exe"));
 
     let preinstall_hook = &NSIS_HOOKS[..NSIS_HOOKS
         .find("!macro NSIS_HOOK_ACTIVATE")
