@@ -668,7 +668,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     assert!(cleanup_clear < cleanup_remove && cleanup_remove < cleanup_error);
     assert!(cleanup_error < cleanup_present);
     assert!(nsis_hooks.contains(
-        "fairypam_backup_cleanup_failed:\n  Abort \"FairyPam could not remove the preserved previous installation. Installation was stopped without reporting success.\""
+        "fairypam_backup_cleanup_failed:\n  SetErrorLevel 1\n  Abort \"FairyPam could not remove the preserved previous installation. Installation was stopped without reporting success.\""
     ));
     for forbidden in ["$PLUGINSDIR", "$TEMP", "ExecShell"] {
         assert!(
