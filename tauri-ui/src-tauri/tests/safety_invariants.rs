@@ -520,16 +520,101 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
             "Windows API error capture must use System ?e followed immediately by Pop: {error_capture}"
         );
     }
-    for failure_path in [
-        "fairypam_stage_verify_failed:\n  System::Call 'kernel32::CloseHandle(p r6)'\n  Abort ",
-        "fairypam_stage_not_directory:\n  System::Call 'kernel32::CloseHandle(p r6)'\n  Abort ",
-        "fairypam_stage_reparse_detected:\n  System::Call 'kernel32::CloseHandle(p r6)'\n  Abort ",
+    fn label_block<'a>(source: &'a str, label: &str) -> &'a str {
+        let start = source
+            .find(label)
+            .expect("the NSIS failure label must exist");
+        let after_label = start + label.len();
+        let end = source[after_label..]
+            .find("\nfairypam_")
+            .map(|offset| after_label + offset)
+            .unwrap_or(source.len());
+        &source[start..end]
+    }
+    for failure_label in [
+        "fairypam_stage_verify_failed:",
+        "fairypam_stage_not_directory:",
+        "fairypam_stage_reparse_detected:",
+    ] {
+        let failure_path = label_block(preinstall_hook, failure_label);
+        let close = failure_path
+            .find("System::Call 'kernel32::CloseHandle(p r6)'")
+            .expect("stage verification failure must close its pinned handle");
+        let error_level = failure_path
+            .find("SetErrorLevel")
+            .expect("stage verification failure must return a nonzero error level");
+        let abort = failure_path
+            .find("Abort ")
+            .expect("stage verification failure must abort");
+        assert!(
+            close < error_level && error_level < abort,
+            "stage verification failure must close its pinned handle, set its error level, then abort: {failure_label}"
+        );
+        if failure_label == "fairypam_stage_verify_failed:" {
+            assert!(
+                failure_path.contains("SetErrorLevel $R5"),
+                "stage verification must retain its captured Win32 error branch"
+            );
+        }
+    }
+    for stale_path in [
+        "fairypam_stale_backup:",
+        "fairypam_stale_stage:",
     ] {
         assert!(
-            preinstall_hook.contains(failure_path),
-            "stage verification failure must close its pinned handle before aborting: {failure_path}"
+            label_block(preinstall_hook, stale_path).starts_with(&format!(
+                "{stale_path}\n  SetErrorLevel ${{ERROR_ALREADY_EXISTS}}\n  Abort "
+            )),
+            "a preserved slot must return ERROR_ALREADY_EXISTS before aborting: {stale_path}"
         );
     }
+    for win32_failure in [
+        "fairypam_stage_sddl_failed:",
+        "fairypam_stage_attributes_failed:",
+        "fairypam_stage_create_failed:",
+        "fairypam_stage_pin_failed:",
+        "fairypam_stage_verify_failed:",
+    ] {
+        let path = label_block(preinstall_hook, win32_failure);
+        assert!(
+            path.contains(
+                "${If} $R5 = 0\n    SetErrorLevel 1\n  ${Else}\n    SetErrorLevel $R5\n  ${EndIf}\n  Abort "
+            ),
+            "the Win32 failure must return $R5, fall back from zero to one, then abort: {win32_failure}"
+        );
+    }
+    for fixed_failure in [
+        "fairypam_stage_not_directory:",
+        "fairypam_stage_reparse_detected:",
+        "fairypam_activate_failed:",
+        "fairypam_stage_failed:",
+        "fairypam_rollback_failed:",
+        "fairypam_backup_cleanup_failed:",
+    ] {
+        let path = label_block(nsis_hooks, fixed_failure);
+        assert!(
+            path.contains("SetErrorLevel 1")
+                && path.find("SetErrorLevel 1") < path.find("Abort "),
+            "every fixed failure must return a nonzero error level before aborting: {fixed_failure}"
+        );
+    }
+    let preinstall_success = &preinstall_hook[..preinstall_hook
+        .find("Goto fairypam_stage_ready")
+        .expect("the preinstall success path must terminate")];
+    assert!(
+        !preinstall_success.contains("SetErrorLevel"),
+        "the successful preinstall path must not set an error level"
+    );
+    let activate_hook = &nsis_hooks[nsis_hooks
+        .find("!macro NSIS_HOOK_ACTIVATE")
+        .expect("the activation hook must exist")..];
+    let activate_success = &activate_hook[..activate_hook
+        .find("Goto fairypam_install_complete")
+        .expect("the activation success path must terminate")];
+    assert!(
+        !activate_success.contains("SetErrorLevel"),
+        "the successful activation path must not set an error level"
+    );
 
     for required in [
         "${FIXED_INSTALL_DIR}.installing",

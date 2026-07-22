@@ -63,25 +63,54 @@ Var FairyPamStageHandle
   Goto fairypam_stage_ready
 
 fairypam_stale_backup:
+  SetErrorLevel ${ERROR_ALREADY_EXISTS}
   Abort "FairyPam found a preserved previous installation. Installation was stopped without changing the active runtime."
 fairypam_stale_stage:
+  SetErrorLevel ${ERROR_ALREADY_EXISTS}
   Abort "FairyPam found an unverified staging directory. Installation was stopped without following or deleting it."
 fairypam_stage_sddl_failed:
+  ${If} $R5 = 0
+    SetErrorLevel 1
+  ${Else}
+    SetErrorLevel $R5
+  ${EndIf}
   Abort "FairyPam could not prepare security for its protected installation staging directory (Win32 error $R5)."
 fairypam_stage_attributes_failed:
+  ${If} $R5 = 0
+    SetErrorLevel 1
+  ${Else}
+    SetErrorLevel $R5
+  ${EndIf}
   Abort "FairyPam could not allocate security attributes for its protected installation staging directory (Win32 error $R5)."
 fairypam_stage_create_failed:
+  ${If} $R5 = 0
+    SetErrorLevel 1
+  ${Else}
+    SetErrorLevel $R5
+  ${EndIf}
   Abort "FairyPam could not create its protected installation staging directory (Win32 error $R5)."
 fairypam_stage_pin_failed:
+  ${If} $R5 = 0
+    SetErrorLevel 1
+  ${Else}
+    SetErrorLevel $R5
+  ${EndIf}
   Abort "FairyPam could not pin its protected installation staging directory (Win32 error $R5)."
 fairypam_stage_verify_failed:
   System::Call 'kernel32::CloseHandle(p r6)'
+  ${If} $R5 = 0
+    SetErrorLevel 1
+  ${Else}
+    SetErrorLevel $R5
+  ${EndIf}
   Abort "FairyPam could not verify its protected installation staging directory (Win32 error $R5)."
 fairypam_stage_not_directory:
   System::Call 'kernel32::CloseHandle(p r6)'
+  SetErrorLevel 1
   Abort "FairyPam rejected a non-directory protected installation staging path."
 fairypam_stage_reparse_detected:
   System::Call 'kernel32::CloseHandle(p r6)'
+  SetErrorLevel 1
   Abort "FairyPam rejected a reparse point at its protected installation staging directory."
 fairypam_stage_ready:
 !macroend
@@ -130,6 +159,7 @@ fairypam_restore_previous:
 fairypam_activate_failed:
   ClearErrors
   RMDir /r "$FairyPamStageDir"
+  SetErrorLevel 1
   Abort "FairyPam could not activate the staged runtime. The previous installation remains active."
 fairypam_stage_failed:
   ${If} $FairyPamStageHandle != 0
@@ -138,10 +168,13 @@ fairypam_stage_failed:
   ${EndIf}
   ClearErrors
   RMDir /r "$FairyPamStageDir"
+  SetErrorLevel 1
   Abort "FairyPam could not validate the staged Agent runtime. The active installation was not changed."
 fairypam_rollback_failed:
+  SetErrorLevel 1
   Abort "FairyPam could not restore the preserved installation. The previous slot remains at the .previous path for recovery."
 fairypam_backup_cleanup_failed:
+  SetErrorLevel 1
   Abort "FairyPam could not remove the preserved previous installation. Installation was stopped without reporting success."
 fairypam_install_complete:
 !macroend
