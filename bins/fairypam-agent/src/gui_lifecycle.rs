@@ -104,7 +104,7 @@ impl GuiLifetime {
     #[cfg(windows)]
     fn watch_process(&self, pid: u32) -> Result<(), AgentError> {
         use windows::Win32::{
-            Foundation::{CloseHandle, WAIT_OBJECT_0},
+            Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
             System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE},
         };
 
@@ -113,11 +113,13 @@ impl GuiLifetime {
         let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.map_err(|error| {
             AgentError::new("local.lifecycle.process_unavailable", error.to_string())
         })?;
+        let raw_handle = handle.0 as usize;
         let state = Arc::clone(&self.state);
         let shutdown = self.shutdown.clone();
         std::thread::Builder::new()
             .name("fairypam-gui-lifetime".to_owned())
             .spawn(move || {
+                let handle = HANDLE(raw_handle as _);
                 // SAFETY: handle is a valid process handle exclusively owned by this thread.
                 let exited = unsafe { WaitForSingleObject(handle, INFINITE) } == WAIT_OBJECT_0;
                 // SAFETY: no later operation uses handle after this close.
