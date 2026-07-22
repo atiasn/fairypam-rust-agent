@@ -232,6 +232,8 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     assert!(AGENT_RUNTIME.contains("verify_private_file(&path)"));
     for required in [
         "\"installMode\": \"perMachine\"",
+        "\"webviewInstallMode\": {",
+        "\"type\": \"skip\"",
         "\"installerHooks\": \"./windows/installer-hooks.nsh\"",
         "\"template\": \"./windows/installer.nsi\"",
         "\"../../target/release/fairypam-agent.exe\": \"fairypam-agent.exe\"",
@@ -248,12 +250,38 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "!define FIXED_INSTALL_DIR \"$PROGRAMFILES64\\${PRODUCTNAME}\"",
         "!error \"FairyPam requires a per-machine installer\"",
         "!error \"FairyPam product installer currently supports x64 only\"",
+        "!error \"FairyPam requires WebView2 skip mode\"",
     ] {
         assert!(
             NSIS_TEMPLATE.contains(required),
             "missing fixed-root template rule: {required}"
         );
     }
+    for forbidden in [
+        "$TEMP\\MicrosoftEdgeWebview2Setup.exe",
+        "NSISdl::download",
+        "ExecWait \"$6 ${WEBVIEW2INSTALLERARGS} /install\"",
+        "needsadmin=true",
+    ] {
+        assert!(
+            !NSIS_TEMPLATE.contains(forbidden),
+            "the elevated installer must not execute a downloaded WebView2 payload: {forbidden}"
+        );
+    }
+    let maintenance_start = NSIS_TEMPLATE
+        .find("!if 0\n; 4. Custom page to ask user if he wants to reinstall/uninstall")
+        .expect("the upstream pre-install maintenance flow must be disabled");
+    let maintenance_end = NSIS_TEMPLATE[maintenance_start..]
+        .find("!endif\n\n; 5. Start menu shortcut page")
+        .map(|offset| maintenance_start + offset)
+        .expect("the disabled maintenance flow must end before normal installation pages");
+    let maintenance = &NSIS_TEMPLATE[maintenance_start..maintenance_end];
+    assert!(
+        maintenance.contains("Page custom PageReinstall PageLeaveReinstall")
+            && maintenance.contains("reinst_uninstall:")
+            && maintenance.contains("ExecWait '$R1' $0"),
+        "only the disabled upstream maintenance block may retain pre-install uninstall code"
+    );
     assert!(!NSIS_TEMPLATE.contains("MUI_PAGE_DIRECTORY"));
     let init_start = NSIS_TEMPLATE
         .find("Function .onInit")
@@ -277,6 +305,16 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     let app_check = install
         .find("!insertmacro CheckIfAppIsRunning")
         .expect("active UI must be closed before staging");
+    for required in [
+        "!insertmacro CheckIfAppIsRunning \"${MAINBINARYNAME}.exe\" \"${PRODUCTNAME}\"",
+        "!insertmacro CheckIfAppIsRunning \"fairypam-agent.exe\" \"FairyPam Agent\"",
+        "!insertmacro CheckIfAppIsRunning \"fairypam-agent-guardian.exe\" \"FairyPam Agent Guardian\"",
+    ] {
+        assert!(
+            install[..preinstall].contains(required),
+            "the old runtime process must be stopped before staging: {required}"
+        );
+    }
     let first_file = install
         .find("File \"${MAINBINARYSRCPATH}\"")
         .expect("install section must extract the main binary");
@@ -387,6 +425,31 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         .find("Rename \"$FairyPamStageDir\" \"$FairyPamFinalDir\"")
         .expect("the complete staged slot must be activated");
     assert!(verify < close_stage && close_stage < preserve && preserve < activate_slot);
+    let cleanup_start = NSIS_HOOKS
+        .find("fairypam_activate_complete:")
+        .expect("activated slot cleanup must be defined");
+    let cleanup_end = NSIS_HOOKS[cleanup_start..]
+        .find("fairypam_restore_previous:")
+        .map(|offset| cleanup_start + offset)
+        .expect("activated slot cleanup must finish before rollback");
+    let cleanup = &NSIS_HOOKS[cleanup_start..cleanup_end];
+    let cleanup_clear = cleanup
+        .find("ClearErrors")
+        .expect("previous-slot cleanup must reset its error state");
+    let cleanup_remove = cleanup
+        .find("RMDir /r \"$FairyPamBackupDir\"")
+        .expect("previous slot must be removed after activation");
+    let cleanup_error = cleanup
+        .find("IfErrors fairypam_backup_cleanup_failed 0")
+        .expect("previous-slot cleanup errors must fail closed");
+    let cleanup_present = cleanup
+        .find("IfFileExists \"$FairyPamBackupDir\" fairypam_backup_cleanup_failed 0")
+        .expect("a retained previous slot must fail closed");
+    assert!(cleanup_clear < cleanup_remove && cleanup_remove < cleanup_error);
+    assert!(cleanup_error < cleanup_present);
+    assert!(NSIS_HOOKS.contains(
+        "fairypam_backup_cleanup_failed:\n  Abort \"FairyPam could not remove the preserved previous installation. Installation was stopped without reporting success.\""
+    ));
     for forbidden in ["$PLUGINSDIR", "$TEMP", "ExecShell"] {
         assert!(
             !NSIS_HOOKS.contains(forbidden),

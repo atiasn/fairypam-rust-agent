@@ -84,6 +84,8 @@ fairypam_activate_complete:
   SetOutPath $INSTDIR
   ClearErrors
   RMDir /r "$FairyPamBackupDir"
+  IfErrors fairypam_backup_cleanup_failed 0
+  IfFileExists "$FairyPamBackupDir" fairypam_backup_cleanup_failed 0
   Goto fairypam_install_complete
 fairypam_restore_previous:
   ClearErrors
@@ -103,5 +105,7 @@ fairypam_stage_failed:
   Abort "FairyPam could not validate the staged Agent runtime. The active installation was not changed."
 fairypam_rollback_failed:
   Abort "FairyPam could not restore the preserved installation. The previous slot remains at the .previous path for recovery."
+fairypam_backup_cleanup_failed:
+  Abort "FairyPam could not remove the preserved previous installation. Installation was stopped without reporting success."
 fairypam_install_complete:
 !macroend
