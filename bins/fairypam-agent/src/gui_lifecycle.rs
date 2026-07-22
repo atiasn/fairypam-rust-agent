@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 pub enum GuiExitReason {
     ExplicitShutdown,
     ProcessExited,
+    WatcherFailed,
 }
 
 #[derive(Debug, Default)]
@@ -47,10 +48,9 @@ impl LifecycleState {
         }
     }
 
-    fn clear_binding(&mut self, pid: u32) {
+    fn watcher_failed(&mut self, pid: u32) {
         if self.bound_pid == Some(pid) {
-            self.bound_pid = None;
-            self.exit_reason = None;
+            self.exit_reason = Some(GuiExitReason::WatcherFailed);
         }
     }
 
@@ -106,10 +106,8 @@ impl GuiLifetime {
     pub fn bind(&self, pid: u32) -> Result<(), AgentError> {
         self.state.lock().map_err(lock_error)?.bind(pid)?;
         if let Err(error) = self.watch_process(pid) {
+            self.state.lock().map_err(lock_error)?.watcher_failed(pid);
             self.shutdown.cancel();
-            if let Ok(mut lifecycle) = self.state.lock() {
-                lifecycle.clear_binding(pid);
-            }
             return Err(error);
         }
         Ok(())
@@ -153,12 +151,14 @@ impl GuiLifetime {
                 let exited = unsafe { WaitForSingleObject(handle, INFINITE) } == WAIT_OBJECT_0;
                 // SAFETY: no later operation uses handle after this close.
                 let _ = unsafe { CloseHandle(handle) };
-                if exited {
-                    if let Ok(mut lifecycle) = state.lock() {
+                if let Ok(mut lifecycle) = state.lock() {
+                    if exited {
                         lifecycle.process_exited(pid);
+                    } else {
+                        lifecycle.watcher_failed(pid);
                     }
-                    shutdown.cancel();
                 }
+                shutdown.cancel();
             });
         if let Err(error) = watcher {
             // SAFETY: the watcher was not started, so this call retains sole ownership.

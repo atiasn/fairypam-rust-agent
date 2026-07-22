@@ -926,12 +926,7 @@ fn shutdown_from_gui_lifecycle(
     driver: &GrpcSessionDriver,
     supervisor: &mut SessionSupervisor<RuntimeSafetyHooks>,
 ) -> Result<(), AgentError> {
-    let reason = driver.gui_lifetime.exit_reason()?.ok_or_else(|| {
-        AgentError::new(
-            "local.lifecycle.shutdown_missing",
-            "GUI lifecycle shutdown was requested without a reason",
-        )
-    })?;
+    let reason = driver.gui_lifetime.exit_reason().ok().flatten();
     if let Ok(mut state) = driver.state.lock() {
         state.record(LogLevel::Info, RuntimeLogMessage::GuiSessionEnded);
     }
@@ -2090,7 +2085,9 @@ mod tests {
                 })
             }));
 
-        local.registration_in_progress.store(true, Ordering::Release);
+        local
+            .registration_in_progress
+            .store(true, Ordering::Release);
         let pending_diagnostics = local
             .execute(&local_caller(), &LocalCommand::RunEnvironmentCheck)
             .unwrap();
