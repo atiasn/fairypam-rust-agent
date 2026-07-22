@@ -52,8 +52,7 @@ fn provision(
     active_root: &std::path::Path,
 ) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
-    verify_install_roots(stage_root, active_root)
-        .map_err(|_| ProvisionFailure::InstallRoots)?;
+    verify_install_roots(stage_root, active_root).map_err(|_| ProvisionFailure::InstallRoots)?;
     verify_nonreparse_directory(std::path::Path::new(PROGRAM_DATA))
         .map_err(|_| ProvisionFailure::ProgramData)?;
     for (path, failure) in [
@@ -63,11 +62,16 @@ fn provision(
             r"C:\ProgramData\FairyPam.Agent\Agent\enrollment",
             ProvisionFailure::Enrollment,
         ),
-        (r"C:\ProgramData\FairyPam.Agent\Agent\audit", ProvisionFailure::Audit),
-        (r"C:\ProgramData\FairyPam.Agent\Agent\logs", ProvisionFailure::Logs),
+        (
+            r"C:\ProgramData\FairyPam.Agent\Agent\audit",
+            ProvisionFailure::Audit,
+        ),
+        (
+            r"C:\ProgramData\FairyPam.Agent\Agent\logs",
+            ProvisionFailure::Logs,
+        ),
     ] {
-        create_or_verify_private_directory(std::path::Path::new(path))
-            .map_err(|_| failure)?;
+        create_or_verify_private_directory(std::path::Path::new(path)).map_err(|_| failure)?;
     }
     Ok(())
 }
