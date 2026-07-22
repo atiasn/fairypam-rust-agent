@@ -387,7 +387,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         .find("ConvertStringSecurityDescriptorToSecurityDescriptorW")
         .expect("the protected staging DACL must be built before directory creation");
     let security_attributes = preinstall_hook
-        .find("*(i 12, p r8, i 0) p.r7")
+        .find("*(i 12, p R8, i 0) p.R7")
         .expect("the staging security attributes must be allocated before directory creation");
     let create_stage = preinstall_hook
         .find("CreateDirectoryW(w \"$FairyPamStageDir\"")
@@ -524,11 +524,11 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         );
     }
     for error_capture in [
-        "ConvertStringSecurityDescriptorToSecurityDescriptorW(w \"${FAIRYPAM_INSTALL_SDDL}\", i 1, *p .r8, p 0) i.r9 ?e'\n  Pop $R5",
-        "*(i 12, p r8, i 0) p.r7 ?e'\n  Pop $R5",
-        "CreateDirectoryW(w \"$FairyPamStageDir\", p r7) i.r9 ?e'\n  Pop $R5",
-        "CreateFileW(w \"$FairyPamStageDir\", i 0x80, i 3, p 0, i 3, i ${FAIRYPAM_STAGE_OPEN_FLAGS}, p 0) p.r6 ?e'\n  Pop $R5",
-        "GetFileAttributesW(w \"$FairyPamStageDir\") i.r9 ?e'\n  Pop $R5",
+        "ConvertStringSecurityDescriptorToSecurityDescriptorW(w \"${FAIRYPAM_INSTALL_SDDL}\", i 1, *p .R8, p 0) i.R9 ?e'\n  Pop $R5",
+        "*(i 12, p R8, i 0) p.R7 ?e'\n  Pop $R5",
+        "CreateDirectoryW(w \"$FairyPamStageDir\", p R7) i.R9 ?e'\n  Pop $R5",
+        "CreateFileW(w \"$FairyPamStageDir\", i 0x80, i 3, p 0, i 3, i ${FAIRYPAM_STAGE_OPEN_FLAGS}, p 0) p.R6 ?e'\n  Pop $R5",
+        "GetFileAttributesW(w \"$FairyPamStageDir\") i.R9 ?e'\n  Pop $R5",
     ] {
         assert!(
             preinstall_hook.contains(error_capture),
@@ -653,7 +653,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     ] {
         let failure_path = label_block(preinstall_hook, failure_label);
         let close = failure_path
-            .find("System::Call 'kernel32::CloseHandle(p r6)'")
+            .find("System::Call 'kernel32::CloseHandle(p R6)'")
             .expect("stage verification failure must close its pinned handle");
         let error_level = failure_path
             .find("!insertmacro FAIRYPAM_SET_STAGE_ERROR")

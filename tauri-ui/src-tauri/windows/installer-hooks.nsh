@@ -39,36 +39,36 @@ Var FairyPamStageHandle
   IfFileExists "$FairyPamStageDir" fairypam_stale_stage 0
 
   ; NSIS is 32-bit, so SECURITY_ATTRIBUTES is 12 bytes here.
-  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${FAIRYPAM_INSTALL_SDDL}", i 1, *p .r8, p 0) i.r9 ?e'
+  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${FAIRYPAM_INSTALL_SDDL}", i 1, *p .R8, p 0) i.R9 ?e'
   Pop $R5
   ${If} $R9 = 0
     Goto fairypam_stage_sddl_failed
   ${EndIf}
-  System::Call '*(i 12, p r8, i 0) p.r7 ?e'
+  System::Call '*(i 12, p R8, i 0) p.R7 ?e'
   Pop $R5
   ${If} $R7 = 0
-    System::Call 'kernel32::LocalFree(p r8)'
+    System::Call 'kernel32::LocalFree(p R8)'
     Goto fairypam_stage_attributes_failed
   ${EndIf}
 
-  System::Call 'kernel32::CreateDirectoryW(w "$FairyPamStageDir", p r7) i.r9 ?e'
+  System::Call 'kernel32::CreateDirectoryW(w "$FairyPamStageDir", p R7) i.R9 ?e'
   Pop $R5
   ${If} $R9 = 0
     System::Free $R7
-    System::Call 'kernel32::LocalFree(p r8)'
+    System::Call 'kernel32::LocalFree(p R8)'
     ${If} $R5 = ${ERROR_ALREADY_EXISTS}
       Goto fairypam_stale_stage
     ${EndIf}
     Goto fairypam_stage_create_failed
   ${EndIf}
   System::Free $R7
-  System::Call 'kernel32::LocalFree(p r8)'
+  System::Call 'kernel32::LocalFree(p R8)'
 
   ; No share-delete keeps the protected, non-reparse stage pinned through verification.
-  System::Call 'kernel32::CreateFileW(w "$FairyPamStageDir", i 0x80, i 3, p 0, i 3, i ${FAIRYPAM_STAGE_OPEN_FLAGS}, p 0) p.r6 ?e'
+  System::Call 'kernel32::CreateFileW(w "$FairyPamStageDir", i 0x80, i 3, p 0, i 3, i ${FAIRYPAM_STAGE_OPEN_FLAGS}, p 0) p.R6 ?e'
   Pop $R5
   IntCmp $R6 -1 fairypam_stage_pin_failed
-  System::Call 'kernel32::GetFileAttributesW(w "$FairyPamStageDir") i.r9 ?e'
+  System::Call 'kernel32::GetFileAttributesW(w "$FairyPamStageDir") i.R9 ?e'
   Pop $R5
   IntCmp $R9 -1 fairypam_stage_verify_failed
   IntOp $R8 $R9 & 0x10 ; FILE_ATTRIBUTE_DIRECTORY
@@ -103,15 +103,15 @@ fairypam_stage_pin_failed:
   !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_PIN} $R5
   Abort "FairyPam could not pin its protected installation staging directory (Win32 error $R5)."
 fairypam_stage_verify_failed:
-  System::Call 'kernel32::CloseHandle(p r6)'
+  System::Call 'kernel32::CloseHandle(p R6)'
   !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_VERIFY} $R5
   Abort "FairyPam could not verify its protected installation staging directory (Win32 error $R5)."
 fairypam_stage_not_directory:
-  System::Call 'kernel32::CloseHandle(p r6)'
+  System::Call 'kernel32::CloseHandle(p R6)'
   !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_NOT_DIRECTORY} 1
   Abort "FairyPam rejected a non-directory protected installation staging path."
 fairypam_stage_reparse_detected:
-  System::Call 'kernel32::CloseHandle(p r6)'
+  System::Call 'kernel32::CloseHandle(p R6)'
   !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_REPARSE} 1
   Abort "FairyPam rejected a reparse point at its protected installation staging directory."
 fairypam_stage_ready:
@@ -128,7 +128,7 @@ fairypam_stage_ready:
   IfFileExists "$FairyPamStageDir\fairypam-agent-guardian.exe" 0 fairypam_stage_failed
   IfFileExists "$FairyPamStageDir\profiles\*.*" 0 fairypam_stage_failed
 
-  System::Call 'kernel32::CloseHandle(p $FairyPamStageHandle) i.r9'
+  System::Call 'kernel32::CloseHandle(p $FairyPamStageHandle) i.R9'
   StrCpy $FairyPamStageHandle 0
   ${If} $R9 = 0
     Goto fairypam_stage_failed
