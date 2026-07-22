@@ -106,8 +106,10 @@ impl GuiLifetime {
     pub fn bind(&self, pid: u32) -> Result<(), AgentError> {
         self.state.lock().map_err(lock_error)?.bind(pid)?;
         if let Err(error) = self.watch_process(pid) {
-            self.state.lock().map_err(lock_error)?.watcher_failed(pid);
             self.shutdown.cancel();
+            if let Ok(mut lifecycle) = self.state.lock() {
+                lifecycle.watcher_failed(pid);
+            }
             return Err(error);
         }
         Ok(())
