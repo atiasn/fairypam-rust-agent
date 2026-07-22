@@ -2090,16 +2090,20 @@ mod tests {
         // Production log tailing requires installer-provisioned private paths.
         // This runtime test verifies the shared record boundary without depending
         // on Windows installer state.
-        let messages = local
-            .state
-            .lock()
-            .unwrap()
-            .logs
+        let messages = {
+            let state = local.state.lock().unwrap();
+            state
+                .logs
+                .iter()
+                .map(|entry| entry.message.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(messages
             .iter()
-            .map(|entry| entry.message.as_str())
-            .collect::<Vec<_>>();
-        assert!(messages.contains(&"后台服务已启动，正在准备连接"));
-        assert!(messages.contains(&"界面请求环境检查"));
+            .any(|message| message == "后台服务已启动，正在准备连接"));
+        assert!(messages
+            .iter()
+            .any(|message| message == "界面请求环境检查"));
 
         let mut enrolled = RuntimeConfig::unregistered();
         enrolled.transport.control_endpoint = "https://hub.example/control".parse().unwrap();
