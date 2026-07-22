@@ -80,7 +80,7 @@ fn verify_install_roots(
     }
     verify_staged_payload_entry(&helper, false)?;
     match active_root.symlink_metadata() {
-        Ok(_) => verify_install_tree(active_root)?,
+        Ok(_) => verify_legacy_active_tree(active_root)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(()),
     }
@@ -90,6 +90,7 @@ fn verify_install_roots(
 #[cfg(windows)]
 fn verify_install_tree(root: &std::path::Path) -> Result<(), ()> {
     verify_trusted_install_entry(root, true)?;
+    verify_staged_payload_entry(root, true)?;
     verify_staged_payload_children(root)
 }
 
@@ -101,6 +102,25 @@ fn verify_staged_payload_children(root: &std::path::Path) -> Result<(), ()> {
         verify_staged_payload_entry(&path, metadata.is_dir())?;
         if metadata.is_dir() {
             verify_staged_payload_children(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_legacy_active_tree(root: &std::path::Path) -> Result<(), ()> {
+    verify_trusted_install_entry(root, true)?;
+    verify_legacy_active_children(root)
+}
+
+#[cfg(windows)]
+fn verify_legacy_active_children(root: &std::path::Path) -> Result<(), ()> {
+    for entry in std::fs::read_dir(root).map_err(|_| ())? {
+        let path = entry.map_err(|_| ())?.path();
+        let metadata = path.symlink_metadata().map_err(|_| ())?;
+        verify_trusted_install_entry(&path, metadata.is_dir())?;
+        if metadata.is_dir() {
+            verify_legacy_active_children(&path)?;
         }
     }
     Ok(())
@@ -210,7 +230,7 @@ fn verify_staged_payload_entry(path: &std::path::Path, directory: bool) -> Resul
         return Err(());
     }
     verify_nonreparse_attributes(path)?;
-    staged_payload_security(&security_sddl(path)?)
+    staged_payload_security(&security_sddl(path)?, &mandatory_label_sddl(path)?)
         .then_some(())
         .ok_or(())
 }
@@ -231,25 +251,42 @@ fn verify_nonreparse_attributes(path: &std::path::Path) -> Result<(), ()> {
 
 #[cfg(windows)]
 fn security_sddl(path: &std::path::Path) -> Result<String, ()> {
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    security_sddl_with_information(
+        path,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+    )
+}
+
+#[cfg(windows)]
+fn mandatory_label_sddl(path: &std::path::Path) -> Result<String, ()> {
+    use windows::Win32::Security::LABEL_SECURITY_INFORMATION;
+
+    security_sddl_with_information(path, LABEL_SECURITY_INFORMATION)
+}
+
+#[cfg(windows)]
+fn security_sddl_with_information(
+    path: &std::path::Path,
+    information: windows::Win32::Security::OBJECT_SECURITY_INFORMATION,
+) -> Result<String, ()> {
     use windows::core::{HSTRING, PWSTR};
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
         SDDL_REVISION_1, SE_FILE_OBJECT,
     };
-    use windows::Win32::Security::{
-        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR,
-    };
+    use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     let status = unsafe {
         GetNamedSecurityInfoW(
             &HSTRING::from(path.to_string_lossy().as_ref()),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
+            information,
             None,
             None,
             None,
@@ -265,9 +302,7 @@ fn security_sddl(path: &std::path::Path) -> Result<String, ()> {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
             descriptor,
             SDDL_REVISION_1,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
+            information,
             &mut text,
             None,
         )
@@ -288,8 +323,38 @@ fn trusted_program_files_security(sddl: &str) -> bool {
     trusted_owner && !dacl_grants_untrusted_write(sddl, true)
 }
 
-fn staged_payload_security(sddl: &str) -> bool {
-    !dacl_grants_untrusted_write(sddl, false)
+fn staged_payload_security(sddl: &str, label_sddl: &str) -> bool {
+    !dacl_grants_untrusted_write(sddl, false) && mandatory_label_is_high_no_write_up(label_sddl)
+}
+
+fn mandatory_label_is_high_no_write_up(sddl: &str) -> bool {
+    let Some(sacl) = sddl.split_once("S:").map(|(_, sacl)| sacl) else {
+        return false;
+    };
+    let mut labels = sacl.split('(').skip(1).filter_map(|raw| {
+        let ace = raw.split(')').next().unwrap_or_default();
+        let fields = ace.split(';').collect::<Vec<_>>();
+        (fields.len() >= 6 && fields[0] == "ML" && !fields[1].contains("IO"))
+            .then_some(fields)
+    });
+    let Some(fields) = labels.next() else {
+        return false;
+    };
+    labels.next().is_none()
+        && mandatory_label_is_high_or_higher(fields[5])
+        && fields[2].as_bytes().chunks_exact(2).any(|right| right == b"NW")
+}
+
+fn mandatory_label_is_high_or_higher(label: &str) -> bool {
+    matches!(label, "HI" | "SI")
+        || label
+            .strip_prefix("0x")
+            .and_then(|value| u32::from_str_radix(value, 16).ok())
+            .is_some_and(|value| value >= 0x3000)
+        || label
+            .strip_prefix("S-1-16-")
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_some_and(|value| value >= 0x3000)
 }
 
 fn dacl_grants_untrusted_write(sddl: &str, allow_creator_owner: bool) -> bool {
@@ -368,18 +433,50 @@ mod tests {
     }
 
     #[test]
-    fn staged_payload_acl_allows_installer_owner_but_not_untrusted_write() {
+    fn staged_payload_requires_high_no_write_up_label() {
         let elevated_installer_owned = "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
+        let high_no_write_up = "S:(ML;OICI;NW;;;HI)";
         assert!(!trusted_program_files_security(elevated_installer_owned));
-        assert!(staged_payload_security(elevated_installer_owned));
+        assert!(staged_payload_security(
+            elevated_installer_owned,
+            high_no_write_up
+        ));
         assert!(trusted_program_files_security(
             "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;CO)"
         ));
         assert!(!staged_payload_security(
-            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;CO)"
+            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;CO)",
+            high_no_write_up
         ));
         assert!(!staged_payload_security(
-            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FW;;;BU)"
+            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FW;;;BU)",
+            high_no_write_up
+        ));
+    }
+
+    #[test]
+    fn legacy_active_allows_missing_label_but_stage_does_not() {
+        let legacy_active = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
+        assert!(trusted_program_files_security(legacy_active));
+        assert!(!staged_payload_security(legacy_active, ""));
+        assert!(!staged_payload_security(
+            legacy_active,
+            "S:(ML;OICI;NW;;;ME)"
+        ));
+    }
+
+    #[test]
+    fn mandatory_label_parser_requires_high_non_inherit_only_no_write_up() {
+        assert!(mandatory_label_is_high_no_write_up("S:(ML;OICI;NW;;;HI)"));
+        assert!(!mandatory_label_is_high_no_write_up("S:(ML;OICI;NW;;;ME)"));
+        assert!(!mandatory_label_is_high_no_write_up(""));
+        assert!(!mandatory_label_is_high_no_write_up("S:(ML;OICI;;;HI)"));
+        assert!(!mandatory_label_is_high_no_write_up("S:(ML;OICIIO;NW;;;HI)"));
+        assert!(!mandatory_label_is_high_no_write_up(
+            "S:(ML;OICI;NW;;;ME)(ML;OICI;NW;;;HI)"
+        ));
+        assert!(!mandatory_label_is_high_no_write_up(
+            "S:(ML;OICI;NW;;;HI)(ML;OICI;NW;;;HI)"
         ));
     }
 }
