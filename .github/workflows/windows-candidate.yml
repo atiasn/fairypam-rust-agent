@@ -219,8 +219,33 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $setup = @(Get-ChildItem tauri-ui/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
           if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
+          & whoami.exe /groups /fo csv /nh
           $installer = Start-Process -FilePath $setup[0].FullName -ArgumentList '/S' -Wait -PassThru
-          if ($installer.ExitCode -ne 0) { throw "NSIS setup failed with exit code $($installer.ExitCode)" }
+          if ($installer.ExitCode -ne 0) {
+            $stageNames = @{
+              1 = 'sddl'
+              2 = 'security-attributes'
+              3 = 'create-directory'
+              4 = 'pin'
+              5 = 'verify'
+              6 = 'not-directory'
+              7 = 'reparse'
+              8 = 'activate'
+              9 = 'stage-validation'
+              10 = 'rollback'
+              11 = 'backup-cleanup'
+              12 = 'stale-backup'
+              13 = 'stale-stage'
+            }
+            $exitCode = [int64]$installer.ExitCode
+            $stageId = [math]::Floor($exitCode / 65536)
+            $detail = $exitCode % 65536
+            $stageName = $stageNames[[int]$stageId]
+            if ($null -ne $stageName) {
+              throw "NSIS setup failed with exit code $exitCode (stage=$stageName, detail=$detail)"
+            }
+            throw "NSIS setup failed with exit code $exitCode"
+          }
           $installRoot = 'C:\Program Files\FairyPam Agent UI'
           foreach ($path in @(
             (Join-Path $installRoot 'fairypam-agent-tauri-ui.exe'),

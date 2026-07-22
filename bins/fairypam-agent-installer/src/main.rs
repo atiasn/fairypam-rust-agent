@@ -78,7 +78,7 @@ fn verify_install_roots(
     if !same_windows_path(&std::env::current_exe().map_err(|_| ())?, &helper) {
         return Err(());
     }
-    verify_trusted_install_entry(&helper, false)?;
+    verify_staged_payload_entry(&helper, false)?;
     match active_root.symlink_metadata() {
         Ok(_) => verify_install_tree(active_root)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -90,12 +90,17 @@ fn verify_install_roots(
 #[cfg(windows)]
 fn verify_install_tree(root: &std::path::Path) -> Result<(), ()> {
     verify_trusted_install_entry(root, true)?;
+    verify_staged_payload_children(root)
+}
+
+#[cfg(windows)]
+fn verify_staged_payload_children(root: &std::path::Path) -> Result<(), ()> {
     for entry in std::fs::read_dir(root).map_err(|_| ())? {
         let path = entry.map_err(|_| ())?.path();
         let metadata = path.symlink_metadata().map_err(|_| ())?;
-        verify_trusted_install_entry(&path, metadata.is_dir())?;
+        verify_staged_payload_entry(&path, metadata.is_dir())?;
         if metadata.is_dir() {
-            verify_install_tree(&path)?;
+            verify_staged_payload_children(&path)?;
         }
     }
     Ok(())
@@ -196,6 +201,21 @@ fn verify_trusted_install_entry(path: &std::path::Path, directory: bool) -> Resu
 }
 
 #[cfg(windows)]
+fn verify_staged_payload_entry(path: &std::path::Path, directory: bool) -> Result<(), ()> {
+    let metadata = path.symlink_metadata().map_err(|_| ())?;
+    if metadata.file_type().is_symlink()
+        || (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+    {
+        return Err(());
+    }
+    verify_nonreparse_attributes(path)?;
+    staged_payload_security(&security_sddl(path)?)
+        .then_some(())
+        .ok_or(())
+}
+
+#[cfg(windows)]
 fn verify_nonreparse_attributes(path: &std::path::Path) -> Result<(), ()> {
     use windows::core::HSTRING;
     use windows::Win32::Storage::FileSystem::{
@@ -268,6 +288,10 @@ fn trusted_program_files_security(sddl: &str) -> bool {
     trusted_owner && !dacl_grants_untrusted_write(sddl)
 }
 
+fn staged_payload_security(sddl: &str) -> bool {
+    !dacl_grants_untrusted_write(sddl)
+}
+
 fn dacl_grants_untrusted_write(sddl: &str) -> bool {
     let Some(dacl) = sddl.split_once("D:").map(|(_, dacl)| dacl) else {
         return true;
@@ -337,6 +361,16 @@ mod tests {
         ));
         assert!(!trusted_program_files_security(
             "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        ));
+    }
+
+    #[test]
+    fn staged_payload_acl_allows_installer_owner_but_not_untrusted_write() {
+        let elevated_installer_owned = "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
+        assert!(!trusted_program_files_security(elevated_installer_owned));
+        assert!(staged_payload_security(elevated_installer_owned));
+        assert!(!staged_payload_security(
+            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FW;;;BU)"
         ));
     }
 }
