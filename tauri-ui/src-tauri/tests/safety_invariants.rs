@@ -178,7 +178,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "let expected_active = program_files.join(\"FairyPam Agent UI\");",
         "roots.is_none_or(|(stage, active)|",
         "verify_install_tree(stage_root)?",
-        "verify_install_tree(active_root)?",
+        "verify_legacy_active_tree(active_root)?",
         "verify_nonreparse_directory",
         "verify_private_directory",
     ] {
