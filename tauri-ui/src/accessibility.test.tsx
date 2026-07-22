@@ -23,7 +23,7 @@ it('has no structural axe violations in the main UI', async () => {
       <App />
     </QueryClientProvider>,
   );
-  await findByRole('heading', { name: 'Agent 已运行' });
+  await findByRole('heading', { name: '后台服务已就绪' });
   const result = await axe.run(container, { rules: { 'color-contrast': { enabled: false } } });
   expect(result.violations).toEqual([]);
 });

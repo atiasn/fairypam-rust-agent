@@ -20,7 +20,7 @@ export function GamesPage() {
           </li>
         ))}
       </ul>
-      <p className="notice">启动功能只会接受已发现的 discovery_id；本界面不接收或显示任意 EXE 路径。</p>
+      <p className="notice">启动功能只会使用已识别的游戏，不会读取或显示任意程序路径。</p>
     </section>
   );
 }

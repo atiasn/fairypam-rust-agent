@@ -23,12 +23,12 @@ const navigation: Array<{ id: Page; label: string }> = [
 ];
 
 function startupLabel(status: string | undefined, isPending: boolean, isError: boolean) {
-  if (isPending) return '正在唤醒本地 Agent 并连接 Hub';
-  if (isError) return 'Agent 启动需要处理';
-  if (status === 'ready') return 'Agent 与 Hub 已连接';
-  if (status === 'hub_wait_timeout') return 'Agent 已就绪，Hub 正在重试连接';
-  if (status === 'agent_ready') return 'Agent 已就绪，等待 Hub 注册';
-  return 'Agent 已就绪';
+  if (isPending) return '正在准备本机服务';
+  if (isError) return '服务启动需要处理';
+  if (status === 'ready') return '服务已连接';
+  if (status === 'hub_wait_timeout') return '服务已就绪，正在重试连接';
+  if (status === 'agent_ready') return '服务已就绪，等待注册';
+  return '服务已就绪';
 }
 
 export default function App() {
@@ -59,15 +59,15 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <div>
-          <p className="eyebrow">FAIRYPAM // NIGHT OPS</p>
-          <h1>AGENT CONTROL</h1>
+          <p className="eyebrow">FAIRYPAM // 夜间值守</p>
+          <h1>控制中心</h1>
         </div>
         <p aria-live="polite" className={`connection ${connection.availability}`}>
           {startupLabel(startup.data?.status, startup.isPending, startup.isError)}
         </p>
       </header>
       <div className="app-layout">
-        <nav aria-label="Agent UI 导航" className="navigation">
+        <nav aria-label="控制中心导航" className="navigation">
           {navigation.map((item) => (
             <button
               aria-current={page === item.id ? 'page' : undefined}

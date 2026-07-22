@@ -4,6 +4,20 @@ import { useQuery } from '@tanstack/react-query';
 import { agentApi } from '../lib/agentApi';
 import { queryKeys } from '../lib/queryKeys';
 
+const levelLabels = {
+  error: '错误',
+  warn: '警告',
+  info: '信息',
+} as const;
+
+const safeLogMessage = /^[\p{Script=Han}\p{P}\p{Zs}]+$/u;
+const unsafeLogMessageFallback = '该运行记录包含不适合展示的技术内容。';
+
+function displayLogMessage(message: string) {
+  // ponytail: only render Chinese text and punctuation; future technical formats use one safe summary.
+  return safeLogMessage.test(message) ? message : unsafeLogMessageFallback;
+}
+
 export function LogsPage() {
   const [level, setLevel] = useState<'error' | 'warn' | 'info'>('info');
   const logs = useQuery({
@@ -12,8 +26,8 @@ export function LogsPage() {
   });
 
   return (
-    <section className="status-card" aria-labelledby="agent-log-heading">
-      <h2 id="agent-log-heading">Agent 日志</h2>
+    <section className="status-card" aria-labelledby="service-log-heading">
+      <h2 id="service-log-heading">服务记录</h2>
       <label>
         最低级别
         <select onChange={(event) => setLevel(event.target.value as typeof level)} value={level}>
@@ -23,10 +37,11 @@ export function LogsPage() {
         </select>
       </label>
       {logs.isError && <p role="status">无法读取固定日志源。</p>}
+      {logs.isSuccess && logs.data.entries.length === 0 && <p role="status">暂时没有可显示的运行记录。服务正常时，记录可能为空。</p>}
       <ul className="log-list">
-        {logs.data?.entries.map((entry, index) => <li key={`${entry.level}-${index}`}><strong>{entry.level}</strong>：{entry.message}</li>)}
+        {logs.data?.entries.map((entry, index) => <li key={`${entry.level}-${index}`}><strong>{levelLabels[entry.level]}</strong>：{displayLogMessage(entry.message)}</li>)}
       </ul>
-      <p className="notice">仅显示 Agent 固定日志源的脱敏尾部，不支持路径输入。</p>
+      <p className="notice">仅显示已脱敏的最近记录，不能选择其他文件或路径。</p>
     </section>
   );
 }

@@ -157,7 +157,7 @@ pub fn redact_log_line(line: &str) -> String {
         || contains_jwt(line)
         || contains_absolute_path(line)
     {
-        "[redacted agent log content]".to_owned()
+        "[已隐藏敏感日志内容]".to_owned()
     } else {
         line.chars().take(512).collect()
     }
@@ -667,7 +667,7 @@ mod tests {
         );
         assert_eq!(
             tail["entries"][0]["message"],
-            "[redacted agent log content]"
+            "[已隐藏敏感日志内容]"
         );
         assert!(!tail.to_string().contains("secret"));
         assert!(!tail.to_string().contains("ProgramData"));
@@ -685,11 +685,26 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let log = FixedLog::open(&root).unwrap();
-        log.append(LogLevel::Info, "token=must-not-appear").unwrap();
+        log.append(LogLevel::Info, "后台服务已启动，正在准备本地连接")
+            .unwrap();
         assert_eq!(
             log.tail(10, &LogLevel::Info).unwrap()["entries"][0]["message"],
-            "[redacted agent log content]"
+            "后台服务已启动，正在准备本地连接"
         );
+        log.append(LogLevel::Info, "token=must-not-appear").unwrap();
+        let tail = log.tail(10, &LogLevel::Info).unwrap();
+        assert_eq!(tail["entries"][0]["message"], "[已隐藏敏感日志内容]");
+        let output = tail.to_string().to_ascii_lowercase();
+        for forbidden in [
+            "agent",
+            "hub",
+            "control",
+            "frame",
+            "grpc",
+            "must-not-appear",
+        ] {
+            assert!(!output.contains(forbidden), "log tail exposed {forbidden}");
+        }
 
         std::fs::write(root.join(LOG_FILE), vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
         log.append(LogLevel::Info, "rotation check").unwrap();
@@ -707,7 +722,7 @@ mod tests {
             pem_marker.as_str(),
             "registration_code=one-time-code",
         ] {
-            assert_eq!(redact_log_line(secret), "[redacted agent log content]");
+            assert_eq!(redact_log_line(secret), "[已隐藏敏感日志内容]");
         }
     }
 

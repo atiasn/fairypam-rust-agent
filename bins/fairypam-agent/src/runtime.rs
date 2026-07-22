@@ -411,8 +411,74 @@ impl Default for RuntimeState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RuntimeLogMessage {
+    AwaitingRegistration,
+    Started,
+    ControlConnectionStarting,
+    ControlConnectionEstablished,
+    FrameConnectionEstablished,
+    EnrollmentRefreshFailed,
+    SessionCleared,
+    GuiSessionEnded,
+    LocalUiBound,
+    LocalUiShutdownRequested,
+    LocalEnvironmentCheckRequested,
+    LocalGameScanRequested,
+    LocalRegistrationRequested,
+    RegistrationFailed,
+    RegistrationAwaitingConfirmation,
+    RegistrationChanged,
+    RegistrationCompleted,
+}
+
+impl RuntimeLogMessage {
+    const ALL: &[Self] = &[
+        Self::AwaitingRegistration,
+        Self::Started,
+        Self::ControlConnectionStarting,
+        Self::ControlConnectionEstablished,
+        Self::FrameConnectionEstablished,
+        Self::EnrollmentRefreshFailed,
+        Self::SessionCleared,
+        Self::GuiSessionEnded,
+        Self::LocalUiBound,
+        Self::LocalUiShutdownRequested,
+        Self::LocalEnvironmentCheckRequested,
+        Self::LocalGameScanRequested,
+        Self::LocalRegistrationRequested,
+        Self::RegistrationFailed,
+        Self::RegistrationAwaitingConfirmation,
+        Self::RegistrationChanged,
+        Self::RegistrationCompleted,
+    ];
+
+    const fn text(self) -> &'static str {
+        match self {
+            Self::AwaitingRegistration => "后台服务正在等待完成安全注册",
+            Self::Started => "后台服务已启动，正在准备本地连接",
+            Self::ControlConnectionStarting => "正在建立本地服务控制连接",
+            Self::ControlConnectionEstablished => "本地服务控制连接已建立",
+            Self::FrameConnectionEstablished => "本地服务画面传输连接已建立",
+            Self::EnrollmentRefreshFailed => "注册信息刷新失败，连接将保持安全关闭",
+            Self::SessionCleared => "本地服务会话已清除，正在重新连接",
+            Self::GuiSessionEnded => "界面会话结束，后台服务正在安全停止",
+            Self::LocalUiBound => "本地界面已连接到后台服务",
+            Self::LocalUiShutdownRequested => "本地界面请求安全停止后台服务",
+            Self::LocalEnvironmentCheckRequested => "本地界面请求环境检查",
+            Self::LocalGameScanRequested => "本地界面请求扫描已安装游戏",
+            Self::LocalRegistrationRequested => "本地界面请求注册服务",
+            Self::RegistrationFailed => "服务注册未完成",
+            Self::RegistrationAwaitingConfirmation => "服务注册正在等待以管理员权限确认",
+            Self::RegistrationChanged => "服务注册信息已变更，正在安全重连",
+            Self::RegistrationCompleted => "服务注册已完成，正在安全重连",
+        }
+    }
+}
+
 impl RuntimeState {
-    fn record(&mut self, level: LogLevel, message: &'static str) {
+    fn record(&mut self, level: LogLevel, message: RuntimeLogMessage) {
+        let message = message.text();
         if self.logs.len() == 200 {
             self.logs.pop_front();
         }
@@ -441,19 +507,20 @@ pub struct GrpcSessionDriver {
 impl GrpcSessionDriver {
     pub fn new(config: RuntimeConfig) -> Self {
         let execution = CommandExecutor::production(config.profiles.clone());
-        let state = if config.awaiting_enrollment {
+        let mut state = if config.awaiting_enrollment {
             let mut state = RuntimeState {
                 last_error_code: "runtime.not_registered".to_owned(),
                 ..RuntimeState::default()
             };
             state.record(
                 LogLevel::Info,
-                "Agent is awaiting authenticated Hub registration",
+                RuntimeLogMessage::AwaitingRegistration,
             );
             state
         } else {
             RuntimeState::default()
         };
+        state.record(LogLevel::Info, RuntimeLogMessage::Started);
         let gui_shutdown = CancellationToken::new();
         Self {
             config: Arc::new(Mutex::new(config)),
@@ -547,7 +614,7 @@ impl SessionDriver for GrpcSessionDriver {
             state.control_state = ConnectionState::Connecting;
             state.frame_state = ConnectionState::Connecting;
             state.last_error_code = "runtime.connecting".to_owned();
-            state.record(LogLevel::Info, "Agent Control connection is starting");
+            state.record(LogLevel::Info, RuntimeLogMessage::ControlConnectionStarting);
         }
         let connection = tokio::select! {
             _ = cancellation.cancelled() => return Err(cancelled()),
@@ -592,7 +659,7 @@ impl SessionDriver for GrpcSessionDriver {
             last_error_code: "runtime.frame_connecting".to_owned(),
             logs,
         };
-        state.record(LogLevel::Info, "Agent Control connection is established");
+        state.record(LogLevel::Info, RuntimeLogMessage::ControlConnectionEstablished);
         Ok(())
     }
 
@@ -680,7 +747,7 @@ impl SessionDriver for GrpcSessionDriver {
         if let Ok(mut state) = self.state.lock() {
             state.frame_state = ConnectionState::Connected;
             state.last_error_code = "runtime.connected".to_owned();
-            state.record(LogLevel::Info, "Agent Frame connection is established");
+            state.record(LogLevel::Info, RuntimeLogMessage::FrameConnectionEstablished);
         }
         loop {
             tokio::select! {
@@ -765,7 +832,7 @@ impl SupervisorHooks for RuntimeSafetyHooks {
                         state.last_error_code = "runtime.enrollment_refresh_failed".to_owned();
                         state.record(
                             LogLevel::Warn,
-                            "Enrollment refresh failed; reconnect remains fail-closed",
+                            RuntimeLogMessage::EnrollmentRefreshFailed,
                         );
                     }
                     tracing::warn!(code = error.code(), "enrollment refresh failed");
@@ -786,7 +853,7 @@ impl SupervisorHooks for RuntimeSafetyHooks {
             };
             state.record(
                 LogLevel::Warn,
-                "Agent session was cleared and will reconnect",
+                RuntimeLogMessage::SessionCleared,
             );
         }
         tracing::info!(effect = "clear_target_session");
@@ -870,7 +937,7 @@ fn shutdown_from_gui_lifecycle(
     if let Ok(mut state) = driver.state.lock() {
         state.record(
             LogLevel::Info,
-            "GUI lifecycle ended; Agent is shutting down safely",
+            RuntimeLogMessage::GuiSessionEnded,
         );
     }
     tracing::info!(?reason, "GUI lifecycle requested safe Agent shutdown");
@@ -934,6 +1001,7 @@ impl LocalControlRuntime for SharedRuntime {
         caller: &fairypam_agent_windows::VerifiedPipeCaller,
         command: &LocalCommand,
     ) -> Result<serde_json::Value, AgentError> {
+        self.record_local_operation(command);
         match command {
             LocalCommand::BindUiLifetime => {
                 self.gui_lifetime.bind(caller.pid)?;
@@ -968,6 +1036,29 @@ impl LocalControlRuntime for SharedRuntime {
 
 #[cfg(any(windows, test))]
 impl SharedRuntime {
+    fn record_local_operation(&self, command: &LocalCommand) {
+        let message = match command {
+            LocalCommand::BindUiLifetime => Some(RuntimeLogMessage::LocalUiBound),
+            LocalCommand::ShutdownAgent => Some(RuntimeLogMessage::LocalUiShutdownRequested),
+            LocalCommand::RunEnvironmentCheck => {
+                Some(RuntimeLogMessage::LocalEnvironmentCheckRequested)
+            }
+            LocalCommand::ScanInstalledGames => Some(RuntimeLogMessage::LocalGameScanRequested),
+            LocalCommand::RegisterHub { .. } => {
+                Some(RuntimeLogMessage::LocalRegistrationRequested)
+            }
+            // The log page reads this same source; recording each tail request
+            // would create a feedback loop during polling.
+            LocalCommand::GetLogTail { .. } => None,
+            _ => None,
+        };
+        if let Some(message) = message {
+            if let Ok(mut state) = self.state.lock() {
+                state.record(LogLevel::Info, message);
+            }
+        }
+    }
+
     #[cfg(windows)]
     fn register_hub(
         &self,
@@ -1024,7 +1115,7 @@ impl SharedRuntime {
         if let Err(error) = result {
             if let Ok(mut state) = self.state.lock() {
                 state.last_error_code = error.code().to_owned();
-                state.record(LogLevel::Warn, "Hub registration was not completed");
+                state.record(LogLevel::Warn, RuntimeLogMessage::RegistrationFailed);
             }
             tracing::warn!(code = error.code(), "Hub registration was not completed");
         }
@@ -1038,7 +1129,7 @@ impl SharedRuntime {
             state.last_error_code = "runtime.enrollment_confirmation_pending".to_owned();
             state.record(
                 LogLevel::Info,
-                "Hub registration is awaiting elevated Agent confirmation",
+                RuntimeLogMessage::RegistrationAwaitingConfirmation,
             );
         }
     }
@@ -1050,7 +1141,7 @@ impl SharedRuntime {
             state.last_error_code = "runtime.enrollment_changed".to_owned();
             state.record(
                 LogLevel::Info,
-                "Hub registration changed; reconnecting safely",
+                RuntimeLogMessage::RegistrationChanged,
             );
         }
         self.reconnect_requested.notify_one();
@@ -1067,7 +1158,7 @@ impl SharedRuntime {
         state.last_error_code = "runtime.enrollment_registered".to_owned();
         state.record(
             LogLevel::Info,
-            "Hub registration completed; reconnecting safely",
+            RuntimeLogMessage::RegistrationCompleted,
         );
         drop((execution, state, current));
         self.enrollment_ready.notify_one();
@@ -1133,27 +1224,27 @@ impl SharedRuntime {
                 "id": id,
                 "status": status.as_str(),
                 "code": if matches!(status, ConnectionState::Connected) { "runtime.connected" } else { "runtime.connection_unavailable" },
-                "recovery": "Check Agent registration and Hub reachability",
+                "recovery": "请检查本地服务注册状态和服务连接是否可用。",
             })
         };
         let registration_ready = binary_ready && guardian_ready;
         let enrollment_check = |id: &str, status: ConnectionState| {
             if awaiting_enrollment {
-                serde_json::json!({"id": id, "status": "pending", "code": "enrollment.required", "recovery": "Register the Agent before checking Hub connectivity"})
+                serde_json::json!({"id": id, "status": "pending", "code": "enrollment.required", "recovery": "请先完成本地服务注册，再检查服务连接。"})
             } else {
                 check(id, status)
             }
         };
         Ok(
             serde_json::json!({"registration_ready": registration_ready, "checks": [
-                {"id": "binary_or_task", "status": if binary_ready { "available" } else { "unavailable" }, "code": if binary_ready { "agent.binary_available" } else { "agent.binary_unavailable" }, "recovery": "Repair the Agent installation if the production binary is unavailable"},
-                {"id": "agent", "status": "available", "code": "agent.running", "recovery": "No action required"},
-                {"id": "certificate", "status": if awaiting_enrollment { "pending" } else if certificate_ready { "available" } else { "unavailable" }, "code": if awaiting_enrollment { "enrollment.required" } else if certificate_ready { "runtime.certificate_files_available" } else { "runtime.certificate_unavailable" }, "recovery": "Register or re-enroll if the Agent cannot connect"},
+                {"id": "binary_or_task", "status": if binary_ready { "available" } else { "unavailable" }, "code": if binary_ready { "agent.binary_available" } else { "agent.binary_unavailable" }, "recovery": "本地服务安装不完整，请重新安装 FairyPam。"},
+                {"id": "agent", "status": "available", "code": "agent.running", "recovery": "无需操作。"},
+                {"id": "certificate", "status": if awaiting_enrollment { "pending" } else if certificate_ready { "available" } else { "unavailable" }, "code": if awaiting_enrollment { "enrollment.required" } else if certificate_ready { "runtime.certificate_files_available" } else { "runtime.certificate_unavailable" }, "recovery": "请完成注册或重新注册本地服务。"},
                 enrollment_check("control", control_state),
                 enrollment_check("frame", frame_state),
-                {"id": "guardian", "status": if guardian_ready { "available" } else { "unavailable" }, "code": if guardian_ready { "guardian.binary_available" } else { "guardian.binary_unavailable" }, "recovery": "Repair the Agent installation if the Guardian binary is unavailable"},
-                {"id": "profiles", "status": if profiles_configured { "available" } else { "unavailable" }, "code": if profiles_configured { "profile.available" } else { "profile.unavailable" }, "recovery": "Install a signed Profile before selecting a target"},
-                {"id": "game_discovery", "status": game_status, "code": game_code, "recovery": "Rescan installed games if the launcher was updated"}
+                {"id": "guardian", "status": if guardian_ready { "available" } else { "unavailable" }, "code": if guardian_ready { "guardian.binary_available" } else { "guardian.binary_unavailable" }, "recovery": "本地服务组件不完整，请重新安装 FairyPam。"},
+                {"id": "profiles", "status": if profiles_configured { "available" } else { "unavailable" }, "code": if profiles_configured { "profile.available" } else { "profile.unavailable" }, "recovery": "请安装已签名配置文件后再选择游戏。"},
+                {"id": "game_discovery", "status": game_status, "code": game_code, "recovery": "启动器更新后，请重新扫描已安装游戏。"}
             ]}),
         )
     }
@@ -1865,7 +1956,7 @@ fn now_unix_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use fairypam_agent_local_protocol::LocalCommand;
+    use fairypam_agent_local_protocol::{LocalCommand, LogLevel};
     use fairypam_agent_protocol::v1::{CloseTarget, FocusTarget, HubControlCommand};
     use fairypam_agent_windows::{IntegrityLevel, VerifiedPipeCaller};
 
@@ -1951,6 +2042,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_log_messages_are_localized_and_hide_internal_terms() {
+        let mut state = RuntimeState::default();
+        for message in RuntimeLogMessage::ALL {
+            assert!(message
+                .text()
+                .chars()
+                .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)));
+            state.record(LogLevel::Info, *message);
+        }
+
+        let output = observability::log_tail_json(
+            state.logs.make_contiguous(),
+            200,
+            &LogLevel::Info,
+        )
+        .to_string()
+        .to_ascii_lowercase();
+        for forbidden in ["agent", "hub", "control", "frame", "grpc"] {
+            assert!(!output.contains(forbidden), "log tail exposed {forbidden}");
+        }
+        assert_eq!(state.logs.len(), RuntimeLogMessage::ALL.len());
+    }
+
     #[tokio::test]
     async fn unregistered_runtime_keeps_local_control_then_notifies_supervisor() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
@@ -1977,6 +2092,32 @@ mod tests {
                 "pending"
             );
         }
+        assert!(diagnostics["checks"].as_array().unwrap().iter().all(|check| {
+            check["recovery"]
+                .as_str()
+                .is_some_and(|message| {
+                    message
+                        .chars()
+                        .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character))
+                })
+        }));
+        let log_tail = local
+            .execute(
+                &local_caller(),
+                &LocalCommand::GetLogTail {
+                    lines: 20,
+                    level: LogLevel::Info,
+                },
+            )
+            .unwrap();
+        let messages = log_tail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["message"].as_str())
+            .collect::<Vec<_>>();
+        assert!(messages.contains(&"后台服务已启动，正在准备本地连接"));
+        assert!(messages.contains(&"本地界面请求环境检查"));
 
         let mut enrolled = RuntimeConfig::unregistered();
         enrolled.transport.control_endpoint = "https://hub.example/control".parse().unwrap();

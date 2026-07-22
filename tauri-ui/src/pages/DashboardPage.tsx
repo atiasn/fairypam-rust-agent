@@ -12,41 +12,50 @@ type Props = {
   retryStartup: () => void;
 };
 
-function hubSummary(status: string | undefined) {
-  if (status === 'ready') return 'Hub Control 与 Frame 通道已就绪。';
-  if (status === 'agent_ready') return '尚未注册 Hub。请在“连接与注册”中完成注册。';
-  if (status === 'hub_wait_timeout') return '已等待 Hub 连接 20 秒，Agent 会继续在后台重试。';
-  return 'Agent 正在自行恢复 Hub 连接。';
+function connectionSummary(status: string | undefined) {
+  if (status === 'ready') return '服务连接已就绪。';
+  if (status === 'agent_ready') return '尚未完成注册。请在“连接与注册”中继续。';
+  if (status === 'hub_wait_timeout') return '正在持续尝试连接，您仍可继续使用本地功能。';
+  return '正在恢复服务连接。';
+}
+
+function serviceStateLabel(state: string) {
+  const labels: Record<string, string> = {
+    connectedidle: '已连接，等待操作',
+    disconnected: '未连接',
+    starting: '正在启动',
+  };
+  return labels[state.toLowerCase()] ?? '正在更新';
 }
 
 export function DashboardPage({ connection, overview, startup, retryStartup }: Props) {
   if (startup.isPending || overview.isLoading) {
-    return <StatusPanel availability="unknown" title="正在启动本地 Agent" detail="正在使用受控启动入口检查服务状态。" />;
+    return <StatusPanel availability="unknown" title="正在准备服务" detail="正在检查服务状态。" />;
   }
   if (startup.isError) {
     return (
       <>
-        <StatusPanel availability="offline" title="Agent 未能在限定时间内就绪" detail="请检查安装或完成注册，然后重试。" />
+        <StatusPanel availability="offline" title="服务暂时无法使用" detail="请检查安装或完成注册，然后重试。" />
         <button onClick={retryStartup} type="button">重试启动</button>
-        <RecoveryCard reason="本地 Agent 启动失败；界面没有启动未知程序。" />
+        <RecoveryCard message="服务未能启动；界面不会启动未经确认的程序。" />
       </>
     );
   }
   if (overview.isError || !overview.data) {
-    return <StatusPanel availability={connection.availability} title="正在读取 Agent 状态" detail="本地服务刚刚启动，请稍候。" />;
+    return <StatusPanel availability={connection.availability} title="正在读取服务状态" detail="服务刚刚启动，请稍候。" />;
   }
   const data = overview.data;
   return (
     <>
       <StatusPanel
         availability={connection.availability}
-        detail={`运行状态：${data.status.state}；采集：${data.status.capture_active ? '活动' : '未活动'}`}
-        title="Agent 已运行"
+        detail={`运行状态：${serviceStateLabel(data.status.state)}；采集功能：${data.status.capture_active ? '已开启' : '未开启'}`}
+        title="后台服务已就绪"
       />
       <section className="status-card" aria-labelledby="startup-heading">
         <h2 id="startup-heading">连接摘要</h2>
-        <p>{hubSummary(startup.data?.status)}</p>
-        <p>关闭界面不会停止 Agent。</p>
+        <p>{connectionSummary(startup.data?.status)}</p>
+        <p>关闭窗口不会停止后台服务。</p>
       </section>
     </>
   );

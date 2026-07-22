@@ -15,6 +15,16 @@ type Props = {
   retryStartup: () => void;
 };
 
+function connectionStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    connected: '已连接',
+    connecting: '正在连接',
+    disconnected: '未连接',
+    offline: '未连接',
+  };
+  return labels[status.toLowerCase()] ?? '正在确认';
+}
+
 export function ConnectionPage({ connection, overview, startup, retryStartup }: Props) {
   const [hubAddress, setHubAddress] = useState('https://');
   const [registrationCode, setRegistrationCode] = useState('');
@@ -35,19 +45,19 @@ export function ConnectionPage({ connection, overview, startup, retryStartup }: 
     <>
       <StatusPanel
         availability={connection.availability}
-        title="本地 Agent"
-        detail={startup.isError ? '本地 Agent 尚未就绪。' : '界面会在打开时自动唤醒本地 Agent。'}
+        title="后台服务"
+        detail={startup.isError ? '后台服务尚未就绪。' : '打开界面时会自动准备后台服务。'}
       />
       <section className="status-card" aria-labelledby="hub-connection-heading">
-        <h2 id="hub-connection-heading">Hub 连接</h2>
-        {status.isLoading && <p>正在读取 Agent 的连接状态。</p>}
-        {status.isError && <p role="status">Agent 正在恢复 Hub 连接。</p>}
+        <h2 id="hub-connection-heading">服务连接</h2>
+        {status.isLoading && <p>正在读取服务连接状态。</p>}
+        {status.isError && <p role="status">服务正在恢复连接。</p>}
         {status.data && (
           <dl>
-            <dt>Hub 地址</dt><dd>{status.data.hub_address || '尚未注册'}</dd>
-            <dt>Control</dt><dd>{status.data.control}</dd>
-            <dt>Frame</dt><dd>{status.data.frame}</dd>
-            <dt>采集</dt><dd>{status.data.capture_active ? '活动' : '未活动'}</dd>
+            <dt>服务地址</dt><dd>{status.data.hub_address || '尚未注册'}</dd>
+            <dt>控制连接</dt><dd>{connectionStatusLabel(status.data.control)}</dd>
+            <dt>画面传输</dt><dd>{connectionStatusLabel(status.data.frame)}</dd>
+            <dt>采集功能</dt><dd>{status.data.capture_active ? '已开启' : '未开启'}</dd>
           </dl>
         )}
         <form
@@ -58,7 +68,7 @@ export function ConnectionPage({ connection, overview, startup, retryStartup }: 
           }}
         >
           <label>
-            Hub HTTPS 地址
+            服务地址
             <input autoComplete="url" onChange={(event) => setHubAddress(event.target.value)} required type="url" value={hubAddress} />
           </label>
           <label>
@@ -67,10 +77,10 @@ export function ConnectionPage({ connection, overview, startup, retryStartup }: 
           </label>
           <button disabled={registration.isPending || !startup.isSuccess} type="submit">注册或重新注册</button>
         </form>
-        {registration.isSuccess && <p role="status">请在高权限 FairyPam Agent 确认注册；确认前不会使用注册码。若未在短时间内确认，本次注册会失效。</p>}
-        {registration.isError && <p role="status">注册未完成。请确认 Agent 已就绪后重试。</p>}
-        {!startup.isSuccess && <p role="status">请先等待本地 Agent 就绪，再提交注册。</p>}
-        <p className="notice">注册码只经已验证的本地 Agent 通道提交，不会被界面保存。</p>
+        {registration.isSuccess && <p role="status">请在系统确认窗口中确认注册；确认前不会使用注册码。若未在短时间内确认，本次注册会失效。</p>}
+        {registration.isError && <p role="status">注册未完成。请确认后台服务已就绪后重试。</p>}
+        {!startup.isSuccess && <p role="status">请先等待后台服务就绪，再提交注册。</p>}
+        <p className="notice">注册码只会通过受保护的通道提交，界面不会保存它。</p>
       </section>
       {startup.isError && <button onClick={retryStartup} type="button">重试启动</button>}
       <RecoveryCard reason={connection.reasonCode} />
