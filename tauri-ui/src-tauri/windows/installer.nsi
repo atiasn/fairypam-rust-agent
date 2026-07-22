@@ -655,6 +655,11 @@ Function .onInstSuccess
 FunctionEnd
 
 Function un.onInit
+  ; Uninstall only from the fixed protected product root; `_?=` must not redirect deletion.
+  StrCmp "$EXEDIR" "${FIXED_INSTALL_DIR}" fairypam_uninstall_root_ok
+  Abort "FairyPam uninstaller must run from its protected installation directory."
+fairypam_uninstall_root_ok:
+  StrCpy $INSTDIR "${FIXED_INSTALL_DIR}"
   !insertmacro SetContext
 
   !if "${INSTALLMODE}" == "both"

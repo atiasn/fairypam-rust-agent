@@ -293,6 +293,21 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     let init = &NSIS_TEMPLATE[init_start..init_end];
     assert!(init.contains("StrCpy $INSTDIR \"${FIXED_INSTALL_DIR}\""));
     assert!(!init.contains("RestorePreviousInstallLocation"));
+    let uninstall_init_start = NSIS_TEMPLATE
+        .find("Function un.onInit")
+        .expect("installer must define uninstaller initialization");
+    let uninstall_init_end = NSIS_TEMPLATE[uninstall_init_start..]
+        .find("FunctionEnd")
+        .map(|offset| uninstall_init_start + offset)
+        .expect("uninstaller initialization must terminate");
+    let uninstall_init = &NSIS_TEMPLATE[uninstall_init_start..uninstall_init_end];
+    let fixed_uninstall_root = uninstall_init
+        .find("StrCmp \"$EXEDIR\" \"${FIXED_INSTALL_DIR}\"")
+        .expect("uninstaller must reject a caller-controlled installation root");
+    let fixed_uninstall_dir = uninstall_init
+        .find("StrCpy $INSTDIR \"${FIXED_INSTALL_DIR}\"")
+        .expect("uninstaller must restore the fixed installation root");
+    assert!(fixed_uninstall_root < fixed_uninstall_dir);
     let install = &NSIS_TEMPLATE[NSIS_TEMPLATE
         .find("Section Install\n")
         .expect("installer must define its install section")..];
