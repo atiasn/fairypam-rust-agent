@@ -149,13 +149,6 @@ impl LocalIdentityError {
         )
     }
 
-    fn logon_session_mismatch() -> Self {
-        Self::new(
-            "local.identity.logon_session_mismatch",
-            "client logon SID does not match pipe owner",
-        )
-    }
-
     fn session_mismatch() -> Self {
         Self::new(
             "local.identity.session_mismatch",
@@ -212,9 +205,16 @@ pub fn verify_pipe_caller(
     if caller.user_sid != owner.user_sid {
         return Err(LocalIdentityError::sid_mismatch());
     }
-    if caller.logon_sid != owner.logon_sid {
-        return Err(LocalIdentityError::logon_session_mismatch());
-    }
+    // NOTE: `caller.logon_sid != owner.logon_sid` is intentionally NOT checked.
+    // The product flow spawns the elevated Agent via `runas` from the same
+    // interactive user, which produces a UAC split token: the GUI keeps the
+    // original logon session while the elevated Agent receives a fresh logon
+    // identifier. Comparing the two values always rejects the legitimate
+    // product flow. The remaining checks (same user SID, same Windows session,
+    // caller integrity meets owner minimum) bind the caller to the same
+    // interactive user the owner represents; substitution by an attacker would
+    // still need to break `verify_fixed_gui_caller` for any privileged command.
+    // See `product-live-start-diagnosis:01`.
     if caller.session_id != owner.session_id {
         return Err(LocalIdentityError::session_mismatch());
     }

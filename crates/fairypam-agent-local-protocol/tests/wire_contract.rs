@@ -57,6 +57,8 @@ fn round_trips_all_supported_command_shapes() {
             level: LogLevel::Info,
         },
         LocalCommand::ScanInstalledGames,
+        LocalCommand::BindUiLifetime,
+        LocalCommand::ShutdownAgent,
         LocalCommand::RegisterHub {
             hub_address: "https://hub.example".to_owned(),
             registration_code: "0123456789abcdef".to_owned(),

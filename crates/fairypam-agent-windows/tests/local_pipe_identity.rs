@@ -23,13 +23,9 @@ fn caller() -> VerifiedPipeCaller {
 }
 
 #[test]
-fn rejects_mismatched_sid_logon_session_and_low_integrity_before_dispatch() {
+fn rejects_mismatched_sid_session_and_low_integrity_before_dispatch() {
     let wrong_sid = VerifiedPipeCaller {
         user_sid: "S-1-5-21-other".to_owned(),
-        ..caller()
-    };
-    let wrong_logon = VerifiedPipeCaller {
-        logon_sid: "S-1-5-5-other".to_owned(),
         ..caller()
     };
     let wrong_session = VerifiedPipeCaller {
@@ -43,7 +39,6 @@ fn rejects_mismatched_sid_logon_session_and_low_integrity_before_dispatch() {
 
     for (caller, code) in [
         (wrong_sid, "local.identity.sid_mismatch"),
-        (wrong_logon, "local.identity.logon_session_mismatch"),
         (wrong_session, "local.identity.session_mismatch"),
         (low_integrity, "local.identity.integrity_mismatch"),
     ] {
@@ -52,6 +47,22 @@ fn rejects_mismatched_sid_logon_session_and_low_integrity_before_dispatch() {
             code
         );
     }
+}
+
+#[test]
+fn uac_split_token_logon_sid_divergence_is_accepted_for_same_user_and_session() {
+    // The product spawns the elevated Agent via `runas` from the same interactive
+    // user. UAC issues a split token whose Logon Identifier differs from the
+    // unelevated GUI's Logon Identifier, even though user SID and session ID
+    // match. The caller must be accepted so the GUI can reach the Agent.
+    let split_token = VerifiedPipeCaller {
+        logon_sid: "S-1-5-5-different-elevated-luid".to_owned(),
+        ..caller()
+    };
+    let verified = verify_pipe_caller(&owner(), split_token)
+        .expect("UAC split token must not be rejected by logon_sid comparison");
+    assert_eq!(verified.user_sid, "S-1-5-21-owner");
+    assert_eq!(verified.session_id, 1);
 }
 
 #[test]
@@ -107,13 +118,13 @@ fn register_hub_gui_proof_is_server_side_and_fails_closed_before_runtime_dispatc
         );
     }
     let caller_guard = adapter
-        .find("if let Err(error) = verify_fixed_gui_caller(caller.pid)")
-        .expect("RegisterHub must verify the fixed product GUI");
+        .find("if requires_fixed_gui(&request.command)")
+        .expect("privileged local commands must verify the fixed product GUI");
     let nonce_guard = adapter
         .find("self.nonces.accept(request.nonce)")
         .expect("requests must pass replay protection");
     let runtime_dispatch = adapter
-        .find("self.runtime.execute(&request.command)")
+        .find(".execute(caller, &request.command)")
         .expect("validated requests must reach the runtime");
     assert!(caller_guard < nonce_guard);
     assert!(caller_guard < runtime_dispatch);

@@ -38,6 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const STATE_ROOT: &str = r"C:\ProgramData\FairyPam\Agent\enrollment";
 const STATE_PARENT: &str = r"C:\ProgramData\FairyPam\Agent";
 const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam\Agent\audit";
+const LOG_ROOT: &str = r"C:\ProgramData\FairyPam\Agent\logs";
 const PRIVATE_DACL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
 const CLAIM_DEADLINE: Duration = Duration::from_secs(15);
 const CLAIM_OPERATION_TIMEOUT_MS: i32 = 5_000;
@@ -357,7 +358,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
 pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), AgentError> {
     let enrollment = Path::new(STATE_ROOT);
     let audit = Path::new(AUDIT_ROOT);
-    if path != enrollment && path != audit {
+    let logs = Path::new(LOG_ROOT);
+    if path != enrollment && path != audit && path != logs {
         return Err(failed());
     }
 

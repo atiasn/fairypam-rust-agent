@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::atomic::{AtomicBool, Ordering}, time::Duration};
 
 use fairypam_agent_local_client::LocalClientError;
 #[cfg(any(windows, test))]
@@ -51,6 +51,7 @@ impl From<LocalClientError> for UiCommandError {
 pub struct ProductionGateway {
     #[cfg(windows)]
     pipe_name: &'static str,
+    ui_lifetime_bound: AtomicBool,
 }
 
 impl ProductionGateway {
@@ -58,12 +59,15 @@ impl ProductionGateway {
     pub fn new() -> Self {
         Self {
             pipe_name: DEFAULT_PIPE_NAME,
+            ui_lifetime_bound: AtomicBool::new(false),
         }
     }
 
     #[cfg(not(windows))]
     pub fn new() -> Self {
-        Self {}
+        Self {
+            ui_lifetime_bound: AtomicBool::new(false),
+        }
     }
 
     #[cfg(windows)]
@@ -121,6 +125,32 @@ impl ProductionGateway {
             status: self.request(LocalCommand::Status).await?,
             doctor: self.request(LocalCommand::Doctor).await?,
         })
+    }
+
+    pub async fn bind_ui_lifetime(&self) -> Result<(), UiCommandError> {
+        if self.ui_lifetime_bound.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.request::<serde_json::Value>(LocalCommand::BindUiLifetime)
+            .await?;
+        self.ui_lifetime_bound.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn clear_ui_lifetime_binding(&self) {
+        self.ui_lifetime_bound.store(false, Ordering::Release);
+    }
+
+    pub async fn shutdown_bound_agent(&self) -> Result<(), UiCommandError> {
+        if !self.ui_lifetime_bound.load(Ordering::Acquire) {
+            return Err(UiCommandError::unavailable(
+                "local.lifecycle.not_bound",
+                "the current GUI has not bound the FairyPam Agent",
+            ));
+        }
+        self.request::<serde_json::Value>(LocalCommand::ShutdownAgent)
+            .await
+            .map(|_| ())
     }
 
     #[cfg(windows)]
@@ -196,7 +226,7 @@ mod tests {
     use serde_json::json;
 
     use super::{decode_response, UiCommandError};
-    use crate::dto::StatusDto;
+    use crate::dto::{EnvironmentCheckDto, StatusDto};
 
     #[test]
     fn rejects_unknown_response_fields() {
@@ -213,5 +243,26 @@ mod tests {
         let error = UiCommandError::from(LocalClientError::pipe_not_found());
 
         assert_eq!(error.code, "local.transport.pipe_not_found");
+    }
+
+    #[test]
+    fn decodes_registration_readiness_before_the_environment_checks() {
+        let response = decode_response::<EnvironmentCheckDto>(
+            fairypam_agent_local_protocol::LocalResponse {
+                body: json!({
+                    "registration_ready": true,
+                    "checks": [{
+                        "id": "agent",
+                        "status": "available",
+                        "code": "agent.running",
+                        "recovery": "No action required"
+                    }]
+                }),
+            },
+        )
+        .expect("Agent environment checks include strict registration readiness");
+
+        assert!(response.registration_ready);
+        assert_eq!(response.checks.len(), 1);
     }
 }

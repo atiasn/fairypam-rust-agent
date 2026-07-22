@@ -28,6 +28,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::{CommandExecutor, CommandOutcome, ExecutionSession, FrameSink};
+use crate::gui_lifecycle::GuiLifetime;
 #[cfg(any(windows, test))]
 use crate::observability;
 use crate::observability::AgentLogRecord;
@@ -415,7 +416,14 @@ impl RuntimeState {
         if self.logs.len() == 200 {
             self.logs.pop_front();
         }
-        self.logs.push_back(AgentLogRecord::new(level, message));
+        self.logs
+            .push_back(AgentLogRecord::new(level.clone(), message));
+        #[cfg(windows)]
+        if let Err(error) =
+            observability::production_log().and_then(|log| log.append(level, message))
+        {
+            tracing::warn!(code = error.code(), "protected Agent log write failed");
+        }
     }
 }
 
@@ -426,6 +434,8 @@ pub struct GrpcSessionDriver {
     enrollment_ready: Arc<tokio::sync::Notify>,
     reconnect_requested: Arc<tokio::sync::Notify>,
     registration_in_progress: Arc<AtomicBool>,
+    gui_shutdown: CancellationToken,
+    gui_lifetime: GuiLifetime,
 }
 
 impl GrpcSessionDriver {
@@ -444,6 +454,7 @@ impl GrpcSessionDriver {
         } else {
             RuntimeState::default()
         };
+        let gui_shutdown = CancellationToken::new();
         Self {
             config: Arc::new(Mutex::new(config)),
             state: Arc::new(Mutex::new(state)),
@@ -451,6 +462,8 @@ impl GrpcSessionDriver {
             enrollment_ready: Arc::new(tokio::sync::Notify::new()),
             reconnect_requested: Arc::new(tokio::sync::Notify::new()),
             registration_in_progress: Arc::new(AtomicBool::new(false)),
+            gui_lifetime: GuiLifetime::new(gui_shutdown.clone()),
+            gui_shutdown,
         }
     }
 
@@ -463,6 +476,7 @@ impl GrpcSessionDriver {
             enrollment_ready: Arc::clone(&self.enrollment_ready),
             reconnect_requested: Arc::clone(&self.reconnect_requested),
             registration_in_progress: Arc::clone(&self.registration_in_progress),
+            gui_lifetime: self.gui_lifetime.clone(),
         }
     }
 
@@ -808,6 +822,10 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
     if !driver.is_registered()? {
         tokio::select! {
             result = driver.wait_until_registered() => result?,
+            _ = driver.gui_shutdown.cancelled() => {
+                local_control.abort();
+                return shutdown_from_gui_lifecycle(&driver, &mut supervisor);
+            }
             result = &mut local_control => return match result {
                 Ok(never) => match never {},
                 Err(error) => Err(AgentError::new("local.runtime_join_failed", error.to_string())),
@@ -815,12 +833,20 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
         }
     }
     #[cfg(windows)]
-    let result = tokio::select! {
-        result = supervisor.run(&driver) => result,
-        result = local_control => match result {
-            Ok(never) => match never {},
-            Err(error) => Err(AgentError::new("local.runtime_join_failed", error.to_string())),
-        },
+    let result = {
+        let mut supervisor_run = Box::pin(supervisor.run(&driver));
+        tokio::select! {
+            result = &mut supervisor_run => result,
+            _ = driver.gui_shutdown.cancelled() => {
+                drop(supervisor_run);
+                local_control.abort();
+                return shutdown_from_gui_lifecycle(&driver, &mut supervisor);
+            }
+            result = local_control => match result {
+                Ok(never) => match never {},
+                Err(error) => Err(AgentError::new("local.runtime_join_failed", error.to_string())),
+            },
+        }
     };
     #[cfg(not(windows))]
     let result = supervisor.run(&driver).await;
@@ -828,6 +854,28 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
         Ok(never) => match never {},
         Err(error) => Err(error),
     }
+}
+
+#[cfg(windows)]
+fn shutdown_from_gui_lifecycle(
+    driver: &GrpcSessionDriver,
+    supervisor: &mut SessionSupervisor<RuntimeSafetyHooks>,
+) -> Result<(), AgentError> {
+    let reason = driver.gui_lifetime.exit_reason()?.ok_or_else(|| {
+        AgentError::new(
+            "local.lifecycle.shutdown_missing",
+            "GUI lifecycle shutdown was requested without a reason",
+        )
+    })?;
+    if let Ok(mut state) = driver.state.lock() {
+        state.record(
+            LogLevel::Info,
+            "GUI lifecycle ended; Agent is shutting down safely",
+        );
+    }
+    tracing::info!(?reason, "GUI lifecycle requested safe Agent shutdown");
+    let _ = supervisor.handle_control_failure()?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -876,16 +924,29 @@ struct SharedRuntime {
     enrollment_ready: Arc<tokio::sync::Notify>,
     reconnect_requested: Arc<tokio::sync::Notify>,
     registration_in_progress: Arc<AtomicBool>,
+    gui_lifetime: GuiLifetime,
 }
 
 #[cfg(any(windows, test))]
 impl LocalControlRuntime for SharedRuntime {
-    fn execute(&mut self, command: &LocalCommand) -> Result<serde_json::Value, AgentError> {
+    fn execute(
+        &mut self,
+        caller: &fairypam_agent_windows::VerifiedPipeCaller,
+        command: &LocalCommand,
+    ) -> Result<serde_json::Value, AgentError> {
         match command {
+            LocalCommand::BindUiLifetime => {
+                self.gui_lifetime.bind(caller.pid)?;
+                Ok(serde_json::json!({"state": "bound"}))
+            }
+            LocalCommand::ShutdownAgent => {
+                self.gui_lifetime.request_shutdown(caller.pid)?;
+                Ok(serde_json::json!({"state": "shutting_down"}))
+            }
             LocalCommand::GetConnectionStatus => self.connection_status(),
             LocalCommand::RunEnvironmentCheck => self.environment_check(),
             LocalCommand::GetLogTail { lines, level } => self.log_tail(*lines, level),
-            LocalCommand::ScanInstalledGames => observability::scan_installed_games(),
+            LocalCommand::ScanInstalledGames => self.scan_installed_games(),
             #[cfg(windows)]
             LocalCommand::RegisterHub {
                 hub_address,
@@ -1037,18 +1098,21 @@ impl SharedRuntime {
             let state = self.state.lock().map_err(lock_error)?;
             (state.control_state, state.frame_state)
         };
-        let (profiles_configured, certificate_ready) = {
+        let (awaiting_enrollment, profiles_configured, certificate_ready, games_available) = {
             let config = self.config.lock().map_err(lock_error)?;
             let certificate_paths = [
                 config.transport.ca_pem.clone(),
                 config.transport.identity_cert_pem.clone(),
                 config.transport.identity_key_pem.clone(),
             ];
+            let games_available = observability::scan_installed_games(&config.profiles).is_ok();
             (
+                config.awaiting_enrollment,
                 !config.profiles.ids().is_empty(),
                 certificate_paths
                     .into_iter()
                     .all(|path| regular_nonempty_file(&path)),
+                games_available,
             )
         };
         let binary_ready = std::env::current_exe()
@@ -1059,7 +1123,7 @@ impl SharedRuntime {
                 regular_nonempty_file(&directory.join("fairypam-agent-guardian.exe"))
             })
         });
-        let (game_status, game_code) = if observability::scan_installed_games().is_ok() {
+        let (game_status, game_code) = if games_available {
             ("available", "game.discovery_ready")
         } else {
             ("unavailable", "game.discovery_unavailable")
@@ -1072,25 +1136,45 @@ impl SharedRuntime {
                 "recovery": "Check Agent registration and Hub reachability",
             })
         };
-        Ok(serde_json::json!({"checks": [
-            {"id": "binary_or_task", "status": if binary_ready { "available" } else { "unavailable" }, "code": if binary_ready { "agent.binary_available" } else { "agent.binary_unavailable" }, "recovery": "Repair the Agent installation if the production binary is unavailable"},
-            {"id": "agent", "status": "available", "code": "agent.running", "recovery": "No action required"},
-            {"id": "certificate", "status": if certificate_ready { "available" } else { "unavailable" }, "code": if certificate_ready { "runtime.certificate_files_available" } else { "runtime.certificate_unavailable" }, "recovery": "Re-enroll if the Agent cannot connect"},
-            check("control", control_state),
-            check("frame", frame_state),
-            {"id": "guardian", "status": if guardian_ready { "available" } else { "unavailable" }, "code": if guardian_ready { "guardian.binary_available" } else { "guardian.binary_unavailable" }, "recovery": "Repair the Agent installation if the Guardian binary is unavailable"},
-            {"id": "profiles", "status": if profiles_configured { "available" } else { "unavailable" }, "code": if profiles_configured { "profile.available" } else { "profile.unavailable" }, "recovery": "Install a signed Profile before selecting a target"},
-            {"id": "game_discovery", "status": game_status, "code": game_code, "recovery": "Rescan installed games if the launcher was updated"}
-        ]}))
+        let registration_ready = binary_ready && guardian_ready;
+        let enrollment_check = |id: &str, status: ConnectionState| {
+            if awaiting_enrollment {
+                serde_json::json!({"id": id, "status": "pending", "code": "enrollment.required", "recovery": "Register the Agent before checking Hub connectivity"})
+            } else {
+                check(id, status)
+            }
+        };
+        Ok(
+            serde_json::json!({"registration_ready": registration_ready, "checks": [
+                {"id": "binary_or_task", "status": if binary_ready { "available" } else { "unavailable" }, "code": if binary_ready { "agent.binary_available" } else { "agent.binary_unavailable" }, "recovery": "Repair the Agent installation if the production binary is unavailable"},
+                {"id": "agent", "status": "available", "code": "agent.running", "recovery": "No action required"},
+                {"id": "certificate", "status": if awaiting_enrollment { "pending" } else if certificate_ready { "available" } else { "unavailable" }, "code": if awaiting_enrollment { "enrollment.required" } else if certificate_ready { "runtime.certificate_files_available" } else { "runtime.certificate_unavailable" }, "recovery": "Register or re-enroll if the Agent cannot connect"},
+                enrollment_check("control", control_state),
+                enrollment_check("frame", frame_state),
+                {"id": "guardian", "status": if guardian_ready { "available" } else { "unavailable" }, "code": if guardian_ready { "guardian.binary_available" } else { "guardian.binary_unavailable" }, "recovery": "Repair the Agent installation if the Guardian binary is unavailable"},
+                {"id": "profiles", "status": if profiles_configured { "available" } else { "unavailable" }, "code": if profiles_configured { "profile.available" } else { "profile.unavailable" }, "recovery": "Install a signed Profile before selecting a target"},
+                {"id": "game_discovery", "status": game_status, "code": game_code, "recovery": "Rescan installed games if the launcher was updated"}
+            ]}),
+        )
     }
 
     fn log_tail(&self, lines: u16, level: &LogLevel) -> Result<serde_json::Value, AgentError> {
-        let mut state = self.state.lock().map_err(lock_error)?;
-        Ok(observability::log_tail_json(
-            state.logs.make_contiguous(),
-            lines,
-            level,
-        ))
+        #[cfg(windows)]
+        return observability::production_log()?.tail(lines, level);
+        #[cfg(not(windows))]
+        {
+            let mut state = self.state.lock().map_err(lock_error)?;
+            Ok(observability::log_tail_json(
+                state.logs.make_contiguous(),
+                lines,
+                level,
+            ))
+        }
+    }
+
+    fn scan_installed_games(&self) -> Result<serde_json::Value, AgentError> {
+        let config = self.config.lock().map_err(lock_error)?;
+        observability::scan_installed_games(&config.profiles)
     }
 }
 
@@ -1599,6 +1683,7 @@ pub async fn run_dev_local() -> Result<(), AgentError> {
             enrollment_ready: Arc::new(tokio::sync::Notify::new()),
             reconnect_requested: Arc::new(tokio::sync::Notify::new()),
             registration_in_progress: Arc::new(AtomicBool::new(false)),
+            gui_lifetime: GuiLifetime::new(CancellationToken::new()),
         },
         config,
     )
@@ -1782,8 +1867,19 @@ fn now_unix_ms() -> i64 {
 mod tests {
     use fairypam_agent_local_protocol::LocalCommand;
     use fairypam_agent_protocol::v1::{CloseTarget, FocusTarget, HubControlCommand};
+    use fairypam_agent_windows::{IntegrityLevel, VerifiedPipeCaller};
 
     use super::*;
+
+    fn local_caller() -> VerifiedPipeCaller {
+        VerifiedPipeCaller {
+            pid: 7,
+            user_sid: "S-1-5-21-owner".to_owned(),
+            logon_sid: "S-1-5-5-owner".to_owned(),
+            session_id: 1,
+            integrity: IntegrityLevel::Medium,
+        }
+    }
 
     #[test]
     fn production_runtime_is_explicitly_dry_run_for_remote_actions() {
@@ -1862,9 +1958,25 @@ mod tests {
 
         assert!(!driver.is_registered().unwrap());
         assert_eq!(
-            local.execute(&LocalCommand::GetConnectionStatus).unwrap()["hub_address"],
+            local
+                .execute(&local_caller(), &LocalCommand::GetConnectionStatus)
+                .unwrap()["hub_address"],
             ""
         );
+        let diagnostics = local
+            .execute(&local_caller(), &LocalCommand::RunEnvironmentCheck)
+            .unwrap();
+        for id in ["certificate", "control", "frame"] {
+            assert_eq!(
+                diagnostics["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|check| check["id"] == id)
+                    .unwrap()["status"],
+                "pending"
+            );
+        }
 
         let mut enrolled = RuntimeConfig::unregistered();
         enrolled.transport.control_endpoint = "https://hub.example/control".parse().unwrap();
@@ -1881,7 +1993,9 @@ mod tests {
 
         assert!(driver.is_registered().unwrap());
         assert_eq!(
-            local.execute(&LocalCommand::GetConnectionStatus).unwrap()["hub_address"],
+            local
+                .execute(&local_caller(), &LocalCommand::GetConnectionStatus)
+                .unwrap()["hub_address"],
             "https://hub.example"
         );
 

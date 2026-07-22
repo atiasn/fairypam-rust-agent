@@ -56,6 +56,7 @@ pub struct EnvironmentCheckItemDto {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentCheckDto {
+    pub registration_ready: bool,
     pub checks: Vec<EnvironmentCheckItemDto>,
 }
 

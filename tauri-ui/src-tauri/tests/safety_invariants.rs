@@ -66,14 +66,14 @@ fn production_ui_cannot_arm_inject_or_reset_emergency() {
 }
 
 #[test]
-fn registration_proves_the_elevated_same_logon_pipe_server_before_dispatch() {
+fn registration_proves_the_elevated_pipe_server_before_dispatch() {
     for required in [
         "GetNamedPipeServerProcessId",
         "server_sid_mismatch",
-        "server_logon_session_mismatch",
         "server_session_mismatch",
         "SECURITY_MANDATORY_HIGH_RID",
         "server_image_mismatch",
+        "UAC `runas` produces a split token",
     ] {
         assert!(
             WINDOWS_PIPE_CLIENT.contains(required),

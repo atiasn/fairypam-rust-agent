@@ -62,6 +62,8 @@ pub enum LocalCommand {
         level: LogLevel,
     },
     ScanInstalledGames,
+    BindUiLifetime,
+    ShutdownAgent,
     RegisterHub {
         hub_address: String,
         registration_code: String,
@@ -448,6 +450,8 @@ fn is_supported_command(command: &str) -> bool {
         | "run_environment_check"
         | "get_log_tail"
         | "scan_installed_games"
+        | "bind_ui_lifetime"
+        | "shutdown_agent"
         | "register_hub" => true,
         #[cfg(feature = "dev-automation")]
         "testbed_pulse" => true,

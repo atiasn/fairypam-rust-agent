@@ -101,8 +101,10 @@ pub async fn ensure_local_agent(
     {
         let deadline = Instant::now() + PIPE_STARTUP_LIMIT;
         match state.status_with_timeout(Duration::from_secs(1)).await {
-            Ok(_) => return observe_hub(&state).await,
-            Err(error) if error.code == "local.transport.pipe_not_found" => {}
+            Ok(_) => return bind_and_observe_hub(&state).await,
+            Err(error) if error.code == "local.transport.pipe_not_found" => {
+                state.clear_ui_lifetime_binding();
+            }
             Err(error) => return Err(error),
         }
 
@@ -121,7 +123,7 @@ pub async fn ensure_local_agent(
                 .status_with_timeout(remaining.min(Duration::from_secs(1)))
                 .await
             {
-                Ok(_) => return observe_hub(&state).await,
+                Ok(_) => return bind_and_observe_hub(&state).await,
                 Err(error) if error.code == "local.transport.pipe_not_found" => {}
                 Err(error) => return Err(error),
             }
@@ -139,6 +141,12 @@ pub async fn ensure_local_agent(
             "FairyPam Agent startup requires Windows",
         ))
     }
+}
+
+#[cfg(windows)]
+async fn bind_and_observe_hub(state: &ProductionGateway) -> CommandResult<SupportStatusDto> {
+    state.bind_ui_lifetime().await?;
+    observe_hub(state).await
 }
 
 #[cfg(windows)]

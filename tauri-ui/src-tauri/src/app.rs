@@ -1,13 +1,39 @@
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    webview::NewWindowResponse,
     Manager, WindowEvent,
 };
 
-use crate::{commands, local_gateway::ProductionGateway};
+use std::time::Duration;
+
+use crate::{
+    commands,
+    gui_single_instance::{GuiInstance, GuiSingleInstance},
+    local_gateway::ProductionGateway,
+};
+
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const BLOCK_PAGE_SURFACES: &str = "for (const event of ['contextmenu', 'dragenter', 'dragover', 'drop']) { window.addEventListener(event, (value) => value.preventDefault(), { capture: true }); }";
 
 pub fn run() -> tauri::Result<()> {
+    let instance = match GuiSingleInstance::acquire()? {
+        GuiInstance::Primary(instance) => instance,
+        GuiInstance::Existing => {
+            crate::gui_single_instance::activate_existing();
+            return Ok(());
+        }
+    };
+    let mut context = tauri::generate_context!();
+    for window in &mut context.config_mut().app.windows {
+        if window.label == "main" {
+            window.create = false;
+            window.drag_drop_enabled = false;
+        }
+    }
+
     tauri::Builder::default()
+        .manage(instance)
         .manage(ProductionGateway::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_overview,
@@ -19,6 +45,14 @@ pub fn run() -> tauri::Result<()> {
             commands::ensure_local_agent,
         ])
         .setup(|app| {
+            let main_config = &app.config().app.windows[0];
+            let main_window = tauri::WebviewWindowBuilder::from_config(app.handle(), main_config)?
+                .on_navigation(allows_application_navigation)
+                .on_new_window(|_, _| NewWindowResponse::Deny)
+                .initialization_script(BLOCK_PAGE_SURFACES)
+                .build()?;
+            disable_default_context_menu(&main_window);
+
             let show_main = MenuItemBuilder::with_id("show-main", "显示主窗口").build(app)?;
             let exit_ui = MenuItemBuilder::with_id("exit-ui", "退出界面").build(app)?;
             let menu = MenuBuilder::new(app)
@@ -29,7 +63,7 @@ pub fn run() -> tauri::Result<()> {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show-main" => show_main_window(app),
-                    "exit-ui" => app.exit(0),
+                    "exit-ui" => shutdown_bound_agent_then_exit(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -53,7 +87,37 @@ pub fn run() -> tauri::Result<()> {
                 }
             }
         })
-        .run(tauri::generate_context!())
+        .run(context)
+}
+
+fn allows_application_navigation(url: &tauri::Url) -> bool {
+    url.scheme() == "tauri"
+        || (cfg!(debug_assertions)
+            && url.scheme() == "http"
+            && url.host_str() == Some("127.0.0.1"))
+}
+
+fn disable_default_context_menu(window: &tauri::WebviewWindow) {
+    let _ = window.with_webview(|webview| {
+        #[cfg(windows)]
+        unsafe {
+            if let Ok(core) = webview.controller().CoreWebView2() {
+                if let Ok(settings) = core.Settings() {
+                    let _ = settings.SetAreDefaultContextMenusEnabled(false);
+                }
+            }
+        }
+    });
+}
+
+fn shutdown_bound_agent_then_exit(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let gateway = app.state::<ProductionGateway>();
+        let _ = gateway.shutdown_bound_agent().await;
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
+        app.exit(0);
+    });
 }
 
 fn show_main_window(app: &tauri::AppHandle) {

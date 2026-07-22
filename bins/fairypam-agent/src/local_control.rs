@@ -13,13 +13,21 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 impl LocalControlRuntime for crate::execution::CommandExecutor {
-    fn execute(&mut self, command: &LocalCommand) -> Result<Value, AgentError> {
+    fn execute(
+        &mut self,
+        _caller: &VerifiedPipeCaller,
+        command: &LocalCommand,
+    ) -> Result<Value, AgentError> {
         self.execute_local(command)
     }
 }
 
 pub trait LocalControlRuntime {
-    fn execute(&mut self, command: &LocalCommand) -> Result<Value, AgentError>;
+    fn execute(
+        &mut self,
+        caller: &VerifiedPipeCaller,
+        command: &LocalCommand,
+    ) -> Result<Value, AgentError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,7 +84,7 @@ impl<R: LocalControlRuntime, A: AuditSink> LocalControlAdapter<R, A> {
         verify_pipe_caller(&self.owner, caller.clone())?;
 
         #[cfg(windows)]
-        if matches!(&request.command, LocalCommand::RegisterHub { .. }) {
+        if requires_fixed_gui(&request.command) {
             if let Err(error) = verify_fixed_gui_caller(caller.pid) {
                 let _ = self.audit.record(AuditEvent {
                     request_id: request.request_id.clone(),
@@ -132,7 +140,10 @@ impl<R: LocalControlRuntime, A: AuditSink> LocalControlAdapter<R, A> {
                 ));
             }
         }
-        let result = self.runtime.execute(&request.command).map_err(domain_error);
+        let result = self
+            .runtime
+            .execute(caller, &request.command)
+            .map_err(domain_error);
         let mut response = match result {
             Ok(body) => ResponseEnvelope {
                 request_id: request.request_id.clone(),
@@ -205,6 +216,8 @@ fn is_mutation(command: &LocalCommand) -> bool {
         | LocalCommand::StartCapture { .. }
         | LocalCommand::StopCapture { .. }
         | LocalCommand::ReleaseAll
+        | LocalCommand::BindUiLifetime
+        | LocalCommand::ShutdownAgent
         | LocalCommand::RegisterHub { .. } => true,
         #[cfg(feature = "dev-automation")]
         LocalCommand::TestbedPulse => true,
@@ -231,8 +244,20 @@ fn command_name(command: &LocalCommand) -> &'static str {
         LocalCommand::RunEnvironmentCheck => "run_environment_check",
         LocalCommand::GetLogTail { .. } => "get_log_tail",
         LocalCommand::ScanInstalledGames => "scan_installed_games",
+        LocalCommand::BindUiLifetime => "bind_ui_lifetime",
+        LocalCommand::ShutdownAgent => "shutdown_agent",
         LocalCommand::RegisterHub { .. } => "register_hub",
     }
+}
+
+#[cfg(windows)]
+fn requires_fixed_gui(command: &LocalCommand) -> bool {
+    matches!(
+        command,
+        LocalCommand::RegisterHub { .. }
+            | LocalCommand::BindUiLifetime
+            | LocalCommand::ShutdownAgent
+    )
 }
 
 fn sha256_hex(value: &str) -> String {

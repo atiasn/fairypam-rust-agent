@@ -163,9 +163,15 @@ fn verify_fixed_agent_server(
     if server.user_sid != current.user_sid {
         return Err(LocalClientError::identity("server_sid_mismatch"));
     }
-    if server.logon_sid != current.logon_sid {
-        return Err(LocalClientError::identity("server_logon_session_mismatch"));
-    }
+    // NOTE: `server.logon_sid != current.logon_sid` is intentionally NOT checked.
+    // UAC `runas` produces a split token: the elevated sibling Agent receives a
+    // fresh Logon Identifier (Statistics.AuthenticationId) while the unelevated
+    // GUI keeps the original logon. Comparing those values always rejects the
+    // legitimate product flow. The remaining checks (same user SID, same
+    // Windows session, high integrity + elevated token, sibling Agent image,
+    // protected Program Files install) already bind the pipe peer to the
+    // sibling Agent the GUI just spawned, so an attacker cannot substitute a
+    // different logon session. See `product-live-start-diagnosis:01`.
     if server.session_id != current.session_id {
         return Err(LocalClientError::identity("server_session_mismatch"));
     }

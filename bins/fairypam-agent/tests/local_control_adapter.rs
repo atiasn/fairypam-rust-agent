@@ -14,7 +14,11 @@ struct FakeRuntime {
 }
 
 impl LocalControlRuntime for FakeRuntime {
-    fn execute(&mut self, command: &LocalCommand) -> Result<Value, AgentError> {
+    fn execute(
+        &mut self,
+        _caller: &VerifiedPipeCaller,
+        command: &LocalCommand,
+    ) -> Result<Value, AgentError> {
         self.calls += 1;
         if matches!(command, LocalCommand::ReleaseAll) {
             self.released += 1;
@@ -24,6 +28,35 @@ impl LocalControlRuntime for FakeRuntime {
         }
         Ok(json!({"authorization":"deny_all"}))
     }
+}
+
+#[test]
+fn gui_lifecycle_commands_are_mutations_and_replay_is_rejected() {
+    let mut adapter = LocalControlAdapter::new(
+        owner(),
+        FakeRuntime::default(),
+        MemoryAudit::default(),
+        "build-1",
+    );
+
+    let response = adapter
+        .handle(&caller(), request(LocalCommand::BindUiLifetime, 31))
+        .unwrap();
+    assert!(response.result.is_ok());
+
+    let replay = adapter
+        .handle(&caller(), request(LocalCommand::BindUiLifetime, 31))
+        .unwrap();
+    assert_eq!(
+        replay.result.unwrap_err().code,
+        "local.protocol.nonce_replayed"
+    );
+
+    let (_, audit) = adapter.into_parts();
+    assert_eq!(audit.0[0].command, "bind_ui_lifetime");
+    assert_eq!(audit.0[0].result_code, "attempt");
+    assert_eq!(audit.0[1].result_code, "ok");
+    assert_eq!(audit.0[2].result_code, "local.protocol.nonce_replayed");
 }
 
 #[derive(Default)]
@@ -86,10 +119,6 @@ fn rejects_mismatched_identity_before_runtime_dispatch() {
     for caller in [
         VerifiedPipeCaller {
             user_sid: "S-1-5-21-other".to_owned(),
-            ..caller()
-        },
-        VerifiedPipeCaller {
-            logon_sid: "S-1-5-5-other".to_owned(),
             ..caller()
         },
         VerifiedPipeCaller {

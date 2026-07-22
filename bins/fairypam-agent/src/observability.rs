@@ -1,11 +1,127 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+};
 
 use fairypam_agent_core::AgentError;
 use fairypam_agent_local_protocol::LogLevel;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+use crate::profile_store::ProfileStore;
+
+const MAX_LOG_BYTES: u64 = 256 * 1024;
+const MAX_LOG_FILES: u8 = 3;
+const LOG_FILE: &str = "agent.log";
+
+pub struct FixedLog {
+    root: PathBuf,
+}
+
+impl FixedLog {
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, AgentError> {
+        let root = root.into();
+        let metadata = root.symlink_metadata().map_err(log_root_error)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(log_root_unavailable());
+        }
+        Ok(Self { root })
+    }
+
+    pub fn append(&self, level: LogLevel, message: &str) -> Result<(), AgentError> {
+        let record = AgentLogRecord::new(level, redact_log_line(message));
+        let line = serde_json::to_string(&json!({
+            "level": log_level_name(&record.level),
+            "message": record.message,
+        }))
+        .map_err(|_| AgentError::new("local.log_write_failed", "Agent log cannot be encoded"))?;
+        self.rotate_if_needed(line.len() as u64 + 1)?;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path(0))
+            .and_then(|mut file| writeln!(file, "{line}"))
+            .map_err(|_| AgentError::new("local.log_write_failed", "Agent log cannot be persisted"))
+    }
+
+    pub fn tail(&self, lines: u16, level: &LogLevel) -> Result<Value, AgentError> {
+        let mut records = Vec::new();
+        for index in (0..MAX_LOG_FILES).rev() {
+            let path = self.path(index);
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
+                let value = serde_json::from_str::<Value>(&line).ok();
+                let Some(value) = value else { continue };
+                let Some(level) = value
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .and_then(parse_log_level)
+                else {
+                    continue;
+                };
+                let Some(message) = value.get("message").and_then(Value::as_str) else {
+                    continue;
+                };
+                records.push(AgentLogRecord::new(level, message));
+            }
+        }
+        Ok(log_tail_json(&records, lines, level))
+    }
+
+    fn rotate_if_needed(&self, incoming: u64) -> Result<(), AgentError> {
+        let current = self.path(0);
+        let size = current
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if size.saturating_add(incoming) <= MAX_LOG_BYTES {
+            return Ok(());
+        }
+        for index in (1..MAX_LOG_FILES).rev() {
+            let source = self.path(index);
+            let target = self.path(index + 1);
+            if source.exists() {
+                let _ = fs::remove_file(&target);
+                fs::rename(source, target).map_err(|_| log_root_unavailable())?;
+            }
+        }
+        if current.exists() {
+            fs::rename(current, self.path(1)).map_err(|_| log_root_unavailable())?;
+        }
+        Ok(())
+    }
+
+    fn path(&self, index: u8) -> PathBuf {
+        match index {
+            0 => self.root.join(LOG_FILE),
+            _ => self.root.join(format!("{LOG_FILE}.{index}")),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn production_log() -> Result<FixedLog, AgentError> {
+    let root = PathBuf::from(r"C:\ProgramData\FairyPam\Agent\logs");
+    crate::enrollment::ensure_private_directory(&root)?;
+    FixedLog::open(root)
+}
+
+fn log_root_error(_: std::io::Error) -> AgentError {
+    log_root_unavailable()
+}
+
+fn log_root_unavailable() -> AgentError {
+    AgentError::new(
+        "local.log_root_unavailable",
+        "protected Agent log directory is unavailable",
+    )
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentLogRecord {
@@ -63,9 +179,9 @@ pub fn log_tail_json(records: &[AgentLogRecord], lines: u16, level: &LogLevel) -
     json!({"entries": entries})
 }
 
-pub fn scan_installed_games() -> Result<Value, AgentError> {
+pub fn scan_installed_games(profiles: &ProfileStore) -> Result<Value, AgentError> {
     let entries = registry_entries()?;
-    Ok(json!({"games": scan_entries(&entries)}))
+    Ok(json!({"games": scan_entries(&entries, profiles)}))
 }
 
 #[derive(Default)]
@@ -113,7 +229,7 @@ const KNOWN_GAMES: &[KnownGame] = &[
     },
 ];
 
-fn scan_entries(entries: &[RegistryEntry]) -> Vec<Value> {
+fn scan_entries(entries: &[RegistryEntry], profiles: &ProfileStore) -> Vec<Value> {
     let mut seen = HashSet::new();
     entries
         .iter()
@@ -145,12 +261,23 @@ fn scan_entries(entries: &[RegistryEntry]) -> Vec<Value> {
                 "name": entry.display_name.as_deref().unwrap_or(known.display_name),
                 "version": version,
                 "installed": installed,
-                // ponytail: discovery remains non-launchable until a signed executable
-                // identity is available; add a verifier before enabling this capability.
-                "supported": false,
+                "supported": installed && profile_supports_process(profiles, known.process_name),
             }))
         })
         .collect()
+}
+
+fn profile_supports_process(profiles: &ProfileStore, process_name: &str) -> bool {
+    profiles.ids().iter().any(|profile_id| {
+        profiles.get(profile_id).is_ok_and(|profile| {
+            profile
+                .profile()
+                .target
+                .process_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(process_name))
+        })
+    })
 }
 
 fn trusted_executable(executable: &Path) -> bool {
@@ -224,6 +351,15 @@ fn log_level_name(level: &LogLevel) -> &'static str {
         LogLevel::Error => "error",
         LogLevel::Warn => "warn",
         LogLevel::Info => "info",
+    }
+}
+
+fn parse_log_level(value: &str) -> Option<LogLevel> {
+    match value {
+        "error" => Some(LogLevel::Error),
+        "warn" => Some(LogLevel::Warn),
+        "info" => Some(LogLevel::Info),
+        _ => None,
     }
 }
 
@@ -413,7 +549,66 @@ fn registry_entries() -> Result<Vec<RegistryEntry>, AgentError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use fairypam_agent_core::profile::{
+        profile_content_sha256, verify_profile, ActionDefinition, CaptureRegion, CaptureSource,
+        Profile, ProfileContent, ProfileEnvelope, SignatureVerifier, TargetRules,
+    };
+
     use super::*;
+
+    struct TestRoot;
+
+    impl SignatureVerifier for TestRoot {
+        fn verify(&self, _digest: &[u8; 32], signature: &str) -> bool {
+            signature == "test-signature"
+        }
+    }
+
+    fn signed_profile_for(process_name: &str) -> ProfileStore {
+        let content = ProfileContent {
+            schema_version: 1,
+            profile: Profile {
+                id: "profile-a".into(),
+                version: "1.0.0".into(),
+                display_name: "Profile A".into(),
+                target: TargetRules {
+                    process_names: vec![process_name.into()],
+                    process_path_sha256: vec!["aa".repeat(32)],
+                    window_classes: vec!["GameWindow".into()],
+                    title_patterns: vec!["Game".into()],
+                    require_elevated: false,
+                    minimum_client_width: 1,
+                    minimum_client_height: 1,
+                    minimum_dpi: 96,
+                },
+                capture_sources: vec![CaptureSource {
+                    id: "client".into(),
+                    region: CaptureRegion::FullClient,
+                    maximum_fps: 1,
+                    encodings: vec!["jpeg".into()],
+                }],
+                actions: BTreeMap::from([(
+                    "movement.forward".into(),
+                    ActionDefinition::Hold { scan_code: 17 },
+                )]),
+            },
+            files: Vec::new(),
+        };
+        let content_sha256 = profile_content_sha256(&content).unwrap();
+        let verified = verify_profile(
+            &serde_json::to_vec(&ProfileEnvelope {
+                content,
+                content_sha256,
+                signature: "test-signature".into(),
+            })
+            .unwrap(),
+            &TestRoot,
+        )
+        .unwrap();
+        ProfileStore::from_verified_profiles([verified]).unwrap()
+    }
 
     #[test]
     fn discovery_id_is_stable_and_does_not_expose_the_install_path() {
@@ -436,7 +631,7 @@ mod tests {
             install_location: Some(root.display().to_string()),
             uninstall_string: Some("uninstall.exe --uninstall_game=hk4e_cn".into()),
         }];
-        let games = scan_entries(&entries);
+        let games = scan_entries(&entries, &ProfileStore::default());
         let first = games.first().expect("known game is discovered");
         assert_eq!(
             first["discovery_id"],
@@ -450,6 +645,14 @@ mod tests {
         assert_eq!(first["supported"], false);
         assert!(!first.to_string().contains(root.to_string_lossy().as_ref()));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn game_support_requires_a_verified_profile_process_mapping() {
+        let profiles = signed_profile_for("YuanShen.exe");
+
+        assert!(profile_supports_process(&profiles, "yuanshen.exe"));
+        assert!(!profile_supports_process(&profiles, "StarRail.exe"));
     }
 
     #[test]
@@ -468,6 +671,31 @@ mod tests {
         );
         assert!(!tail.to_string().contains("secret"));
         assert!(!tail.to_string().contains("ProgramData"));
+    }
+
+    #[test]
+    fn persistent_log_redacts_and_rotates_within_a_fixed_bound() {
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-fixed-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = FixedLog::open(&root).unwrap();
+        log.append(LogLevel::Info, "token=must-not-appear").unwrap();
+        assert_eq!(
+            log.tail(10, &LogLevel::Info).unwrap()["entries"][0]["message"],
+            "[redacted agent log content]"
+        );
+
+        std::fs::write(root.join(LOG_FILE), vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
+        log.append(LogLevel::Info, "rotation check").unwrap();
+        assert!(root.join(LOG_FILE).is_file());
+        assert!(root.join(format!("{LOG_FILE}.1")).is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -492,7 +720,7 @@ mod tests {
             install_location: Some(r"C:\\attacker".into()),
             uninstall_string: Some("uninstall.exe --uninstall_game=hk4e_cn".into()),
         }];
-        assert!(scan_entries(&user_entries).is_empty());
+        assert!(scan_entries(&user_entries, &ProfileStore::default()).is_empty());
 
         let root = std::env::temp_dir().join(format!("fairypam-reparse-{}", std::process::id()));
         let target = root.join("target");
