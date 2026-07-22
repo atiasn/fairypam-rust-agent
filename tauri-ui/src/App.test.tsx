@@ -132,6 +132,23 @@ describe('App', () => {
 
   });
 
+  it('注册请求失败时清除注册码且不显示拒绝详情', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.registerHub).mockRejectedValueOnce(new Error('registration-code=not-for-display'));
+    const app = renderApp();
+    const view = within(app.container);
+
+    await user.click(view.getByRole('button', { name: '连接与注册' }));
+    await user.clear(view.getByLabelText('服务地址'));
+    await user.type(view.getByLabelText('服务地址'), 'https://register.example');
+    await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
+    await user.click(view.getByRole('button', { name: '注册或重新注册' }));
+
+    expect(await view.findByText('注册请求未提交。请确认后台服务已就绪后重试。')).toBeInTheDocument();
+    expect(view.getByLabelText('一次性注册码')).toHaveValue('');
+    expect(view.queryByText('registration-code=not-for-display')).not.toBeInTheDocument();
+  });
+
   it('将自动环境检查映射为中文结果且不暴露机器代码', async () => {
     const user = userEvent.setup();
     vi.mocked(agentApi.runEnvironmentCheck).mockResolvedValueOnce({

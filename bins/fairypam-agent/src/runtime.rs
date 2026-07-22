@@ -466,13 +466,28 @@ impl RuntimeLogMessage {
     }
 }
 
+fn registration_failure_code(code: &str) -> &'static str {
+    match code {
+        "enrollment.elevation_required" => "enrollment.elevation_required",
+        "enrollment.request_invalid" => "enrollment.request_invalid",
+        "enrollment.network_failed" => "enrollment.network_failed",
+        "enrollment.failed" => "enrollment.failed",
+        "runtime.enrollment_invalid" => "runtime.enrollment_invalid",
+        "runtime.state_poisoned" => "runtime.state_poisoned",
+        _ => "enrollment.failed",
+    }
+}
+
 impl RuntimeState {
     fn record(&mut self, level: LogLevel, message: RuntimeLogMessage) {
         self.record_text(level, message.text());
     }
 
     fn record_registration_failure(&mut self, code: &str) {
-        self.record_text(LogLevel::Warn, &format!("服务注册失败（错误码：{code}）"));
+        self.record_text(
+            LogLevel::Warn,
+            &format!("服务注册失败（错误码：{}）", registration_failure_code(code)),
+        );
     }
 
     fn record_text(&mut self, level: LogLevel, message: &str) {
@@ -1914,6 +1929,18 @@ mod tests {
     use fairypam_agent_windows::{IntegrityLevel, VerifiedPipeCaller};
 
     use super::*;
+
+    #[test]
+    fn registration_failure_log_code_is_whitelisted() {
+        assert_eq!(
+            registration_failure_code("enrollment.network_failed"),
+            "enrollment.network_failed"
+        );
+        assert_eq!(
+            registration_failure_code("registration-code=not-for-log"),
+            "enrollment.failed"
+        );
+    }
 
     fn local_caller() -> VerifiedPipeCaller {
         VerifiedPipeCaller {

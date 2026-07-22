@@ -53,6 +53,10 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
     const hubAddress = data.get('hubAddress');
     const registrationCode = data.get('registrationCode');
     if (typeof hubAddress !== 'string' || typeof registrationCode !== 'string') return;
+    const clearRegistrationCode = () => {
+      const input = form.elements.namedItem('registrationCode');
+      if (input instanceof HTMLInputElement) input.value = '';
+    };
 
     setRegistrationStatus('submitting');
     void agentApi.registerHub(hubAddress.trim(), registrationCode).then(
@@ -65,7 +69,10 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
           queryClient.invalidateQueries({ queryKey: ['agent-ui', 'log-tail'] }),
         ]);
       },
-      () => setRegistrationStatus('error'),
+      () => {
+        clearRegistrationCode();
+        setRegistrationStatus('error');
+      },
     );
   };
 
