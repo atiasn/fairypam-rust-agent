@@ -34,7 +34,7 @@ impl GuiSingleInstance {
                 let _ = unsafe { CloseHandle(handle) };
                 return Ok(GuiInstance::Existing);
             }
-            return Ok(GuiInstance::Primary(Self {
+            Ok(GuiInstance::Primary(Self {
                 handle: handle.0 as usize,
             }));
         }
