@@ -535,6 +535,22 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
             "Windows API error capture must use System ?e followed immediately by Pop: {error_capture}"
         );
     }
+    let activation_hook = &nsis_hooks[nsis_hooks
+        .find("!macro NSIS_HOOK_ACTIVATE")
+        .expect("installer must define its activation hook")..];
+    let restore_handle = activation_hook
+        .find("StrCpy $R6 $FairyPamStageHandle\n  System::Call 'kernel32::CloseHandle(p R6) i.R9 ?e'\n  Pop $R5")
+        .expect("activation must restore the pinned handle through the System register source and capture a close failure");
+    let clear_handle = activation_hook[restore_handle..]
+        .find("StrCpy $FairyPamStageHandle 0")
+        .map(|offset| restore_handle + offset)
+        .expect("activation must clear the saved handle only after CloseHandle succeeds");
+    assert!(restore_handle < clear_handle);
+    assert!(
+        activation_hook[restore_handle..clear_handle]
+            .contains("!insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_ACTIVATE} $R5"),
+        "a failed stage-handle close must preserve the Win32 error in the activation exit code"
+    );
     fn label_block<'a>(source: &'a str, label: &str) -> &'a str {
         let start = source
             .find(label)
@@ -626,6 +642,12 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
             "fairypam_stage_failed:",
             "FAIRYPAM_STAGE_VALIDATION",
             "1",
+        ),
+        (
+            nsis_hooks,
+            "fairypam_stage_helper_failed:",
+            "FAIRYPAM_STAGE_VALIDATION",
+            "$R3",
         ),
         (
             nsis_hooks,
@@ -733,10 +755,13 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "IfFileExists \"$FairyPamStageDir\\fairypam-agent.exe\"",
         "IfFileExists \"$FairyPamStageDir\\fairypam-agent-guardian.exe\"",
         "IfFileExists \"$FairyPamStageDir\\profiles\\*.*\"",
+        "SetOutPath \"$PROGRAMFILES64\"",
         "Rename \"$FairyPamFinalDir\" \"$FairyPamBackupDir\"",
         "Rename \"$FairyPamStageDir\" \"$FairyPamFinalDir\"",
         "Rename \"$FairyPamBackupDir\" \"$FairyPamFinalDir\"",
         "ExecWait '\"$FairyPamStageDir\\resources\\runtime\\fairypam-agent-installer.exe\" \"$FairyPamStageDir\" \"$FairyPamFinalDir\"' $0",
+        "StrCpy $R3 $0",
+        "Goto fairypam_stage_helper_failed",
         "IfFileExists \"$FairyPamFinalDir\" 0 fairypam_activate_fresh",
     ] {
         assert!(
@@ -751,13 +776,17 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         .find("CloseHandle")
         .map(|offset| verify + offset)
         .expect("the staging directory must remain pinned through helper verification");
+    let leave_stage = nsis_hooks[verify..]
+        .find("SetOutPath \"$PROGRAMFILES64\"")
+        .map(|offset| verify + offset)
+        .expect("the installer must leave the staged current directory before activation");
     let preserve = nsis_hooks
         .find("Rename \"$FairyPamFinalDir\" \"$FairyPamBackupDir\"")
         .expect("the previous slot must be preserved");
     let activate_slot = nsis_hooks
         .find("Rename \"$FairyPamStageDir\" \"$FairyPamFinalDir\"")
         .expect("the complete staged slot must be activated");
-    assert!(verify < close_stage && close_stage < preserve && preserve < activate_slot);
+    assert!(verify < leave_stage && leave_stage < close_stage && close_stage < preserve && preserve < activate_slot);
     let cleanup_start = nsis_hooks
         .find("fairypam_activate_complete:")
         .expect("activated slot cleanup must be defined");
@@ -802,6 +831,10 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "verify_staged_payload_children(root)",
         "verify_staged_payload_entry(&path, metadata.is_dir())?",
         "Ok(_) => verify_legacy_active_tree(active_root)?",
+        "ProvisionFailure::InstallRoots",
+        "ProvisionFailure::ProgramData",
+        "ProvisionFailure::ProductRoot",
+        "ProvisionFailure::Logs",
     ] {
         assert!(
             INSTALLER_PROVISIONER.contains(required),

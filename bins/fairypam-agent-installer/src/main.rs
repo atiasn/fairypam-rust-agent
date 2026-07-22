@@ -8,12 +8,17 @@ fn main() {
 #[cfg(windows)]
 fn main() {
     let mut arguments = std::env::args_os().skip(1);
-    let roots = arguments.next().zip(arguments.next());
-    if roots.is_none_or(|(stage, active)| {
-        arguments.next().is_some()
-            || provision(std::path::Path::new(&stage), std::path::Path::new(&active)).is_err()
-    }) {
-        std::process::exit(1);
+    let exit_code = match arguments.next().zip(arguments.next()) {
+        Some((stage, active)) if arguments.next().is_none() => {
+            match provision(std::path::Path::new(&stage), std::path::Path::new(&active)) {
+                Ok(()) => 0,
+                Err(failure) => failure as i32,
+            }
+        }
+        _ => 1,
+    };
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 }
 
@@ -29,18 +34,40 @@ const TRUSTED_INSTALLER_SID: &str =
     "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
 #[cfg(windows)]
-fn provision(stage_root: &std::path::Path, active_root: &std::path::Path) -> Result<(), ()> {
-    ensure_elevated()?;
-    verify_install_roots(stage_root, active_root)?;
-    verify_nonreparse_directory(std::path::Path::new(PROGRAM_DATA))?;
-    for path in [
-        PRODUCT_ROOT,
-        AGENT_ROOT,
-        r"C:\ProgramData\FairyPam.Agent\Agent\enrollment",
-        r"C:\ProgramData\FairyPam.Agent\Agent\audit",
-        r"C:\ProgramData\FairyPam.Agent\Agent\logs",
+#[repr(i32)]
+enum ProvisionFailure {
+    Elevated = 2,
+    InstallRoots = 3,
+    ProgramData = 4,
+    ProductRoot = 5,
+    AgentRoot = 6,
+    Enrollment = 7,
+    Audit = 8,
+    Logs = 9,
+}
+
+#[cfg(windows)]
+fn provision(
+    stage_root: &std::path::Path,
+    active_root: &std::path::Path,
+) -> Result<(), ProvisionFailure> {
+    ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
+    verify_install_roots(stage_root, active_root)
+        .map_err(|_| ProvisionFailure::InstallRoots)?;
+    verify_nonreparse_directory(std::path::Path::new(PROGRAM_DATA))
+        .map_err(|_| ProvisionFailure::ProgramData)?;
+    for (path, failure) in [
+        (PRODUCT_ROOT, ProvisionFailure::ProductRoot),
+        (AGENT_ROOT, ProvisionFailure::AgentRoot),
+        (
+            r"C:\ProgramData\FairyPam.Agent\Agent\enrollment",
+            ProvisionFailure::Enrollment,
+        ),
+        (r"C:\ProgramData\FairyPam.Agent\Agent\audit", ProvisionFailure::Audit),
+        (r"C:\ProgramData\FairyPam.Agent\Agent\logs", ProvisionFailure::Logs),
     ] {
-        create_or_verify_private_directory(std::path::Path::new(path))?;
+        create_or_verify_private_directory(std::path::Path::new(path))
+            .map_err(|_| failure)?;
     }
     Ok(())
 }

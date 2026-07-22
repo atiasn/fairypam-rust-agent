@@ -122,17 +122,28 @@ fairypam_stage_ready:
   ExecWait '"$FairyPamStageDir\resources\runtime\fairypam-agent-installer.exe" "$FairyPamStageDir" "$FairyPamFinalDir"' $0
   IfErrors fairypam_stage_failed 0
   ${If} $0 != 0
-    Goto fairypam_stage_failed
+    StrCpy $R3 $0
+    Goto fairypam_stage_helper_failed
   ${EndIf}
   IfFileExists "$FairyPamStageDir\fairypam-agent.exe" 0 fairypam_stage_failed
   IfFileExists "$FairyPamStageDir\fairypam-agent-guardian.exe" 0 fairypam_stage_failed
   IfFileExists "$FairyPamStageDir\profiles\*.*" 0 fairypam_stage_failed
 
-  System::Call 'kernel32::CloseHandle(p $FairyPamStageHandle) i.R9'
-  StrCpy $FairyPamStageHandle 0
+  ; SetOutPath makes the stage the installer process current directory. Windows
+  ; locks a process current directory, so leave the staged slot before its
+  ; handle is released and it is renamed into the fixed active location.
+  SetOutPath "$PROGRAMFILES64"
+  ; System maps R6 directly to the native handle parameter. Restore the
+  ; saved value before release: the generated NSIS payload can use $R6 while
+  ; extracting files, but must never change the pinned kernel handle itself.
+  StrCpy $R6 $FairyPamStageHandle
+  System::Call 'kernel32::CloseHandle(p R6) i.R9 ?e'
+  Pop $R5
   ${If} $R9 = 0
-    Goto fairypam_stage_failed
+    !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_ACTIVATE} $R5
+    Abort "FairyPam could not release its protected installation staging directory (Win32 error $R5). The active installation was not changed."
   ${EndIf}
+  StrCpy $FairyPamStageHandle 0
   IfFileExists "$FairyPamFinalDir" 0 fairypam_activate_fresh
   ClearErrors
   Rename "$FairyPamFinalDir" "$FairyPamBackupDir"
@@ -165,12 +176,16 @@ fairypam_activate_failed:
   Abort "FairyPam could not activate the staged runtime. The previous installation remains active."
 fairypam_stage_failed:
   ${If} $FairyPamStageHandle != 0
-    System::Call 'kernel32::CloseHandle(p $FairyPamStageHandle)'
+    StrCpy $R6 $FairyPamStageHandle
+    System::Call 'kernel32::CloseHandle(p R6)'
     StrCpy $FairyPamStageHandle 0
   ${EndIf}
   ClearErrors
   RMDir /r "$FairyPamStageDir"
   !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_VALIDATION} 1
+  Abort "FairyPam could not validate the staged Agent runtime. The active installation was not changed."
+fairypam_stage_helper_failed:
+  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_VALIDATION} $R3
   Abort "FairyPam could not validate the staged Agent runtime. The active installation was not changed."
 fairypam_rollback_failed:
   !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_ROLLBACK} 1
