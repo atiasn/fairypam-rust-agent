@@ -2101,8 +2101,8 @@ mod tests {
             .iter()
             .filter_map(|entry| entry["message"].as_str())
             .collect::<Vec<_>>();
-        assert!(messages.contains(&"后台服务已启动，正在准备本地连接"));
-        assert!(messages.contains(&"本地界面请求环境检查"));
+        assert!(messages.contains(&"后台服务已启动，正在准备连接"));
+        assert!(messages.contains(&"界面请求环境检查"));
 
         let mut enrolled = RuntimeConfig::unregistered();
         enrolled.transport.control_endpoint = "https://hub.example/control".parse().unwrap();
