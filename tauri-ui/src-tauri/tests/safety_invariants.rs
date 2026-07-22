@@ -257,6 +257,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "!define FIXED_INSTALL_DIR \"$PROGRAMFILES64\\${PRODUCTNAME}\"",
         "!error \"FairyPam requires a per-machine installer\"",
         "!error \"FairyPam product installer currently supports x64 only\"",
+        "!if \"${INSTALLWEBVIEW2MODE}\" != \"\"",
         "!error \"FairyPam requires WebView2 skip mode\"",
     ] {
         assert!(

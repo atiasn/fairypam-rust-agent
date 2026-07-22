@@ -88,7 +88,9 @@ OutFile "${OUTFILE}"
 !if "${ARCH}" != "x64"
   !error "FairyPam product installer currently supports x64 only"
 !endif
-!if "${INSTALLWEBVIEW2MODE}" != "skip"
+; Tauri serializes WebviewInstallMode::Skip as an empty NSIS mode string.
+; Any non-empty value selects a payload/downloader mode and is rejected.
+!if "${INSTALLWEBVIEW2MODE}" != ""
   !error "FairyPam requires WebView2 skip mode"
 !endif
 !define FIXED_INSTALL_DIR "$PROGRAMFILES64\${PRODUCTNAME}"
