@@ -786,7 +786,12 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     let activate_slot = nsis_hooks
         .find("Rename \"$FairyPamStageDir\" \"$FairyPamFinalDir\"")
         .expect("the complete staged slot must be activated");
-    assert!(verify < leave_stage && leave_stage < close_stage && close_stage < preserve && preserve < activate_slot);
+    assert!(
+        verify < leave_stage
+            && leave_stage < close_stage
+            && close_stage < preserve
+            && preserve < activate_slot
+    );
     let cleanup_start = nsis_hooks
         .find("fairypam_activate_complete:")
         .expect("activated slot cleanup must be defined");
