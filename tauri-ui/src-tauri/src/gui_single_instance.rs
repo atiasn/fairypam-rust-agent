@@ -20,7 +20,7 @@ pub enum GuiInstance {
 
 pub struct GuiSingleInstance {
     #[cfg(windows)]
-    handle: HANDLE,
+    handle: usize,
 }
 
 impl GuiSingleInstance {
@@ -34,7 +34,9 @@ impl GuiSingleInstance {
                 let _ = unsafe { CloseHandle(handle) };
                 return Ok(GuiInstance::Existing);
             }
-            return Ok(GuiInstance::Primary(Self { handle }));
+            return Ok(GuiInstance::Primary(Self {
+                handle: handle.0 as usize,
+            }));
         }
 
         #[cfg(not(windows))]
@@ -62,7 +64,7 @@ impl Drop for GuiSingleInstance {
         #[cfg(windows)]
         {
             // SAFETY: the primary instance exclusively owns this mutex handle.
-            let _ = unsafe { CloseHandle(self.handle) };
+            let _ = unsafe { CloseHandle(HANDLE(self.handle as _)) };
         }
     }
 }

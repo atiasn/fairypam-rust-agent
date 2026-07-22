@@ -11,9 +11,8 @@ use windows::{
         Foundation::{CloseHandle, LocalFree, ERROR_ACCESS_DENIED, HANDLE, HLOCAL},
         Security::{
             Authorization::ConvertSidToStringSidW, GetSidSubAuthority, GetSidSubAuthorityCount,
-            GetTokenInformation, TokenElevation, TokenIntegrityLevel, TokenSessionId,
-            TokenStatistics, TokenUser, PSID, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-            TOKEN_STATISTICS, TOKEN_USER,
+            GetTokenInformation, TokenElevation, TokenIntegrityLevel, TokenSessionId, TokenUser,
+            PSID, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{
             CreateFileW, GetFileAttributesW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY,
@@ -130,7 +129,6 @@ impl Drop for OwnedHandle {
 
 struct ProcessIdentity {
     user_sid: String,
-    logon_sid: String,
     session_id: u32,
     integrity_rid: u32,
     elevated: bool,
@@ -163,10 +161,10 @@ fn verify_fixed_agent_server(
     if server.user_sid != current.user_sid {
         return Err(LocalClientError::identity("server_sid_mismatch"));
     }
-    // NOTE: `server.logon_sid != current.logon_sid` is intentionally NOT checked.
-    // UAC `runas` produces a split token: the elevated sibling Agent receives a
-    // fresh Logon Identifier (Statistics.AuthenticationId) while the unelevated
-    // GUI keeps the original logon. Comparing those values always rejects the
+    // NOTE: Logon SID is intentionally not part of this check. UAC `runas`
+    // produces a split token: the elevated sibling Agent receives a fresh
+    // Logon Identifier while the unelevated GUI keeps the original logon.
+    // Comparing those values always rejects the
     // legitimate product flow. The remaining checks (same user SID, same
     // Windows session, high integrity + elevated token, sibling Agent image,
     // protected Program Files install) already bind the pipe peer to the
@@ -335,8 +333,6 @@ fn process_identity(pid: u32) -> Result<ProcessIdentity, LocalClientError> {
 fn token_identity(token: OwnedHandle) -> Result<ProcessIdentity, LocalClientError> {
     let user = token_information(token.0, TokenUser)?;
     let user = unsafe { &*(user.as_ptr().cast::<TOKEN_USER>()) };
-    let statistics = token_information(token.0, TokenStatistics)?;
-    let statistics = unsafe { &*(statistics.as_ptr().cast::<TOKEN_STATISTICS>()) };
     let session = token_information(token.0, TokenSessionId)?;
     let session_id = u32::from_ne_bytes(
         session[..size_of::<u32>()]
@@ -349,10 +345,6 @@ fn token_identity(token: OwnedHandle) -> Result<ProcessIdentity, LocalClientErro
     let elevation = unsafe { &*(elevation.as_ptr().cast::<TOKEN_ELEVATION>()) };
     Ok(ProcessIdentity {
         user_sid: sid_to_string(user.User.Sid)?,
-        logon_sid: format!(
-            "S-1-5-5-{}-{}",
-            statistics.AuthenticationId.HighPart as u32, statistics.AuthenticationId.LowPart,
-        ),
         session_id,
         integrity_rid: integrity_rid(label.Label.Sid)?,
         elevated: elevation.TokenIsElevated != 0,
