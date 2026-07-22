@@ -57,7 +57,7 @@ export function DiagnosticsPage({ overview }: Props) {
       {environment.data && (
         <ul className="check-list">
           {environment.data.checks.map((check) => (
-            <li key={check.id}><strong>{checkLabels[check.id] ?? '服务项目'}</strong>：{checkStatusLabel(check.status)}{check.recovery && `；${check.recovery}`}</li>
+            <li key={check.id}><strong>{checkLabels[check.id] ?? '服务项目'}</strong>：{checkStatusLabel(check.status)}</li>
           ))}
         </ul>
       )}

@@ -82,7 +82,8 @@ describe('App', () => {
 
     await user.click(view.getByRole('button', { name: '环境检查' }));
     await user.click(view.getByRole('button', { name: '检查本地环境' }));
-    expect(await view.findByRole('listitem')).toHaveTextContent('守护服务：正常；无需操作');
+    expect(await view.findByRole('listitem')).toHaveTextContent('守护服务：正常');
+    expect(view.queryByText('无需操作')).not.toBeInTheDocument();
     expect(view.queryByText('guardian.binary_available')).not.toBeInTheDocument();
 
     await user.click(view.getByRole('button', { name: '游戏' }));

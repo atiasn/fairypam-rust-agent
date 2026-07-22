@@ -1,6 +1,5 @@
 import type { UseQueryResult } from '@tanstack/react-query';
 
-import { RecoveryCard } from '../components/RecoveryCard';
 import { StatusPanel } from '../components/StatusPanel';
 import type { ConnectionState } from '../lib/connectionReducer';
 import type { Overview, SupportStatus } from '../lib/contracts';
@@ -37,7 +36,6 @@ export function DashboardPage({ connection, overview, startup, retryStartup }: P
       <>
         <StatusPanel availability="offline" title="服务暂时无法使用" detail="请检查安装或完成注册，然后重试。" />
         <button onClick={retryStartup} type="button">重试启动</button>
-        <RecoveryCard message="服务未能启动；界面不会启动未经确认的程序。" />
       </>
     );
   }

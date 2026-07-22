@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 
-import { RecoveryCard } from '../components/RecoveryCard';
 import { StatusPanel } from '../components/StatusPanel';
 import { agentApi } from '../lib/agentApi';
 import type { ConnectionState } from '../lib/connectionReducer';
@@ -83,7 +82,6 @@ export function ConnectionPage({ connection, overview, startup, retryStartup }: 
         <p className="notice">注册码只会通过受保护的通道提交，界面不会保存它。</p>
       </section>
       {startup.isError && <button onClick={retryStartup} type="button">重试启动</button>}
-      <RecoveryCard reason={connection.reasonCode} />
     </>
   );
 }
