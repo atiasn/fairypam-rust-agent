@@ -92,9 +92,7 @@ pub fn run() -> tauri::Result<()> {
 
 fn allows_application_navigation(url: &tauri::Url) -> bool {
     url.scheme() == "tauri"
-        || (cfg!(debug_assertions)
-            && url.scheme() == "http"
-            && url.host_str() == Some("127.0.0.1"))
+        || (cfg!(debug_assertions) && url.scheme() == "http" && url.host_str() == Some("127.0.0.1"))
 }
 
 fn disable_default_context_menu(window: &tauri::WebviewWindow) {

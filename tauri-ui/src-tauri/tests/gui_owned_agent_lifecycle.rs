@@ -51,6 +51,9 @@ fn production_webview_rejects_extra_navigation_and_page_surfaces() {
         "NewWindowResponse::Deny",
         "SetAreDefaultContextMenusEnabled(false)",
     ] {
-        assert!(APP.contains(required), "missing WebView hardening: {required}");
+        assert!(
+            APP.contains(required),
+            "missing WebView hardening: {required}"
+        );
     }
 }

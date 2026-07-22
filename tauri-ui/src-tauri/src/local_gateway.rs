@@ -1,4 +1,7 @@
-use std::{sync::atomic::{AtomicBool, Ordering}, time::Duration};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use fairypam_agent_local_client::LocalClientError;
 #[cfg(any(windows, test))]
@@ -247,8 +250,8 @@ mod tests {
 
     #[test]
     fn decodes_registration_readiness_before_the_environment_checks() {
-        let response = decode_response::<EnvironmentCheckDto>(
-            fairypam_agent_local_protocol::LocalResponse {
+        let response =
+            decode_response::<EnvironmentCheckDto>(fairypam_agent_local_protocol::LocalResponse {
                 body: json!({
                     "registration_ready": true,
                     "checks": [{
@@ -258,9 +261,8 @@ mod tests {
                         "recovery": "No action required"
                     }]
                 }),
-            },
-        )
-        .expect("Agent environment checks include strict registration readiness");
+            })
+            .expect("Agent environment checks include strict registration readiness");
 
         assert!(response.registration_ready);
         assert_eq!(response.checks.len(), 1);
