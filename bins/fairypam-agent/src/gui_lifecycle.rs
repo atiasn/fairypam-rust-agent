@@ -82,7 +82,7 @@ impl GuiLifetime {
 
     pub fn bind(&self, pid: u32) -> Result<(), AgentError> {
         self.state.lock().map_err(lock_error)?.bind(pid)?;
-        #[cfg(windows)]
+        #[cfg(all(windows, not(test)))]
         self.watch_process(pid)?;
         Ok(())
     }
@@ -97,11 +97,12 @@ impl GuiLifetime {
         Ok(reason)
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub fn exit_reason(&self) -> Result<Option<GuiExitReason>, AgentError> {
         Ok(self.state.lock().map_err(lock_error)?.exit_reason())
     }
 
-    #[cfg(windows)]
+    #[cfg(all(windows, not(test)))]
     fn watch_process(&self, pid: u32) -> Result<(), AgentError> {
         use windows::Win32::{
             Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
