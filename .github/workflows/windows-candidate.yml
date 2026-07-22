@@ -4,6 +4,10 @@ run-name: "Windows core build ${{ github.sha }} #${{ github.run_number }}"
 on:
   workflow_dispatch:
 
+concurrency:
+  group: windows-candidate-${{ github.sha }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write
