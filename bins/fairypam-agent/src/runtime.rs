@@ -842,7 +842,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
                 local_control.abort();
                 return shutdown_from_gui_lifecycle(&driver, &mut supervisor);
             }
-            result = local_control => match result {
+            result = &mut local_control => match result {
                 Ok(never) => match never {},
                 Err(error) => Err(AgentError::new("local.runtime_join_failed", error.to_string())),
             },

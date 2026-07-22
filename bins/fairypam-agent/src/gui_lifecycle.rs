@@ -105,12 +105,12 @@ impl GuiLifetime {
     fn watch_process(&self, pid: u32) -> Result<(), AgentError> {
         use windows::Win32::{
             Foundation::{CloseHandle, WAIT_OBJECT_0},
-            System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, SYNCHRONIZE},
+            System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE},
         };
 
         // SAFETY: pid came from the authenticated Pipe caller; the returned
         // process handle is owned by this watcher and closed on every exit path.
-        let handle = unsafe { OpenProcess(SYNCHRONIZE, false, pid) }.map_err(|error| {
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.map_err(|error| {
             AgentError::new("local.lifecycle.process_unavailable", error.to_string())
         })?;
         let state = Arc::clone(&self.state);

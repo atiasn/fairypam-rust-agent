@@ -59,6 +59,17 @@ fn gui_lifecycle_commands_are_mutations_and_replay_is_rejected() {
     assert_eq!(audit.0[2].result_code, "local.protocol.nonce_replayed");
 }
 
+#[test]
+fn windows_gui_lifecycle_uses_process_sync_and_keeps_local_control_abortable() {
+    let lifecycle = include_str!("../src/gui_lifecycle.rs");
+    let runtime = include_str!("../src/runtime.rs");
+
+    assert!(lifecycle.contains("PROCESS_SYNCHRONIZE"));
+    assert!(lifecycle.contains("OpenProcess(PROCESS_SYNCHRONIZE, false, pid)"));
+    assert!(!runtime.contains("result = local_control =>"));
+    assert!(runtime.matches("result = &mut local_control =>").count() >= 2);
+}
+
 #[derive(Default)]
 struct MemoryAudit(Vec<AuditEvent>);
 
