@@ -388,7 +388,10 @@ fn registration_claims_directly_without_desktop_confirmation() {
     let elevated = registration
         .find("ensure_elevated()?")
         .expect("the direct claim must remain elevated");
-    assert!(elevated < claim, "elevation must precede the direct claim");
+    assert!(
+        elevated < claim,
+        "elevation must precede the direct claim"
+    );
     assert!(!enrollment.contains("MessageBoxW("));
     assert!(!enrollment.contains("REPLACEMENT_CONFIRMATION_TIMEOUT"));
     assert!(!enrollment.contains("replacement_cancelled"));
@@ -399,8 +402,9 @@ fn registration_claims_directly_without_desktop_confirmation() {
         .and_then(|(_, source)| source.split_once("fn mark_registration_started"))
         .map(|(source, _)| source)
         .expect("registration failure logging must remain isolated");
-    assert!(registration_finish
-        .contains("tracing::warn!(code = error.code(), \"Hub registration was not completed\")"));
+    assert!(registration_finish.contains(
+        "tracing::warn!(code = error.code(), \"Hub registration was not completed\")"
+    ));
     assert!(
         !registration_finish.contains("error = %error"),
         "registration tracing must not persist dynamic error messages"

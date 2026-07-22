@@ -768,11 +768,8 @@ mod tests {
             .unwrap();
         log.append(LogLevel::Info, "服务注册已完成，正在安全重连")
             .unwrap();
-        log.append(
-            LogLevel::Warn,
-            "服务注册失败（错误码：enrollment.network_failed）",
-        )
-        .unwrap();
+        log.append(LogLevel::Warn, "服务注册失败（错误码：enrollment.network_failed）")
+            .unwrap();
         let hub = "https://enroll-7f8c3d.example";
         let code = "r7Pq9Lm2Vx6Aa1Zz";
         let pem = "-----BEGIN CERTIFICATE-----Q29kZXg=";
@@ -784,10 +781,7 @@ mod tests {
 
         let tail = log.tail(10, &LogLevel::Info).unwrap();
         let entries = tail["entries"].as_array().unwrap();
-        assert_eq!(
-            entries[1]["message"],
-            "服务注册失败（错误码：enrollment.network_failed）"
-        );
+        assert_eq!(entries[1]["message"], "服务注册失败（错误码：enrollment.network_failed）");
         assert_eq!(entries[2]["message"], "服务注册已完成，正在安全重连");
         assert_eq!(entries[3]["message"], "服务注册已开始，正在安全领取凭据");
         let persisted = std::fs::read_to_string(root.join(LOG_FILE)).unwrap();

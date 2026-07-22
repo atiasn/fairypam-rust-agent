@@ -486,10 +486,7 @@ impl RuntimeState {
     fn record_registration_failure(&mut self, code: &str) {
         self.record_text(
             LogLevel::Warn,
-            &format!(
-                "服务注册失败（错误码：{}）",
-                registration_failure_code(code)
-            ),
+            &format!("服务注册失败（错误码：{}）", registration_failure_code(code)),
         );
     }
 
