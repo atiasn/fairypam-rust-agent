@@ -44,7 +44,14 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
     },
   });
   const registrationReady = environment.data?.registration_ready === true;
-  const registrationEnabled = canMutate && overview.isSuccess && startup.isSuccess && registrationReady;
+  const registrationEnabled = canMutate
+    && overview.isSuccess
+    && startup.isSuccess
+    && environment.isSuccess
+    && !environment.isFetching
+    && !environment.isError
+    && !environment.data.registration_pending
+    && registrationReady;
   return (
     <>
       <StatusPanel
@@ -68,7 +75,9 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
           className="enrollment-form"
           onSubmit={(event) => {
             event.preventDefault();
-            registration.mutate();
+            if (registrationEnabled) {
+              registration.mutate();
+            }
           }}
         >
           <label>

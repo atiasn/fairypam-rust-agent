@@ -1172,6 +1172,7 @@ impl SharedRuntime {
     }
 
     fn environment_check(&self) -> Result<serde_json::Value, AgentError> {
+        let registration_pending = self.registration_in_progress.load(Ordering::Acquire);
         let (control_state, frame_state) = {
             let state = self.state.lock().map_err(lock_error)?;
             (state.control_state, state.frame_state)
@@ -1223,7 +1224,7 @@ impl SharedRuntime {
             }
         };
         Ok(
-            serde_json::json!({"registration_ready": registration_ready, "checks": [
+            serde_json::json!({"registration_ready": registration_ready, "registration_pending": registration_pending, "checks": [
                 {"id": "binary_or_task", "status": if binary_ready { "available" } else { "unavailable" }, "code": if binary_ready { "agent.binary_available" } else { "agent.binary_unavailable" }, "recovery": "本地服务安装不完整，请重新安装 FairyPam。"},
                 {"id": "agent", "status": "available", "code": "agent.running", "recovery": "无需操作。"},
                 {"id": "certificate", "status": if awaiting_enrollment { "pending" } else if certificate_ready { "available" } else { "unavailable" }, "code": if awaiting_enrollment { "enrollment.required" } else if certificate_ready { "runtime.certificate_files_available" } else { "runtime.certificate_unavailable" }, "recovery": "请完成注册或重新注册本地服务。"},
@@ -2065,6 +2066,7 @@ mod tests {
         let diagnostics = local
             .execute(&local_caller(), &LocalCommand::RunEnvironmentCheck)
             .unwrap();
+        assert_eq!(diagnostics["registration_pending"], false);
         for id in ["certificate", "control", "frame"] {
             assert_eq!(
                 diagnostics["checks"]
@@ -2087,6 +2089,12 @@ mod tests {
                         .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character))
                 })
             }));
+
+        local.registration_in_progress.store(true, Ordering::Release);
+        let pending_diagnostics = local
+            .execute(&local_caller(), &LocalCommand::RunEnvironmentCheck)
+            .unwrap();
+        assert_eq!(pending_diagnostics["registration_pending"], true);
         // Production log tailing requires installer-provisioned private paths.
         // This runtime test verifies the shared record boundary without depending
         // on Windows installer state.

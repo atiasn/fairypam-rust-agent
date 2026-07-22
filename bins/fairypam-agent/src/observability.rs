@@ -83,6 +83,10 @@ impl FixedLog {
         if size.saturating_add(incoming) <= MAX_LOG_BYTES {
             return Ok(());
         }
+        let legacy_overflow = self.path(MAX_LOG_FILES);
+        if legacy_overflow.exists() {
+            fs::remove_file(&legacy_overflow).map_err(|_| log_root_unavailable())?;
+        }
         for index in (1..MAX_LOG_FILES).rev() {
             let source = self.path(index - 1);
             let target = self.path(index);
@@ -723,6 +727,11 @@ mod tests {
         std::fs::write(log.path(0), vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
         std::fs::write(log.path(1), "{\"level\":\"info\",\"message\":\"middle\"}\n").unwrap();
         std::fs::write(log.path(2), "{\"level\":\"info\",\"message\":\"oldest\"}\n").unwrap();
+        std::fs::write(
+            log.path(MAX_LOG_FILES),
+            "{\"level\":\"info\",\"message\":\"legacy overflow\"}\n",
+        )
+        .unwrap();
         log.append(LogLevel::Info, "newest").unwrap();
 
         let files = std::fs::read_dir(&root)
@@ -756,6 +765,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(files.len(), MAX_LOG_FILES as usize);
+        assert!(!log.path(MAX_LOG_FILES).exists());
         assert!(retained_messages
             .iter()
             .all(|message| tail_messages.contains(&message.as_str())));

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -8,7 +8,7 @@ vi.mock('./lib/agentApi', () => ({
     ensureLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
     getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false }, doctor: { profiles: ['signed-profile'], runtime: 'dry_run' } }),
     getConnectionStatus: vi.fn().mockResolvedValue({ hub_address: 'https://hub.test', control: 'connected', frame: 'connected', capture_active: false, recovery_code: '' }),
-    runEnvironmentCheck: vi.fn().mockResolvedValue({ registration_ready: true, checks: [] }),
+    runEnvironmentCheck: vi.fn().mockResolvedValue({ registration_ready: true, registration_pending: false, checks: [] }),
     getLogTail: vi.fn().mockResolvedValue({ entries: [] }),
     scanInstalledGames: vi.fn().mockResolvedValue({ games: [] }),
     registerHub: vi.fn().mockResolvedValue({ status: 'pending' }),
@@ -57,6 +57,7 @@ describe('App', () => {
     const user = userEvent.setup();
     vi.mocked(agentApi.runEnvironmentCheck).mockResolvedValueOnce({
       registration_ready: false,
+      registration_pending: false,
       checks: [{ id: 'guardian', status: 'unavailable', code: 'guardian.unavailable', recovery: '请处理' }],
     });
     const app = renderApp();
@@ -68,6 +69,39 @@ describe('App', () => {
 
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
     expect(view.getByText('请先完成本机环境检查，再提交注册。')).toBeInTheDocument();
+    fireEvent.submit(view.getByRole('button', { name: '注册或重新注册' }).closest('form')!);
+    expect(agentApi.registerHub).not.toHaveBeenCalled();
+  });
+
+  it('环境检查刷新中或最新检查失败时保持注册禁用', async () => {
+    const user = userEvent.setup();
+    let rejectRefresh: (reason?: unknown) => void;
+    vi.mocked(agentApi.runEnvironmentCheck)
+      .mockResolvedValueOnce({ registration_ready: true, registration_pending: false, checks: [] })
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        rejectRefresh = reject;
+      }));
+    const app = renderApp();
+    const view = within(app.container);
+
+    await user.click(view.getByRole('button', { name: '连接与注册' }));
+    let register = view.getByRole('button', { name: '注册或重新注册' });
+    await waitFor(() => expect(register).toBeEnabled());
+    await user.click(view.getByRole('button', { name: '环境检查' }));
+    await user.click(view.getByRole('button', { name: '检查本地环境' }));
+    expect(await view.findByText('正在检查。')).toBeInTheDocument();
+
+    await user.click(view.getByRole('button', { name: '连接与注册' }));
+    register = view.getByRole('button', { name: '注册或重新注册' });
+    expect(register).toBeDisabled();
+    fireEvent.submit(register.closest('form')!);
+    expect(agentApi.registerHub).not.toHaveBeenCalled();
+
+    rejectRefresh!(new Error('环境检查失败'));
+    expect(await view.findByText('本机环境暂时无法确认，请稍后重试。')).toBeInTheDocument();
+    expect(register).toBeDisabled();
+    fireEvent.submit(register.closest('form')!);
+    expect(agentApi.registerHub).not.toHaveBeenCalled();
   });
 
   it('显示中文服务状态并只通过固定通道提交注册', async () => {
@@ -80,9 +114,15 @@ describe('App', () => {
     await user.clear(view.getByLabelText('服务地址'));
     await user.type(view.getByLabelText('服务地址'), 'https://register.example');
     await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
+    vi.mocked(agentApi.runEnvironmentCheck)
+      .mockResolvedValueOnce({ registration_ready: true, registration_pending: true, checks: [] })
+      .mockResolvedValueOnce({ registration_ready: true, registration_pending: false, checks: [] });
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
     expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
     await waitFor(() => expect(agentApi.runEnvironmentCheck).toHaveBeenCalledTimes(2));
+    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
+    await waitFor(() => expect(agentApi.runEnvironmentCheck).toHaveBeenCalledTimes(3), { timeout: 3_000 });
+    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
     expect(await view.findByText('请在系统确认窗口中确认注册；确认前不会使用注册码。若未在短时间内确认，本次注册会失效。')).toBeInTheDocument();
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
     expect(view.getByText(/注册码只会通过受保护的通道提交/)).toBeInTheDocument();
@@ -93,6 +133,7 @@ describe('App', () => {
     const user = userEvent.setup();
     vi.mocked(agentApi.runEnvironmentCheck).mockResolvedValueOnce({
       registration_ready: true,
+      registration_pending: false,
       checks: [{ id: 'guardian', status: 'available', code: 'guardian.binary_available', recovery: '无需操作' }],
     });
     vi.mocked(agentApi.scanInstalledGames).mockResolvedValueOnce({
@@ -148,6 +189,18 @@ describe('App', () => {
     await user.click(view.getByRole('button', { name: '连接与注册' }));
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
     expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
+  });
+
+  it('服务状态丢失时不自动重新请求环境检查', async () => {
+    vi.mocked(agentApi.getOverview).mockRejectedValueOnce({
+      code: 'local.transport.disconnected',
+      message: '服务连接中断',
+    });
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByRole('heading', { name: '服务暂时无法使用' })).toBeInTheDocument();
+    expect(agentApi.runEnvironmentCheck).not.toHaveBeenCalled();
   });
 
   it('日志和游戏在后台服务就绪前不请求本地通道', async () => {

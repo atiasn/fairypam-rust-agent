@@ -57,6 +57,7 @@ pub struct EnvironmentCheckItemDto {
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentCheckDto {
     pub registration_ready: bool,
+    pub registration_pending: bool,
     pub checks: Vec<EnvironmentCheckItemDto>,
 }
 

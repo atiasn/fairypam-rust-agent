@@ -254,6 +254,7 @@ mod tests {
             decode_response::<EnvironmentCheckDto>(fairypam_agent_local_protocol::LocalResponse {
                 body: json!({
                     "registration_ready": true,
+                    "registration_pending": false,
                     "checks": [{
                         "id": "agent",
                         "status": "available",
@@ -265,6 +266,7 @@ mod tests {
             .expect("Agent environment checks include strict registration readiness");
 
         assert!(response.registration_ready);
+        assert!(!response.registration_pending);
         assert_eq!(response.checks.len(), 1);
     }
 }
