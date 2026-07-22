@@ -491,12 +491,15 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         ),
         "the protected staging SDDL must remain defined for the preinstall hook"
     );
-    assert!(
-        nsis_hooks.contains(
-            "!define FAIRYPAM_STAGE_OPEN_FLAGS 0x02200000 ; FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT"
-        ),
-        "the protected staging open flags must remain defined for the preinstall hook"
-    );
+    for required in [
+        "Var FairyPamStageHandle",
+        "!define FAIRYPAM_STAGE_OPEN_FLAGS 0x02200000 ; FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT",
+    ] {
+        assert!(
+            nsis_hooks.contains(required),
+            "the installer hook must retain its pinned-stage declaration: {required}"
+        );
+    }
     for required in [
         "FAIRYPAM_INSTALL_SDDL",
         "CreateDirectoryW(w \"$FairyPamStageDir\"",
@@ -512,7 +515,6 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "Win32 error $R5",
         "i 0x80, i 3, p 0, i 3",
         "${FAIRYPAM_STAGE_OPEN_FLAGS}",
-        "Var FairyPamStageHandle",
         "StrCpy $INSTDIR \"$FairyPamStageDir\"",
         "SetOutPath $INSTDIR",
     ] {
