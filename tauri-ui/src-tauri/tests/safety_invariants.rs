@@ -176,7 +176,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "FOLDERID_ProgramFilesX64",
         "let expected_stage = program_files.join(\"FairyPam Agent UI.installing\");",
         "let expected_active = program_files.join(\"FairyPam Agent UI\");",
-        "roots.is_none_or(|(stage, active)|",
+        "Some((stage, active)) if arguments.next().is_none()",
         "verify_install_tree(stage_root)?",
         "verify_legacy_active_tree(active_root)?",
         "verify_nonreparse_directory",
