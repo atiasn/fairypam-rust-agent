@@ -31,6 +31,27 @@ fn restart_after_exact_pipe_not_found_clears_the_cached_binding_before_uac() {
 }
 
 #[test]
+fn already_bound_agent_retries_without_requesting_uac_then_returns_repair_result() {
+    let responsive_agent = COMMANDS
+        .find("Ok(_) => return bind_existing_agent(&state).await")
+        .expect("a responsive Agent must use the existing-Agent recovery path");
+    let recovery = COMMANDS
+        .find("async fn bind_existing_agent")
+        .expect("already-bound recovery must be isolated from UAC startup");
+    let launch = COMMANDS
+        .find("fn launch_fixed_agent")
+        .expect("the fixed UAC launch must remain present");
+    let recovery_body = &COMMANDS[recovery..launch];
+
+    assert!(responsive_agent < recovery && recovery < launch);
+    assert!(recovery_body.contains("GUI_LIFECYCLE_RECOVERY_LIMIT"));
+    assert!(recovery_body.contains("local.lifecycle.already_bound"));
+    assert!(recovery_body.contains("state.bind_ui_lifetime().await"));
+    assert!(recovery_body.contains("startup.agent_repair_required"));
+    assert!(!recovery_body.contains("launch_fixed_agent"));
+}
+
+#[test]
 fn second_gui_instance_only_activates_the_primary_window() {
     assert!(APP.contains("GuiSingleInstance::acquire"));
     assert!(APP.contains("activate_existing"));

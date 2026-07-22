@@ -84,15 +84,12 @@ impl FixedLog {
             return Ok(());
         }
         for index in (1..MAX_LOG_FILES).rev() {
-            let source = self.path(index);
-            let target = self.path(index + 1);
+            let source = self.path(index - 1);
+            let target = self.path(index);
             if source.exists() {
                 let _ = fs::remove_file(&target);
                 fs::rename(source, target).map_err(|_| log_root_unavailable())?;
             }
-        }
-        if current.exists() {
-            fs::rename(current, self.path(1)).map_err(|_| log_root_unavailable())?;
         }
         Ok(())
     }
@@ -707,6 +704,70 @@ mod tests {
         log.append(LogLevel::Info, "rotation check").unwrap();
         assert!(root.join(LOG_FILE).is_file());
         assert!(root.join(format!("{LOG_FILE}.1")).is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rotation_retains_and_tails_every_log_file() {
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-fixed-log-retention-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let log = FixedLog::open(&root).unwrap();
+
+        std::fs::write(log.path(0), vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
+        std::fs::write(
+            log.path(1),
+            "{\"level\":\"info\",\"message\":\"middle\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            log.path(2),
+            "{\"level\":\"info\",\"message\":\"oldest\"}\n",
+        )
+        .unwrap();
+        log.append(LogLevel::Info, "newest").unwrap();
+
+        let files = std::fs::read_dir(&root)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(LOG_FILE))
+            .collect::<Vec<_>>();
+        let retained_messages = files
+            .iter()
+            .flat_map(|entry| {
+                std::fs::read_to_string(entry.path())
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+            .filter_map(|entry| {
+                entry
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        let tail = log.tail(u16::MAX, &LogLevel::Info).unwrap();
+        let tail_messages = tail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("message").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(files.len(), MAX_LOG_FILES as usize);
+        assert!(retained_messages
+            .iter()
+            .all(|message| tail_messages.contains(&message.as_str())));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

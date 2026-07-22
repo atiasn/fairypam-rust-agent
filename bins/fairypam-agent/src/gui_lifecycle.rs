@@ -47,6 +47,13 @@ impl LifecycleState {
         }
     }
 
+    fn clear_binding(&mut self, pid: u32) {
+        if self.bound_pid == Some(pid) {
+            self.bound_pid = None;
+            self.exit_reason = None;
+        }
+    }
+
     pub const fn exit_reason(&self) -> Option<GuiExitReason> {
         self.exit_reason
     }
@@ -70,6 +77,8 @@ impl LifecycleState {
 pub struct GuiLifetime {
     state: Arc<Mutex<LifecycleState>>,
     shutdown: CancellationToken,
+    #[cfg(test)]
+    watch_process: Arc<dyn Fn(u32) -> Result<(), AgentError> + Send + Sync>,
 }
 
 impl GuiLifetime {
@@ -77,13 +86,32 @@ impl GuiLifetime {
         Self {
             state: Arc::new(Mutex::new(LifecycleState::default())),
             shutdown,
+            #[cfg(test)]
+            watch_process: Arc::new(|_| Ok(())),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_watcher(
+        shutdown: CancellationToken,
+        watch_process: impl Fn(u32) -> Result<(), AgentError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LifecycleState::default())),
+            shutdown,
+            watch_process: Arc::new(watch_process),
         }
     }
 
     pub fn bind(&self, pid: u32) -> Result<(), AgentError> {
         self.state.lock().map_err(lock_error)?.bind(pid)?;
-        #[cfg(all(windows, not(test)))]
-        self.watch_process(pid)?;
+        if let Err(error) = self.watch_process(pid) {
+            self.shutdown.cancel();
+            if let Ok(mut lifecycle) = self.state.lock() {
+                lifecycle.clear_binding(pid);
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -117,7 +145,7 @@ impl GuiLifetime {
         let raw_handle = handle.0 as usize;
         let state = Arc::clone(&self.state);
         let shutdown = self.shutdown.clone();
-        std::thread::Builder::new()
+        let watcher = std::thread::Builder::new()
             .name("fairypam-gui-lifetime".to_owned())
             .spawn(move || {
                 let handle = HANDLE(raw_handle as _);
@@ -131,8 +159,25 @@ impl GuiLifetime {
                     }
                     shutdown.cancel();
                 }
-            })
-            .map_err(|error| AgentError::new("local.lifecycle.watch_failed", error.to_string()))?;
+            });
+        if let Err(error) = watcher {
+            // SAFETY: the watcher was not started, so this call retains sole ownership.
+            let _ = unsafe { CloseHandle(handle) };
+            return Err(AgentError::new(
+                "local.lifecycle.watch_failed",
+                error.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn watch_process(&self, pid: u32) -> Result<(), AgentError> {
+        (self.watch_process)(pid)
+    }
+
+    #[cfg(all(not(windows), not(test)))]
+    fn watch_process(&self, _pid: u32) -> Result<(), AgentError> {
         Ok(())
     }
 }

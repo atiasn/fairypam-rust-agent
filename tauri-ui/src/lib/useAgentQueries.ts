@@ -27,5 +27,11 @@ export function useAgentQueries(enabled: boolean) {
       refetchInterval: foregroundInterval,
       refetchIntervalInBackground: false,
     }),
+    environment: useQuery({
+      queryKey: queryKeys.environment,
+      queryFn: agentApi.runEnvironmentCheck,
+      enabled,
+      retry: false,
+    }),
   };
 }

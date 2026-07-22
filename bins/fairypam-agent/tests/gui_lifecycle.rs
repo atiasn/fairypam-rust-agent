@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use fairypam_agent_core::AgentError;
 #[path = "../src/gui_lifecycle.rs"]
 mod gui_lifecycle;
 
@@ -61,4 +64,28 @@ fn gui_lifetime_cancels_the_shared_shutdown_signal() {
         Some(GuiExitReason::ExplicitShutdown)
     );
     assert!(shutdown.is_cancelled());
+}
+
+#[test]
+fn watcher_setup_failure_cancels_shutdown_and_leaves_a_later_binding_possible() {
+    let shutdown = CancellationToken::new();
+    let fail_once = AtomicBool::new(true);
+    let lifecycle = GuiLifetime::new_with_watcher(shutdown.clone(), move |_| {
+        if fail_once.swap(false, Ordering::SeqCst) {
+            Err(AgentError::new(
+                "local.lifecycle.watch_failed",
+                "watcher setup failed",
+            ))
+        } else {
+            Ok(())
+        }
+    });
+
+    assert_eq!(
+        lifecycle.bind(100).unwrap_err().code(),
+        "local.lifecycle.watch_failed"
+    );
+    assert!(shutdown.is_cancelled());
+    assert_eq!(lifecycle.exit_reason().unwrap(), None);
+    assert!(lifecycle.bind(101).is_ok());
 }

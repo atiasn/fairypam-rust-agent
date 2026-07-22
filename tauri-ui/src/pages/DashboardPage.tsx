@@ -40,7 +40,12 @@ export function DashboardPage({ connection, overview, startup, retryStartup }: P
     );
   }
   if (overview.isError || !overview.data) {
-    return <StatusPanel availability={connection.availability} title="正在读取服务状态" detail="服务刚刚启动，请稍候。" />;
+    return (
+      <>
+        <StatusPanel availability={connection.availability} title="服务暂时无法使用" detail="服务连接已中断，请手动重试。" />
+        <button onClick={retryStartup} type="button">重试启动</button>
+      </>
+    );
   }
   const data = overview.data;
   return (

@@ -38,7 +38,7 @@ export type EnvironmentCheckItem = {
   code: string;
   recovery: string;
 };
-export type EnvironmentCheck = { checks: EnvironmentCheckItem[] };
+export type EnvironmentCheck = { registration_ready: boolean; checks: EnvironmentCheckItem[] };
 export type LogEntry = { level: 'error' | 'warn' | 'info'; message: string };
 export type LogTail = { entries: LogEntry[] };
 export type InstalledGame = {

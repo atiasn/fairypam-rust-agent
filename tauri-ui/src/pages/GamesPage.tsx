@@ -3,14 +3,15 @@ import { useQuery } from '@tanstack/react-query';
 import { agentApi } from '../lib/agentApi';
 import { queryKeys } from '../lib/queryKeys';
 
-export function GamesPage() {
-  const games = useQuery({ queryKey: queryKeys.games, queryFn: agentApi.scanInstalledGames });
+export function GamesPage({ enabled }: { enabled: boolean }) {
+  const games = useQuery({ queryKey: queryKeys.games, queryFn: agentApi.scanInstalledGames, enabled });
 
   return (
     <section className="status-card" aria-labelledby="games-heading">
       <h2 id="games-heading">已发现的米哈游游戏</h2>
-      {games.isLoading && <p>正在扫描受支持的启动器安装。</p>}
-      {games.isError && <p role="status">游戏扫描失败。</p>}
+      {!enabled && <p role="status">正在等待后台服务就绪。</p>}
+      {enabled && games.isLoading && <p>正在扫描受支持的启动器安装。</p>}
+      {enabled && games.isError && <p role="status">游戏扫描失败。</p>}
       {games.data?.games.length === 0 && <p>未发现可用游戏。</p>}
       <ul className="game-list">
         {games.data?.games.map((game) => (

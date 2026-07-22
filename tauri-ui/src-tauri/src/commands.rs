@@ -24,6 +24,10 @@ type CommandResult<T> = Result<T, UiCommandError>;
 #[cfg(windows)]
 const PIPE_STARTUP_LIMIT: Duration = Duration::from_secs(20);
 #[cfg(windows)]
+const GUI_LIFECYCLE_RECOVERY_LIMIT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const GUI_LIFECYCLE_RECOVERY_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(windows)]
 const HUB_OBSERVATION_LIMIT: Duration = Duration::from_secs(20);
 #[cfg(windows)]
 const HUB_OBSERVATION_ATTEMPTS: u8 = 20;
@@ -101,7 +105,7 @@ pub async fn ensure_local_agent(
     {
         let deadline = Instant::now() + PIPE_STARTUP_LIMIT;
         match state.status_with_timeout(Duration::from_secs(1)).await {
-            Ok(_) => return bind_and_observe_hub(&state).await,
+            Ok(_) => return bind_existing_agent(&state).await,
             Err(error) if error.code == "local.transport.pipe_not_found" => {
                 state.clear_ui_lifetime_binding();
             }
@@ -141,6 +145,28 @@ pub async fn ensure_local_agent(
             "FairyPam Agent startup requires Windows",
         ))
     }
+}
+
+#[cfg(windows)]
+async fn bind_existing_agent(state: &ProductionGateway) -> CommandResult<SupportStatusDto> {
+    let deadline = Instant::now() + GUI_LIFECYCLE_RECOVERY_LIMIT;
+    loop {
+        match state.bind_ui_lifetime().await {
+            Ok(()) => return observe_hub(state).await,
+            Err(error) if error.code == "local.lifecycle.already_bound" => {}
+            Err(error) => return Err(error),
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(GUI_LIFECYCLE_RECOVERY_INTERVAL.min(remaining)).await;
+    }
+    Err(UiCommandError::unavailable(
+        "startup.agent_repair_required",
+        "FairyPam Agent is still closing a previous GUI session; retry after it exits",
+    ))
 }
 
 #[cfg(windows)]

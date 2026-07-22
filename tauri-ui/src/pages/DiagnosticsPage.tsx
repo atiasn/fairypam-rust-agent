@@ -1,9 +1,8 @@
-import { useMutation, type UseQueryResult } from '@tanstack/react-query';
+import type { UseQueryResult } from '@tanstack/react-query';
 
-import { agentApi } from '../lib/agentApi';
-import type { Overview } from '../lib/contracts';
+import type { EnvironmentCheck, Overview } from '../lib/contracts';
 
-type Props = { overview: UseQueryResult<Overview> };
+type Props = { environment: UseQueryResult<EnvironmentCheck>; overview: UseQueryResult<Overview> };
 
 const checkLabels: Record<string, string> = {
   binary_or_task: '服务安装',
@@ -44,15 +43,14 @@ function runtimeLabel(runtime: string | undefined) {
   return runtime ? labels[runtime.toLowerCase()] ?? '正在确认' : '不可用';
 }
 
-export function DiagnosticsPage({ overview }: Props) {
-  const environment = useMutation({ mutationFn: agentApi.runEnvironmentCheck });
+export function DiagnosticsPage({ environment, overview }: Props) {
   return (
     <section className="status-card" aria-labelledby="diagnostics-heading">
       <h2 id="diagnostics-heading">环境检查</h2>
       <p>状态：{serviceStateLabel(overview.data?.status.state)}</p>
       <p>运行模式：{runtimeLabel(overview.data?.doctor.runtime)}</p>
-      <button onClick={() => environment.mutate()} type="button">检查本地环境</button>
-      {environment.isPending && <p>正在检查。</p>}
+      <button disabled={environment.isFetching} onClick={() => void environment.refetch()} type="button">检查本地环境</button>
+      {environment.isFetching && <p>正在检查。</p>}
       {environment.isError && <p role="status">环境检查失败。</p>}
       {environment.data && (
         <ul className="check-list">

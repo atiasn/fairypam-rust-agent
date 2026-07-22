@@ -1,14 +1,14 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, within } from '@testing-library/react';
+import { render, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./lib/agentApi', () => ({
   agentApi: {
     ensureLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
     getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false }, doctor: { profiles: ['signed-profile'], runtime: 'dry_run' } }),
     getConnectionStatus: vi.fn().mockResolvedValue({ hub_address: 'https://hub.test', control: 'connected', frame: 'connected', capture_active: false, recovery_code: '' }),
-    runEnvironmentCheck: vi.fn().mockResolvedValue({ checks: [] }),
+    runEnvironmentCheck: vi.fn().mockResolvedValue({ registration_ready: true, checks: [] }),
     getLogTail: vi.fn().mockResolvedValue({ entries: [] }),
     scanInstalledGames: vi.fn().mockResolvedValue({ games: [] }),
     registerHub: vi.fn().mockResolvedValue({ status: 'pending' }),
@@ -27,6 +27,8 @@ function renderApp() {
 }
 
 describe('App', () => {
+  beforeEach(() => vi.clearAllMocks());
+
   it('仅显示中文产品导航并自动准备后台服务', async () => {
     const app = renderApp();
     const view = within(app.container);
@@ -51,6 +53,23 @@ describe('App', () => {
     expect(view.queryByText('服务启动需要处理')).not.toBeInTheDocument();
   });
 
+  it('启动后自动检查本机环境，并在未就绪时禁用注册', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.runEnvironmentCheck).mockResolvedValueOnce({
+      registration_ready: false,
+      checks: [{ id: 'guardian', status: 'unavailable', code: 'guardian.unavailable', recovery: '请处理' }],
+    });
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
+    await waitFor(() => expect(agentApi.runEnvironmentCheck).toHaveBeenCalledOnce());
+    await user.click(view.getByRole('button', { name: '连接与注册' }));
+
+    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
+    expect(view.getByText('请先完成本机环境检查，再提交注册。')).toBeInTheDocument();
+  });
+
   it('显示中文服务状态并只通过固定通道提交注册', async () => {
     const user = userEvent.setup();
     const app = renderApp();
@@ -63,15 +82,17 @@ describe('App', () => {
     await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
     expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
+    await waitFor(() => expect(agentApi.runEnvironmentCheck).toHaveBeenCalledTimes(2));
     expect(await view.findByText('请在系统确认窗口中确认注册；确认前不会使用注册码。若未在短时间内确认，本次注册会失效。')).toBeInTheDocument();
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
     expect(view.getByText(/注册码只会通过受保护的通道提交/)).toBeInTheDocument();
     expect(view.queryByText(/UAC|注册窗口/)).not.toBeInTheDocument();
   });
 
-  it('将环境检查映射为中文结果且不暴露机器代码', async () => {
+  it('将自动环境检查映射为中文结果且不暴露机器代码', async () => {
     const user = userEvent.setup();
     vi.mocked(agentApi.runEnvironmentCheck).mockResolvedValueOnce({
+      registration_ready: true,
       checks: [{ id: 'guardian', status: 'available', code: 'guardian.binary_available', recovery: '无需操作' }],
     });
     vi.mocked(agentApi.scanInstalledGames).mockResolvedValueOnce({
@@ -81,7 +102,6 @@ describe('App', () => {
     const view = within(app.container);
 
     await user.click(view.getByRole('button', { name: '环境检查' }));
-    await user.click(view.getByRole('button', { name: '检查本地环境' }));
     expect(await view.findByRole('listitem')).toHaveTextContent('守护服务：正常');
     expect(view.queryByText('无需操作')).not.toBeInTheDocument();
     expect(view.queryByText('guardian.binary_available')).not.toBeInTheDocument();
@@ -112,6 +132,43 @@ describe('App', () => {
 
     await user.click(view.getByRole('button', { name: '日志' }));
     expect(await view.findByText('暂时没有可显示的运行记录。服务正常时，记录可能为空。')).toBeInTheDocument();
+  });
+
+  it('服务状态丢失时禁用注册并提供手动重试', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.getOverview).mockRejectedValueOnce({
+      code: 'local.transport.disconnected',
+      message: '服务连接中断',
+    });
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByRole('heading', { name: '服务暂时无法使用' })).toBeInTheDocument();
+    expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
+    await user.click(view.getByRole('button', { name: '连接与注册' }));
+    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
+    expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
+  });
+
+  it('日志和游戏在后台服务就绪前不请求本地通道', async () => {
+    const user = userEvent.setup();
+    let resolveStartup: (value: { status: string }) => void;
+    vi.mocked(agentApi.ensureLocalAgent).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveStartup = resolve;
+    }));
+    const app = renderApp();
+    const view = within(app.container);
+
+    await user.click(view.getByRole('button', { name: '日志' }));
+    expect(view.getByText('正在等待后台服务就绪。')).toBeInTheDocument();
+    expect(agentApi.getLogTail).not.toHaveBeenCalled();
+    resolveStartup!({ status: 'ready' });
+    expect(await view.findByText('暂时没有可显示的运行记录。服务正常时，记录可能为空。')).toBeInTheDocument();
+    expect(agentApi.getLogTail).toHaveBeenCalledOnce();
+
+    await user.click(view.getByRole('button', { name: '游戏' }));
+    expect(await view.findByText('未发现可用游戏。')).toBeInTheDocument();
+    expect(agentApi.scanInstalledGames).toHaveBeenCalledOnce();
   });
 
   it('以中文安全摘要替代英文、协议和机器术语日志，同时保留中文脱敏记录', async () => {

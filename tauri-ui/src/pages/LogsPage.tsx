@@ -18,11 +18,12 @@ function displayLogMessage(message: string) {
   return safeLogMessage.test(message) ? message : unsafeLogMessageFallback;
 }
 
-export function LogsPage() {
+export function LogsPage({ enabled }: { enabled: boolean }) {
   const [level, setLevel] = useState<'error' | 'warn' | 'info'>('info');
   const logs = useQuery({
     queryKey: queryKeys.logTail(level),
     queryFn: () => agentApi.getLogTail(100, level),
+    enabled,
   });
 
   return (
@@ -36,7 +37,8 @@ export function LogsPage() {
           <option value="info">信息</option>
         </select>
       </label>
-      {logs.isError && <p role="status">无法读取固定日志源。</p>}
+      {!enabled && <p role="status">正在等待后台服务就绪。</p>}
+      {enabled && logs.isError && <p role="status">无法读取固定日志源。</p>}
       {logs.isSuccess && logs.data.entries.length === 0 && <p role="status">暂时没有可显示的运行记录。服务正常时，记录可能为空。</p>}
       <ul className="log-list">
         {logs.data?.entries.map((entry, index) => <li key={`${entry.level}-${index}`}><strong>{levelLabels[entry.level]}</strong>：{displayLogMessage(entry.message)}</li>)}

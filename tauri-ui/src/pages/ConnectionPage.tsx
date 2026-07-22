@@ -4,11 +4,13 @@ import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tan
 import { StatusPanel } from '../components/StatusPanel';
 import { agentApi } from '../lib/agentApi';
 import type { ConnectionState } from '../lib/connectionReducer';
-import type { Overview, SupportStatus } from '../lib/contracts';
+import type { EnvironmentCheck, Overview, SupportStatus } from '../lib/contracts';
 import { queryKeys } from '../lib/queryKeys';
 
 type Props = {
   connection: ConnectionState;
+  canMutate: boolean;
+  environment: UseQueryResult<EnvironmentCheck>;
   overview: UseQueryResult<Overview>;
   startup: UseQueryResult<SupportStatus>;
   retryStartup: () => void;
@@ -24,7 +26,7 @@ function connectionStatusLabel(status: string) {
   return labels[status.toLowerCase()] ?? '正在确认';
 }
 
-export function ConnectionPage({ connection, overview, startup, retryStartup }: Props) {
+export function ConnectionPage({ canMutate, connection, environment, overview, startup, retryStartup }: Props) {
   const [hubAddress, setHubAddress] = useState('https://');
   const [registrationCode, setRegistrationCode] = useState('');
   const status = useQuery({
@@ -38,8 +40,11 @@ export function ConnectionPage({ connection, overview, startup, retryStartup }: 
     onSuccess: () => {
       setRegistrationCode('');
       void queryClient.invalidateQueries({ queryKey: queryKeys.connection });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.environment });
     },
   });
+  const registrationReady = environment.data?.registration_ready === true;
+  const registrationEnabled = canMutate && overview.isSuccess && startup.isSuccess && registrationReady;
   return (
     <>
       <StatusPanel
@@ -74,14 +79,16 @@ export function ConnectionPage({ connection, overview, startup, retryStartup }: 
             一次性注册码
             <input autoComplete="one-time-code" onChange={(event) => setRegistrationCode(event.target.value)} required type="password" value={registrationCode} />
           </label>
-          <button disabled={registration.isPending || !startup.isSuccess} type="submit">注册或重新注册</button>
+          <button disabled={registration.isPending || !registrationEnabled} type="submit">注册或重新注册</button>
         </form>
         {registration.isSuccess && <p role="status">请在系统确认窗口中确认注册；确认前不会使用注册码。若未在短时间内确认，本次注册会失效。</p>}
         {registration.isError && <p role="status">注册未完成。请确认后台服务已就绪后重试。</p>}
+        {!registrationReady && <p role="status">请先完成本机环境检查，再提交注册。</p>}
+        {environment.isError && <p role="status">本机环境暂时无法确认，请稍后重试。</p>}
         {!startup.isSuccess && <p role="status">请先等待后台服务就绪，再提交注册。</p>}
         <p className="notice">注册码只会通过受保护的通道提交，界面不会保存它。</p>
       </section>
-      {startup.isError && <button onClick={retryStartup} type="button">重试启动</button>}
+      {(startup.isError || overview.isError) && <button onClick={retryStartup} type="button">重试启动</button>}
     </>
   );
 }

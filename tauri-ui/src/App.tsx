@@ -50,10 +50,19 @@ export default function App() {
   const common = {
     connection,
     canMutate: canMutate(connection),
+    environment: queries.environment,
     overview: queries.overview,
     startup,
-    retryStartup: () => void startup.refetch(),
+    retryStartup: () => {
+      void startup.refetch().then((result) => {
+        if (!result.isError) {
+          void queries.overview.refetch();
+          void queries.environment.refetch();
+        }
+      });
+    },
   };
+  const agentReady = startup.isSuccess && queries.overview.isSuccess;
 
   return (
     <div className="app-shell">
@@ -83,9 +92,9 @@ export default function App() {
         <main>
           {page === 'dashboard' && <DashboardPage {...common} />}
           {page === 'connection' && <ConnectionPage {...common} />}
-          {page === 'environment' && <DiagnosticsPage overview={queries.overview} />}
-          {page === 'logs' && <LogsPage />}
-          {page === 'games' && <GamesPage />}
+          {page === 'environment' && <DiagnosticsPage environment={queries.environment} overview={queries.overview} />}
+          {page === 'logs' && <LogsPage enabled={agentReady} />}
+          {page === 'games' && <GamesPage enabled={agentReady} />}
         </main>
       </div>
     </div>
