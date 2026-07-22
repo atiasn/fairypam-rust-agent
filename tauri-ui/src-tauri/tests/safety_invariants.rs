@@ -382,27 +382,113 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     let descriptor = preinstall_hook
         .find("ConvertStringSecurityDescriptorToSecurityDescriptorW")
         .expect("the protected staging DACL must be built before directory creation");
+    let security_attributes = preinstall_hook
+        .find("*(i 12, p r8, i 0) p.r7")
+        .expect("the staging security attributes must be allocated before directory creation");
     let create_stage = preinstall_hook
-        .find("CreateDirectoryW")
+        .find("CreateDirectoryW(w \"$FairyPamStageDir\"")
         .expect("the staging directory must be created with its final DACL");
     let pin_stage = preinstall_hook
-        .find("CreateFileW")
+        .find("CreateFileW(w \"$FairyPamStageDir\"")
         .expect("the staging directory must be pinned against replacement");
+    let pin_invalid_handle = preinstall_hook
+        .find("IntCmp $R6 -1 fairypam_stage_pin_failed")
+        .expect("an invalid staging handle must fail closed");
+    let verify_stage = preinstall_hook
+        .find("GetFileAttributesW(w \"$FairyPamStageDir\"")
+        .expect("the staging directory must reject reparse points");
+    let invalid_attributes = preinstall_hook
+        .find("IntCmp $R9 -1 fairypam_stage_verify_failed")
+        .expect("invalid staging attributes must fail closed");
+    let reject_reparse = preinstall_hook
+        .find(
+            "IntOp $R8 $R9 & 0x400 ; FILE_ATTRIBUTE_REPARSE_POINT\n  ${If} $R8 != 0\n    Goto fairypam_stage_reparse_detected",
+        )
+        .expect("a reparse staging directory must be rejected before extraction");
+    let stage_handle = preinstall_hook
+        .find("StrCpy $FairyPamStageHandle $R6")
+        .expect("the verified staging directory handle must remain pinned");
     let staged_inst_dir = preinstall_hook
         .find("StrCpy $INSTDIR \"$FairyPamStageDir\"")
         .expect("payload extraction must target the fixed staging directory");
     let staged_out_dir = preinstall_hook
         .find("SetOutPath $INSTDIR")
         .expect("NSIS OUTDIR must follow the fixed staging directory");
-    assert!(descriptor < create_stage && create_stage < pin_stage);
-    assert!(pin_stage < staged_inst_dir && staged_inst_dir < staged_out_dir);
+    let create_error = preinstall_hook[create_stage..]
+        .find("?e'\n  Pop $R5")
+        .map(|offset| create_stage + offset)
+        .expect("the staging directory creation error must be captured by System before cleanup");
+    let pin_error = preinstall_hook[pin_stage..]
+        .find("?e'\n  Pop $R5")
+        .map(|offset| pin_stage + offset)
+        .expect("the staging directory pin error must be popped immediately after the System call");
+    assert!(
+        preinstall_hook
+            .find("IfFileExists \"$FairyPamBackupDir\" fairypam_stale_backup 0")
+            .expect("the preserved backup slot must stop before staging")
+            < descriptor
+    );
+    assert!(
+        preinstall_hook
+            .find("IfFileExists \"$FairyPamStageDir\" fairypam_stale_stage 0")
+            .expect("the preserved stage slot must stop before staging")
+            < descriptor
+    );
+    assert!(descriptor < security_attributes && security_attributes < create_stage);
+    assert!(descriptor < create_stage && create_stage < create_error && create_error < pin_stage);
+    assert!(pin_stage < pin_error && pin_error < pin_invalid_handle && pin_invalid_handle < verify_stage);
+    assert!(verify_stage < invalid_attributes && invalid_attributes < stage_handle);
+    assert!(invalid_attributes < reject_reparse && reject_reparse < stage_handle);
+    assert!(pin_stage < verify_stage && verify_stage < stage_handle);
+    assert!(stage_handle < staged_inst_dir && staged_inst_dir < staged_out_dir);
+    for target in nsis_hooks
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("Goto "))
+        .map(|line| line.split_whitespace().next().expect("Goto must name a label"))
+    {
+        assert!(
+            nsis_hooks
+                .lines()
+                .map(str::trim)
+                .any(|line| line.strip_suffix(':') == Some(target)),
+            "missing NSIS Goto label: {target}"
+        );
+    }
+    assert!(preinstall_hook.contains("IfFileExists \"$FairyPamBackupDir\" fairypam_stale_backup 0"));
     assert!(preinstall_hook.contains("IfFileExists \"$FairyPamStageDir\" fairypam_stale_stage 0"));
+    assert!(preinstall_hook.contains(
+        "${If} $R5 = ${ERROR_ALREADY_EXISTS}\n      Goto fairypam_stale_stage"
+    ));
+    assert!(!preinstall_hook.contains("RMDir \"$FairyPamStageDir\""));
     assert!(!preinstall_hook.contains("RMDir /r \"$FairyPamStageDir\""));
+    assert!(!preinstall_hook.contains("GetLastError()"));
+    for forbidden in [
+        "${GetParent}",
+        "FairyPamProductParentDir",
+        "CreateDirectoryW(w \"$FairyPamFinalDir\"",
+        "CreateDirectoryW(w \"$PROGRAMFILES64",
+    ] {
+        assert!(
+            !preinstall_hook.contains(forbidden),
+            "the installer must not create or modify a Program Files parent: {forbidden}"
+        );
+    }
     for required in [
         "FAIRYPAM_INSTALL_SDDL",
         "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)",
+        "ERROR_ALREADY_EXISTS 183",
         "CreateDirectoryW(w \"$FairyPamStageDir\"",
         "CreateFileW(w \"$FairyPamStageDir\"",
+        "GetFileAttributesW(w \"$FairyPamStageDir\")",
+        "IntCmp $R6 -1 fairypam_stage_pin_failed",
+        "IntCmp $R9 -1 fairypam_stage_verify_failed",
+        "fairypam_stage_pin_failed:",
+        "fairypam_stage_verify_failed:",
+        "IntOp $R8 $R9 & 0x10",
+        "IntOp $R8 $R9 & 0x400",
+        "?e'\n  Pop $R5",
+        "Win32 error $R5",
         "i 0x80, i 3, p 0, i 3",
         "FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT",
         "FILE_FLAG_OPEN_REPARSE_POINT",
@@ -413,6 +499,28 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         assert!(
             preinstall_hook.contains(required),
             "staging must be created, pinned, and selected before extraction: {required}"
+        );
+    }
+    for error_capture in [
+        "ConvertStringSecurityDescriptorToSecurityDescriptorW(w \"${FAIRYPAM_INSTALL_SDDL}\", i 1, *p .r8, p 0) i.r9 ?e'\n  Pop $R5",
+        "*(i 12, p r8, i 0) p.r7 ?e'\n  Pop $R5",
+        "CreateDirectoryW(w \"$FairyPamStageDir\", p r7) i.r9 ?e'\n  Pop $R5",
+        "CreateFileW(w \"$FairyPamStageDir\", i 0x80, i 3, p 0, i 3, i ${FAIRYPAM_STAGE_OPEN_FLAGS}, p 0) p.r6 ?e'\n  Pop $R5",
+        "GetFileAttributesW(w \"$FairyPamStageDir\") i.r9 ?e'\n  Pop $R5",
+    ] {
+        assert!(
+            preinstall_hook.contains(error_capture),
+            "Windows API error capture must use System ?e followed immediately by Pop: {error_capture}"
+        );
+    }
+    for failure_path in [
+        "fairypam_stage_verify_failed:\n  System::Call 'kernel32::CloseHandle(p r6)'\n  Abort ",
+        "fairypam_stage_not_directory:\n  System::Call 'kernel32::CloseHandle(p r6)'\n  Abort ",
+        "fairypam_stage_reparse_detected:\n  System::Call 'kernel32::CloseHandle(p r6)'\n  Abort ",
+    ] {
+        assert!(
+            preinstall_hook.contains(failure_path),
+            "stage verification failure must close its pinned handle before aborting: {failure_path}"
         );
     }
 

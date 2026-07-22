@@ -4,6 +4,7 @@ Var FairyPamBackupDir
 Var FairyPamStageHandle
 
 !define FAIRYPAM_INSTALL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)"
+!define ERROR_ALREADY_EXISTS 183
 !define FILE_FLAG_OPEN_REPARSE_POINT 0x00200000
 !define FAIRYPAM_STAGE_OPEN_FLAGS 0x02200000 ; FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
 
@@ -16,25 +17,46 @@ Var FairyPamStageHandle
   IfFileExists "$FairyPamStageDir" fairypam_stale_stage 0
 
   ; NSIS is 32-bit, so SECURITY_ATTRIBUTES is 12 bytes here.
-  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${FAIRYPAM_INSTALL_SDDL}", i 1, *p .r8, p 0) i.r9'
+  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${FAIRYPAM_INSTALL_SDDL}", i 1, *p .r8, p 0) i.r9 ?e'
+  Pop $R5
   ${If} $R9 = 0
-    Goto fairypam_stage_prepare_failed
+    Goto fairypam_stage_sddl_failed
   ${EndIf}
-  System::Call '*(i 12, p r8, i 0) p.r7'
+  System::Call '*(i 12, p r8, i 0) p.r7 ?e'
+  Pop $R5
   ${If} $R7 = 0
     System::Call 'kernel32::LocalFree(p r8)'
-    Goto fairypam_stage_prepare_failed
-  ${EndIf}
-  System::Call 'kernel32::CreateDirectoryW(w "$FairyPamStageDir", p r7) i.r9'
-  System::Free $R7
-  System::Call 'kernel32::LocalFree(p r8)'
-  ${If} $R9 = 0
-    Goto fairypam_stage_prepare_failed
+    Goto fairypam_stage_attributes_failed
   ${EndIf}
 
+  System::Call 'kernel32::CreateDirectoryW(w "$FairyPamStageDir", p r7) i.r9 ?e'
+  Pop $R5
+  ${If} $R9 = 0
+    System::Free $R7
+    System::Call 'kernel32::LocalFree(p r8)'
+    ${If} $R5 = ${ERROR_ALREADY_EXISTS}
+      Goto fairypam_stale_stage
+    ${EndIf}
+    Goto fairypam_stage_create_failed
+  ${EndIf}
+  System::Free $R7
+  System::Call 'kernel32::LocalFree(p r8)'
+
   ; No share-delete keeps the protected, non-reparse stage pinned through verification.
-  System::Call 'kernel32::CreateFileW(w "$FairyPamStageDir", i 0x80, i 3, p 0, i 3, i ${FAIRYPAM_STAGE_OPEN_FLAGS}, p 0) p.r6'
-  IntCmp $R6 -1 fairypam_stage_prepare_failed
+  System::Call 'kernel32::CreateFileW(w "$FairyPamStageDir", i 0x80, i 3, p 0, i 3, i ${FAIRYPAM_STAGE_OPEN_FLAGS}, p 0) p.r6 ?e'
+  Pop $R5
+  IntCmp $R6 -1 fairypam_stage_pin_failed
+  System::Call 'kernel32::GetFileAttributesW(w "$FairyPamStageDir") i.r9 ?e'
+  Pop $R5
+  IntCmp $R9 -1 fairypam_stage_verify_failed
+  IntOp $R8 $R9 & 0x10 ; FILE_ATTRIBUTE_DIRECTORY
+  ${If} $R8 = 0
+    Goto fairypam_stage_not_directory
+  ${EndIf}
+  IntOp $R8 $R9 & 0x400 ; FILE_ATTRIBUTE_REPARSE_POINT
+  ${If} $R8 != 0
+    Goto fairypam_stage_reparse_detected
+  ${EndIf}
   StrCpy $FairyPamStageHandle $R6
   StrCpy $INSTDIR "$FairyPamStageDir"
   SetOutPath $INSTDIR
@@ -44,9 +66,23 @@ fairypam_stale_backup:
   Abort "FairyPam found a preserved previous installation. Installation was stopped without changing the active runtime."
 fairypam_stale_stage:
   Abort "FairyPam found an unverified staging directory. Installation was stopped without following or deleting it."
-fairypam_stage_prepare_failed:
-  RMDir "$FairyPamStageDir"
-  Abort "FairyPam could not create its protected installation staging directory."
+fairypam_stage_sddl_failed:
+  Abort "FairyPam could not prepare security for its protected installation staging directory (Win32 error $R5)."
+fairypam_stage_attributes_failed:
+  Abort "FairyPam could not allocate security attributes for its protected installation staging directory (Win32 error $R5)."
+fairypam_stage_create_failed:
+  Abort "FairyPam could not create its protected installation staging directory (Win32 error $R5)."
+fairypam_stage_pin_failed:
+  Abort "FairyPam could not pin its protected installation staging directory (Win32 error $R5)."
+fairypam_stage_verify_failed:
+  System::Call 'kernel32::CloseHandle(p r6)'
+  Abort "FairyPam could not verify its protected installation staging directory (Win32 error $R5)."
+fairypam_stage_not_directory:
+  System::Call 'kernel32::CloseHandle(p r6)'
+  Abort "FairyPam rejected a non-directory protected installation staging path."
+fairypam_stage_reparse_detected:
+  System::Call 'kernel32::CloseHandle(p r6)'
+  Abort "FairyPam rejected a reparse point at its protected installation staging directory."
 fairypam_stage_ready:
 !macroend
 
