@@ -164,6 +164,8 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     // template semantics, not a checkout-specific line-ending convention.
     let normalized_nsis_template = NSIS_TEMPLATE.replace("\r\n", "\n");
     let nsis_template = normalized_nsis_template.as_str();
+    let normalized_nsis_hooks = NSIS_HOOKS.replace("\r\n", "\n");
+    let nsis_hooks = normalized_nsis_hooks.as_str();
     for required in [
         "C:\\ProgramData\\FairyPam.Agent",
         "CreateDirectoryW",
@@ -373,7 +375,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     assert!(!nsis_template.contains("$PLUGINSDIR"));
     assert!(!nsis_template.contains("fairypam-agent-installer.exe"));
 
-    let preinstall_hook = &NSIS_HOOKS[..NSIS_HOOKS
+    let preinstall_hook = &nsis_hooks[..nsis_hooks
         .find("!macro NSIS_HOOK_ACTIVATE")
         .expect("installer must define its activation hook")];
     let descriptor = preinstall_hook
@@ -427,32 +429,32 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "IfFileExists \"$FairyPamFinalDir\" 0 fairypam_activate_fresh",
     ] {
         assert!(
-            NSIS_HOOKS.contains(required),
+            nsis_hooks.contains(required),
             "missing atomic slot rule: {required}"
         );
     }
-    let verify = NSIS_HOOKS
+    let verify = nsis_hooks
         .find("ExecWait '\"$FairyPamStageDir\\resources\\runtime\\fairypam-agent-installer.exe\"")
         .expect("the staged helper must verify the complete slot");
-    let close_stage = NSIS_HOOKS[verify..]
+    let close_stage = nsis_hooks[verify..]
         .find("CloseHandle")
         .map(|offset| verify + offset)
         .expect("the staging directory must remain pinned through helper verification");
-    let preserve = NSIS_HOOKS
+    let preserve = nsis_hooks
         .find("Rename \"$FairyPamFinalDir\" \"$FairyPamBackupDir\"")
         .expect("the previous slot must be preserved");
-    let activate_slot = NSIS_HOOKS
+    let activate_slot = nsis_hooks
         .find("Rename \"$FairyPamStageDir\" \"$FairyPamFinalDir\"")
         .expect("the complete staged slot must be activated");
     assert!(verify < close_stage && close_stage < preserve && preserve < activate_slot);
-    let cleanup_start = NSIS_HOOKS
+    let cleanup_start = nsis_hooks
         .find("fairypam_activate_complete:")
         .expect("activated slot cleanup must be defined");
-    let cleanup_end = NSIS_HOOKS[cleanup_start..]
+    let cleanup_end = nsis_hooks[cleanup_start..]
         .find("fairypam_restore_previous:")
         .map(|offset| cleanup_start + offset)
         .expect("activated slot cleanup must finish before rollback");
-    let cleanup = &NSIS_HOOKS[cleanup_start..cleanup_end];
+    let cleanup = &nsis_hooks[cleanup_start..cleanup_end];
     let cleanup_clear = cleanup
         .find("ClearErrors")
         .expect("previous-slot cleanup must reset its error state");
@@ -467,16 +469,16 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         .expect("a retained previous slot must fail closed");
     assert!(cleanup_clear < cleanup_remove && cleanup_remove < cleanup_error);
     assert!(cleanup_error < cleanup_present);
-    assert!(NSIS_HOOKS.contains(
+    assert!(nsis_hooks.contains(
         "fairypam_backup_cleanup_failed:\n  Abort \"FairyPam could not remove the preserved previous installation. Installation was stopped without reporting success.\""
     ));
     for forbidden in ["$PLUGINSDIR", "$TEMP", "ExecShell"] {
         assert!(
-            !NSIS_HOOKS.contains(forbidden),
+            !nsis_hooks.contains(forbidden),
             "product helper must never execute from a temporary path: {forbidden}"
         );
     }
-    assert!(!NSIS_HOOKS.contains("fairypam-agent.exe.new"));
+    assert!(!nsis_hooks.contains("fairypam-agent.exe.new"));
     for required in [
         "verify_install_tree(stage_root)?",
         ".join(\"resources\")",
