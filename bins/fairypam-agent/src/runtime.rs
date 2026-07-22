@@ -433,6 +433,7 @@ enum RuntimeLogMessage {
 }
 
 impl RuntimeLogMessage {
+    #[cfg(test)]
     const ALL: &[Self] = &[
         Self::AwaitingRegistration,
         Self::Started,
@@ -2086,20 +2087,16 @@ mod tests {
                         .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character))
                 })
             }));
-        let log_tail = local
-            .execute(
-                &local_caller(),
-                &LocalCommand::GetLogTail {
-                    lines: 20,
-                    level: LogLevel::Info,
-                },
-            )
-            .unwrap();
-        let messages = log_tail["entries"]
-            .as_array()
+        // Production log tailing requires installer-provisioned private paths.
+        // This runtime test verifies the shared record boundary without depending
+        // on Windows installer state.
+        let messages = local
+            .state
+            .lock()
             .unwrap()
+            .logs
             .iter()
-            .filter_map(|entry| entry["message"].as_str())
+            .map(|entry| entry.message.as_str())
             .collect::<Vec<_>>();
         assert!(messages.contains(&"后台服务已启动，正在准备连接"));
         assert!(messages.contains(&"界面请求环境检查"));
