@@ -26,11 +26,9 @@ export type RegistrationStatus = { status: 'pending' };
 export type ExportResult = { saved: boolean; reasonCode?: string };
 export type PreviewDto = { mimeType: 'image/jpeg' | 'image/png'; bytes: number[] };
 export type ConnectionStatus = {
-  hub_address: string;
   control: string;
   frame: string;
   capture_active: boolean;
-  recovery_code: string;
 };
 export type EnvironmentCheckItem = {
   id: string;

@@ -36,9 +36,6 @@ use windows::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_ALWAYS, OPEN_EXISTING,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
-};
 
 pub(crate) const PRODUCT_STATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent";
 pub(crate) const STATE_PARENT: &str = r"C:\ProgramData\FairyPam.Agent\Agent";
@@ -48,21 +45,12 @@ pub(crate) const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 const CLAIM_DEADLINE: Duration = Duration::from_secs(15);
 const CLAIM_OPERATION_TIMEOUT_MS: i32 = 5_000;
-const REPLACEMENT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// The Agent owns the whole enrollment transaction: the trusted elevated
-/// confirmation always happens before the Hub receives the one-time code.
-pub fn register_with_confirmation(
-    hub_address: &str,
-    registration_code: &str,
-    replaces_existing_registration: bool,
-) -> Result<(), AgentError> {
+/// The elevated Agent claims the one-time code after the protected Pipe has
+/// authenticated the GUI caller. No desktop confirmation is required.
+pub fn register(hub_address: &str, registration_code: &str) -> Result<(), AgentError> {
     validate_registration_request(hub_address, registration_code).map_err(|_| invalid())?;
-    // The confirmation itself is part of the security boundary. Do not let a
-    // medium-integrity fallback process obtain apparent user consent.
     ensure_elevated()?;
     let deadline = Instant::now() + CLAIM_DEADLINE;
-    confirm_registration(hub_address, replaces_existing_registration, deadline)?;
     register_before(hub_address, registration_code, deadline)
 }
 
@@ -74,51 +62,6 @@ fn register_before(
     let (host, port, path) = claim_target(hub_address)?;
     let payload = claim(&host, port, &path, registration_code, deadline)?;
     persist(&payload)
-}
-
-fn confirm_registration(
-    hub_address: &str,
-    replaces_existing_registration: bool,
-    deadline: Instant,
-) -> Result<(), AgentError> {
-    let uri = hub_address.parse::<Uri>().map_err(|_| invalid())?;
-    let authority = uri.authority().ok_or_else(invalid)?;
-    let host = match authority.port_u16() {
-        Some(port) => format!("{}:{port}", authority.host()),
-        None => authority.host().to_owned(),
-    };
-    let message = if replaces_existing_registration {
-        format!(
-            "FairyPam Agent 已经注册。\n\n是否重新注册到 Hub：\n{host}\n\n此操作将替换当前证书和信任配置。"
-        )
-    } else {
-        format!("是否将 FairyPam Agent 注册到 Hub：\n{host}\n\n只有确认后才会使用一次性注册码。")
-    };
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result = unsafe {
-            MessageBoxW(
-                None,
-                &HSTRING::from(message),
-                &HSTRING::from("FairyPam 重新注册确认"),
-                MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
-            )
-        };
-        let _ = sender.send(result == IDYES);
-    });
-    let timeout = deadline
-        .saturating_duration_since(Instant::now())
-        .min(REPLACEMENT_CONFIRMATION_TIMEOUT);
-    if receiver
-        .recv_timeout(timeout)
-        .is_ok_and(|accepted| accepted)
-    {
-        return Ok(());
-    }
-    Err(AgentError::new(
-        "enrollment.replacement_cancelled",
-        "Hub registration replacement was not authorized",
-    ))
 }
 
 fn claim_target(value: &str) -> Result<(String, u16, String), AgentError> {

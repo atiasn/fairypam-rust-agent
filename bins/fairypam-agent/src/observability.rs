@@ -753,6 +753,50 @@ mod tests {
     }
 
     #[test]
+    fn persistent_log_keeps_registration_lifecycle_but_never_registration_material() {
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-registration-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let log = FixedLog::open(&root).unwrap();
+        log.append(LogLevel::Info, "服务注册已开始，正在安全领取凭据")
+            .unwrap();
+        log.append(LogLevel::Info, "服务注册已完成，正在安全重连")
+            .unwrap();
+        log.append(LogLevel::Warn, "服务注册失败（错误码：enrollment.network_failed）")
+            .unwrap();
+        let hub = "https://enroll-7f8c3d.example";
+        let code = "r7Pq9Lm2Vx6Aa1Zz";
+        let pem = "-----BEGIN CERTIFICATE-----Q29kZXg=";
+        log.append(
+            LogLevel::Warn,
+            &format!("registration_code={code}; hub={hub}; certificate={pem}"),
+        )
+        .unwrap();
+
+        let tail = log.tail(10, &LogLevel::Info).unwrap();
+        let entries = tail["entries"].as_array().unwrap();
+        assert_eq!(entries[1]["message"], "服务注册失败（错误码：enrollment.network_failed）");
+        assert_eq!(entries[2]["message"], "服务注册已完成，正在安全重连");
+        assert_eq!(entries[3]["message"], "服务注册已开始，正在安全领取凭据");
+        let persisted = std::fs::read_to_string(root.join(LOG_FILE)).unwrap();
+        let evidence = format!("{persisted}{tail}");
+        for secret in [hub, code, pem] {
+            assert!(
+                !evidence.contains(secret),
+                "registration material reached the persistent log or GetLogTail"
+            );
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rotation_retains_and_tails_every_log_file() {
         let root = std::env::temp_dir().join(format!(
             "fairypam-fixed-log-retention-{}-{}",

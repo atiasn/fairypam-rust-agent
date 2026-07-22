@@ -143,9 +143,8 @@ fn product_uac_and_enrollment_publication_fail_closed() {
         "STATE_PARENT",
         "PRODUCT_STATE_ROOT",
         "AUDIT_ROOT",
-        "register_with_confirmation",
+        "pub fn register(",
         "ensure_elevated()?",
-        "REPLACEMENT_CONFIRMATION_TIMEOUT",
     ] {
         assert!(
             AGENT_ENROLLMENT.contains(required),
@@ -153,6 +152,7 @@ fn product_uac_and_enrollment_publication_fail_closed() {
         );
     }
     assert!(!AGENT_ENROLLMENT.contains("fs::create_dir_all(path)"));
+    assert!(!AGENT_ENROLLMENT.contains("MessageBoxW("));
     assert!(AGENT_RUNTIME.contains("registration_pending"));
     assert!(GATEWAY.contains("RegistrationStatusDto"));
 }

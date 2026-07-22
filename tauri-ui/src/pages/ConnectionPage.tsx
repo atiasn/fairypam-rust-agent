@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
+import { useState, type FormEvent } from 'react';
+import { useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 
 import { StatusPanel } from '../components/StatusPanel';
 import { agentApi } from '../lib/agentApi';
@@ -27,22 +27,13 @@ function connectionStatusLabel(status: string) {
 }
 
 export function ConnectionPage({ canMutate, connection, environment, overview, startup, retryStartup }: Props) {
-  const [hubAddress, setHubAddress] = useState('https://');
-  const [registrationCode, setRegistrationCode] = useState('');
+  const [registrationStatus, setRegistrationStatus] = useState<'idle' | 'submitting' | 'submitted' | 'error'>('idle');
   const status = useQuery({
     queryKey: queryKeys.connection,
     queryFn: agentApi.getConnectionStatus,
     enabled: overview.isSuccess,
   });
   const queryClient = useQueryClient();
-  const registration = useMutation({
-    mutationFn: () => agentApi.registerHub(hubAddress.trim(), registrationCode),
-    onSuccess: () => {
-      setRegistrationCode('');
-      void queryClient.invalidateQueries({ queryKey: queryKeys.connection });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.environment });
-    },
-  });
   const registrationReady = environment.data?.registration_ready === true;
   const registrationEnabled = canMutate
     && overview.isSuccess
@@ -52,6 +43,32 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
     && !environment.isError
     && !environment.data.registration_pending
     && registrationReady;
+
+  const submitRegistration = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!registrationEnabled || registrationStatus === 'submitting') return;
+
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const hubAddress = data.get('hubAddress');
+    const registrationCode = data.get('registrationCode');
+    if (typeof hubAddress !== 'string' || typeof registrationCode !== 'string') return;
+
+    setRegistrationStatus('submitting');
+    void agentApi.registerHub(hubAddress.trim(), registrationCode).then(
+      () => {
+        form.reset();
+        setRegistrationStatus('submitted');
+        void Promise.all([
+          queryClient.invalidateQueries({ queryKey: queryKeys.connection }),
+          queryClient.invalidateQueries({ queryKey: queryKeys.environment }),
+          queryClient.invalidateQueries({ queryKey: ['agent-ui', 'log-tail'] }),
+        ]);
+      },
+      () => setRegistrationStatus('error'),
+    );
+  };
+
   return (
     <>
       <StatusPanel
@@ -65,7 +82,6 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
         {status.isError && <p role="status">服务正在恢复连接。</p>}
         {status.data && (
           <dl>
-            <dt>服务地址</dt><dd>{status.data.hub_address || '尚未注册'}</dd>
             <dt>控制连接</dt><dd>{connectionStatusLabel(status.data.control)}</dd>
             <dt>画面传输</dt><dd>{connectionStatusLabel(status.data.frame)}</dd>
             <dt>采集功能</dt><dd>{status.data.capture_active ? '已开启' : '未开启'}</dd>
@@ -73,25 +89,21 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
         )}
         <form
           className="enrollment-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (registrationEnabled) {
-              registration.mutate();
-            }
-          }}
+          onSubmit={submitRegistration}
         >
           <label>
             服务地址
-            <input autoComplete="url" onChange={(event) => setHubAddress(event.target.value)} required type="url" value={hubAddress} />
+            <input autoComplete="url" defaultValue="https://" name="hubAddress" required type="url" />
           </label>
           <label>
             一次性注册码
-            <input autoComplete="one-time-code" onChange={(event) => setRegistrationCode(event.target.value)} required type="password" value={registrationCode} />
+            <input autoComplete="one-time-code" name="registrationCode" required type="password" />
           </label>
-          <button disabled={registration.isPending || !registrationEnabled} type="submit">注册或重新注册</button>
+          <button disabled={registrationStatus === 'submitting' || !registrationEnabled} type="submit">注册或重新注册</button>
         </form>
-        {registration.isSuccess && <p role="status">请在系统确认窗口中确认注册；确认前不会使用注册码。若未在短时间内确认，本次注册会失效。</p>}
-        {registration.isError && <p role="status">注册未完成。请确认后台服务已就绪后重试。</p>}
+        {registrationStatus === 'submitting' && <p role="status">正在提交注册请求。</p>}
+        {registrationStatus === 'submitted' && <p role="status">已提交，正在完成注册；结果见运行日志。</p>}
+        {registrationStatus === 'error' && <p role="status">注册请求未提交。请确认后台服务已就绪后重试。</p>}
         {!registrationReady && <p role="status">请先完成本机环境检查，再提交注册。</p>}
         {environment.isError && <p role="status">本机环境暂时无法确认，请稍后重试。</p>}
         {!startup.isSuccess && <p role="status">请先等待后台服务就绪，再提交注册。</p>}

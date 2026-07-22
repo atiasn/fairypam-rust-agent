@@ -418,8 +418,7 @@ enum RuntimeLogMessage {
     LocalEnvironmentCheckRequested,
     LocalGameScanRequested,
     LocalRegistrationRequested,
-    RegistrationFailed,
-    RegistrationAwaitingConfirmation,
+    RegistrationStarted,
     RegistrationChanged,
     RegistrationCompleted,
 }
@@ -440,8 +439,7 @@ impl RuntimeLogMessage {
         Self::LocalEnvironmentCheckRequested,
         Self::LocalGameScanRequested,
         Self::LocalRegistrationRequested,
-        Self::RegistrationFailed,
-        Self::RegistrationAwaitingConfirmation,
+        Self::RegistrationStarted,
         Self::RegistrationChanged,
         Self::RegistrationCompleted,
     ];
@@ -461,8 +459,7 @@ impl RuntimeLogMessage {
             Self::LocalEnvironmentCheckRequested => "界面请求环境检查",
             Self::LocalGameScanRequested => "界面请求扫描已安装游戏",
             Self::LocalRegistrationRequested => "界面请求注册服务",
-            Self::RegistrationFailed => "服务注册未完成",
-            Self::RegistrationAwaitingConfirmation => "服务注册正在等待以管理员权限确认",
+            Self::RegistrationStarted => "服务注册已开始，正在安全领取凭据",
             Self::RegistrationChanged => "服务注册信息已变更，正在安全重连",
             Self::RegistrationCompleted => "服务注册已完成，正在安全重连",
         }
@@ -471,7 +468,14 @@ impl RuntimeLogMessage {
 
 impl RuntimeState {
     fn record(&mut self, level: LogLevel, message: RuntimeLogMessage) {
-        let message = message.text();
+        self.record_text(level, message.text());
+    }
+
+    fn record_registration_failure(&mut self, code: &str) {
+        self.record_text(LogLevel::Warn, &format!("服务注册失败（错误码：{code}）"));
+    }
+
+    fn record_text(&mut self, level: LogLevel, message: &str) {
         if self.logs.len() == 200 {
             self.logs.pop_front();
         }
@@ -1045,16 +1049,15 @@ impl SharedRuntime {
         hub_address: &str,
         registration_code: &str,
     ) -> Result<serde_json::Value, AgentError> {
-        // Return before the elevated Agent dialogue is shown. This one pipe
-        // remains available for status and retry requests during the bounded
-        // human-confirmation window.
+        // Return while the direct claim runs so this Pipe remains available
+        // for status and retry requests.
         if self.registration_in_progress.swap(true, Ordering::AcqRel) {
             return Err(AgentError::new(
                 "enrollment.registration_pending",
-                "a Hub registration confirmation is already pending",
+                "a Hub registration is already pending",
             ));
         }
-        self.mark_registration_pending();
+        self.mark_registration_started();
         let runtime = self.clone();
         let hub_address = hub_address.to_owned();
         let registration_code = registration_code.to_owned();
@@ -1065,10 +1068,15 @@ impl SharedRuntime {
         {
             self.registration_in_progress
                 .store(false, Ordering::Release);
-            return Err(AgentError::new(
+            let error = AgentError::new(
                 "enrollment.unavailable",
                 "Hub registration could not be started",
-            ));
+            );
+            if let Ok(mut state) = self.state.lock() {
+                state.last_error_code = error.code().to_owned();
+                state.record_registration_failure(error.code());
+            }
+            return Err(error);
         }
         Ok(registration_pending())
     }
@@ -1080,22 +1088,18 @@ impl SharedRuntime {
             .lock()
             .map(|config| config.awaiting_enrollment)
             .unwrap_or(true);
-        let result = crate::enrollment::register_with_confirmation(
-            &hub_address,
-            &registration_code,
-            !was_waiting,
-        )
-        .and_then(|_| RuntimeConfig::from_enrollment_state())
-        .and_then(|config| self.activate_enrollment(config))
-        .map(|_| {
-            if !was_waiting {
-                self.request_reconnect();
-            }
-        });
+        let result = crate::enrollment::register(&hub_address, &registration_code)
+            .and_then(|_| RuntimeConfig::from_enrollment_state())
+            .and_then(|config| self.activate_enrollment(config))
+            .map(|_| {
+                if !was_waiting {
+                    self.request_reconnect();
+                }
+            });
         if let Err(error) = result {
             if let Ok(mut state) = self.state.lock() {
                 state.last_error_code = error.code().to_owned();
-                state.record(LogLevel::Warn, RuntimeLogMessage::RegistrationFailed);
+                state.record_registration_failure(error.code());
             }
             tracing::warn!(code = error.code(), "Hub registration was not completed");
         }
@@ -1104,13 +1108,10 @@ impl SharedRuntime {
     }
 
     #[cfg(windows)]
-    fn mark_registration_pending(&self) {
+    fn mark_registration_started(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.last_error_code = "runtime.enrollment_confirmation_pending".to_owned();
-            state.record(
-                LogLevel::Info,
-                RuntimeLogMessage::RegistrationAwaitingConfirmation,
-            );
+            state.last_error_code = "runtime.enrollment_registration_pending".to_owned();
+            state.record(LogLevel::Info, RuntimeLogMessage::RegistrationStarted);
         }
     }
 
@@ -1148,9 +1149,7 @@ impl SharedRuntime {
             .as_bool()
             .unwrap_or(false);
         let state = self.state.lock().map_err(lock_error)?;
-        let config = self.config.lock().map_err(lock_error)?;
         Ok(serde_json::json!({
-            "hub_address": if config.awaiting_enrollment { String::new() } else { display_hub_address(&config.transport.control_endpoint) },
             "control": state.control_state.as_str(),
             "frame": state.frame_state.as_str(),
             "capture_active": capture_active,
@@ -1817,17 +1816,6 @@ fn required_path(name: &'static str) -> Result<PathBuf, AgentError> {
     Ok(PathBuf::from(required(name)?))
 }
 
-#[cfg(any(windows, test))]
-fn display_hub_address(uri: &Uri) -> String {
-    let Some(host) = uri.host() else {
-        return "unavailable".to_owned();
-    };
-    match uri.port_u16() {
-        Some(port) => format!("https://{host}:{port}"),
-        None => format!("https://{host}"),
-    }
-}
-
 fn map_transport(error: TransportError) -> AgentError {
     AgentError::new(error.code(), error.to_string())
 }
@@ -2034,12 +2022,11 @@ mod tests {
         let mut local = driver.local_runtime();
 
         assert!(!driver.is_registered().unwrap());
-        assert_eq!(
-            local
-                .execute(&local_caller(), &LocalCommand::GetConnectionStatus)
-                .unwrap()["hub_address"],
-            ""
-        );
+        assert!(local
+            .execute(&local_caller(), &LocalCommand::GetConnectionStatus)
+            .unwrap()
+            .get("hub_address")
+            .is_none());
         let diagnostics = local
             .execute(&local_caller(), &LocalCommand::RunEnvironmentCheck)
             .unwrap();
@@ -2104,12 +2091,11 @@ mod tests {
             .expect("registration state must remain readable");
 
         assert!(driver.is_registered().unwrap());
-        assert_eq!(
-            local
-                .execute(&local_caller(), &LocalCommand::GetConnectionStatus)
-                .unwrap()["hub_address"],
-            "https://hub.example"
-        );
+        let status = local
+            .execute(&local_caller(), &LocalCommand::GetConnectionStatus)
+            .unwrap();
+        assert!(status.get("hub_address").is_none());
+        assert!(!status.to_string().contains("hub.example"));
 
         local.request_reconnect();
         tokio::time::timeout(Duration::from_millis(10), driver.wait_for_reconnect())
