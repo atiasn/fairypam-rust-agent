@@ -12,10 +12,8 @@ Var FairyPamStageHandle
   StrCpy $FairyPamStageDir "${FIXED_INSTALL_DIR}.installing"
   StrCpy $FairyPamBackupDir "${FIXED_INSTALL_DIR}.previous"
   StrCpy $FairyPamStageHandle 0
-  ; This candidate never replaces a slot it did not create and verify.
-  IfFileExists "$FairyPamFinalDir" fairypam_existing_active 0
-  IfFileExists "$FairyPamBackupDir" fairypam_existing_previous 0
-  IfFileExists "$FairyPamStageDir" fairypam_existing_stage 0
+  IfFileExists "$FairyPamBackupDir" fairypam_stale_backup 0
+  IfFileExists "$FairyPamStageDir" fairypam_stale_stage 0
 
   ; NSIS is 32-bit, so SECURITY_ATTRIBUTES is 12 bytes here.
   System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${FAIRYPAM_INSTALL_SDDL}", i 1, *p .r8, p 0) i.r9'
@@ -42,11 +40,9 @@ Var FairyPamStageHandle
   SetOutPath $INSTDIR
   Goto fairypam_stage_ready
 
-fairypam_existing_active:
-  Abort "FairyPam found an existing installation. This candidate does not replace installed runtimes."
-fairypam_existing_previous:
-  Abort "FairyPam found a preserved previous installation. Installation was stopped without changing it."
-fairypam_existing_stage:
+fairypam_stale_backup:
+  Abort "FairyPam found a preserved previous installation. Installation was stopped without changing the active runtime."
+fairypam_stale_stage:
   Abort "FairyPam found an unverified staging directory. Installation was stopped without following or deleting it."
 fairypam_stage_prepare_failed:
   RMDir "$FairyPamStageDir"
@@ -70,19 +66,46 @@ fairypam_stage_ready:
   ${If} $R9 = 0
     Goto fairypam_stage_failed
   ${EndIf}
+  IfFileExists "$FairyPamFinalDir" 0 fairypam_activate_fresh
+  ClearErrors
+  Rename "$FairyPamFinalDir" "$FairyPamBackupDir"
+  IfErrors fairypam_activate_failed 0
+  ClearErrors
+  Rename "$FairyPamStageDir" "$FairyPamFinalDir"
+  IfErrors fairypam_restore_previous 0
+  Goto fairypam_activate_complete
+
+fairypam_activate_fresh:
   ClearErrors
   Rename "$FairyPamStageDir" "$FairyPamFinalDir"
   IfErrors fairypam_activate_failed 0
+fairypam_activate_complete:
   StrCpy $INSTDIR "$FairyPamFinalDir"
   SetOutPath $INSTDIR
+  ClearErrors
+  RMDir /r "$FairyPamBackupDir"
+  IfErrors fairypam_backup_cleanup_failed 0
+  IfFileExists "$FairyPamBackupDir" fairypam_backup_cleanup_failed 0
   Goto fairypam_install_complete
+fairypam_restore_previous:
+  ClearErrors
+  Rename "$FairyPamBackupDir" "$FairyPamFinalDir"
+  IfErrors fairypam_rollback_failed 0
 fairypam_activate_failed:
-  Abort "FairyPam could not activate the staged runtime. The protected staging directory remains for recovery."
+  ClearErrors
+  RMDir /r "$FairyPamStageDir"
+  Abort "FairyPam could not activate the staged runtime. The previous installation remains active."
 fairypam_stage_failed:
   ${If} $FairyPamStageHandle != 0
     System::Call 'kernel32::CloseHandle(p $FairyPamStageHandle)'
     StrCpy $FairyPamStageHandle 0
   ${EndIf}
-  Abort "FairyPam could not validate the staged Agent runtime. The protected staging directory remains for recovery."
+  ClearErrors
+  RMDir /r "$FairyPamStageDir"
+  Abort "FairyPam could not validate the staged Agent runtime. The active installation was not changed."
+fairypam_rollback_failed:
+  Abort "FairyPam could not restore the preserved installation. The previous slot remains at the .previous path for recovery."
+fairypam_backup_cleanup_failed:
+  Abort "FairyPam could not remove the preserved previous installation. Installation was stopped without reporting success."
 fairypam_install_complete:
 !macroend
