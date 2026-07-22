@@ -557,10 +557,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
             );
         }
     }
-    for stale_path in [
-        "fairypam_stale_backup:",
-        "fairypam_stale_stage:",
-    ] {
+    for stale_path in ["fairypam_stale_backup:", "fairypam_stale_stage:"] {
         assert!(
             label_block(preinstall_hook, stale_path).starts_with(&format!(
                 "{stale_path}\n  SetErrorLevel ${{ERROR_ALREADY_EXISTS}}\n  Abort "
