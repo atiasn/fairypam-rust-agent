@@ -379,9 +379,10 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     let preinstall_start = nsis_hooks
         .find("!macro NSIS_HOOK_PREINSTALL")
         .expect("installer must define its preinstall hook");
-    let preinstall_hook = &nsis_hooks[preinstall_start..nsis_hooks
-        .find("!macro NSIS_HOOK_ACTIVATE")
-        .expect("installer must define its activation hook")];
+    let preinstall_hook = &nsis_hooks[preinstall_start
+        ..nsis_hooks
+            .find("!macro NSIS_HOOK_ACTIVATE")
+            .expect("installer must define its activation hook")];
     let descriptor = preinstall_hook
         .find("ConvertStringSecurityDescriptorToSecurityDescriptorW")
         .expect("the protected staging DACL must be built before directory creation");
@@ -561,7 +562,12 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
             "FAIRYPAM_STAGE_STALE_STAGE",
             "${ERROR_ALREADY_EXISTS}",
         ),
-        (preinstall_hook, "fairypam_stage_sddl_failed:", "FAIRYPAM_STAGE_SDDL", "$R5"),
+        (
+            preinstall_hook,
+            "fairypam_stage_sddl_failed:",
+            "FAIRYPAM_STAGE_SDDL",
+            "$R5",
+        ),
         (
             preinstall_hook,
             "fairypam_stage_attributes_failed:",
@@ -574,18 +580,48 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
             "FAIRYPAM_STAGE_CREATE_DIRECTORY",
             "$R5",
         ),
-        (preinstall_hook, "fairypam_stage_pin_failed:", "FAIRYPAM_STAGE_PIN", "$R5"),
-        (preinstall_hook, "fairypam_stage_verify_failed:", "FAIRYPAM_STAGE_VERIFY", "$R5"),
+        (
+            preinstall_hook,
+            "fairypam_stage_pin_failed:",
+            "FAIRYPAM_STAGE_PIN",
+            "$R5",
+        ),
+        (
+            preinstall_hook,
+            "fairypam_stage_verify_failed:",
+            "FAIRYPAM_STAGE_VERIFY",
+            "$R5",
+        ),
         (
             preinstall_hook,
             "fairypam_stage_not_directory:",
             "FAIRYPAM_STAGE_NOT_DIRECTORY",
             "1",
         ),
-        (preinstall_hook, "fairypam_stage_reparse_detected:", "FAIRYPAM_STAGE_REPARSE", "1"),
-        (nsis_hooks, "fairypam_activate_failed:", "FAIRYPAM_STAGE_ACTIVATE", "1"),
-        (nsis_hooks, "fairypam_stage_failed:", "FAIRYPAM_STAGE_VALIDATION", "1"),
-        (nsis_hooks, "fairypam_rollback_failed:", "FAIRYPAM_STAGE_ROLLBACK", "1"),
+        (
+            preinstall_hook,
+            "fairypam_stage_reparse_detected:",
+            "FAIRYPAM_STAGE_REPARSE",
+            "1",
+        ),
+        (
+            nsis_hooks,
+            "fairypam_activate_failed:",
+            "FAIRYPAM_STAGE_ACTIVATE",
+            "1",
+        ),
+        (
+            nsis_hooks,
+            "fairypam_stage_failed:",
+            "FAIRYPAM_STAGE_VALIDATION",
+            "1",
+        ),
+        (
+            nsis_hooks,
+            "fairypam_rollback_failed:",
+            "FAIRYPAM_STAGE_ROLLBACK",
+            "1",
+        ),
         (
             nsis_hooks,
             "fairypam_backup_cleanup_failed:",
@@ -642,7 +678,8 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     ] {
         let path = label_block(preinstall_hook, win32_failure);
         assert!(
-            path.contains("!insertmacro FAIRYPAM_SET_STAGE_ERROR") && path.contains("$R5\n  Abort "),
+            path.contains("!insertmacro FAIRYPAM_SET_STAGE_ERROR")
+                && path.contains("$R5\n  Abort "),
             "the Win32 failure must encode its captured error then abort: {win32_failure}"
         );
     }
@@ -656,8 +693,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     ] {
         let path = label_block(nsis_hooks, fixed_failure);
         assert!(
-            path.contains("!insertmacro FAIRYPAM_SET_STAGE_ERROR")
-                && path.contains(" 1\n  Abort "),
+            path.contains("!insertmacro FAIRYPAM_SET_STAGE_ERROR") && path.contains(" 1\n  Abort "),
             "every fixed failure must encode a nonzero reason before aborting: {fixed_failure}"
         );
     }
@@ -762,9 +798,10 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
     }
     let payload_verifier = &INSTALLER_PROVISIONER[INSTALLER_PROVISIONER
         .find("fn verify_staged_payload_entry")
-        .expect("installer helper must define a staged payload verifier")..INSTALLER_PROVISIONER
-        .find("fn verify_nonreparse_attributes")
-        .expect("payload verifier must precede the shared reparse guard")];
+        .expect("installer helper must define a staged payload verifier")
+        ..INSTALLER_PROVISIONER
+            .find("fn verify_nonreparse_attributes")
+            .expect("payload verifier must precede the shared reparse guard")];
     for required in [
         "metadata.file_type().is_symlink()",
         "verify_nonreparse_attributes(path)?",
