@@ -505,7 +505,7 @@ fn product_installer_provisions_new_private_state_before_runtime_launch() {
         "?e'\n  Pop $R5",
         "Win32 error $R5",
         "i 0x80, i 3, p 0, i 3",
-        "FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT",
+        "${FAIRYPAM_STAGE_OPEN_FLAGS}",
         "FILE_FLAG_OPEN_REPARSE_POINT",
         "Var FairyPamStageHandle",
         "StrCpy $INSTDIR \"$FairyPamStageDir\"",
