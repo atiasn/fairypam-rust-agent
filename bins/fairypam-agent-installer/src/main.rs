@@ -285,14 +285,14 @@ fn trusted_program_files_security(sddl: &str) -> bool {
         || sddl.starts_with("O:SY")
         || sddl.starts_with("O:TI")
         || sddl.starts_with(&format!("O:{TRUSTED_INSTALLER_SID}"));
-    trusted_owner && !dacl_grants_untrusted_write(sddl)
+    trusted_owner && !dacl_grants_untrusted_write(sddl, true)
 }
 
 fn staged_payload_security(sddl: &str) -> bool {
-    !dacl_grants_untrusted_write(sddl)
+    !dacl_grants_untrusted_write(sddl, false)
 }
 
-fn dacl_grants_untrusted_write(sddl: &str) -> bool {
+fn dacl_grants_untrusted_write(sddl: &str, allow_creator_owner: bool) -> bool {
     let Some(dacl) = sddl.split_once("D:").map(|(_, dacl)| dacl) else {
         return true;
     };
@@ -303,7 +303,10 @@ fn dacl_grants_untrusted_write(sddl: &str) -> bool {
             return false;
         }
         let trustee = fields[5];
-        if matches!(trustee, "SY" | "BA" | "CO") || trustee == TRUSTED_INSTALLER_SID {
+        if matches!(trustee, "SY" | "BA")
+            || (allow_creator_owner && trustee == "CO")
+            || trustee == TRUSTED_INSTALLER_SID
+        {
             return false;
         }
         write_capable_rights(fields[2])
@@ -369,6 +372,12 @@ mod tests {
         let elevated_installer_owned = "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
         assert!(!trusted_program_files_security(elevated_installer_owned));
         assert!(staged_payload_security(elevated_installer_owned));
+        assert!(trusted_program_files_security(
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;CO)"
+        ));
+        assert!(!staged_payload_security(
+            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;CO)"
+        ));
         assert!(!staged_payload_security(
             "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FW;;;BU)"
         ));
