@@ -49,11 +49,16 @@ fn lifecycle_records_gui_process_exit_for_the_bound_pid() {
 fn gui_lifetime_cancels_the_shared_shutdown_signal() {
     let shutdown = CancellationToken::new();
     let lifecycle = GuiLifetime::new(shutdown.clone());
+    let pid = std::process::id();
 
-    lifecycle.bind(100).unwrap();
+    lifecycle.bind(pid).unwrap();
     assert_eq!(
-        lifecycle.request_shutdown(100).unwrap(),
+        lifecycle.request_shutdown(pid).unwrap(),
         GuiExitReason::ExplicitShutdown
+    );
+    assert_eq!(
+        lifecycle.exit_reason().unwrap(),
+        Some(GuiExitReason::ExplicitShutdown)
     );
     assert!(shutdown.is_cancelled());
 }
