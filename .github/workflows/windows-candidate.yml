@@ -223,6 +223,19 @@ jobs:
           $installRoot = 'C:\Program Files\FairyPam'
           $installer = Start-Process -FilePath $setup[0].FullName -ArgumentList '/S' -Wait -PassThru
           if ($installer.ExitCode -ne 0) {
+            $bootstrapHelper = Join-Path $installRoot '.fairypam-installer\payload\resources\runtime\fairypam-agent-installer.exe'
+            $requiredPaths = [ordered]@{
+              ui = Join-Path $installRoot 'fairypam-agent-tauri-ui.exe'
+              agent = Join-Path $installRoot 'fairypam-agent.exe'
+              guardian = Join-Path $installRoot 'fairypam-agent-guardian.exe'
+              runtime_helper = Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'
+              profiles = Join-Path $installRoot 'profiles'
+              bootstrap_helper = $bootstrapHelper
+            }
+            foreach ($entry in $requiredPaths.GetEnumerator()) {
+              $exists = Test-Path -LiteralPath $entry.Value
+              Write-Host "FairyPam diagnostic path: name=$($entry.Key) exists=$exists path=$($entry.Value)"
+            }
             if (Test-Path -LiteralPath $installRoot -PathType Container) {
               try {
                 Write-Host "FairyPam installation root SDDL: $((Get-Acl -LiteralPath $installRoot).Sddl)"
@@ -230,9 +243,34 @@ jobs:
               catch {
                 Write-Host 'FairyPam installation root exists but its SDDL could not be read.'
               }
+              Get-ChildItem -LiteralPath $installRoot -Force -Recurse | ForEach-Object {
+                $kind = if ($_.PSIsContainer) { 'directory' } else { 'file' }
+                $length = if ($_.PSIsContainer) { 0 } else { $_.Length }
+                $relative = [System.IO.Path]::GetRelativePath($installRoot, $_.FullName)
+                Write-Host "FairyPam diagnostic tree: kind=$kind relative=$relative length=$length"
+              }
             }
             else {
               Write-Host 'FairyPam installation root does not exist after failed setup.'
+            }
+            if (Test-Path -LiteralPath $bootstrapHelper -PathType Leaf) {
+              try {
+                $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+                $startInfo.FileName = $bootstrapHelper
+                $startInfo.UseShellExecute = $false
+                $startInfo.ArgumentList.Add('--preflight')
+                $startInfo.ArgumentList.Add($installRoot)
+                $preflight = [System.Diagnostics.Process]::Start($startInfo)
+                $preflight.WaitForExit()
+                Write-Host "FairyPam diagnostic preflight: status=completed exit_code=$($preflight.ExitCode)"
+                $preflight.Dispose()
+              }
+              catch {
+                Write-Host "FairyPam diagnostic preflight: status=launch_failed hresult=$($_.Exception.HResult) type=$($_.Exception.GetType().FullName)"
+              }
+            }
+            else {
+              Write-Host 'FairyPam diagnostic preflight: status=helper_missing'
             }
             $stageNames = @{
               1 = 'sddl'
