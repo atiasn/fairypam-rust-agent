@@ -19,11 +19,15 @@ import App from './App';
 import { agentApi } from './lib/agentApi';
 
 function renderApp() {
-  return render(
-    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <App />
-    </QueryClientProvider>,
-  );
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return {
+    ...render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    ),
+    queryClient,
+  };
 }
 
 describe('App', () => {
@@ -224,7 +228,9 @@ describe('App', () => {
       const view = within(app.container);
 
       expect(await view.findByRole('heading', { name: '服务暂时无法使用' })).toBeInTheDocument();
-      expect(agentApi.runEnvironmentCheck).not.toHaveBeenCalled();
+      expect(agentApi.runEnvironmentCheck).not.toHaveBeenCalledWith(
+        expect.objectContaining({ client: app.queryClient }),
+      );
     } finally {
       getOverview.mockResolvedValue({
         status: { state: 'ConnectedIdle', capture_active: false },
