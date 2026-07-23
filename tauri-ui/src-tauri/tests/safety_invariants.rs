@@ -16,6 +16,14 @@ const INSTALLER_LAYOUT_BUILD: &str =
 const NSIS_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
 const NSIS_TEMPLATE: &str = include_str!("../windows/installer.nsi");
 
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .and_then(|(_, tail)| tail.split_once(end))
+        .map(|(section, _)| section)
+        .unwrap_or_else(|| panic!("missing source section: {start} .. {end}"))
+}
+
 #[test]
 fn production_ui_cannot_arm_inject_or_reset_emergency() {
     for forbidden in [
@@ -190,14 +198,22 @@ fn product_installer_uses_one_fixed_protected_root() {
         "const INSTALL_BOOTSTRAP_DIRECTORY: &str = env!(\"FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY\");",
         "\"--preflight\" => preflight(install_root)",
         "\"--provision\" => provision(install_root)",
+        "\"--installed-preflight\" => installed_preflight(install_root)",
         "fn provision(install_root: &std::path::Path)",
         "fn preflight(install_root: &std::path::Path)",
-        "fn verify_install_root(install_root: &std::path::Path)",
+        "fn installed_preflight(install_root: &std::path::Path)",
+        "fn verify_bootstrap_install_root(install_root: &std::path::Path)",
+        "fn verify_installed_runtime_root(install_root: &std::path::Path)",
+        "fn verify_install_root(",
+        "expected_helper: &std::path::Path,",
         "let expected_root = program_files.join(INSTALL_DIRECTORY);",
         "verify_install_tree(install_root)?;",
-        "let helper = install_root",
         ".join(INSTALL_BOOTSTRAP_DIRECTORY)",
-        "verify_staged_payload_entry(&helper, false)?;",
+        ".join(\"payload\")",
+        ".join(\"resources\")",
+        ".join(\"runtime\")",
+        ".join(\"fairypam-agent-installer.exe\")",
+        "verify_staged_payload_entry(expected_helper, false)?;",
         "verify_trusted_install_entry(&program_files, true)?;",
         "trusted_install_owner(sddl)",
     ] {
@@ -309,6 +325,20 @@ fn product_installer_uses_one_fixed_protected_root() {
         NSIS_TEMPLATE.contains("!insertmacro NSIS_HOOK_PREPAYLOAD"),
         "the template must preflight the live tree before normal payload extraction"
     );
+    for command in ["--preflight", "--provision"] {
+        assert!(
+            NSIS_HOOKS.contains(&format!(
+                "${{FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}}\\payload\\resources\\runtime\\fairypam-agent-installer.exe\" {command} \"$FairyPamInstallDir\""
+            )),
+            "install must validate through the bootstrap helper: {command}"
+        );
+    }
+    assert!(
+        NSIS_TEMPLATE.contains(
+            "\"$INSTDIR\\resources\\runtime\\fairypam-agent-installer.exe\" --installed-preflight \"$INSTDIR\""
+        ),
+        "uninstall must validate through the installed runtime helper"
+    );
     for required in [
         "$INSTDIR\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\\payload\\profiles",
         "$INSTDIR\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\\payload\\resources",
@@ -347,6 +377,111 @@ fn product_installer_uses_one_fixed_protected_root() {
         );
     }
 }
+
+#[test]
+fn product_installer_binds_each_command_to_one_helper_phase() {
+    let dispatch = source_between(
+        INSTALLER_PROVISIONER,
+        "#[cfg(windows)]\nfn main() {",
+        "const PROGRAM_DATA: &str",
+    );
+    for mapping in [
+        "\"--preflight\" => preflight(install_root)",
+        "\"--provision\" => provision(install_root)",
+        "\"--installed-preflight\" => installed_preflight(install_root)",
+    ] {
+        assert!(dispatch.contains(mapping), "missing command mapping: {mapping}");
+    }
+
+    let provision = source_between(
+        INSTALLER_PROVISIONER,
+        "fn provision(",
+        "fn preflight(",
+    );
+    let preflight = source_between(
+        INSTALLER_PROVISIONER,
+        "fn preflight(",
+        "fn installed_preflight(",
+    );
+    let installed_preflight = source_between(
+        INSTALLER_PROVISIONER,
+        "fn installed_preflight(",
+        "fn verify_bootstrap_install_root(",
+    );
+    assert!(provision.contains("verify_bootstrap_install_root(install_root)"));
+    assert!(preflight.contains("verify_bootstrap_install_root(install_root)"));
+    assert!(installed_preflight.contains("verify_installed_runtime_root(install_root)"));
+    assert!(!provision.contains("verify_installed_runtime_root"));
+    assert!(!preflight.contains("verify_installed_runtime_root"));
+    assert!(!installed_preflight.contains("verify_bootstrap_install_root"));
+
+    let bootstrap = source_between(
+        INSTALLER_PROVISIONER,
+        "fn verify_bootstrap_install_root(",
+        "fn verify_installed_runtime_root(",
+    );
+    for component in [
+        ".join(INSTALL_BOOTSTRAP_DIRECTORY)",
+        ".join(\"payload\")",
+        ".join(\"resources\")",
+        ".join(\"runtime\")",
+        ".join(\"fairypam-agent-installer.exe\")",
+    ] {
+        assert!(
+            bootstrap.contains(component),
+            "bootstrap helper path is missing: {component}"
+        );
+    }
+    assert_eq!(
+        bootstrap
+            .matches("verify_install_root(install_root, &expected_helper)")
+            .count(),
+        1
+    );
+
+    let installed = source_between(
+        INSTALLER_PROVISIONER,
+        "fn verify_installed_runtime_root(",
+        "fn verify_install_root(",
+    );
+    assert!(!installed.contains("INSTALL_BOOTSTRAP_DIRECTORY"));
+    for component in [
+        ".join(\"resources\")",
+        ".join(\"runtime\")",
+        ".join(\"fairypam-agent-installer.exe\")",
+    ] {
+        assert!(
+            installed.contains(component),
+            "installed helper path is missing: {component}"
+        );
+    }
+    assert_eq!(
+        installed
+            .matches("verify_install_root(install_root, &expected_helper)")
+            .count(),
+        1
+    );
+
+    let shared = source_between(
+        INSTALLER_PROVISIONER,
+        "fn verify_install_root(",
+        "fn verify_install_tree(",
+    );
+    let compact = shared.split_whitespace().collect::<String>();
+    let identity_guard = "if!same_windows_path(&std::env::current_exe().map_err(|_|())?,expected_helper,){returnErr(());}";
+    let entry_guard = "verify_staged_payload_entry(expected_helper,false)?;";
+    let identity_index = compact
+        .find(identity_guard)
+        .expect("shared verifier must reject a mismatched current executable");
+    let entry_index = compact
+        .find(entry_guard)
+        .expect("shared verifier must verify the matched helper entry");
+    assert!(
+        identity_index < entry_index,
+        "helper identity must be established before its protected entry is accepted"
+    );
+}
+
 #[test]
 fn fixed_uac_target_requires_a_complete_nonwritable_program_files_chain() {
     let commands = include_str!("../src/commands.rs");

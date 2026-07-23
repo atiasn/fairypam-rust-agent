@@ -14,6 +14,7 @@ fn main() {
             match command.to_string_lossy().as_ref() {
                 "--preflight" => preflight(install_root),
                 "--provision" => provision(install_root),
+                "--installed-preflight" => installed_preflight(install_root),
                 _ => Err(ProvisionFailure::InstallRoots),
             }
             .map_or_else(|failure| failure as i32, |_| 0)
@@ -56,7 +57,7 @@ enum ProvisionFailure {
 #[cfg(windows)]
 fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
-    verify_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    verify_bootstrap_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
     verify_nonreparse_directory(std::path::Path::new(PROGRAM_DATA))
         .map_err(|_| ProvisionFailure::ProgramData)?;
     for (path, failure) in [
@@ -83,11 +84,40 @@ fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
 #[cfg(windows)]
 fn preflight(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
-    verify_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)
+    verify_bootstrap_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)
 }
 
 #[cfg(windows)]
-fn verify_install_root(install_root: &std::path::Path) -> Result<(), ()> {
+fn installed_preflight(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
+    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)
+}
+
+#[cfg(windows)]
+fn verify_bootstrap_install_root(install_root: &std::path::Path) -> Result<(), ()> {
+    let expected_helper = install_root
+        .join(INSTALL_BOOTSTRAP_DIRECTORY)
+        .join("payload")
+        .join("resources")
+        .join("runtime")
+        .join("fairypam-agent-installer.exe");
+    verify_install_root(install_root, &expected_helper)
+}
+
+#[cfg(windows)]
+fn verify_installed_runtime_root(install_root: &std::path::Path) -> Result<(), ()> {
+    let expected_helper = install_root
+        .join("resources")
+        .join("runtime")
+        .join("fairypam-agent-installer.exe");
+    verify_install_root(install_root, &expected_helper)
+}
+
+#[cfg(windows)]
+fn verify_install_root(
+    install_root: &std::path::Path,
+    expected_helper: &std::path::Path,
+) -> Result<(), ()> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{
         FOLDERID_ProgramFilesX64, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
@@ -106,15 +136,13 @@ fn verify_install_root(install_root: &std::path::Path) -> Result<(), ()> {
 
     verify_trusted_install_entry(&program_files, true)?;
     verify_install_tree(install_root)?;
-    verify_staged_payload_entry(&install_root.join(INSTALL_BOOTSTRAP_DIRECTORY), true)?;
-    let helper = install_root
-        .join("resources")
-        .join("runtime")
-        .join("fairypam-agent-installer.exe");
-    if !same_windows_path(&std::env::current_exe().map_err(|_| ())?, &helper) {
+    if !same_windows_path(
+        &std::env::current_exe().map_err(|_| ())?,
+        expected_helper,
+    ) {
         return Err(());
     }
-    verify_staged_payload_entry(&helper, false)?;
+    verify_staged_payload_entry(expected_helper, false)?;
     Ok(())
 }
 
