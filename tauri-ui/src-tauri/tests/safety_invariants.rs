@@ -224,8 +224,10 @@ fn product_installer_uses_one_fixed_protected_root() {
         "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
         "!define FAIRYPAM_INSTALL_OWNER_SDDL \"O:BA\"",
         "!define FAIRYPAM_INSTALL_DACL_SDDL \"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)\"",
+        "!define FAIRYPAM_INSTALL_INHERITED_DACL_SDDL \"D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x1200a9;;;BU)\"",
         "!define FAIRYPAM_INSTALL_FILE_SDDL \"O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)S:(ML;;NW;;;HI)\"",
         "!define FAIRYPAM_INSTALL_FILE_DACL_SDDL \"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)\"",
+        "!define FAIRYPAM_INSTALL_PROTECTED_DACL_SECURITY_INFORMATION 0x80000004",
         "!define FAIRYPAM_INSTALL_DETAIL_FILE_CREATE 0x1000",
         "!define FAIRYPAM_INSTALL_DETAIL_FILE_ATTRIBUTES 0x2000",
         "!define FAIRYPAM_INSTALL_DETAIL_FILE_TYPE 0x3000",
@@ -234,7 +236,7 @@ fn product_installer_uses_one_fixed_protected_root() {
         "ConvertStringSecurityDescriptorToSecurityDescriptorW(w \"${FAIRYPAM_INSTALL_FILE_SDDL}\"",
         "StrCpy $FairyPamInstallDir \"${FAIRYPAM_INSTALL_ROOT}\"",
         "CreateDirectoryW(w \"$FairyPamInstallDir\"",
-        "SHCreateDirectoryExW(p 0, w \"${directory}\", p R7) i.R9",
+        "CreateDirectoryW(w \"${directory}\", p R7) i.R9",
         "CreateFileW(w \"$FairyPamInstallDir\"",
         "GetFileAttributesW(w \"$FairyPamInstallDir\")",
         "FILE_ATTRIBUTE_REPARSE_POINT",
@@ -244,8 +246,14 @@ fn product_installer_uses_one_fixed_protected_root() {
         "i ${FAIRYPAM_INSTALL_DACL_SECURITY_INFORMATION}",
         "kernel32::lstrcmpW(p R8, w \"${FAIRYPAM_INSTALL_OWNER_SDDL}\") i.R9",
         "kernel32::lstrcmpW(p R8, w R4) i.R9",
+        "kernel32::lstrcmpW(p R8, w R3) i.R9",
+        "GetSecurityDescriptorDacl(p R8",
+        "SetNamedSecurityInfoW(w \"${object}\"",
+        "i ${FAIRYPAM_INSTALL_PROTECTED_DACL_SECURITY_INFORMATION}",
         "StrCpy $R4 \"${FAIRYPAM_INSTALL_DACL_SDDL}\"",
+        "StrCpy $R3 \"${FAIRYPAM_INSTALL_INHERITED_DACL_SDDL}\"",
         "StrCpy $R4 \"${FAIRYPAM_INSTALL_FILE_DACL_SDDL}\"",
+        "StrCpy $R3 \"\"",
         "!insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT \"$FairyPamInstallDir\" fairypam_install_untrusted_security",
         "!insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT \"${file}\" ${failure_label}",
         "!insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY \"$FairyPamBootstrapDir\" fairypam_install_untrusted_security",
@@ -290,6 +298,10 @@ fn product_installer_uses_one_fixed_protected_root() {
         "the installer must pass the expected DACL through a stable NSIS register"
     );
     assert!(
+        !NSIS_HOOKS.contains("SHCreateDirectoryExW"),
+        "resource directories must be created one level at a time"
+    );
+    assert!(
         NSIS_TEMPLATE.contains("!insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH \"$FairyPamInstallDir\" fairypam_uninstall_untrusted_root"),
         "the uninstaller must reject an untrusted product root before deleting declared files"
     );
@@ -297,6 +309,17 @@ fn product_installer_uses_one_fixed_protected_root() {
         NSIS_TEMPLATE.contains("!insertmacro NSIS_HOOK_PREPAYLOAD"),
         "the template must preflight the live tree before normal payload extraction"
     );
+    for required in [
+        "$INSTDIR\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\\payload\\profiles",
+        "$INSTDIR\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\\payload\\resources",
+        "$INSTDIR\\profiles",
+        "$INSTDIR\\resources",
+    ] {
+        assert!(
+            NSIS_TEMPLATE.contains(required),
+            "the child-first resource list needs an explicit protected parent: {required}"
+        );
+    }
     assert_eq!(
         NSIS_TEMPLATE
             .matches("{{#each resources_ancestors}}")

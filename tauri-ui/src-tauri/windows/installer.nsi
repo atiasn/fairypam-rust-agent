@@ -550,6 +550,11 @@ Section Install
   ; already-protected root. It examines any existing product tree before the
   ; normal payload below can overwrite or execute files in that tree.
   SetOutPath "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload"
+  ; Tauri emits resource ancestors child-first. Establish the two declared
+  ; top-level resource parents explicitly so every later CreateDirectoryW call
+  ; has a protected direct parent and cannot create an inherited intermediate.
+  !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\profiles" fairypam_install_untrusted_security
+  !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources" fairypam_install_untrusted_security
   {{#each resources_ancestors}}
     !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\\{{this}}" fairypam_install_untrusted_security
     CreateDirectory "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\\{{this}}"
@@ -567,6 +572,8 @@ Section Install
   File "${MAINBINARYSRCPATH}"
 
   ; Copy resources
+  !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\profiles" fairypam_install_untrusted_security
+  !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\resources" fairypam_install_untrusted_security
   {{#each resources_ancestors}}
     !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\\{{this}}" fairypam_install_untrusted_security
     CreateDirectory "$INSTDIR\\{{this}}"
@@ -686,6 +693,7 @@ Function un.onInit
 fairypam_uninstall_root_ok:
   StrCpy $INSTDIR "${FAIRYPAM_INSTALL_ROOT}"
   StrCpy $FairyPamInstallDir "${FAIRYPAM_INSTALL_ROOT}"
+  StrCpy $R3 ""
   !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH "$FairyPamInstallDir" fairypam_uninstall_untrusted_root
   StrCpy $FairyPamBootstrapDir "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}"
   StrCpy $FairyPamBootstrapPayloadDir "$FairyPamBootstrapDir\payload"

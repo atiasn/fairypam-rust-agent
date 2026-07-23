@@ -11,6 +11,11 @@ Var FairyPamBootstrapPayloadDir
 !define FAIRYPAM_INSTALL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)S:(ML;OICI;NW;;;HI)"
 !define FAIRYPAM_INSTALL_OWNER_SDDL "O:BA"
 !define FAIRYPAM_INSTALL_DACL_SDDL "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+; Tauri 2.11 emits resource ancestors child-first. Older failed installers
+; therefore left only this exact read/execute inherited DACL on intermediate
+; directories created by the previous recursive directory API. It is accepted
+; solely for one-way normalization to the protected DACL above.
+!define FAIRYPAM_INSTALL_INHERITED_DACL_SDDL "D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x1200a9;;;BU)"
 !define FAIRYPAM_INSTALL_FILE_SDDL "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)S:(ML;;NW;;;HI)"
 !define FAIRYPAM_INSTALL_FILE_DACL_SDDL "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
 !define ERROR_ALREADY_EXISTS 183
@@ -32,6 +37,7 @@ Var FairyPamBootstrapPayloadDir
 !define FAIRYPAM_INSTALL_OPEN_FLAGS 0x02200000 ; FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
 !define FAIRYPAM_INSTALL_OWNER_SECURITY_INFORMATION 0x00000001
 !define FAIRYPAM_INSTALL_DACL_SECURITY_INFORMATION 0x00000004
+!define FAIRYPAM_INSTALL_PROTECTED_DACL_SECURITY_INFORMATION 0x80000004
 !define FAIRYPAM_INSTALL_SECURITY_INFORMATION 0x00000005 ; owner + DACL; protection is encoded in D: P
 
 !macro FAIRYPAM_SET_INSTALL_ERROR stage_base detail
@@ -77,14 +83,72 @@ Var FairyPamBootstrapPayloadDir
     Goto ${failure_label}
   ${EndIf}
   System::Call 'kernel32::lstrcmpW(p R8, w R4) i.R9'
-  System::Call 'kernel32::LocalFree(p R8)'
   ${If} $R9 != 0
-    StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_DACL}
-    IntOp $R5 $R5 | 1
+    ; R3 is empty for roots/files. Directory callers may provide only the
+    ; single inherited form produced by the previous broken creation order.
+    ${If} $R3 == ""
+      System::Call 'kernel32::LocalFree(p R8)'
+      StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_DACL}
+      IntOp $R5 $R5 | 1
+      System::Call 'kernel32::LocalFree(p R7)'
+      Goto ${failure_label}
+    ${EndIf}
+    System::Call 'kernel32::lstrcmpW(p R8, w R3) i.R9'
+    System::Call 'kernel32::LocalFree(p R8)'
+    ${If} $R9 != 0
+      StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_DACL}
+      IntOp $R5 $R5 | 1
+      System::Call 'kernel32::LocalFree(p R7)'
+      Goto ${failure_label}
+    ${EndIf}
+
+    ; The inherited descriptor has the exact trusted ACE set and no untrusted
+    ; write right. Make it protected before any payload file is written.
     System::Call 'kernel32::LocalFree(p R7)'
-    Goto ${failure_label}
+    System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w R4, i 1, *p .R8, p 0) i.R9 ?e'
+    Pop $R5
+    ${If} $R9 = 0
+      Goto ${failure_label}
+    ${EndIf}
+    System::Call 'advapi32::GetSecurityDescriptorDacl(p R8, *i .R9, *p .R0, *i .R1) i.R2'
+    ${If} $R2 = 0
+      System::Call 'kernel32::LocalFree(p R8)'
+      StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_DACL}
+      IntOp $R5 $R5 | 2
+      Goto ${failure_label}
+    ${EndIf}
+    System::Call 'advapi32::SetNamedSecurityInfoW(w "${object}", i 1, i ${FAIRYPAM_INSTALL_PROTECTED_DACL_SECURITY_INFORMATION}, p 0, p 0, p R0, p 0) i.R9'
+    System::Call 'kernel32::LocalFree(p R8)'
+    ${If} $R9 != 0
+      StrCpy $R5 $R9
+      Goto ${failure_label}
+    ${EndIf}
+
+    ; Re-read after normalization. A successful setter call alone is not the
+    ; verification boundary.
+    System::Call 'advapi32::GetNamedSecurityInfoW(w "${object}", i 1, i ${FAIRYPAM_INSTALL_DACL_SECURITY_INFORMATION}, p 0, p 0, p 0, p 0, *p .R7) i.R9'
+    ${If} $R9 != 0
+      StrCpy $R5 $R9
+      Goto ${failure_label}
+    ${EndIf}
+    System::Call 'advapi32::ConvertSecurityDescriptorToStringSecurityDescriptorW(p R7, i 1, i ${FAIRYPAM_INSTALL_DACL_SECURITY_INFORMATION}, *p .R8, p 0) i.R9 ?e'
+    Pop $R5
+    ${If} $R9 = 0
+      System::Call 'kernel32::LocalFree(p R7)'
+      Goto ${failure_label}
+    ${EndIf}
+    System::Call 'kernel32::lstrcmpW(p R8, w R4) i.R9'
+    System::Call 'kernel32::LocalFree(p R8)'
+    System::Call 'kernel32::LocalFree(p R7)'
+    ${If} $R9 != 0
+      StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_DACL}
+      IntOp $R5 $R5 | 3
+      Goto ${failure_label}
+    ${EndIf}
+  ${Else}
+    System::Call 'kernel32::LocalFree(p R8)'
+    System::Call 'kernel32::LocalFree(p R7)'
   ${EndIf}
-  System::Call 'kernel32::LocalFree(p R7)'
 !macroend
 
 !macro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH directory failure_label
@@ -117,17 +181,20 @@ Var FairyPamBootstrapPayloadDir
     System::Call 'kernel32::LocalFree(p R8)'
     Goto ${failure_label}
   ${EndIf}
-  System::Call 'shell32::SHCreateDirectoryExW(p 0, w "${directory}", p R7) i.R9'
-  StrCpy $R5 $R9
+  ; Never recurse here: a recursive API can create intermediate directories
+  ; with inherited security. Missing parents now fail closed.
+  System::Call 'kernel32::CreateDirectoryW(w "${directory}", p R7) i.R9 ?e'
+  Pop $R5
   System::Free $R7
   System::Call 'kernel32::LocalFree(p R8)'
-  ${If} $R9 != 0
-    ${If} $R9 != ${ERROR_ALREADY_EXISTS}
-      ${If} $R9 != ${ERROR_FILE_EXISTS}
+  ${If} $R9 = 0
+    ${If} $R5 != ${ERROR_ALREADY_EXISTS}
+      ${If} $R5 != ${ERROR_FILE_EXISTS}
         Goto ${failure_label}
       ${EndIf}
     ${EndIf}
   ${EndIf}
+  StrCpy $R3 "${FAIRYPAM_INSTALL_INHERITED_DACL_SDDL}"
   !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH "${directory}" ${failure_label}
 !macroend
 
@@ -179,6 +246,7 @@ Var FairyPamBootstrapPayloadDir
     Goto ${failure_label}
   ${EndIf}
   StrCpy $R4 "${FAIRYPAM_INSTALL_FILE_DACL_SDDL}"
+  StrCpy $R3 ""
   !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "${file}" ${failure_label}
 !macroend
 
@@ -229,6 +297,7 @@ fairypam_open_existing_install:
     Goto fairypam_install_reparse_detected
   ${EndIf}
   StrCpy $R4 "${FAIRYPAM_INSTALL_DACL_SDDL}"
+  StrCpy $R3 ""
   !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "$FairyPamInstallDir" fairypam_install_untrusted_security
   StrCpy $FairyPamBootstrapDir "$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}"
   StrCpy $FairyPamBootstrapPayloadDir "$FairyPamBootstrapDir\payload"

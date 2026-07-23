@@ -310,6 +310,34 @@ jobs:
           $profiles = Join-Path $installRoot 'profiles'
           if (-not (Test-Path -LiteralPath $profiles -PathType Container)) { throw "missing installed profiles directory: $profiles" }
 
+      - name: Smoke trusted NSIS product reinstall
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $setup = @(Get-ChildItem tauri-ui/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
+          if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
+          $installRoot = 'C:\Program Files\FairyPam'
+          $protectedDacl = 'D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
+          $protectedDirectories = @(
+            $installRoot,
+            (Join-Path $installRoot '.fairypam-installer'),
+            (Join-Path $installRoot '.fairypam-installer\payload'),
+            (Join-Path $installRoot '.fairypam-installer\payload\profiles'),
+            (Join-Path $installRoot '.fairypam-installer\payload\resources'),
+            (Join-Path $installRoot 'profiles'),
+            (Join-Path $installRoot 'resources')
+          )
+          $installer = Start-Process -FilePath $setup[0].FullName -ArgumentList '/S' -Wait -PassThru
+          if ($installer.ExitCode -ne 0) {
+            throw "trusted reinstall failed with exit code $($installer.ExitCode)"
+          }
+          foreach ($target in $protectedDirectories) {
+            $actual = (Get-Acl -LiteralPath $target).Sddl
+            if (-not $actual.Contains($protectedDacl) -or $actual.Contains('ID;')) {
+              throw "trusted reinstall retained a non-protected ACL: $target ($actual)"
+            }
+          }
+
       - name: Package product installer receipt
         shell: pwsh
         run: |
