@@ -16,10 +16,7 @@ fn main() {
                 "--provision" => provision(install_root),
                 _ => Err(ProvisionFailure::InstallRoots),
             }
-            .map_or_else(
-                |failure| failure as i32,
-                |_| 0,
-            )
+            .map_or_else(|failure| failure as i32, |_| 0)
         }
         _ => 1,
     };
