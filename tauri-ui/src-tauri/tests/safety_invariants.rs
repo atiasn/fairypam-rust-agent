@@ -382,7 +382,7 @@ fn product_installer_uses_one_fixed_protected_root() {
 fn product_installer_binds_each_command_to_one_helper_phase() {
     let dispatch = source_between(
         INSTALLER_PROVISIONER,
-        "#[cfg(windows)]\nfn main() {",
+        "let exit_code = match",
         "const PROGRAM_DATA: &str",
     );
     for mapping in [
