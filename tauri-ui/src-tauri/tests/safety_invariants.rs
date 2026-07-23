@@ -278,7 +278,9 @@ fn product_installer_uses_one_fixed_protected_root() {
         "the template must preflight the live tree before normal payload extraction"
     );
     assert_eq!(
-        NSIS_TEMPLATE.matches("{{#each resources_ancestors}}").count(),
+        NSIS_TEMPLATE
+            .matches("{{#each resources_ancestors}}")
+            .count(),
         3,
         "every resource ancestor must be materialized and verified"
     );
