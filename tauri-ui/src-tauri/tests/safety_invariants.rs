@@ -253,7 +253,7 @@ fn product_installer_uses_one_fixed_protected_root() {
         "CreateFileW(w \"${file}\", i 0x40000000",
         "IntOp $R5 $R5 | ${FAIRYPAM_INSTALL_DETAIL_FILE_CREATE}",
         "IntOp $R5 $R5 | ${FAIRYPAM_INSTALL_DETAIL_FILE_ATTRIBUTES}",
-        "IntOp $R5 $R5 | ${FAIRYPAM_INSTALL_DETAIL_FILE_TYPE}",
+        "StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_FILE_TYPE}",
         "IntOp $R5 $R5 | ${FAIRYPAM_INSTALL_DETAIL_OWNER}",
         "IntOp $R5 $R5 | ${FAIRYPAM_INSTALL_DETAIL_DACL}",
         "SetOutPath $INSTDIR",
