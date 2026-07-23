@@ -468,7 +468,7 @@ fn product_installer_binds_each_command_to_one_helper_phase() {
         "fn verify_install_tree(",
     );
     let compact = shared.split_whitespace().collect::<String>();
-    let identity_guard = "if!same_windows_path(&std::env::current_exe().map_err(|_|())?,expected_helper,){returnErr(());}";
+    let identity_guard = "if!same_windows_path(&std::env::current_exe().map_err(|_|())?,expected_helper){returnErr(());}";
     let entry_guard = "verify_staged_payload_entry(expected_helper,false)?;";
     let identity_index = compact
         .find(identity_guard)

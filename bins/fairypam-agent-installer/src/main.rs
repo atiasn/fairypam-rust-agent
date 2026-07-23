@@ -136,10 +136,7 @@ fn verify_install_root(
 
     verify_trusted_install_entry(&program_files, true)?;
     verify_install_tree(install_root)?;
-    if !same_windows_path(
-        &std::env::current_exe().map_err(|_| ())?,
-        expected_helper,
-    ) {
+    if !same_windows_path(&std::env::current_exe().map_err(|_| ())?, expected_helper) {
         return Err(());
     }
     verify_staged_payload_entry(expected_helper, false)?;
