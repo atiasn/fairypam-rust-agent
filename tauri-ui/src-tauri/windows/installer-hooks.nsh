@@ -11,6 +11,8 @@ Var FairyPamBootstrapPayloadDir
 !define FAIRYPAM_INSTALL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)S:(ML;OICI;NW;;;HI)"
 !define FAIRYPAM_INSTALL_OWNER_SDDL "O:BA"
 !define FAIRYPAM_INSTALL_DACL_SDDL "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+!define FAIRYPAM_INSTALL_FILE_SDDL "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)S:(ML;;NW;;;HI)"
+!define FAIRYPAM_INSTALL_FILE_DACL_SDDL "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
 !define ERROR_ALREADY_EXISTS 183
 !define ERROR_FILE_EXISTS 80
 !define FAIRYPAM_INSTALL_SDDL_ERROR 65536
@@ -36,11 +38,11 @@ Var FairyPamBootstrapPayloadDir
   SetErrorLevel $R4
 !macroend
 
-!macro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY directory failure_label
+!macro FAIRYPAM_VERIFY_PROTECTED_OBJECT object expected_dacl failure_label
   ; A pre-existing root is safe to update only when it was created with the
   ; product's protected owner/DACL. Verify this before NSIS writes or executes
   ; anything inside it; a root with a user-writable DACL may contain junctions.
-  System::Call 'advapi32::GetNamedSecurityInfoW(w "${directory}", i 1, i ${FAIRYPAM_INSTALL_SECURITY_INFORMATION}, p 0, p 0, p 0, p 0, *p .R7) i.R9'
+  System::Call 'advapi32::GetNamedSecurityInfoW(w "${object}", i 1, i ${FAIRYPAM_INSTALL_SECURITY_INFORMATION}, p 0, p 0, p 0, p 0, *p .R7) i.R9'
   ${If} $R9 != 0
     StrCpy $R5 $R9
     Goto ${failure_label}
@@ -68,7 +70,7 @@ Var FairyPamBootstrapPayloadDir
     System::Call 'kernel32::LocalFree(p R7)'
     Goto ${failure_label}
   ${EndIf}
-  System::Call 'kernel32::lstrcmpW(p R8, w "${FAIRYPAM_INSTALL_DACL_SDDL}") i.R9'
+  System::Call 'kernel32::lstrcmpW(p R8, w ${expected_dacl}) i.R9'
   System::Call 'kernel32::LocalFree(p R8)'
   ${If} $R9 != 0
     StrCpy $R5 1
@@ -90,7 +92,7 @@ Var FairyPamBootstrapPayloadDir
   ${If} $R8 != 0
     Goto ${failure_label}
   ${EndIf}
-  !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY "${directory}" ${failure_label}
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "${directory}" "${FAIRYPAM_INSTALL_DACL_SDDL}" ${failure_label}
 !macroend
 
 !macro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY directory failure_label
@@ -125,7 +127,7 @@ Var FairyPamBootstrapPayloadDir
   ; Establish owner and DACL before File/WriteUninstaller overwrites an
   ; existing leaf. Without this, a user-owned read-only-looking file can later
   ; restore its own write permission between extraction and ExecWait.
-  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${FAIRYPAM_INSTALL_SDDL}", i 1, *p .R8, p 0) i.R9 ?e'
+  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${FAIRYPAM_INSTALL_FILE_SDDL}", i 1, *p .R8, p 0) i.R9 ?e'
   Pop $R5
   ${If} $R9 = 0
     Goto ${failure_label}
@@ -158,7 +160,7 @@ Var FairyPamBootstrapPayloadDir
   ${If} $R8 != 0
     Goto ${failure_label}
   ${EndIf}
-  !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY "${file}" ${failure_label}
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "${file}" "${FAIRYPAM_INSTALL_FILE_DACL_SDDL}" ${failure_label}
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL
@@ -207,7 +209,7 @@ fairypam_open_existing_install:
   ${If} $R8 != 0
     Goto fairypam_install_reparse_detected
   ${EndIf}
-  !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY "$FairyPamInstallDir" fairypam_install_untrusted_security
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "$FairyPamInstallDir" "${FAIRYPAM_INSTALL_DACL_SDDL}" fairypam_install_untrusted_security
   StrCpy $FairyPamBootstrapDir "$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}"
   StrCpy $FairyPamBootstrapPayloadDir "$FairyPamBootstrapDir\payload"
   !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$FairyPamBootstrapDir" fairypam_install_untrusted_security
