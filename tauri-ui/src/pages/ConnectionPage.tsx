@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 
 import { StatusPanel } from '../components/StatusPanel';
@@ -27,7 +27,8 @@ function connectionStatusLabel(status: string) {
 }
 
 export function ConnectionPage({ canMutate, connection, environment, overview, startup, retryStartup }: Props) {
-  const [registrationStatus, setRegistrationStatus] = useState<'idle' | 'submitting' | 'submitted' | 'error'>('idle');
+  const [registrationStatus, setRegistrationStatus] = useState<'idle' | 'submitting' | 'submitted' | 'completed' | 'error'>('idle');
+  const [registrationPendingAt, setRegistrationPendingAt] = useState(0);
   const status = useQuery({
     queryKey: queryKeys.connection,
     queryFn: agentApi.getConnectionStatus,
@@ -44,9 +45,20 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
     && !environment.data.registration_pending
     && registrationReady;
 
+  useEffect(() => {
+    if (registrationStatus !== 'submitted') return;
+    if (environment.isError) {
+      setRegistrationStatus('error');
+      return;
+    }
+    if (environment.dataUpdatedAt <= registrationPendingAt || environment.data?.registration_pending) return;
+    const certificate = environment.data?.checks.find((check) => check.id === 'certificate');
+    setRegistrationStatus(certificate?.status === 'available' ? 'completed' : 'error');
+  }, [environment.data, environment.dataUpdatedAt, environment.isError, registrationPendingAt, registrationStatus]);
+
   const submitRegistration = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!registrationEnabled || registrationStatus === 'submitting') return;
+    if (!registrationEnabled || registrationStatus === 'submitting' || registrationStatus === 'submitted') return;
 
     const form = event.currentTarget;
     const data = new FormData(form);
@@ -61,13 +73,24 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
     };
 
     setRegistrationStatus('submitting');
+    setRegistrationPendingAt(0);
     void agentApi.registerHub(hubAddress.trim(), registrationCode).then(
-      () => {
+      async () => {
         clearRegistrationFields();
-        setRegistrationStatus('submitted');
+        const environmentResult = await environment.refetch();
+        const certificate = environmentResult.data?.checks.find((check) => check.id === 'certificate');
+        if (environmentResult.isError) {
+          setRegistrationStatus('error');
+        } else if (certificate?.status === 'available') {
+          setRegistrationStatus('completed');
+        } else if (environmentResult.data?.registration_pending) {
+          setRegistrationPendingAt(environmentResult.dataUpdatedAt);
+          setRegistrationStatus('submitted');
+        } else {
+          setRegistrationStatus('error');
+        }
         void Promise.all([
           queryClient.invalidateQueries({ queryKey: queryKeys.connection }),
-          queryClient.invalidateQueries({ queryKey: queryKeys.environment }),
           queryClient.invalidateQueries({ queryKey: ['agent-ui', 'log-tail'] }),
         ]);
       },
@@ -108,11 +131,12 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
             一次性注册码
             <input autoComplete="off" name="registrationCode" required type="password" />
           </label>
-          <button disabled={registrationStatus === 'submitting' || !registrationEnabled} type="submit">注册或重新注册</button>
+          <button disabled={registrationStatus === 'submitting' || registrationStatus === 'submitted' || !registrationEnabled} type="submit">注册或重新注册</button>
         </form>
         {registrationStatus === 'submitting' && <p role="status">正在提交注册请求。</p>}
-        {registrationStatus === 'submitted' && <p role="status">已提交，正在完成注册；结果见运行日志。</p>}
-        {registrationStatus === 'error' && <p role="status">注册请求未提交。请确认后台服务已就绪后重试。</p>}
+        {registrationStatus === 'submitted' && <p role="status">正在完成注册，请稍候。</p>}
+        {registrationStatus === 'completed' && <p role="status">注册已完成，正在连接服务。</p>}
+        {registrationStatus === 'error' && <p role="status">注册未完成。请获取新的注册码后重试。</p>}
         {!registrationReady && <p role="status">请先完成本机环境检查，再提交注册。</p>}
         {environment.isError && <p role="status">本机环境暂时无法确认，请稍后重试。</p>}
         {!startup.isSuccess && <p role="status">请先等待后台服务就绪，再提交注册。</p>}

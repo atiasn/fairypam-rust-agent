@@ -118,14 +118,12 @@ describe('App', () => {
     await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
     vi.mocked(agentApi.runEnvironmentCheck)
       .mockResolvedValueOnce({ registration_ready: true, registration_pending: true, checks: [] })
-      .mockResolvedValueOnce({ registration_ready: true, registration_pending: false, checks: [] });
+      .mockResolvedValueOnce({ registration_ready: true, registration_pending: false, checks: [{ id: 'certificate', status: 'available', code: 'runtime.certificate_files_available', recovery: '无需操作' }] });
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
     expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
-    await waitFor(() => expect(agentApi.runEnvironmentCheck).toHaveBeenCalledTimes(2));
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
-    await waitFor(() => expect(agentApi.runEnvironmentCheck).toHaveBeenCalledTimes(3), { timeout: 3_000 });
+    expect(await view.findByText('注册已完成，正在连接服务。')).toBeInTheDocument();
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
-    expect(await view.findByText('已提交，正在完成注册；结果见运行日志。')).toBeInTheDocument();
     expect(view.getByLabelText('服务地址')).toHaveValue('');
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
     expect(view.getByLabelText('服务地址')).toHaveAttribute('autocomplete', 'off');
@@ -147,7 +145,7 @@ describe('App', () => {
     await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
 
-    expect(await view.findByText('注册请求未提交。请确认后台服务已就绪后重试。')).toBeInTheDocument();
+    expect(await view.findByText('注册未完成。请获取新的注册码后重试。')).toBeInTheDocument();
     expect(view.getByLabelText('服务地址')).toHaveValue('');
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
     expect(view.queryByText('registration-code=not-for-display')).not.toBeInTheDocument();
