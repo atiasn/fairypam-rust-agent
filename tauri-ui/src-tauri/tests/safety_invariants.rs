@@ -390,14 +390,13 @@ fn product_installer_binds_each_command_to_one_helper_phase() {
         "\"--provision\" => provision(install_root)",
         "\"--installed-preflight\" => installed_preflight(install_root)",
     ] {
-        assert!(dispatch.contains(mapping), "missing command mapping: {mapping}");
+        assert!(
+            dispatch.contains(mapping),
+            "missing command mapping: {mapping}"
+        );
     }
 
-    let provision = source_between(
-        INSTALLER_PROVISIONER,
-        "fn provision(",
-        "fn preflight(",
-    );
+    let provision = source_between(INSTALLER_PROVISIONER, "fn provision(", "fn preflight(");
     let preflight = source_between(
         INSTALLER_PROVISIONER,
         "fn preflight(",
