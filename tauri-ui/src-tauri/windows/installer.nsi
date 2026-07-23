@@ -550,7 +550,7 @@ Section Install
   ; already-protected root. It examines any existing product tree before the
   ; normal payload below can overwrite or execute files in that tree.
   SetOutPath "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload"
-  {{#each resources_dirs}}
+  {{#each resources_ancestors}}
     !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\\{{this}}" fairypam_install_untrusted_security
     CreateDirectory "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\\{{this}}"
   {{/each}}
@@ -567,7 +567,7 @@ Section Install
   File "${MAINBINARYSRCPATH}"
 
   ; Copy resources
-  {{#each resources_dirs}}
+  {{#each resources_ancestors}}
     !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\\{{this}}" fairypam_install_untrusted_security
     CreateDirectory "$INSTDIR\\{{this}}"
   {{/each}}

@@ -107,13 +107,15 @@ Var FairyPamBootstrapPayloadDir
     System::Call 'kernel32::LocalFree(p R8)'
     Goto ${failure_label}
   ${EndIf}
-  System::Call 'kernel32::CreateDirectoryW(w "${directory}", p R7) i.R9 ?e'
-  Pop $R5
+  System::Call 'shell32::SHCreateDirectoryExW(p 0, w "${directory}", p R7) i.R9'
+  StrCpy $R5 $R9
   System::Free $R7
   System::Call 'kernel32::LocalFree(p R8)'
-  ${If} $R9 = 0
-    ${If} $R5 != ${ERROR_ALREADY_EXISTS}
-      Goto ${failure_label}
+  ${If} $R9 != 0
+    ${If} $R9 != ${ERROR_ALREADY_EXISTS}
+      ${If} $R9 != ${ERROR_FILE_EXISTS}
+        Goto ${failure_label}
+      ${EndIf}
     ${EndIf}
   ${EndIf}
   !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH "${directory}" ${failure_label}

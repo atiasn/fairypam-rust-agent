@@ -226,6 +226,7 @@ fn product_installer_uses_one_fixed_protected_root() {
         "!define FAIRYPAM_INSTALL_DACL_SDDL \"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)\"",
         "StrCpy $FairyPamInstallDir \"${FAIRYPAM_INSTALL_ROOT}\"",
         "CreateDirectoryW(w \"$FairyPamInstallDir\"",
+        "SHCreateDirectoryExW(p 0, w \"${directory}\", p R7) i.R9",
         "CreateFileW(w \"$FairyPamInstallDir\"",
         "GetFileAttributesW(w \"$FairyPamInstallDir\")",
         "FILE_ATTRIBUTE_REPARSE_POINT",
@@ -275,6 +276,11 @@ fn product_installer_uses_one_fixed_protected_root() {
     assert!(
         NSIS_TEMPLATE.contains("!insertmacro NSIS_HOOK_PREPAYLOAD"),
         "the template must preflight the live tree before normal payload extraction"
+    );
+    assert_eq!(
+        NSIS_TEMPLATE.matches("{{#each resources_ancestors}}").count(),
+        3,
+        "every resource ancestor must be materialized and verified"
     );
     for line in NSIS_TEMPLATE.lines() {
         assert!(
