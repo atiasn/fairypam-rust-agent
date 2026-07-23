@@ -8,13 +8,11 @@ const WINDOWS_PIPE_CLIENT: &str =
 const WINDOWS_PIPE_SERVER: &str =
     include_str!("../../../crates/fairypam-agent-windows/src/local_pipe.rs");
 const AGENT_ENROLLMENT: &str = include_str!("../../../bins/fairypam-agent/src/enrollment.rs");
-const AGENT_OBSERVABILITY: &str = include_str!("../../../bins/fairypam-agent/src/observability.rs");
 const AGENT_RUNTIME: &str = include_str!("../../../bins/fairypam-agent/src/runtime.rs");
 const INSTALLER_PROVISIONER: &str =
     include_str!("../../../bins/fairypam-agent-installer/src/main.rs");
 const INSTALLER_LAYOUT_BUILD: &str =
     include_str!("../../../bins/fairypam-agent-installer/build.rs");
-const TAURI_CONFIG: &str = include_str!("../tauri.conf.json");
 const NSIS_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
 const INSTALL_LAYOUT: &str = include_str!("../windows/install-layout.nsh");
 const NSIS_TEMPLATE: &str = include_str!("../windows/installer.nsi");
