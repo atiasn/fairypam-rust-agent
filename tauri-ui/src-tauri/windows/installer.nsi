@@ -699,8 +699,8 @@ fairypam_uninstall_root_ok:
   StrCpy $FairyPamBootstrapPayloadDir "$FairyPamBootstrapDir\payload"
   !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH "$FairyPamBootstrapDir" fairypam_uninstall_untrusted_root
   !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH "$FairyPamBootstrapPayloadDir" fairypam_uninstall_untrusted_root
-  IfFileExists "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources\runtime\fairypam-agent-installer.exe" 0 fairypam_uninstall_untrusted_root
-  ExecWait '"$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources\runtime\fairypam-agent-installer.exe" --preflight "$INSTDIR"' $0
+  IfFileExists "$INSTDIR\resources\runtime\fairypam-agent-installer.exe" 0 fairypam_uninstall_untrusted_root
+  ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --preflight "$INSTDIR"' $0
   IfErrors fairypam_uninstall_untrusted_root 0
   ${If} $0 != 0
     Goto fairypam_uninstall_untrusted_root

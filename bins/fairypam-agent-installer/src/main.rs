@@ -35,8 +35,6 @@ const AGENT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent";
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 #[cfg(windows)]
 const INSTALL_DIRECTORY: &str = env!("FAIRYPAM_INSTALL_DIRECTORY");
-#[cfg(windows)]
-const INSTALL_BOOTSTRAP_DIRECTORY: &str = env!("FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY");
 const TRUSTED_INSTALLER_SID: &str =
     "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
@@ -107,8 +105,6 @@ fn verify_install_root(install_root: &std::path::Path) -> Result<(), ()> {
     verify_trusted_install_entry(&program_files, true)?;
     verify_install_tree(install_root)?;
     let helper = install_root
-        .join(INSTALL_BOOTSTRAP_DIRECTORY)
-        .join("payload")
         .join("resources")
         .join("runtime")
         .join("fairypam-agent-installer.exe");
