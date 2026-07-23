@@ -179,7 +179,7 @@ fn product_installer_uses_one_fixed_protected_root() {
         "install-layout.nsh",
         "FAIRYPAM_INSTALL_DIRECTORY",
         "FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY",
-        "cargo:rustc-env=FAIRYPAM_INSTALL_DIRECTORY={value}",
+        "cargo:rustc-env=FAIRYPAM_INSTALL_DIRECTORY={install_directory}",
         "cargo:rustc-env=FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY={bootstrap_directory}",
         "!define FAIRYPAM_INSTALL_ROOT \"$PROGRAMFILES64\\${FAIRYPAM_INSTALL_DIRECTORY}\"",
         "InstallDir \"${FAIRYPAM_INSTALL_ROOT}\"",
