@@ -28,6 +28,7 @@ ManifestDPIAwareness PerMonitorV2
 !include "Win\COM.nsh"
 !include "Win\Propkey.nsh"
 !include "StrFunc.nsh"
+!include "install-layout.nsh"
 ${StrCase}
 ${StrLoc}
 
@@ -93,8 +94,10 @@ OutFile "${OUTFILE}"
 !if "${INSTALLWEBVIEW2MODE}" != ""
   !error "FairyPam requires WebView2 skip mode"
 !endif
-!define FIXED_INSTALL_DIR "$PROGRAMFILES64\${PRODUCTNAME}"
-InstallDir "${FIXED_INSTALL_DIR}"
+; Product display text and installation layout intentionally differ: the
+; human-facing name can evolve without moving the fixed protected root.
+!define FAIRYPAM_INSTALL_ROOT "$PROGRAMFILES64\${FAIRYPAM_INSTALL_DIRECTORY}"
+InstallDir "${FAIRYPAM_INSTALL_ROOT}"
 
 VIProductVersion "${VERSIONWITHBUILD}"
 VIAddVersionKey "ProductName" "${PRODUCTNAME}"
@@ -506,7 +509,7 @@ Function .onInit
 
   !insertmacro SetContext
   ; Override /D and never restore an install root from writable command-line or registry state.
-  StrCpy $INSTDIR "${FIXED_INSTALL_DIR}"
+  StrCpy $INSTDIR "${FAIRYPAM_INSTALL_ROOT}"
 FunctionEnd
 
 
@@ -534,7 +537,7 @@ SectionEnd
 
 Section Install
   ; Fix the architecture-correct Known Folder before any product resource is unpacked.
-  StrCpy $INSTDIR "${FIXED_INSTALL_DIR}"
+  StrCpy $INSTDIR "${FAIRYPAM_INSTALL_ROOT}"
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
   !insertmacro CheckIfAppIsRunning "fairypam-agent.exe" "FairyPam Agent"
@@ -544,23 +547,44 @@ Section Install
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
+  ; Materialize a verifier from the same authenticated bundle in a child of the
+  ; already-protected root. It examines any existing product tree before the
+  ; normal payload below can overwrite or execute files in that tree.
+  SetOutPath "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload"
+  {{#each resources_dirs}}
+    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\{{this}}" fairypam_install_untrusted_security
+    CreateDirectory "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\{{this}}"
+  {{/each}}
+  {{#each resources}}
+    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\{{this.[1]}}" fairypam_install_untrusted_security
+    File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
+  {{/each}}
+  !ifmacrodef NSIS_HOOK_PREPAYLOAD
+    !insertmacro NSIS_HOOK_PREPAYLOAD
+  !endif
+
   ; Copy main executable
+  !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\${MAINBINARYNAME}.exe" fairypam_install_untrusted_security
   File "${MAINBINARYSRCPATH}"
 
   ; Copy resources
   {{#each resources_dirs}}
+    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\{{this}}" fairypam_install_untrusted_security
     CreateDirectory "$INSTDIR\\{{this}}"
   {{/each}}
   {{#each resources}}
+    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\{{this.[1]}}" fairypam_install_untrusted_security
     File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
   {{/each}}
 
   ; Copy external binaries
   {{#each binaries}}
+    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\{{this}}" fairypam_install_untrusted_security
     File /a "/oname={{this}}" "{{no-escape @key}}"
   {{/each}}
 
-  ; Create the staged uninstaller before atomically activating the complete product root.
+  ; Create the uninstaller with the protected descriptor before it is written.
+  !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\uninstall.exe" fairypam_install_untrusted_security
   WriteUninstaller "$INSTDIR\uninstall.exe"
   !ifmacrodef NSIS_HOOK_ACTIVATE
     !insertmacro NSIS_HOOK_ACTIVATE
@@ -658,10 +682,22 @@ FunctionEnd
 
 Function un.onInit
   ; Uninstall only from the fixed protected product root; `_?=` must not redirect deletion.
-  StrCmp "$EXEDIR" "${FIXED_INSTALL_DIR}" fairypam_uninstall_root_ok
+  StrCmp "$EXEDIR" "${FAIRYPAM_INSTALL_ROOT}" fairypam_uninstall_root_ok
   Abort "FairyPam uninstaller must run from its protected installation directory."
 fairypam_uninstall_root_ok:
-  StrCpy $INSTDIR "${FIXED_INSTALL_DIR}"
+  StrCpy $INSTDIR "${FAIRYPAM_INSTALL_ROOT}"
+  StrCpy $FairyPamInstallDir "${FAIRYPAM_INSTALL_ROOT}"
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH "$FairyPamInstallDir" fairypam_uninstall_untrusted_root
+  StrCpy $FairyPamBootstrapDir "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}"
+  StrCpy $FairyPamBootstrapPayloadDir "$FairyPamBootstrapDir\payload"
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH "$FairyPamBootstrapDir" fairypam_uninstall_untrusted_root
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH "$FairyPamBootstrapPayloadDir" fairypam_uninstall_untrusted_root
+  IfFileExists "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources\runtime\fairypam-agent-installer.exe" 0 fairypam_uninstall_untrusted_root
+  ExecWait '"$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources\runtime\fairypam-agent-installer.exe" --preflight "$INSTDIR"' $0
+  IfErrors fairypam_uninstall_untrusted_root 0
+  ${If} $0 != 0
+    Goto fairypam_uninstall_untrusted_root
+  ${EndIf}
   !insertmacro SetContext
 
   !if "${INSTALLMODE}" == "both"
@@ -679,6 +715,10 @@ fairypam_uninstall_root_ok:
   ${IfNot} ${Errors}
     StrCpy $UpdateMode 1
   ${EndIf}
+  Goto fairypam_uninstall_init_complete
+fairypam_uninstall_untrusted_root:
+  Abort "FairyPam rejected an untrusted protected installation directory."
+fairypam_uninstall_init_complete:
 FunctionEnd
 
 Section Uninstall

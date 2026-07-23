@@ -3,11 +3,14 @@
 ## 当前产品安装器候选
 
 本 change 新增 `perMachine` Tauri NSIS setup 候选：安装器将 GUI、Agent、Guardian、安装辅助
-程序和 `profiles/` 部署到固定的受保护 `Program Files` 目录，并将 Agent 状态根设为
-`C:\ProgramData\FairyPam.Agent\Agent`。它先在固定 `Program Files` staging 目录完成校验，再 activate
-为正式安装目录。已有受保护安装只会在完整 staging 校验后先移动到 `.previous`，再激活新 slot；
-激活失败会恢复旧 slot。残留的 `.previous` 或 `.installing` slot 一律 fail-closed，保留给受控恢复流程，
-不能被安装器猜测、跟随或删除。
+程序和 `profiles/` 部署到由 `windows/install-layout.nsh` 统一定义的受保护
+`C:\Program Files\FairyPam` 目录，并将 Agent 状态根设为
+`C:\ProgramData\FairyPam.Agent\Agent`。安装布局只有一个固定产品根：首次安装以最终 DACL 创建
+该根，后续安装只覆盖声明的产品文件。安装器会固定并验证该根不是 reparse point，并从该根内
+受保护 bootstrap 子树启动同包验证程序；它会在任何既有产品载荷被写入或执行前验证完整树的
+owner/DACL/MIC/reparse，再验证新的运行时载荷与状态根。安装器不再创建、激活、恢复或递归删除
+`.installing`、`.previous` 或旧产品目录；因此残留的历史目录不会阻塞新安装，也不会被提升权限的
+安装器跟随或删除。
 
 CI 尚未触发，因此尚无 setup、receipt 或 provenance attestation。CI 成功时才会产生
 `fairypam-agent-setup-windows.exe`、同源 receipt 及其 provenance attestation；同步器只会在此后下载并验证它们。
@@ -28,7 +31,7 @@ pending，不能把该候选作为发布包或安装验收证据。
 | 注册状态可恢复与持久化脱敏审计 | pending | `WINDOWS-LIVE-SMOKE` | 候选继续要求无效候选不发布 pointer、旧状态保留和生产审计不含秘密；CI 成功后的 attestation 也不代替 Windows 状态恢复 smoke。 | 关闭 `WINDOWS-BUILD` 后，验证无效 URI/key/cert 与半开 claim 后仍可 Status/重试，并检查真实 JSONL newline 与 ACL。 |
 | GUI 与 Agent 生命周期解耦 | pending | `TAURI-GUI-HUMAN` | 现有托盘行为测试是 UI 层证据，未覆盖已安装候选。 | 从已安装候选的托盘退出后确认 Agent 仍运行。 |
 | 可访问和可诊断的失败态 | pass | Vitest/RTL | 加载、失败、键盘导航与 axe gate 通过。 | Windows 人工检查作为 UI smoke 的一部分。 |
-| 受管产品安装器与状态根 | pending | static security re-review, `WINDOWS-BUILD`, `WINDOWS-LIVE-SMOKE` | 设计的 CI candidate 为 `perMachine`；CI 成功后的 receipt 将声明受管布局与 `C:\ProgramData\FairyPam.Agent\Agent` 状态根。WebView2 bootstrapper 固定为 `skip` 并由模板编译期拒绝非 `skip`，upstream pre-uninstall 路径已禁用；已有安装采用 verify → active→`.previous` → stage→active → rollback，残留 slot 仍 fail-closed。 | 在标准 Windows 账户验证 fresh install、成功升级、辅助程序或两次 Rename 失败后的 rollback、残留 `.previous`/`.installing` 拒绝，以及状态根 ACL、DACL/reparse 和 UAC。 |
+| 受管产品安装器与状态根 | pending | static security re-review, `WINDOWS-BUILD`, `WINDOWS-LIVE-SMOKE` | 设计的 CI candidate 为 `perMachine`，产品文件始终位于单一 `C:\Program Files\FairyPam` 根，状态位于 `C:\ProgramData\FairyPam.Agent\Agent`。WebView2 bootstrapper 固定为 `skip` 并由模板编译期拒绝非 `skip`；首次根创建时应用最终 DACL，后续只覆盖声明载荷，拒绝根 reparse point，且无 slot Rename 或递归清理。 | 在标准 Windows 账户验证 fresh install、同根成功升级、旧 `.installing`/`.previous`/旧目录不阻塞安装且不被删除，以及产品根/状态根 ACL、DACL/reparse 和 UAC。 |
 | 生产安装布局不含开发者 CLI | pending | `WINDOWS-BUILD`, `WINDOWS-LIVE-SMOKE` | CI 成功后的 receipt 将声明 GUI、Agent、Guardian、安装辅助程序和 `profiles/`；开发者 CLI/Dev 脚本不是产品安装布局。 | 在真实安装后验证实际布局不含 `fairypam-agentctl.exe` 或 Dev 入口。 |
 | AuthentiCode/publisher | pending | `SIGNED-RELEASE` | 尚无本变更的 GitHub Actions setup；候选将为 non-promotable、未签名。 | 正式发布前验证 Agent/GUI/安装器的 AuthentiCode 链和允许的 publisher。 |
 
@@ -36,8 +39,8 @@ pending，不能把该候选作为发布包或安装验收证据。
 
 产品用户入口是受管 NSIS setup；不要手工解包或部署 runtime，也不要使用 `fairypam-agentctl.exe`。
 在上述 pending 门禁关闭前，不向用户交付该候选。届时须在 **Windows 交互桌面**（不能是 SSH token）
-记录以下 smoke：fresh install；已有 active 的成功升级；辅助程序或 Rename 失败后的旧 slot 恢复；残留
-`.previous` 或 `.installing` slot 时拒绝且不变更；已运行 Agent 时普通打开无 UAC；Agent 缺失时自动请求一次 UAC；只出现 UAC 而没有
+记录以下 smoke：fresh install；同一固定根的成功升级；历史 `.previous`、`.installing` 或旧产品目录
+存在时新根安装成功且这些历史目录不被删除；根路径为 reparse point 时拒绝且不变更；已运行 Agent 时普通打开无 UAC；Agent 缺失时自动请求一次 UAC；只出现 UAC 而没有
 命令行窗口；拒绝 UAC 后安全离线；Hub 注册值不出现在命令行、响应、日志或审计；fake Pipe server
 与非 GUI caller 被拒绝；Hub/Pipe 超时后下一条 Status 和重试仍可完成；无效候选不改变 `current`
 pointer；20 秒内本地管道/Hub 状态、五项导航与托盘左/右键行为。

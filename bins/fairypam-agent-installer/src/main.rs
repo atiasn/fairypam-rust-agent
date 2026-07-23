@@ -8,12 +8,18 @@ fn main() {
 #[cfg(windows)]
 fn main() {
     let mut arguments = std::env::args_os().skip(1);
-    let exit_code = match arguments.next().zip(arguments.next()) {
-        Some((stage, active)) if arguments.next().is_none() => {
-            match provision(std::path::Path::new(&stage), std::path::Path::new(&active)) {
-                Ok(()) => 0,
-                Err(failure) => failure as i32,
+    let exit_code = match (arguments.next(), arguments.next()) {
+        (Some(command), Some(install_root)) if arguments.next().is_none() => {
+            let install_root = std::path::Path::new(&install_root);
+            match command.to_string_lossy().as_ref() {
+                "--preflight" => preflight(install_root),
+                "--provision" => provision(install_root),
+                _ => Err(ProvisionFailure::InstallRoots),
             }
+            .map_or_else(
+                |failure| failure as i32,
+                |_| 0,
+            )
         }
         _ => 1,
     };
@@ -30,6 +36,10 @@ const PRODUCT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent";
 const AGENT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent";
 #[cfg(windows)]
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+#[cfg(windows)]
+const INSTALL_DIRECTORY: &str = env!("FAIRYPAM_INSTALL_DIRECTORY");
+#[cfg(windows)]
+const INSTALL_BOOTSTRAP_DIRECTORY: &str = env!("FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY");
 const TRUSTED_INSTALLER_SID: &str =
     "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
@@ -47,12 +57,9 @@ enum ProvisionFailure {
 }
 
 #[cfg(windows)]
-fn provision(
-    stage_root: &std::path::Path,
-    active_root: &std::path::Path,
-) -> Result<(), ProvisionFailure> {
+fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
-    verify_install_roots(stage_root, active_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    verify_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
     verify_nonreparse_directory(std::path::Path::new(PROGRAM_DATA))
         .map_err(|_| ProvisionFailure::ProgramData)?;
     for (path, failure) in [
@@ -77,10 +84,13 @@ fn provision(
 }
 
 #[cfg(windows)]
-fn verify_install_roots(
-    stage_root: &std::path::Path,
-    active_root: &std::path::Path,
-) -> Result<(), ()> {
+fn preflight(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
+    verify_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)
+}
+
+#[cfg(windows)]
+fn verify_install_root(install_root: &std::path::Path) -> Result<(), ()> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{
         FOLDERID_ProgramFilesX64, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
@@ -92,17 +102,16 @@ fn verify_install_roots(
     let program_files = unsafe { known.to_string().map_err(|_| ())? };
     unsafe { CoTaskMemFree(Some(known.0.cast())) };
     let program_files = std::path::PathBuf::from(program_files);
-    let expected_stage = program_files.join("FairyPam Agent UI.installing");
-    let expected_active = program_files.join("FairyPam Agent UI");
-    if !same_windows_path(stage_root, &expected_stage)
-        || !same_windows_path(active_root, &expected_active)
-    {
+    let expected_root = program_files.join(INSTALL_DIRECTORY);
+    if !same_windows_path(install_root, &expected_root) {
         return Err(());
     }
 
     verify_trusted_install_entry(&program_files, true)?;
-    verify_install_tree(stage_root)?;
-    let helper = stage_root
+    verify_install_tree(install_root)?;
+    let helper = install_root
+        .join(INSTALL_BOOTSTRAP_DIRECTORY)
+        .join("payload")
         .join("resources")
         .join("runtime")
         .join("fairypam-agent-installer.exe");
@@ -110,11 +119,6 @@ fn verify_install_roots(
         return Err(());
     }
     verify_staged_payload_entry(&helper, false)?;
-    match active_root.symlink_metadata() {
-        Ok(_) => verify_legacy_active_tree(active_root)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(()),
-    }
     Ok(())
 }
 
@@ -133,25 +137,6 @@ fn verify_staged_payload_children(root: &std::path::Path) -> Result<(), ()> {
         verify_staged_payload_entry(&path, metadata.is_dir())?;
         if metadata.is_dir() {
             verify_staged_payload_children(&path)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn verify_legacy_active_tree(root: &std::path::Path) -> Result<(), ()> {
-    verify_trusted_install_entry(root, true)?;
-    verify_legacy_active_children(root)
-}
-
-#[cfg(windows)]
-fn verify_legacy_active_children(root: &std::path::Path) -> Result<(), ()> {
-    for entry in std::fs::read_dir(root).map_err(|_| ())? {
-        let path = entry.map_err(|_| ())?.path();
-        let metadata = path.symlink_metadata().map_err(|_| ())?;
-        verify_trusted_install_entry(&path, metadata.is_dir())?;
-        if metadata.is_dir() {
-            verify_legacy_active_children(&path)?;
         }
     }
     Ok(())
@@ -349,15 +334,20 @@ fn security_sddl_with_information(
 }
 
 fn trusted_program_files_security(sddl: &str) -> bool {
-    let trusted_owner = sddl.starts_with("O:BA")
+    trusted_install_owner(sddl) && !dacl_grants_untrusted_write(sddl, true)
+}
+
+fn trusted_install_owner(sddl: &str) -> bool {
+    sddl.starts_with("O:BA")
         || sddl.starts_with("O:SY")
         || sddl.starts_with("O:TI")
-        || sddl.starts_with(&format!("O:{TRUSTED_INSTALLER_SID}"));
-    trusted_owner && !dacl_grants_untrusted_write(sddl, true)
+        || sddl.starts_with(&format!("O:{TRUSTED_INSTALLER_SID}"))
 }
 
 fn staged_payload_security(sddl: &str, label_sddl: &str) -> bool {
-    !dacl_grants_untrusted_write(sddl, false) && mandatory_label_is_high_no_write_up(label_sddl)
+    trusted_install_owner(sddl)
+        && !dacl_grants_untrusted_write(sddl, false)
+        && mandatory_label_is_high_no_write_up(label_sddl)
 }
 
 fn mandatory_label_is_high_no_write_up(sddl: &str) -> bool {
@@ -469,12 +459,15 @@ mod tests {
     }
 
     #[test]
-    fn staged_payload_requires_high_no_write_up_label() {
-        let elevated_installer_owned = "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
+    fn staged_payload_requires_trusted_owner_and_high_no_write_up_label() {
+        let trusted_install_owned = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
         let high_no_write_up = "S:(ML;OICI;NW;;;HI)";
-        assert!(!trusted_program_files_security(elevated_installer_owned));
         assert!(staged_payload_security(
-            elevated_installer_owned,
+            trusted_install_owned,
+            high_no_write_up
+        ));
+        assert!(!staged_payload_security(
+            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)",
             high_no_write_up
         ));
         assert!(trusted_program_files_security(

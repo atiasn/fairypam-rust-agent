@@ -1,27 +1,25 @@
-Var FairyPamFinalDir
-Var FairyPamStageDir
-Var FairyPamBackupDir
-Var FairyPamStageHandle
+Var FairyPamInstallDir
+Var FairyPamInstallHandle
+Var FairyPamBootstrapDir
+Var FairyPamBootstrapPayloadDir
 
 !define FAIRYPAM_INSTALL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)S:(ML;OICI;NW;;;HI)"
+!define FAIRYPAM_INSTALL_DACL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)"
 !define ERROR_ALREADY_EXISTS 183
-!define FAIRYPAM_STAGE_SDDL 65536
-!define FAIRYPAM_STAGE_SECURITY_ATTRIBUTES 131072
-!define FAIRYPAM_STAGE_CREATE_DIRECTORY 196608
-!define FAIRYPAM_STAGE_PIN 262144
-!define FAIRYPAM_STAGE_VERIFY 327680
-!define FAIRYPAM_STAGE_NOT_DIRECTORY 393216
-!define FAIRYPAM_STAGE_REPARSE 458752
-!define FAIRYPAM_STAGE_ACTIVATE 524288
-!define FAIRYPAM_STAGE_VALIDATION 589824
-!define FAIRYPAM_STAGE_ROLLBACK 655360
-!define FAIRYPAM_STAGE_BACKUP_CLEANUP 720896
-!define FAIRYPAM_STAGE_STALE_BACKUP 786432
-!define FAIRYPAM_STAGE_STALE_STAGE 851968
-!define FILE_FLAG_OPEN_REPARSE_POINT 0x00200000
-!define FAIRYPAM_STAGE_OPEN_FLAGS 0x02200000 ; FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+!define ERROR_FILE_EXISTS 80
+!define FAIRYPAM_INSTALL_SDDL_ERROR 65536
+!define FAIRYPAM_INSTALL_SECURITY_ATTRIBUTES_ERROR 131072
+!define FAIRYPAM_INSTALL_CREATE_DIRECTORY_ERROR 196608
+!define FAIRYPAM_INSTALL_PIN_ERROR 262144
+!define FAIRYPAM_INSTALL_VERIFY_ERROR 327680
+!define FAIRYPAM_INSTALL_NOT_DIRECTORY_ERROR 393216
+!define FAIRYPAM_INSTALL_REPARSE_ERROR 458752
+!define FAIRYPAM_INSTALL_VALIDATION_ERROR 524288
+!define FAIRYPAM_INSTALL_RELEASE_ERROR 589824
+!define FAIRYPAM_INSTALL_OPEN_FLAGS 0x02200000 ; FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+!define FAIRYPAM_INSTALL_SECURITY_INFORMATION 0x00000005 ; owner + DACL; protection is encoded in D: P
 
-!macro FAIRYPAM_SET_STAGE_ERROR stage_base detail
+!macro FAIRYPAM_SET_INSTALL_ERROR stage_base detail
   IntOp $R4 ${detail} & 0xFFFF
   ${If} $R4 = 0
     StrCpy $R4 1
@@ -30,168 +28,249 @@ Var FairyPamStageHandle
   SetErrorLevel $R4
 !macroend
 
-!macro NSIS_HOOK_PREINSTALL
-  StrCpy $FairyPamFinalDir "${FIXED_INSTALL_DIR}"
-  StrCpy $FairyPamStageDir "${FIXED_INSTALL_DIR}.installing"
-  StrCpy $FairyPamBackupDir "${FIXED_INSTALL_DIR}.previous"
-  StrCpy $FairyPamStageHandle 0
-  IfFileExists "$FairyPamBackupDir" fairypam_stale_backup 0
-  IfFileExists "$FairyPamStageDir" fairypam_stale_stage 0
+!macro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY directory failure_label
+  ; A pre-existing root is safe to update only when it was created with the
+  ; product's protected owner/DACL. Verify this before NSIS writes or executes
+  ; anything inside it; a root with a user-writable DACL may contain junctions.
+  System::Call 'advapi32::GetNamedSecurityInfoW(w "${directory}", i 1, i ${FAIRYPAM_INSTALL_SECURITY_INFORMATION}, p 0, p 0, p 0, p 0, *p .R7) i.R9'
+  ${If} $R9 != 0
+    StrCpy $R5 $R9
+    Goto ${failure_label}
+  ${EndIf}
+  System::Call 'advapi32::ConvertSecurityDescriptorToStringSecurityDescriptorW(p R7, i 1, i ${FAIRYPAM_INSTALL_SECURITY_INFORMATION}, *p .R8, p 0) i.R9 ?e'
+  Pop $R5
+  ${If} $R9 = 0
+    System::Call 'kernel32::LocalFree(p R7)'
+    Goto ${failure_label}
+  ${EndIf}
+  System::Call '*$R8(&w .R9)'
+  System::Call 'kernel32::LocalFree(p R8)'
+  System::Call 'kernel32::LocalFree(p R7)'
+  StrCmp "$R9" "${FAIRYPAM_INSTALL_DACL_SDDL}" +2
+    Goto ${failure_label}
+!macroend
 
-  ; NSIS is 32-bit, so SECURITY_ATTRIBUTES is 12 bytes here.
+!macro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH directory failure_label
+  System::Call 'kernel32::GetFileAttributesW(w "${directory}") i.R9 ?e'
+  Pop $R5
+  IntCmp $R9 -1 ${failure_label}
+  IntOp $R8 $R9 & 0x10 ; FILE_ATTRIBUTE_DIRECTORY
+  ${If} $R8 = 0
+    Goto ${failure_label}
+  ${EndIf}
+  IntOp $R8 $R9 & 0x400 ; FILE_ATTRIBUTE_REPARSE_POINT
+  ${If} $R8 != 0
+    Goto ${failure_label}
+  ${EndIf}
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY "${directory}" ${failure_label}
+!macroend
+
+!macro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY directory failure_label
+  ; The bootstrap is created with the same explicit descriptor as the product
+  ; root. On a later install, check it before any executable is copied there.
   System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${FAIRYPAM_INSTALL_SDDL}", i 1, *p .R8, p 0) i.R9 ?e'
   Pop $R5
   ${If} $R9 = 0
-    Goto fairypam_stage_sddl_failed
+    Goto ${failure_label}
   ${EndIf}
   System::Call '*(i 12, p R8, i 0) p.R7 ?e'
   Pop $R5
   ${If} $R7 = 0
     System::Call 'kernel32::LocalFree(p R8)'
-    Goto fairypam_stage_attributes_failed
+    Goto ${failure_label}
   ${EndIf}
-
-  System::Call 'kernel32::CreateDirectoryW(w "$FairyPamStageDir", p R7) i.R9 ?e'
+  System::Call 'kernel32::CreateDirectoryW(w "${directory}", p R7) i.R9 ?e'
   Pop $R5
-  ${If} $R9 = 0
-    System::Free $R7
-    System::Call 'kernel32::LocalFree(p R8)'
-    ${If} $R5 = ${ERROR_ALREADY_EXISTS}
-      Goto fairypam_stale_stage
-    ${EndIf}
-    Goto fairypam_stage_create_failed
-  ${EndIf}
   System::Free $R7
   System::Call 'kernel32::LocalFree(p R8)'
+  ${If} $R9 = 0
+    ${If} $R5 != ${ERROR_ALREADY_EXISTS}
+      Goto ${failure_label}
+    ${EndIf}
+  ${EndIf}
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH "${directory}" ${failure_label}
+!macroend
 
-  ; No share-delete keeps the protected, non-reparse stage pinned through verification.
-  System::Call 'kernel32::CreateFileW(w "$FairyPamStageDir", i 0x80, i 3, p 0, i 3, i ${FAIRYPAM_STAGE_OPEN_FLAGS}, p 0) p.R6 ?e'
+!macro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE file failure_label
+  ; Establish owner and DACL before File/WriteUninstaller overwrites an
+  ; existing leaf. Without this, a user-owned read-only-looking file can later
+  ; restore its own write permission between extraction and ExecWait.
+  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${FAIRYPAM_INSTALL_SDDL}", i 1, *p .R8, p 0) i.R9 ?e'
   Pop $R5
-  IntCmp $R6 -1 fairypam_stage_pin_failed
-  System::Call 'kernel32::GetFileAttributesW(w "$FairyPamStageDir") i.R9 ?e'
+  ${If} $R9 = 0
+    Goto ${failure_label}
+  ${EndIf}
+  System::Call '*(i 12, p R8, i 0) p.R7 ?e'
   Pop $R5
-  IntCmp $R9 -1 fairypam_stage_verify_failed
+  ${If} $R7 = 0
+    System::Call 'kernel32::LocalFree(p R8)'
+    Goto ${failure_label}
+  ${EndIf}
+  System::Call 'kernel32::CreateFileW(w "${file}", i 0x40000000, i 0, p R7, i 1, i 0x00200000, p 0) p.R0 ?e'
+  Pop $R5
+  System::Free $R7
+  System::Call 'kernel32::LocalFree(p R8)'
+  ${If} $R0 = -1
+    ${If} $R5 != ${ERROR_FILE_EXISTS}
+      Goto ${failure_label}
+    ${EndIf}
+  ${Else}
+    System::Call 'kernel32::CloseHandle(p R0)'
+  ${EndIf}
+  System::Call 'kernel32::GetFileAttributesW(w "${file}") i.R9 ?e'
+  Pop $R5
+  IntCmp $R9 -1 ${failure_label}
   IntOp $R8 $R9 & 0x10 ; FILE_ATTRIBUTE_DIRECTORY
-  ${If} $R8 = 0
-    Goto fairypam_stage_not_directory
+  ${If} $R8 != 0
+    Goto ${failure_label}
   ${EndIf}
   IntOp $R8 $R9 & 0x400 ; FILE_ATTRIBUTE_REPARSE_POINT
   ${If} $R8 != 0
-    Goto fairypam_stage_reparse_detected
+    Goto ${failure_label}
   ${EndIf}
-  StrCpy $FairyPamStageHandle $R6
-  StrCpy $INSTDIR "$FairyPamStageDir"
-  SetOutPath $INSTDIR
-  Goto fairypam_stage_ready
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY "${file}" ${failure_label}
+!macroend
 
-fairypam_stale_backup:
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_STALE_BACKUP} ${ERROR_ALREADY_EXISTS}
-  Abort "FairyPam found a preserved previous installation. Installation was stopped without changing the active runtime."
-fairypam_stale_stage:
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_STALE_STAGE} ${ERROR_ALREADY_EXISTS}
-  Abort "FairyPam found an unverified staging directory. Installation was stopped without following or deleting it."
-fairypam_stage_sddl_failed:
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_SDDL} $R5
-  Abort "FairyPam could not prepare security for its protected installation staging directory (Win32 error $R5)."
-fairypam_stage_attributes_failed:
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_SECURITY_ATTRIBUTES} $R5
-  Abort "FairyPam could not allocate security attributes for its protected installation staging directory (Win32 error $R5)."
-fairypam_stage_create_failed:
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_CREATE_DIRECTORY} $R5
-  Abort "FairyPam could not create its protected installation staging directory (Win32 error $R5)."
-fairypam_stage_pin_failed:
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_PIN} $R5
-  Abort "FairyPam could not pin its protected installation staging directory (Win32 error $R5)."
-fairypam_stage_verify_failed:
-  System::Call 'kernel32::CloseHandle(p R6)'
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_VERIFY} $R5
-  Abort "FairyPam could not verify its protected installation staging directory (Win32 error $R5)."
-fairypam_stage_not_directory:
-  System::Call 'kernel32::CloseHandle(p R6)'
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_NOT_DIRECTORY} 1
-  Abort "FairyPam rejected a non-directory protected installation staging path."
-fairypam_stage_reparse_detected:
-  System::Call 'kernel32::CloseHandle(p R6)'
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_REPARSE} 1
-  Abort "FairyPam rejected a reparse point at its protected installation staging directory."
-fairypam_stage_ready:
+!macro NSIS_HOOK_PREINSTALL
+  StrCpy $FairyPamInstallDir "${FAIRYPAM_INSTALL_ROOT}"
+  StrCpy $FairyPamInstallHandle 0
+  IfFileExists "$FairyPamInstallDir" fairypam_open_existing_install 0
+
+  ; First install creates the only product directory with its final ACL before
+  ; any payload is extracted. Reinstallations overwrite the same fixed files.
+  System::Call 'advapi32::ConvertStringSecurityDescriptorToSecurityDescriptorW(w "${FAIRYPAM_INSTALL_SDDL}", i 1, *p .R8, p 0) i.R9 ?e'
+  Pop $R5
+  ${If} $R9 = 0
+    Goto fairypam_install_sddl_failed
+  ${EndIf}
+  System::Call '*(i 12, p R8, i 0) p.R7 ?e'
+  Pop $R5
+  ${If} $R7 = 0
+    System::Call 'kernel32::LocalFree(p R8)'
+    Goto fairypam_install_attributes_failed
+  ${EndIf}
+  System::Call 'kernel32::CreateDirectoryW(w "$FairyPamInstallDir", p R7) i.R9 ?e'
+  Pop $R5
+  System::Free $R7
+  System::Call 'kernel32::LocalFree(p R8)'
+  ${If} $R9 = 0
+    ${If} $R5 = ${ERROR_ALREADY_EXISTS}
+      Goto fairypam_open_existing_install
+    ${EndIf}
+    Goto fairypam_install_create_failed
+  ${EndIf}
+
+fairypam_open_existing_install:
+  ; Pin and inspect the exact fixed root. There is intentionally no recursive
+  ; cleanup: the installer overwrites only declared payload files.
+  System::Call 'kernel32::CreateFileW(w "$FairyPamInstallDir", i 0x80, i 3, p 0, i 3, i ${FAIRYPAM_INSTALL_OPEN_FLAGS}, p 0) p.R6 ?e'
+  Pop $R5
+  IntCmp $R6 -1 fairypam_install_pin_failed
+  System::Call 'kernel32::GetFileAttributesW(w "$FairyPamInstallDir") i.R9 ?e'
+  Pop $R5
+  IntCmp $R9 -1 fairypam_install_verify_failed
+  IntOp $R8 $R9 & 0x10 ; FILE_ATTRIBUTE_DIRECTORY
+  ${If} $R8 = 0
+    Goto fairypam_install_not_directory
+  ${EndIf}
+  IntOp $R8 $R9 & 0x400 ; FILE_ATTRIBUTE_REPARSE_POINT
+  ${If} $R8 != 0
+    Goto fairypam_install_reparse_detected
+  ${EndIf}
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY "$FairyPamInstallDir" fairypam_install_untrusted_security
+  StrCpy $FairyPamBootstrapDir "$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}"
+  StrCpy $FairyPamBootstrapPayloadDir "$FairyPamBootstrapDir\payload"
+  !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$FairyPamBootstrapDir" fairypam_install_untrusted_security
+  !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$FairyPamBootstrapPayloadDir" fairypam_install_untrusted_security
+  StrCpy $FairyPamInstallHandle $R6
+  StrCpy $INSTDIR "$FairyPamInstallDir"
+  SetOutPath $INSTDIR
+!macroend
+
+!macro NSIS_HOOK_PREPAYLOAD
+  ; This verifier was copied into the protected bootstrap subtree before any
+  ; existing product payload is touched. It refuses reparse points and
+  ; user-writable entries throughout the current tree before replacement.
+  ExecWait '"$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources\runtime\fairypam-agent-installer.exe" --preflight "$FairyPamInstallDir"' $0
+  IfErrors fairypam_install_validation_failed 0
+  ${If} $0 != 0
+    StrCpy $R3 $0
+    Goto fairypam_install_helper_failed
+  ${EndIf}
+  SetOutPath "$FairyPamInstallDir"
 !macroend
 
 !macro NSIS_HOOK_ACTIVATE
-  IfFileExists "$FairyPamStageDir\resources\runtime\fairypam-agent-installer.exe" 0 fairypam_stage_failed
-  ExecWait '"$FairyPamStageDir\resources\runtime\fairypam-agent-installer.exe" "$FairyPamStageDir" "$FairyPamFinalDir"' $0
-  IfErrors fairypam_stage_failed 0
+  IfFileExists "$FairyPamInstallDir\resources\runtime\fairypam-agent-installer.exe" 0 fairypam_install_validation_failed
+  IfFileExists "$FairyPamInstallDir\fairypam-agent.exe" 0 fairypam_install_validation_failed
+  IfFileExists "$FairyPamInstallDir\fairypam-agent-guardian.exe" 0 fairypam_install_validation_failed
+  IfFileExists "$FairyPamInstallDir\profiles\*.*" 0 fairypam_install_validation_failed
+  IfFileExists "$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources\runtime\fairypam-agent-installer.exe" 0 fairypam_install_validation_failed
+  ExecWait '"$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources\runtime\fairypam-agent-installer.exe" --provision "$FairyPamInstallDir"' $0
+  IfErrors fairypam_install_validation_failed 0
   ${If} $0 != 0
     StrCpy $R3 $0
-    Goto fairypam_stage_helper_failed
+    Goto fairypam_install_helper_failed
   ${EndIf}
-  IfFileExists "$FairyPamStageDir\fairypam-agent.exe" 0 fairypam_stage_failed
-  IfFileExists "$FairyPamStageDir\fairypam-agent-guardian.exe" 0 fairypam_stage_failed
-  IfFileExists "$FairyPamStageDir\profiles\*.*" 0 fairypam_stage_failed
 
-  ; SetOutPath makes the stage the installer process current directory. Windows
-  ; locks a process current directory, so leave the staged slot before its
-  ; handle is released and it is renamed into the fixed active location.
+  ; Leave the product directory before releasing its pinned handle. The final
+  ; layout is already active, so no rename, backup, or residual deletion occurs.
   SetOutPath "$PROGRAMFILES64"
-  ; System maps R6 directly to the native handle parameter. Restore the
-  ; saved value before release: the generated NSIS payload can use $R6 while
-  ; extracting files, but must never change the pinned kernel handle itself.
-  StrCpy $R6 $FairyPamStageHandle
+  StrCpy $R6 $FairyPamInstallHandle
   System::Call 'kernel32::CloseHandle(p R6) i.R9 ?e'
   Pop $R5
   ${If} $R9 = 0
-    !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_ACTIVATE} $R5
-    Abort "FairyPam could not release its protected installation staging directory (Win32 error $R5). The active installation was not changed."
+    !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_RELEASE_ERROR} $R5
+    Abort "FairyPam could not release its protected installation directory (Win32 error $R5)."
   ${EndIf}
-  StrCpy $FairyPamStageHandle 0
-  IfFileExists "$FairyPamFinalDir" 0 fairypam_activate_fresh
-  ClearErrors
-  Rename "$FairyPamFinalDir" "$FairyPamBackupDir"
-  IfErrors fairypam_activate_failed 0
-  ClearErrors
-  Rename "$FairyPamStageDir" "$FairyPamFinalDir"
-  IfErrors fairypam_restore_previous 0
-  Goto fairypam_activate_complete
-
-fairypam_activate_fresh:
-  ClearErrors
-  Rename "$FairyPamStageDir" "$FairyPamFinalDir"
-  IfErrors fairypam_activate_failed 0
-fairypam_activate_complete:
-  StrCpy $INSTDIR "$FairyPamFinalDir"
+  StrCpy $FairyPamInstallHandle 0
+  StrCpy $INSTDIR "$FairyPamInstallDir"
   SetOutPath $INSTDIR
-  ClearErrors
-  RMDir /r "$FairyPamBackupDir"
-  IfErrors fairypam_backup_cleanup_failed 0
-  IfFileExists "$FairyPamBackupDir" fairypam_backup_cleanup_failed 0
   Goto fairypam_install_complete
-fairypam_restore_previous:
-  ClearErrors
-  Rename "$FairyPamBackupDir" "$FairyPamFinalDir"
-  IfErrors fairypam_rollback_failed 0
-fairypam_activate_failed:
-  ClearErrors
-  RMDir /r "$FairyPamStageDir"
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_ACTIVATE} 1
-  Abort "FairyPam could not activate the staged runtime. The previous installation remains active."
-fairypam_stage_failed:
-  ${If} $FairyPamStageHandle != 0
-    StrCpy $R6 $FairyPamStageHandle
+
+fairypam_install_sddl_failed:
+  !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_SDDL_ERROR} $R5
+  Abort "FairyPam could not prepare security for its protected installation directory (Win32 error $R5)."
+fairypam_install_attributes_failed:
+  !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_SECURITY_ATTRIBUTES_ERROR} $R5
+  Abort "FairyPam could not allocate security attributes for its protected installation directory (Win32 error $R5)."
+fairypam_install_create_failed:
+  !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_CREATE_DIRECTORY_ERROR} $R5
+  Abort "FairyPam could not create its protected installation directory (Win32 error $R5)."
+fairypam_install_pin_failed:
+  !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_PIN_ERROR} $R5
+  Abort "FairyPam could not pin its protected installation directory (Win32 error $R5)."
+fairypam_install_verify_failed:
+  System::Call 'kernel32::CloseHandle(p R6)'
+  !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_VERIFY_ERROR} $R5
+  Abort "FairyPam could not verify its protected installation directory (Win32 error $R5)."
+fairypam_install_not_directory:
+  System::Call 'kernel32::CloseHandle(p R6)'
+  !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_NOT_DIRECTORY_ERROR} 1
+  Abort "FairyPam rejected a non-directory protected installation path."
+fairypam_install_reparse_detected:
+  System::Call 'kernel32::CloseHandle(p R6)'
+  !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_REPARSE_ERROR} 1
+  Abort "FairyPam rejected a reparse point at its protected installation path."
+fairypam_install_untrusted_security:
+  System::Call 'kernel32::CloseHandle(p R6)'
+  !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_VERIFY_ERROR} $R5
+  Abort "FairyPam rejected an untrusted protected installation directory."
+fairypam_install_validation_failed:
+  ${If} $FairyPamInstallHandle != 0
+    StrCpy $R6 $FairyPamInstallHandle
     System::Call 'kernel32::CloseHandle(p R6)'
-    StrCpy $FairyPamStageHandle 0
+    StrCpy $FairyPamInstallHandle 0
   ${EndIf}
-  ClearErrors
-  RMDir /r "$FairyPamStageDir"
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_VALIDATION} 1
-  Abort "FairyPam could not validate the staged Agent runtime. The active installation was not changed."
-fairypam_stage_helper_failed:
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_VALIDATION} $R3
-  Abort "FairyPam could not validate the staged Agent runtime. The active installation was not changed."
-fairypam_rollback_failed:
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_ROLLBACK} 1
-  Abort "FairyPam could not restore the preserved installation. The previous slot remains at the .previous path for recovery."
-fairypam_backup_cleanup_failed:
-  !insertmacro FAIRYPAM_SET_STAGE_ERROR ${FAIRYPAM_STAGE_BACKUP_CLEANUP} 1
-  Abort "FairyPam could not remove the preserved previous installation. Installation was stopped without reporting success."
+  !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_VALIDATION_ERROR} 1
+  Abort "FairyPam could not validate the installed Agent runtime."
+fairypam_install_helper_failed:
+  ${If} $FairyPamInstallHandle != 0
+    StrCpy $R6 $FairyPamInstallHandle
+    System::Call 'kernel32::CloseHandle(p R6)'
+    StrCpy $FairyPamInstallHandle 0
+  ${EndIf}
+  !insertmacro FAIRYPAM_SET_INSTALL_ERROR ${FAIRYPAM_INSTALL_VALIDATION_ERROR} $R3
+  Abort "FairyPam could not validate the installed Agent runtime."
 fairypam_install_complete:
 !macroend
