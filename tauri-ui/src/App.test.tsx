@@ -122,8 +122,8 @@ describe('App', () => {
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
     expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
-    expect(await view.findByText('注册已完成，正在连接服务。')).toBeInTheDocument();
-    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
+    expect(await view.findByText('正在完成注册，请稍候。')).toBeInTheDocument();
+    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
     expect(view.getByLabelText('服务地址')).toHaveValue('');
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
     expect(view.getByLabelText('服务地址')).toHaveAttribute('autocomplete', 'off');
