@@ -551,11 +551,11 @@ Section Install
   ; normal payload below can overwrite or execute files in that tree.
   SetOutPath "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload"
   {{#each resources_dirs}}
-    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\{{this}}" fairypam_install_untrusted_security
-    CreateDirectory "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\{{this}}"
+    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\\{{this}}" fairypam_install_untrusted_security
+    CreateDirectory "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\\{{this}}"
   {{/each}}
   {{#each resources}}
-    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\{{this.[1]}}" fairypam_install_untrusted_security
+    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\\{{this.[1]}}" fairypam_install_untrusted_security
     File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
   {{/each}}
   !ifmacrodef NSIS_HOOK_PREPAYLOAD
@@ -568,17 +568,17 @@ Section Install
 
   ; Copy resources
   {{#each resources_dirs}}
-    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\{{this}}" fairypam_install_untrusted_security
+    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\\{{this}}" fairypam_install_untrusted_security
     CreateDirectory "$INSTDIR\\{{this}}"
   {{/each}}
   {{#each resources}}
-    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\{{this.[1]}}" fairypam_install_untrusted_security
+    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\\{{this.[1]}}" fairypam_install_untrusted_security
     File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
   {{/each}}
 
   ; Copy external binaries
   {{#each binaries}}
-    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\{{this}}" fairypam_install_untrusted_security
+    !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE "$INSTDIR\\{{this}}" fairypam_install_untrusted_security
     File /a "/oname={{this}}" "{{no-escape @key}}"
   {{/each}}
 

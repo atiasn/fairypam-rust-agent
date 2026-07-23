@@ -276,6 +276,12 @@ fn product_installer_uses_one_fixed_protected_root() {
         NSIS_TEMPLATE.contains("!insertmacro NSIS_HOOK_PREPAYLOAD"),
         "the template must preflight the live tree before normal payload extraction"
     );
+    for line in NSIS_TEMPLATE.lines() {
+        assert!(
+            !line.replace("\\\\{{", "").contains("\\{{"),
+            "a Windows path must not escape a Handlebars placeholder: {line}"
+        );
+    }
     for forbidden in [
         "RMDir /r",
         "Rename ",
