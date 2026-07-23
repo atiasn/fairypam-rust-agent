@@ -28,7 +28,6 @@ ManifestDPIAwareness PerMonitorV2
 !include "Win\COM.nsh"
 !include "Win\Propkey.nsh"
 !include "StrFunc.nsh"
-!include "install-layout.nsh"
 ${StrCase}
 ${StrLoc}
 

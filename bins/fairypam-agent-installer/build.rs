@@ -5,7 +5,7 @@ const BOOTSTRAP_DEFINE_PREFIX: &str = "!define FAIRYPAM_INSTALL_BOOTSTRAP_DIRECT
 
 fn main() {
     let layout = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest directory"))
-        .join("../../tauri-ui/src-tauri/windows/install-layout.nsh");
+        .join("../../tauri-ui/src-tauri/windows/installer-hooks.nsh");
     println!("cargo:rerun-if-changed={}", layout.display());
     let source = std::fs::read_to_string(&layout).expect("read Windows install layout");
     let install_directory = parse_layout_value(&source, DEFINE_PREFIX, false);

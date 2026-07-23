@@ -3,6 +3,8 @@ Var FairyPamInstallHandle
 Var FairyPamBootstrapDir
 Var FairyPamBootstrapPayloadDir
 
+!define FAIRYPAM_INSTALL_DIRECTORY "FairyPam"
+!define FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY ".fairypam-installer"
 !define FAIRYPAM_INSTALL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)S:(ML;OICI;NW;;;HI)"
 !define FAIRYPAM_INSTALL_DACL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)"
 !define ERROR_ALREADY_EXISTS 183

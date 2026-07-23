@@ -3,7 +3,7 @@
 ## 当前产品安装器候选
 
 本 change 新增 `perMachine` Tauri NSIS setup 候选：安装器将 GUI、Agent、Guardian、安装辅助
-程序和 `profiles/` 部署到由 `windows/install-layout.nsh` 统一定义的受保护
+程序和 `profiles/` 部署到由 `windows/installer-hooks.nsh` 统一定义的受保护
 `C:\Program Files\FairyPam` 目录，并将 Agent 状态根设为
 `C:\ProgramData\FairyPam.Agent\Agent`。安装布局只有一个固定产品根：首次安装以最终 DACL 创建
 该根，后续安装只覆盖声明的产品文件。安装器会固定并验证该根不是 reparse point，并从该根内

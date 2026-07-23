@@ -14,7 +14,6 @@ const INSTALLER_PROVISIONER: &str =
 const INSTALLER_LAYOUT_BUILD: &str =
     include_str!("../../../bins/fairypam-agent-installer/build.rs");
 const NSIS_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
-const INSTALL_LAYOUT: &str = include_str!("../windows/install-layout.nsh");
 const NSIS_TEMPLATE: &str = include_str!("../windows/installer.nsi");
 
 #[test]
@@ -161,20 +160,19 @@ fn product_uac_and_enrollment_publication_fail_closed() {
 #[test]
 fn product_installer_uses_one_fixed_protected_root() {
     assert!(
-        INSTALL_LAYOUT.contains("!define FAIRYPAM_INSTALL_DIRECTORY \"FairyPam\""),
+        NSIS_HOOKS.contains("!define FAIRYPAM_INSTALL_DIRECTORY \"FairyPam\""),
         "the product root must be defined once"
     );
     assert!(
-        !INSTALL_LAYOUT.contains("FAIRYPAM_LEGACY_INSTALL_DIRECTORY"),
+        !NSIS_HOOKS.contains("FAIRYPAM_LEGACY_INSTALL_DIRECTORY"),
         "the layout must not retain a second migration root"
     );
     assert!(
-        INSTALL_LAYOUT
-            .contains("!define FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY \".fairypam-installer\""),
+        NSIS_HOOKS.contains("!define FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY \".fairypam-installer\""),
         "the bootstrap subtree must be declared beside the fixed product root"
     );
     for required in [
-        "install-layout.nsh",
+        "installer-hooks.nsh",
         "FAIRYPAM_INSTALL_DIRECTORY",
         "FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY",
         "cargo:rustc-env=FAIRYPAM_INSTALL_DIRECTORY={install_directory}",
