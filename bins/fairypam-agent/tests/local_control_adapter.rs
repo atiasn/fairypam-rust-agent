@@ -253,13 +253,7 @@ fn registration_is_not_dispatched_when_its_audit_cannot_be_persisted() {
     let (runtime, _) = adapter.into_parts();
 
     assert_eq!(runtime.calls, 0);
-    assert_eq!(
-        response
-            .result
-            .unwrap_err()
-            .code,
-        "local.audit_failed"
-    );
+    assert_eq!(response.result.unwrap_err().code, "local.audit_failed");
 }
 
 #[test]
@@ -427,10 +421,7 @@ fn registration_claims_directly_without_desktop_confirmation() {
     let elevated = registration
         .find("ensure_elevated()?")
         .expect("the direct claim must remain elevated");
-    assert!(
-        elevated < claim,
-        "elevation must precede the direct claim"
-    );
+    assert!(elevated < claim, "elevation must precede the direct claim");
     assert!(!enrollment.contains("MessageBoxW("));
     assert!(!enrollment.contains("REPLACEMENT_CONFIRMATION_TIMEOUT"));
     assert!(!enrollment.contains("replacement_cancelled"));
@@ -441,9 +432,8 @@ fn registration_claims_directly_without_desktop_confirmation() {
         .and_then(|(_, source)| source.split_once("fn mark_registration_started"))
         .map(|(source, _)| source)
         .expect("registration failure logging must remain isolated");
-    assert!(registration_finish.contains(
-        "tracing::warn!(code = error.code(), \"Hub registration was not completed\")"
-    ));
+    assert!(registration_finish
+        .contains("tracing::warn!(code = error.code(), \"Hub registration was not completed\")"));
     assert!(
         !registration_finish.contains("error = %error"),
         "registration tracing must not persist dynamic error messages"
