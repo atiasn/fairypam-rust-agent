@@ -220,8 +220,20 @@ jobs:
           $setup = @(Get-ChildItem tauri-ui/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
           if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
           & whoami.exe /groups /fo csv /nh
+          $installRoot = 'C:\Program Files\FairyPam'
           $installer = Start-Process -FilePath $setup[0].FullName -ArgumentList '/S' -Wait -PassThru
           if ($installer.ExitCode -ne 0) {
+            if (Test-Path -LiteralPath $installRoot -PathType Container) {
+              try {
+                Write-Host "FairyPam installation root SDDL: $((Get-Acl -LiteralPath $installRoot).Sddl)"
+              }
+              catch {
+                Write-Host 'FairyPam installation root exists but its SDDL could not be read.'
+              }
+            }
+            else {
+              Write-Host 'FairyPam installation root does not exist after failed setup.'
+            }
             $stageNames = @{
               1 = 'sddl'
               2 = 'security-attributes'
@@ -242,7 +254,6 @@ jobs:
             }
             throw "NSIS setup failed with exit code $exitCode"
           }
-          $installRoot = 'C:\Program Files\FairyPam'
           foreach ($path in @(
             (Join-Path $installRoot 'fairypam-agent-tauri-ui.exe'),
             (Join-Path $installRoot 'fairypam-agent.exe'),
