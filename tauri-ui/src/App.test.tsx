@@ -214,15 +214,23 @@ describe('App', () => {
   });
 
   it('服务状态丢失时不自动重新请求环境检查', async () => {
-    vi.mocked(agentApi.getOverview).mockRejectedValueOnce({
+    const getOverview = vi.mocked(agentApi.getOverview);
+    getOverview.mockRejectedValue({
       code: 'local.transport.disconnected',
       message: '服务连接中断',
     });
-    const app = renderApp();
-    const view = within(app.container);
+    try {
+      const app = renderApp();
+      const view = within(app.container);
 
-    expect(await view.findByRole('heading', { name: '服务暂时无法使用' })).toBeInTheDocument();
-    expect(agentApi.runEnvironmentCheck).not.toHaveBeenCalled();
+      expect(await view.findByRole('heading', { name: '服务暂时无法使用' })).toBeInTheDocument();
+      expect(agentApi.runEnvironmentCheck).not.toHaveBeenCalled();
+    } finally {
+      getOverview.mockResolvedValue({
+        status: { state: 'ConnectedIdle', capture_active: false },
+        doctor: { profiles: ['signed-profile'], runtime: 'dry_run' },
+      });
+    }
   });
 
   it('日志和游戏在后台服务就绪前不请求本地通道', async () => {

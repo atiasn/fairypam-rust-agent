@@ -230,12 +230,8 @@ jobs:
               5 = 'verify'
               6 = 'not-directory'
               7 = 'reparse'
-              8 = 'activate'
-              9 = 'stage-validation'
-              10 = 'rollback'
-              11 = 'backup-cleanup'
-              12 = 'stale-backup'
-              13 = 'stale-stage'
+              8 = 'validation'
+              9 = 'release'
             }
             $exitCode = [int64]$installer.ExitCode
             $stageId = [math]::Floor($exitCode / 65536)
@@ -246,12 +242,13 @@ jobs:
             }
             throw "NSIS setup failed with exit code $exitCode"
           }
-          $installRoot = 'C:\Program Files\FairyPam Agent UI'
+          $installRoot = 'C:\Program Files\FairyPam'
           foreach ($path in @(
             (Join-Path $installRoot 'fairypam-agent-tauri-ui.exe'),
             (Join-Path $installRoot 'fairypam-agent.exe'),
             (Join-Path $installRoot 'fairypam-agent-guardian.exe'),
-            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe')
+            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'),
+            (Join-Path $installRoot '.fairypam-installer\payload\resources\runtime\fairypam-agent-installer.exe')
           )) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "missing installed product file: $path" }
           }
