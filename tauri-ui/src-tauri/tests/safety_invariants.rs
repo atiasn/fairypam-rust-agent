@@ -12,7 +12,8 @@ const AGENT_OBSERVABILITY: &str = include_str!("../../../bins/fairypam-agent/src
 const AGENT_RUNTIME: &str = include_str!("../../../bins/fairypam-agent/src/runtime.rs");
 const INSTALLER_PROVISIONER: &str =
     include_str!("../../../bins/fairypam-agent-installer/src/main.rs");
-const INSTALLER_LAYOUT_BUILD: &str = include_str!("../../../bins/fairypam-agent-installer/build.rs");
+const INSTALLER_LAYOUT_BUILD: &str =
+    include_str!("../../../bins/fairypam-agent-installer/build.rs");
 const TAURI_CONFIG: &str = include_str!("../tauri.conf.json");
 const NSIS_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
 const INSTALL_LAYOUT: &str = include_str!("../windows/install-layout.nsh");
@@ -170,7 +171,8 @@ fn product_installer_uses_one_fixed_protected_root() {
         "the layout must not retain a second migration root"
     );
     assert!(
-        INSTALL_LAYOUT.contains("!define FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY \".fairypam-installer\""),
+        INSTALL_LAYOUT
+            .contains("!define FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY \".fairypam-installer\""),
         "the bootstrap subtree must be declared beside the fixed product root"
     );
     for required in [
