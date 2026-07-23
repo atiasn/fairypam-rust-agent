@@ -89,6 +89,7 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
         } else {
           setRegistrationStatus('error');
         }
+        retryStartup();
         void Promise.all([
           queryClient.invalidateQueries({ queryKey: queryKeys.connection }),
           queryClient.invalidateQueries({ queryKey: ['agent-ui', 'log-tail'] }),

@@ -109,6 +109,9 @@ describe('App', () => {
 
   it('显示中文服务状态并直接提交注册，不回显提交内容', async () => {
     const user = userEvent.setup();
+    vi.mocked(agentApi.ensureLocalAgent)
+      .mockResolvedValueOnce({ status: 'agent_ready' })
+      .mockResolvedValueOnce({ status: 'ready' });
     const app = renderApp();
     const view = within(app.container);
 
@@ -121,9 +124,10 @@ describe('App', () => {
       .mockResolvedValueOnce({ registration_ready: true, registration_pending: false, checks: [{ id: 'certificate', status: 'available', code: 'runtime.certificate_files_available', recovery: '无需操作' }] });
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
     expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
-    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
-    expect(await view.findByText('正在完成注册，请稍候。')).toBeInTheDocument();
-    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
+    expect(await view.findByText('注册已完成，正在连接服务。')).toBeInTheDocument();
+    expect(await view.findByText('服务已连接')).toBeInTheDocument();
+    expect(agentApi.ensureLocalAgent).toHaveBeenCalledTimes(2);
+    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
     expect(view.getByLabelText('服务地址')).toHaveValue('');
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
     expect(view.getByLabelText('服务地址')).toHaveAttribute('autocomplete', 'off');
