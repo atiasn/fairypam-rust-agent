@@ -212,15 +212,54 @@ fn registration_audit_and_response_never_echo_credentials() {
         )
         .unwrap();
     let (_, audit) = adapter.into_parts();
-    let evidence = format!("{} {response:?}", audit.0[1].to_json());
+    let audit_json = audit
+        .0
+        .iter()
+        .map(AuditEvent::to_json)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let evidence = format!("{audit_json} {response:?}");
 
     assert_eq!(audit.0[0].result_code, "attempt");
     assert_eq!(audit.0[1].command, "register_hub");
     assert_eq!(audit.0[1].result_code, "pending");
+    assert!(!audit_json.contains("request-2"));
+    assert!(!audit_json.contains("S-1-5-21-owner"));
+    assert!(!audit_json.contains("build-1"));
     assert!(!evidence.contains(hub));
     assert!(!evidence.contains(code));
     assert!(!evidence.contains("certificate"));
     assert!(!evidence.contains("private_key"));
+}
+
+#[test]
+#[cfg(not(windows))]
+fn registration_is_not_dispatched_when_its_audit_cannot_be_persisted() {
+    let mut adapter =
+        LocalControlAdapter::new(owner(), FakeRuntime::default(), FailingAudit, "build-1");
+
+    let response = adapter
+        .handle(
+            &caller(),
+            request(
+                LocalCommand::RegisterHub {
+                    hub_address: "https://hub.example".to_owned(),
+                    registration_code: "fp_enroll_secret_0123456789".to_owned(),
+                },
+                12,
+            ),
+        )
+        .unwrap();
+    let (runtime, _) = adapter.into_parts();
+
+    assert_eq!(runtime.calls, 0);
+    assert_eq!(
+        response
+            .result
+            .unwrap_err()
+            .code,
+        "local.audit_failed"
+    );
 }
 
 #[test]
