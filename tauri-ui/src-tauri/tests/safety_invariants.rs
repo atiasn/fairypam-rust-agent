@@ -222,6 +222,8 @@ fn product_installer_uses_one_fixed_protected_root() {
 
     for required in [
         "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+        "!define FAIRYPAM_INSTALL_OWNER_SDDL \"O:BA\"",
+        "!define FAIRYPAM_INSTALL_DACL_SDDL \"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)\"",
         "StrCpy $FairyPamInstallDir \"${FAIRYPAM_INSTALL_ROOT}\"",
         "CreateDirectoryW(w \"$FairyPamInstallDir\"",
         "CreateFileW(w \"$FairyPamInstallDir\"",
@@ -229,8 +231,10 @@ fn product_installer_uses_one_fixed_protected_root() {
         "FILE_ATTRIBUTE_REPARSE_POINT",
         "GetNamedSecurityInfoW",
         "ConvertSecurityDescriptorToStringSecurityDescriptorW",
-        "kernel32::lstrcpynW(w .R9, p R8, i ${NSIS_MAX_STRLEN}) p.R0",
-        "FAIRYPAM_INSTALL_DACL_SDDL",
+        "i ${FAIRYPAM_INSTALL_OWNER_SECURITY_INFORMATION}",
+        "i ${FAIRYPAM_INSTALL_DACL_SECURITY_INFORMATION}",
+        "kernel32::lstrcmpW(p R8, w \"${FAIRYPAM_INSTALL_OWNER_SDDL}\") i.R9",
+        "kernel32::lstrcmpW(p R8, w \"${FAIRYPAM_INSTALL_DACL_SDDL}\") i.R9",
         "!insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY \"$FairyPamInstallDir\" fairypam_install_untrusted_security",
         "!insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY \"$FairyPamBootstrapDir\" fairypam_install_untrusted_security",
         "!macro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE",
@@ -255,6 +259,14 @@ fn product_installer_uses_one_fixed_protected_root() {
     assert!(
         !NSIS_HOOKS.contains("*$R8(&w .R9)"),
         "the installer must not treat an API-owned WCHAR pointer as an unbounded struct member"
+    );
+    assert!(
+        !NSIS_HOOKS.contains("lstrcpynW"),
+        "the installer must compare API-owned SDDL without copying it through an NSIS buffer"
+    );
+    assert!(
+        !NSIS_HOOKS.contains("StrCmp \"$R9\" \"${FAIRYPAM_INSTALL_DACL_SDDL}\""),
+        "the installer must not compare a pointer-derived SDDL through an NSIS register"
     );
     assert!(
         NSIS_TEMPLATE.contains("!insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH \"$FairyPamInstallDir\" fairypam_uninstall_untrusted_root"),

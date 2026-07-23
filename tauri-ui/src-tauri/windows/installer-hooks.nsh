@@ -9,7 +9,8 @@ Var FairyPamBootstrapPayloadDir
 ; FILE_GENERIC_EXECUTE (0x1200a9). Use that canonical mask both when the
 ; protected root is created and when its DACL is verified.
 !define FAIRYPAM_INSTALL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)S:(ML;OICI;NW;;;HI)"
-!define FAIRYPAM_INSTALL_DACL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+!define FAIRYPAM_INSTALL_OWNER_SDDL "O:BA"
+!define FAIRYPAM_INSTALL_DACL_SDDL "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
 !define ERROR_ALREADY_EXISTS 183
 !define ERROR_FILE_EXISTS 80
 !define FAIRYPAM_INSTALL_SDDL_ERROR 65536
@@ -22,6 +23,8 @@ Var FairyPamBootstrapPayloadDir
 !define FAIRYPAM_INSTALL_VALIDATION_ERROR 524288
 !define FAIRYPAM_INSTALL_RELEASE_ERROR 589824
 !define FAIRYPAM_INSTALL_OPEN_FLAGS 0x02200000 ; FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+!define FAIRYPAM_INSTALL_OWNER_SECURITY_INFORMATION 0x00000001
+!define FAIRYPAM_INSTALL_DACL_SECURITY_INFORMATION 0x00000004
 !define FAIRYPAM_INSTALL_SECURITY_INFORMATION 0x00000005 ; owner + DACL; protection is encoded in D: P
 
 !macro FAIRYPAM_SET_INSTALL_ERROR stage_base detail
@@ -42,20 +45,37 @@ Var FairyPamBootstrapPayloadDir
     StrCpy $R5 $R9
     Goto ${failure_label}
   ${EndIf}
-  System::Call 'advapi32::ConvertSecurityDescriptorToStringSecurityDescriptorW(p R7, i 1, i ${FAIRYPAM_INSTALL_SECURITY_INFORMATION}, *p .R8, p 0) i.R9 ?e'
+  ; Convert and compare each component independently. The Win32 conversion
+  ; returns an API-owned UTF-16 pointer; compare it in place so verification
+  ; does not depend on NSIS string-buffer marshaling.
+  System::Call 'advapi32::ConvertSecurityDescriptorToStringSecurityDescriptorW(p R7, i 1, i ${FAIRYPAM_INSTALL_OWNER_SECURITY_INFORMATION}, *p .R8, p 0) i.R9 ?e'
   Pop $R5
   ${If} $R9 = 0
     System::Call 'kernel32::LocalFree(p R7)'
     Goto ${failure_label}
   ${EndIf}
-  ; StringSecurityDescriptor is a pointer to a NUL-terminated WCHAR string.
-  ; `&w` is a fixed-size struct member in System.dll and cannot read this
-  ; pointer safely without a length; copy it into the NSIS string buffer first.
-  System::Call 'kernel32::lstrcpynW(w .R9, p R8, i ${NSIS_MAX_STRLEN}) p.R0'
+  System::Call 'kernel32::lstrcmpW(p R8, w "${FAIRYPAM_INSTALL_OWNER_SDDL}") i.R9'
   System::Call 'kernel32::LocalFree(p R8)'
-  System::Call 'kernel32::LocalFree(p R7)'
-  StrCmp "$R9" "${FAIRYPAM_INSTALL_DACL_SDDL}" +2
+  ${If} $R9 != 0
+    StrCpy $R5 1
+    System::Call 'kernel32::LocalFree(p R7)'
     Goto ${failure_label}
+  ${EndIf}
+
+  System::Call 'advapi32::ConvertSecurityDescriptorToStringSecurityDescriptorW(p R7, i 1, i ${FAIRYPAM_INSTALL_DACL_SECURITY_INFORMATION}, *p .R8, p 0) i.R9 ?e'
+  Pop $R5
+  ${If} $R9 = 0
+    System::Call 'kernel32::LocalFree(p R7)'
+    Goto ${failure_label}
+  ${EndIf}
+  System::Call 'kernel32::lstrcmpW(p R8, w "${FAIRYPAM_INSTALL_DACL_SDDL}") i.R9'
+  System::Call 'kernel32::LocalFree(p R8)'
+  ${If} $R9 != 0
+    StrCpy $R5 1
+    System::Call 'kernel32::LocalFree(p R7)'
+    Goto ${failure_label}
+  ${EndIf}
+  System::Call 'kernel32::LocalFree(p R7)'
 !macroend
 
 !macro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH directory failure_label
