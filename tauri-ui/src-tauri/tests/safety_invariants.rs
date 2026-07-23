@@ -221,6 +221,7 @@ fn product_installer_uses_one_fixed_protected_root() {
     }
 
     for required in [
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
         "StrCpy $FairyPamInstallDir \"${FAIRYPAM_INSTALL_ROOT}\"",
         "CreateDirectoryW(w \"$FairyPamInstallDir\"",
         "CreateFileW(w \"$FairyPamInstallDir\"",
@@ -246,6 +247,10 @@ fn product_installer_uses_one_fixed_protected_root() {
             "missing fixed-root NSIS guard: {required}"
         );
     }
+    assert!(
+        !NSIS_HOOKS.contains("(A;OICI;GRGX;;;BU)"),
+        "the installer must compare the canonical file-system read/execute mask"
+    );
     assert!(
         NSIS_TEMPLATE.contains("!insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH \"$FairyPamInstallDir\" fairypam_uninstall_untrusted_root"),
         "the uninstaller must reject an untrusted product root before deleting declared files"

@@ -5,8 +5,11 @@ Var FairyPamBootstrapPayloadDir
 
 !define FAIRYPAM_INSTALL_DIRECTORY "FairyPam"
 !define FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY ".fairypam-installer"
-!define FAIRYPAM_INSTALL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)S:(ML;OICI;NW;;;HI)"
-!define FAIRYPAM_INSTALL_DACL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)"
+; Windows normalizes GRGX on a file-system object to FILE_GENERIC_READ |
+; FILE_GENERIC_EXECUTE (0x1200a9). Use that canonical mask both when the
+; protected root is created and when its DACL is verified.
+!define FAIRYPAM_INSTALL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)S:(ML;OICI;NW;;;HI)"
+!define FAIRYPAM_INSTALL_DACL_SDDL "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
 !define ERROR_ALREADY_EXISTS 183
 !define ERROR_FILE_EXISTS 80
 !define FAIRYPAM_INSTALL_SDDL_ERROR 65536
