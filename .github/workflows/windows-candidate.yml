@@ -247,7 +247,13 @@ jobs:
                 $kind = if ($_.PSIsContainer) { 'directory' } else { 'file' }
                 $length = if ($_.PSIsContainer) { 0 } else { $_.Length }
                 $relative = [System.IO.Path]::GetRelativePath($installRoot, $_.FullName)
-                Write-Host "FairyPam diagnostic tree: kind=$kind relative=$relative length=$length"
+                try {
+                  $sddl = (Get-Acl -LiteralPath $_.FullName).Sddl
+                }
+                catch {
+                  $sddl = 'unavailable'
+                }
+                Write-Host "FairyPam diagnostic tree: kind=$kind relative=$relative length=$length sddl=$sddl"
               }
             }
             else {

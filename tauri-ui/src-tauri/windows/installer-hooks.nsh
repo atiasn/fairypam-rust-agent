@@ -24,6 +24,11 @@ Var FairyPamBootstrapPayloadDir
 !define FAIRYPAM_INSTALL_REPARSE_ERROR 458752
 !define FAIRYPAM_INSTALL_VALIDATION_ERROR 524288
 !define FAIRYPAM_INSTALL_RELEASE_ERROR 589824
+!define FAIRYPAM_INSTALL_DETAIL_FILE_CREATE 0x1000
+!define FAIRYPAM_INSTALL_DETAIL_FILE_ATTRIBUTES 0x2000
+!define FAIRYPAM_INSTALL_DETAIL_FILE_TYPE 0x3000
+!define FAIRYPAM_INSTALL_DETAIL_OWNER 0x4000
+!define FAIRYPAM_INSTALL_DETAIL_DACL 0x5000
 !define FAIRYPAM_INSTALL_OPEN_FLAGS 0x02200000 ; FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
 !define FAIRYPAM_INSTALL_OWNER_SECURITY_INFORMATION 0x00000001
 !define FAIRYPAM_INSTALL_DACL_SECURITY_INFORMATION 0x00000004
@@ -59,7 +64,8 @@ Var FairyPamBootstrapPayloadDir
   System::Call 'kernel32::lstrcmpW(p R8, w "${FAIRYPAM_INSTALL_OWNER_SDDL}") i.R9'
   System::Call 'kernel32::LocalFree(p R8)'
   ${If} $R9 != 0
-    StrCpy $R5 1
+    StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_OWNER}
+    IntOp $R5 $R5 | 1
     System::Call 'kernel32::LocalFree(p R7)'
     Goto ${failure_label}
   ${EndIf}
@@ -73,7 +79,8 @@ Var FairyPamBootstrapPayloadDir
   System::Call 'kernel32::lstrcmpW(p R8, w R4) i.R9'
   System::Call 'kernel32::LocalFree(p R8)'
   ${If} $R9 != 0
-    StrCpy $R5 1
+    StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_DACL}
+    IntOp $R5 $R5 | 1
     System::Call 'kernel32::LocalFree(p R7)'
     Goto ${failure_label}
   ${EndIf}
@@ -145,6 +152,8 @@ Var FairyPamBootstrapPayloadDir
   System::Call 'kernel32::LocalFree(p R8)'
   ${If} $R0 = -1
     ${If} $R5 != ${ERROR_FILE_EXISTS}
+      IntOp $R5 $R5 & 0x0FFF
+      IntOp $R5 $R5 | ${FAIRYPAM_INSTALL_DETAIL_FILE_CREATE}
       Goto ${failure_label}
     ${EndIf}
   ${Else}
@@ -152,13 +161,21 @@ Var FairyPamBootstrapPayloadDir
   ${EndIf}
   System::Call 'kernel32::GetFileAttributesW(w "${file}") i.R9 ?e'
   Pop $R5
-  IntCmp $R9 -1 ${failure_label}
+  ${If} $R9 = -1
+    IntOp $R5 $R5 & 0x0FFF
+    IntOp $R5 $R5 | ${FAIRYPAM_INSTALL_DETAIL_FILE_ATTRIBUTES}
+    Goto ${failure_label}
+  ${EndIf}
   IntOp $R8 $R9 & 0x10 ; FILE_ATTRIBUTE_DIRECTORY
   ${If} $R8 != 0
+    StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_FILE_TYPE}
+    IntOp $R5 $R5 | 1
     Goto ${failure_label}
   ${EndIf}
   IntOp $R8 $R9 & 0x400 ; FILE_ATTRIBUTE_REPARSE_POINT
   ${If} $R8 != 0
+    StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_FILE_TYPE}
+    IntOp $R5 $R5 | 2
     Goto ${failure_label}
   ${EndIf}
   StrCpy $R4 "${FAIRYPAM_INSTALL_FILE_DACL_SDDL}"
