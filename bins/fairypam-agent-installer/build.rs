@@ -14,7 +14,7 @@ fn main() {
     println!("cargo:rustc-env=FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY={bootstrap_directory}");
 }
 
-fn parse_layout_value(source: &str, prefix: &str, allow_dot: bool) -> &str {
+fn parse_layout_value<'a>(source: &'a str, prefix: &str, allow_dot: bool) -> &'a str {
     source
         .lines()
         .find_map(|line| line.trim().strip_prefix(prefix))
