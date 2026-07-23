@@ -238,9 +238,11 @@ fn product_installer_uses_one_fixed_protected_root() {
         "i ${FAIRYPAM_INSTALL_OWNER_SECURITY_INFORMATION}",
         "i ${FAIRYPAM_INSTALL_DACL_SECURITY_INFORMATION}",
         "kernel32::lstrcmpW(p R8, w \"${FAIRYPAM_INSTALL_OWNER_SDDL}\") i.R9",
-        "kernel32::lstrcmpW(p R8, w ${expected_dacl}) i.R9",
-        "!insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT \"$FairyPamInstallDir\" \"${FAIRYPAM_INSTALL_DACL_SDDL}\" fairypam_install_untrusted_security",
-        "!insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT \"${file}\" \"${FAIRYPAM_INSTALL_FILE_DACL_SDDL}\" ${failure_label}",
+        "kernel32::lstrcmpW(p R8, w R4) i.R9",
+        "StrCpy $R4 \"${FAIRYPAM_INSTALL_DACL_SDDL}\"",
+        "StrCpy $R4 \"${FAIRYPAM_INSTALL_FILE_DACL_SDDL}\"",
+        "!insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT \"$FairyPamInstallDir\" fairypam_install_untrusted_security",
+        "!insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT \"${file}\" ${failure_label}",
         "!insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY \"$FairyPamBootstrapDir\" fairypam_install_untrusted_security",
         "!macro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE",
         "CreateFileW(w \"${file}\", i 0x40000000",
@@ -272,6 +274,10 @@ fn product_installer_uses_one_fixed_protected_root() {
     assert!(
         !NSIS_HOOKS.contains("StrCmp \"$R9\" \"${FAIRYPAM_INSTALL_DACL_SDDL}\""),
         "the installer must not compare a pointer-derived SDDL through an NSIS register"
+    );
+    assert!(
+        !NSIS_HOOKS.contains("expected_dacl"),
+        "the installer must pass the expected DACL through a stable NSIS register"
     );
     assert!(
         NSIS_TEMPLATE.contains("!insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH \"$FairyPamInstallDir\" fairypam_uninstall_untrusted_root"),

@@ -38,7 +38,7 @@ Var FairyPamBootstrapPayloadDir
   SetErrorLevel $R4
 !macroend
 
-!macro FAIRYPAM_VERIFY_PROTECTED_OBJECT object expected_dacl failure_label
+!macro FAIRYPAM_VERIFY_PROTECTED_OBJECT object failure_label
   ; A pre-existing root is safe to update only when it was created with the
   ; product's protected owner/DACL. Verify this before NSIS writes or executes
   ; anything inside it; a root with a user-writable DACL may contain junctions.
@@ -70,7 +70,7 @@ Var FairyPamBootstrapPayloadDir
     System::Call 'kernel32::LocalFree(p R7)'
     Goto ${failure_label}
   ${EndIf}
-  System::Call 'kernel32::lstrcmpW(p R8, w ${expected_dacl}) i.R9'
+  System::Call 'kernel32::lstrcmpW(p R8, w R4) i.R9'
   System::Call 'kernel32::LocalFree(p R8)'
   ${If} $R9 != 0
     StrCpy $R5 1
@@ -92,7 +92,8 @@ Var FairyPamBootstrapPayloadDir
   ${If} $R8 != 0
     Goto ${failure_label}
   ${EndIf}
-  !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "${directory}" "${FAIRYPAM_INSTALL_DACL_SDDL}" ${failure_label}
+  StrCpy $R4 "${FAIRYPAM_INSTALL_DACL_SDDL}"
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "${directory}" ${failure_label}
 !macroend
 
 !macro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY directory failure_label
@@ -160,7 +161,8 @@ Var FairyPamBootstrapPayloadDir
   ${If} $R8 != 0
     Goto ${failure_label}
   ${EndIf}
-  !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "${file}" "${FAIRYPAM_INSTALL_FILE_DACL_SDDL}" ${failure_label}
+  StrCpy $R4 "${FAIRYPAM_INSTALL_FILE_DACL_SDDL}"
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "${file}" ${failure_label}
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL
@@ -209,7 +211,8 @@ fairypam_open_existing_install:
   ${If} $R8 != 0
     Goto fairypam_install_reparse_detected
   ${EndIf}
-  !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "$FairyPamInstallDir" "${FAIRYPAM_INSTALL_DACL_SDDL}" fairypam_install_untrusted_security
+  StrCpy $R4 "${FAIRYPAM_INSTALL_DACL_SDDL}"
+  !insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT "$FairyPamInstallDir" fairypam_install_untrusted_security
   StrCpy $FairyPamBootstrapDir "$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}"
   StrCpy $FairyPamBootstrapPayloadDir "$FairyPamBootstrapDir\payload"
   !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$FairyPamBootstrapDir" fairypam_install_untrusted_security
