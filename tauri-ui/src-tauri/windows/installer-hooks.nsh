@@ -48,7 +48,10 @@ Var FairyPamBootstrapPayloadDir
     System::Call 'kernel32::LocalFree(p R7)'
     Goto ${failure_label}
   ${EndIf}
-  System::Call '*$R8(&w .R9)'
+  ; StringSecurityDescriptor is a pointer to a NUL-terminated WCHAR string.
+  ; `&w` is a fixed-size struct member in System.dll and cannot read this
+  ; pointer safely without a length; copy it into the NSIS string buffer first.
+  System::Call 'kernel32::lstrcpynW(w .R9, p R8, i ${NSIS_MAX_STRLEN}) p.R0'
   System::Call 'kernel32::LocalFree(p R8)'
   System::Call 'kernel32::LocalFree(p R7)'
   StrCmp "$R9" "${FAIRYPAM_INSTALL_DACL_SDDL}" +2

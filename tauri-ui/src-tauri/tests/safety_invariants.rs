@@ -229,6 +229,7 @@ fn product_installer_uses_one_fixed_protected_root() {
         "FILE_ATTRIBUTE_REPARSE_POINT",
         "GetNamedSecurityInfoW",
         "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+        "kernel32::lstrcpynW(w .R9, p R8, i ${NSIS_MAX_STRLEN}) p.R0",
         "FAIRYPAM_INSTALL_DACL_SDDL",
         "!insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY \"$FairyPamInstallDir\" fairypam_install_untrusted_security",
         "!insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY \"$FairyPamBootstrapDir\" fairypam_install_untrusted_security",
@@ -250,6 +251,10 @@ fn product_installer_uses_one_fixed_protected_root() {
     assert!(
         !NSIS_HOOKS.contains("(A;OICI;GRGX;;;BU)"),
         "the installer must compare the canonical file-system read/execute mask"
+    );
+    assert!(
+        !NSIS_HOOKS.contains("*$R8(&w .R9)"),
+        "the installer must not treat an API-owned WCHAR pointer as an unbounded struct member"
     );
     assert!(
         NSIS_TEMPLATE.contains("!insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH \"$FairyPamInstallDir\" fairypam_uninstall_untrusted_root"),
