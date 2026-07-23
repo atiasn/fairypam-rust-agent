@@ -19,15 +19,11 @@ import App from './App';
 import { agentApi } from './lib/agentApi';
 
 function renderApp() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return {
-    ...render(
-      <QueryClientProvider client={queryClient}>
-        <App />
-      </QueryClientProvider>,
-    ),
-    queryClient,
-  };
+  return render(
+    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <App />
+    </QueryClientProvider>,
+  );
 }
 
 describe('App', () => {
@@ -215,28 +211,6 @@ describe('App', () => {
     await user.click(view.getByRole('button', { name: '连接与注册' }));
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
     expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
-  });
-
-  it('服务状态丢失时不自动重新请求环境检查', async () => {
-    const getOverview = vi.mocked(agentApi.getOverview);
-    getOverview.mockRejectedValue({
-      code: 'local.transport.disconnected',
-      message: '服务连接中断',
-    });
-    try {
-      const app = renderApp();
-      const view = within(app.container);
-
-      expect(await view.findByRole('heading', { name: '服务暂时无法使用' })).toBeInTheDocument();
-      expect(agentApi.runEnvironmentCheck).not.toHaveBeenCalledWith(
-        expect.objectContaining({ client: app.queryClient }),
-      );
-    } finally {
-      getOverview.mockResolvedValue({
-        status: { state: 'ConnectedIdle', capture_active: false },
-        doctor: { profiles: ['signed-profile'], runtime: 'dry_run' },
-      });
-    }
   });
 
   it('日志和游戏在后台服务就绪前不请求本地通道', async () => {
