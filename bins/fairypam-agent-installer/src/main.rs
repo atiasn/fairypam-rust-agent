@@ -70,7 +70,6 @@ enum ProvisionFailure {
     Audit = 8,
     Logs = 9,
     Rollback = 10,
-    Tasks = 11,
     TaskMissing = 12,
     TaskInvalid = 13,
     TaskOperation = 14,
@@ -132,6 +131,16 @@ enum TaskError {
     Invalid,
     Operation,
     Rollback,
+}
+
+#[cfg(windows)]
+fn task_failure(error: TaskError) -> ProvisionFailure {
+    match error {
+        TaskError::Missing => ProvisionFailure::TaskMissing,
+        TaskError::Invalid => ProvisionFailure::TaskInvalid,
+        TaskError::Operation => ProvisionFailure::TaskOperation,
+        TaskError::Rollback => ProvisionFailure::TaskRollback,
+    }
 }
 
 #[cfg(windows)]
@@ -291,10 +300,10 @@ fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     }
     if let Err(error) = provision_fixed_tasks(install_root) {
         let rollback_failed = rollback_directory_changes(&changes).is_err();
-        return if error == TaskError::Rollback || rollback_failed {
+        return if rollback_failed {
             Err(ProvisionFailure::Rollback)
         } else {
-            Err(ProvisionFailure::Tasks)
+            Err(task_failure(error))
         };
     }
     Ok(())
@@ -316,13 +325,7 @@ fn installed_preflight(install_root: &std::path::Path) -> Result<(), ProvisionFa
 fn repair_fixed_tasks(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
     verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
-    provision_fixed_tasks(install_root).map_err(|error| {
-        if error == TaskError::Rollback {
-            ProvisionFailure::TaskRollback
-        } else {
-            ProvisionFailure::Tasks
-        }
-    })
+    provision_fixed_tasks(install_root).map_err(task_failure)
 }
 
 #[cfg(windows)]
@@ -701,12 +704,7 @@ fn run_fixed_task(
             .map(|_| ())
             .map_err(|_| TaskError::Operation)
     })
-    .map_err(|error| match error {
-        TaskError::Missing => ProvisionFailure::TaskMissing,
-        TaskError::Invalid => ProvisionFailure::TaskInvalid,
-        TaskError::Operation => ProvisionFailure::TaskOperation,
-        TaskError::Rollback => ProvisionFailure::TaskRollback,
-    })
+    .map_err(task_failure)
 }
 
 #[cfg(windows)]
