@@ -389,10 +389,20 @@ fn private_security(path: &Path) -> bool {
     };
     let result = converted.is_ok()
         && unsafe { text.to_string() }
-            .is_ok_and(|value| value == PRIVATE_SDDL || value == "O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)");
+            .is_ok_and(|value| private_sddl_matches(&value));
     let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(text.0.cast()))) };
     let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
     result
+}
+
+fn private_sddl_matches(value: &str) -> bool {
+    matches!(
+        value,
+        "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+            | "O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)"
+            | "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)"
+            | "O:BAD:PAI(A;;FA;;;BA)(A;;FA;;;SY)"
+    )
 }
 
 fn create_private_directory(path: &Path) -> Result<(), AgentError> {
@@ -494,4 +504,25 @@ fn network() -> AgentError {
 
 fn failed() -> AgentError {
     AgentError::new("enrollment.failed", "registration could not be completed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::private_sddl_matches;
+
+    #[test]
+    fn private_sddl_accepts_windows_auto_inherited_marker_without_inherited_aces() {
+        assert!(private_sddl_matches(
+            "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)"
+        ));
+        assert!(!private_sddl_matches(
+            "O:BAD:PAI(A;ID;FA;;;SY)(A;;FA;;;BA)"
+        ));
+        assert!(!private_sddl_matches(
+            "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"
+        ));
+        assert!(!private_sddl_matches(
+            "O:BAD:AI(A;;FA;;;SY)(A;;FA;;;BA)"
+        ));
+    }
 }
