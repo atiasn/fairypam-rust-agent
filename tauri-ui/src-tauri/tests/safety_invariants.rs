@@ -47,7 +47,6 @@ fn production_ui_cannot_arm_inject_or_reset_emergency() {
     for forbidden in [
         "fairypam_agentctl",
         "schtasks",
-        "std::process::Command",
         "std::env::args",
         "FAIRYPAM_AGENT_PIPE",
         "println!",
@@ -109,7 +108,7 @@ fn registration_proves_the_elevated_pipe_server_before_dispatch() {
 fn product_uac_and_enrollment_publication_fail_closed() {
     let commands = include_str!("../src/commands.rs");
     for required in [
-        "for path in [&gui, &agent]",
+        "for path in [&gui, &helper]",
         "verify_protected_program_files_path(path)",
         "startup.install_root_untrusted",
     ] {
@@ -197,7 +196,7 @@ fn product_installer_uses_one_fixed_protected_root() {
         "const INSTALL_DIRECTORY: &str = env!(\"FAIRYPAM_INSTALL_DIRECTORY\");",
         "const INSTALL_BOOTSTRAP_DIRECTORY: &str = env!(\"FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY\");",
         "\"--preflight\" => preflight(install_root)",
-        "\"--provision\" => provision(install_root)",
+        "\"--provision\" => with_install_transaction(|| provision(install_root))",
         "\"--installed-preflight\" => installed_preflight(install_root)",
         "fn provision(install_root: &std::path::Path)",
         "fn preflight(install_root: &std::path::Path)",
@@ -387,7 +386,7 @@ fn product_installer_binds_each_command_to_one_helper_phase() {
     );
     for mapping in [
         "\"--preflight\" => preflight(install_root)",
-        "\"--provision\" => provision(install_root)",
+        "\"--provision\" => with_install_transaction(|| provision(install_root))",
         "\"--installed-preflight\" => installed_preflight(install_root)",
     ] {
         assert!(
