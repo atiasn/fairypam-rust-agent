@@ -314,21 +314,65 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(windows)]
 fn launch_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
     verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
-    for restart in 0..=AGENT_RESTART_COUNT {
-        let status = std::process::Command::new(install_root.join("fairypam-agent.exe"))
-            .current_dir(install_root)
-            .status()
-            .map_err(|_| ProvisionFailure::TaskOperation)?;
-        if status.success() {
-            return Ok(());
+    let job = kill_on_close_job()?;
+    let result = (|| {
+        for restart in 0..=AGENT_RESTART_COUNT {
+            let mut child = std::process::Command::new(install_root.join("fairypam-agent.exe"))
+                .current_dir(install_root)
+                .spawn()
+                .map_err(|_| ProvisionFailure::TaskOperation)?;
+            if unsafe { AssignProcessToJobObject(job, HANDLE(child.as_raw_handle())) }.is_err() {
+                let _ = child.kill();
+                return Err(ProvisionFailure::TaskOperation);
+            }
+            let status = child
+                .wait()
+                .map_err(|_| ProvisionFailure::TaskOperation)?;
+            if status.success() {
+                return Ok(());
+            }
+            if restart < AGENT_RESTART_COUNT {
+                std::thread::sleep(AGENT_RESTART_INTERVAL);
+            }
         }
-        if restart < AGENT_RESTART_COUNT {
-            std::thread::sleep(AGENT_RESTART_INTERVAL);
-        }
+        Err(ProvisionFailure::AgentRestartExhausted)
+    })();
+    let _ = unsafe { CloseHandle(job) };
+    result
+}
+
+#[cfg(windows)]
+fn kill_on_close_job() -> Result<windows::Win32::Foundation::HANDLE, ProvisionFailure> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::JobObjects::{
+        CreateJobObjectW, SetInformationJobObject, JobObjectExtendedLimitInformation,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+        .map_err(|_| ProvisionFailure::TaskOperation)?;
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            std::mem::size_of_val(&limits) as u32,
+        )
+    };
+    if configured.is_err() {
+        let _ = unsafe { CloseHandle(job) };
+        return Err(ProvisionFailure::TaskOperation);
     }
-    Err(ProvisionFailure::AgentRestartExhausted)
+    Ok(job)
 }
 
 #[cfg(windows)]
