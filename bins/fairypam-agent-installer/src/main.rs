@@ -1350,9 +1350,7 @@ fn task_identity_matches_sid(identity: &str, expected_sid: &str) -> Result<bool,
 
 #[cfg(windows)]
 fn interactive_session_user_sid() -> Result<String, ()> {
-    use windows::Win32::System::RemoteDesktop::{
-        ProcessIdToSessionId, WTSDomainName, WTSUserName,
-    };
+    use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSDomainName, WTSUserName};
     use windows::Win32::System::Threading::GetCurrentProcessId;
 
     fn session_value(
