@@ -840,7 +840,7 @@ fn run_fixed_task(
                 return Err(TaskError::Operation);
             }
             if task == FixedTask::Agent {
-                wait_for_agent_processes_to_exit(install_root)?;
+                wait_for_product_processes_to_exit(install_root)?;
             }
         } else if matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
             return Ok(());
@@ -1075,6 +1075,7 @@ fn managed_process_is_running(
             } else if executable.eq_ignore_ascii_case("fairypam-agent-guardian.exe") {
                 Some(install_root.join("fairypam-agent-guardian.exe"))
             } else if include_launcher
+                && entry.th32ProcessID != std::process::id()
                 && executable.eq_ignore_ascii_case("fairypam-agent-installer.exe")
             {
                 Some(install_root.join(FixedTask::Agent.executable()))
