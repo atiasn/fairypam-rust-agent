@@ -319,8 +319,18 @@ jobs:
           if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
           $installRoot = 'C:\Program Files\FairyPam'
           $stateRoot = 'C:\ProgramData\FairyPam.Agent'
-          $legacyPrincipal = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-          $legacySddl = "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;$legacyPrincipal)"
+          $legacyPrincipal = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          function Test-SddlHasSid {
+            param(
+              [string]$Sddl,
+              [Security.Principal.SecurityIdentifier]$Sid
+            )
+            $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+            return @($descriptor.DiscretionaryAcl | Where-Object {
+              $_.SecurityIdentifier.Value -eq $Sid.Value
+            }).Count -gt 0
+          }
+          $legacySddl = "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;$($legacyPrincipal.Value))"
           $unsupportedSddl = 'O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;WD)'
           $legacyTargets = @(
             $stateRoot,
@@ -337,7 +347,7 @@ jobs:
           Set-Acl -LiteralPath $legacyTargets[2] -AclObject $unsupportedAcl -ErrorAction Stop
           foreach ($target in $legacyTargets[0..1]) {
             $actual = (Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl
-            if (-not $actual.Contains("(A;OICI;FA;;;$legacyPrincipal)")) {
+            if (-not (Test-SddlHasSid -Sddl $actual -Sid $legacyPrincipal)) {
               throw "legacy ACL fixture was not installed: $target ($actual)"
             }
           }
@@ -364,7 +374,7 @@ jobs:
             $legacyAcl.SetSecurityDescriptorSddlForm($legacySddl)
             Set-Acl -LiteralPath $target -AclObject $legacyAcl -ErrorAction Stop
             $actual = (Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl
-            if (-not $actual.Contains("(A;OICI;FA;;;$legacyPrincipal)")) {
+            if (-not (Test-SddlHasSid -Sddl $actual -Sid $legacyPrincipal)) {
               throw "legacy ACL fixture was not installed: $target ($actual)"
             }
           }
@@ -400,7 +410,7 @@ jobs:
                 -not $actual.Contains('D:P') -or
                 -not $actual.Contains('(A;;FA;;;SY)') -or
                 -not $actual.Contains('(A;;FA;;;BA)') -or
-                $actual.Contains($legacyPrincipal)) {
+                (Test-SddlHasSid -Sddl $actual -Sid $legacyPrincipal)) {
               throw "trusted reinstall did not normalize Agent state ACL: $target ($actual)"
             }
           }
