@@ -703,6 +703,7 @@ fn canonical_task_security_sddl(value: &str) -> Result<String, TaskError> {
     with_security_descriptor(value, |descriptor| {
         security_descriptor_sddl(descriptor, information)
     })
+    .map(|sddl| sddl.replacen("D:PAI", "D:P", 1))
     .map_err(|_| TaskError::InvalidSecurity)
 }
 
