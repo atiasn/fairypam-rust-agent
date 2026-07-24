@@ -63,6 +63,7 @@ const TRUSTED_INSTALLER_SID: &str =
     "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
 #[cfg(windows)]
+#[derive(Clone, Copy)]
 #[repr(i32)]
 enum ProvisionFailure {
     Elevated = 2,
