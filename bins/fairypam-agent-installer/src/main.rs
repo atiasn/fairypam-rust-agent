@@ -553,7 +553,7 @@ fn validate_fixed_task(
     let mut source = BSTR::default();
     unsafe { registration.URI(&mut uri) }.map_err(|_| TaskError::Operation)?;
     unsafe { registration.Source(&mut source) }.map_err(|_| TaskError::Operation)?;
-    if uri.to_string() != task.uri() || source.to_string() != "FairyPam Installer" {
+    if uri != task.uri() || source != "FairyPam Installer" {
         return Err(TaskError::Invalid);
     }
 
@@ -569,7 +569,7 @@ fn validate_fixed_task(
     } else {
         TASK_RUNLEVEL_LUA
     };
-    if principal_user.to_string() != user_sid
+    if principal_user != user_sid
         || logon != TASK_LOGON_INTERACTIVE_TOKEN
         || run_level != expected_run_level
     {
@@ -588,7 +588,7 @@ fn validate_fixed_task(
     unsafe { settings.RestartCount(&mut restart_count) }.map_err(|_| TaskError::Operation)?;
     unsafe { settings.RestartInterval(&mut restart_interval) }.map_err(|_| TaskError::Operation)?;
     let restart_is_valid = match task {
-        FixedTask::Agent => restart_count == 3 && restart_interval.to_string() == "PT1M",
+        FixedTask::Agent => restart_count == 3 && restart_interval == "PT1M",
         FixedTask::Ui => restart_count == 0,
     };
     if !allow_demand.as_bool()
@@ -614,7 +614,7 @@ fn validate_fixed_task(
     unsafe { trigger.UserId(&mut trigger_user) }.map_err(|_| TaskError::Operation)?;
     unsafe { trigger.Delay(&mut trigger_delay) }.map_err(|_| TaskError::Operation)?;
     unsafe { trigger.Enabled(&mut trigger_enabled) }.map_err(|_| TaskError::Operation)?;
-    if trigger_user.to_string() != user_sid
+    if trigger_user != user_sid
         || !trigger_delay.is_empty()
         || !trigger_enabled.as_bool()
     {

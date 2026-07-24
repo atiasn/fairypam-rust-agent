@@ -552,8 +552,7 @@ fn local_identity_contract_verifies_peer_and_install_root_before_sensitive_actio
         );
     }
     assert!(
-        client.find("verify_fixed_agent_server(")
-            < client.find("self.pipe = Some(pipe)"),
+        client.find("verify_fixed_agent_server(") < client.find("self.pipe = Some(pipe)"),
         "the GUI must verify the pipe server before any protocol bytes can be sent"
     );
     assert!(adapter.contains("if let Err(error) = verify_fixed_gui_caller(caller.pid)"));
@@ -630,9 +629,9 @@ fn installer_owns_fixed_task_registration_and_bounded_recovery() {
         .expect("uninstall task removal must occur after confirmation");
     assert!(!before_uninstall.contains("--remove-tasks \"$INSTDIR\""));
     assert!(uninstall_section.contains("--remove-tasks \"$INSTDIR\""));
-    assert!(!NSIS_TEMPLATE.contains(
-        "nsis_tauri_utils::RunAsUser \"$INSTDIR\\${MAINBINARYNAME}.exe\""
-    ));
+    assert!(
+        !NSIS_TEMPLATE.contains("nsis_tauri_utils::RunAsUser \"$INSTDIR\\${MAINBINARYNAME}.exe\"")
+    );
 }
 
 #[test]
