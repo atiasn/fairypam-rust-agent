@@ -1018,7 +1018,10 @@ fn wait_for_managed_processes_to_exit(
     include_launcher: bool,
 ) -> Result<(), TaskError> {
     for _ in 0..100 {
-        if !managed_process_is_running(install_root, include_launcher)? {
+        if matches!(
+            managed_process_is_running(install_root, include_launcher),
+            Ok(false)
+        ) {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
