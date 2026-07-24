@@ -345,8 +345,12 @@ jobs:
           }
 
           $recoveredPid = $replacement[0].Id
-          & 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe' --restart-agent-task 'C:\Program Files\FairyPam'
-          if ($LASTEXITCODE -ne 0) { throw "controlled Agent task restart failed: $LASTEXITCODE" }
+          $restart = Start-Process `
+            -FilePath 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe' `
+            -ArgumentList '--restart-agent-task', '"C:\Program Files\FairyPam"' `
+            -Wait `
+            -PassThru
+          if ($restart.ExitCode -ne 0) { throw "controlled Agent task restart failed: $($restart.ExitCode)" }
           $deadline = [DateTime]::UtcNow.AddSeconds(30)
           do {
             Start-Sleep -Seconds 1
