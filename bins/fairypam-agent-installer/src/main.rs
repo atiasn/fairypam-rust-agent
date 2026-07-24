@@ -215,7 +215,22 @@ fn with_install_transaction<T>(
 
 #[cfg(any(windows, test))]
 fn fixed_task_security(user_sid: &str) -> String {
-    format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;{user_sid})")
+    fixed_task_security_variants(user_sid)[0].clone()
+}
+
+#[cfg(any(windows, test))]
+fn fixed_task_security_variants(user_sid: &str) -> [String; 6] {
+    let system = "(A;;FA;;;SY)";
+    let administrators = "(A;;FA;;;BA)";
+    let user = format!("(A;;FRFX;;;{user_sid})");
+    [
+        format!("D:P{system}{administrators}{user}"),
+        format!("D:P{system}{user}{administrators}"),
+        format!("D:P{administrators}{system}{user}"),
+        format!("D:P{administrators}{user}{system}"),
+        format!("D:P{user}{system}{administrators}"),
+        format!("D:P{user}{administrators}{system}"),
+    ]
 }
 
 #[cfg(any(windows, test))]
@@ -671,12 +686,13 @@ fn validate_fixed_task(
     let security_information = DACL_SECURITY_INFORMATION.0 as i32;
     let actual_security = unsafe { registered.GetSecurityDescriptor(security_information) }
         .map_err(|_| TaskError::Operation)?;
-    if canonical_task_security_sddl(&actual_security.to_string())?
-        != canonical_task_security_sddl(&fixed_task_security(user_sid))?
-    {
-        return Err(TaskError::InvalidSecurity);
+    let actual_security = canonical_task_security_sddl(&actual_security.to_string())?;
+    for expected_security in fixed_task_security_variants(user_sid) {
+        if canonical_task_security_sddl(&expected_security)? == actual_security {
+            return Ok(registered);
+        }
     }
-    Ok(registered)
+    Err(TaskError::InvalidSecurity)
 }
 
 #[cfg(windows)]
