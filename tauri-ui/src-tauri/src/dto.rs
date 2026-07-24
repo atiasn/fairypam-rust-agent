@@ -21,7 +21,7 @@ pub struct SupportStatusDto {
 }
 
 /// RegisterHub is intentionally asynchronous: the local Pipe only accepts
-/// the request while the elevated Agent completes the direct claim.
+/// the request, while the elevated Agent obtains explicit user confirmation.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrationStatusDto {
@@ -37,6 +37,7 @@ pub enum RegistrationPendingStatus {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionStatusDto {
+    pub hub_address: String,
     pub control: String,
     pub frame: String,
     pub capture_active: bool,

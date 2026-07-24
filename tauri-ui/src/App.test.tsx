@@ -7,7 +7,7 @@ vi.mock('./lib/agentApi', () => ({
   agentApi: {
     ensureLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
     getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false }, doctor: { profiles: ['signed-profile'], runtime: 'dry_run' } }),
-    getConnectionStatus: vi.fn().mockResolvedValue({ control: 'connected', frame: 'connected', capture_active: false }),
+    getConnectionStatus: vi.fn().mockResolvedValue({ hub_address: 'https://hub.test', control: 'connected', frame: 'connected', capture_active: false, recovery_code: '' }),
     runEnvironmentCheck: vi.fn().mockResolvedValue({ registration_ready: true, registration_pending: false, checks: [] }),
     getLogTail: vi.fn().mockResolvedValue({ entries: [] }),
     scanInstalledGames: vi.fn().mockResolvedValue({ games: [] }),
@@ -27,10 +27,7 @@ function renderApp() {
 }
 
 describe('App', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(agentApi.getLogTail).mockResolvedValue({ entries: [] });
-  });
+  beforeEach(() => vi.clearAllMocks());
 
   it('仅显示中文产品导航并自动准备后台服务', async () => {
     const app = renderApp();
@@ -107,52 +104,29 @@ describe('App', () => {
     expect(agentApi.registerHub).not.toHaveBeenCalled();
   });
 
-  it('显示中文服务状态并直接提交注册，不回显提交内容', async () => {
+  it('显示中文服务状态并只通过固定通道提交注册', async () => {
     const user = userEvent.setup();
-    vi.mocked(agentApi.ensureLocalAgent)
-      .mockResolvedValueOnce({ status: 'agent_ready' })
-      .mockResolvedValueOnce({ status: 'ready' });
     const app = renderApp();
     const view = within(app.container);
 
     await user.click(view.getByRole('button', { name: '连接与注册' }));
+    expect(await view.findByText('https://hub.test')).toBeInTheDocument();
     await user.clear(view.getByLabelText('服务地址'));
     await user.type(view.getByLabelText('服务地址'), 'https://register.example');
     await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
     vi.mocked(agentApi.runEnvironmentCheck)
       .mockResolvedValueOnce({ registration_ready: true, registration_pending: true, checks: [] })
-      .mockResolvedValueOnce({ registration_ready: true, registration_pending: false, checks: [{ id: 'certificate', status: 'available', code: 'runtime.certificate_files_available', recovery: '无需操作' }] });
+      .mockResolvedValueOnce({ registration_ready: true, registration_pending: false, checks: [] });
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
     expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
-    expect(await view.findByText('注册已完成，正在连接服务。')).toBeInTheDocument();
-    expect(await view.findByText('服务已连接')).toBeInTheDocument();
-    expect(agentApi.ensureLocalAgent).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(agentApi.runEnvironmentCheck).toHaveBeenCalledTimes(2));
+    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
+    await waitFor(() => expect(agentApi.runEnvironmentCheck).toHaveBeenCalledTimes(3), { timeout: 3_000 });
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
-    expect(view.getByLabelText('服务地址')).toHaveValue('');
+    expect(await view.findByText('请在系统确认窗口中确认注册；确认前不会使用注册码。若未在短时间内确认，本次注册会失效。')).toBeInTheDocument();
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
-    expect(view.getByLabelText('服务地址')).toHaveAttribute('autocomplete', 'off');
-    expect(view.getByLabelText('一次性注册码')).toHaveAttribute('autocomplete', 'off');
     expect(view.getByText(/注册码只会通过受保护的通道提交/)).toBeInTheDocument();
-    expect(view.queryByText(/UAC|注册窗口|系统确认/)).not.toBeInTheDocument();
-
-  });
-
-  it('注册请求失败时清除注册码且不显示拒绝详情', async () => {
-    const user = userEvent.setup();
-    vi.mocked(agentApi.registerHub).mockRejectedValueOnce(new Error('registration-code=not-for-display'));
-    const app = renderApp();
-    const view = within(app.container);
-
-    await user.click(view.getByRole('button', { name: '连接与注册' }));
-    await user.clear(view.getByLabelText('服务地址'));
-    await user.type(view.getByLabelText('服务地址'), 'https://register.example');
-    await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
-    await user.click(view.getByRole('button', { name: '注册或重新注册' }));
-
-    expect(await view.findByText('注册未完成。请获取新的注册码后重试。')).toBeInTheDocument();
-    expect(view.getByLabelText('服务地址')).toHaveValue('');
-    expect(view.getByLabelText('一次性注册码')).toHaveValue('');
-    expect(view.queryByText('registration-code=not-for-display')).not.toBeInTheDocument();
+    expect(view.queryByText(/UAC|注册窗口/)).not.toBeInTheDocument();
   });
 
   it('将自动环境检查映射为中文结果且不暴露机器代码', async () => {
@@ -217,6 +191,18 @@ describe('App', () => {
     expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
   });
 
+  it('服务状态丢失时不自动重新请求环境检查', async () => {
+    vi.mocked(agentApi.getOverview).mockRejectedValueOnce({
+      code: 'local.transport.disconnected',
+      message: '服务连接中断',
+    });
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByRole('heading', { name: '服务暂时无法使用' })).toBeInTheDocument();
+    expect(agentApi.runEnvironmentCheck).not.toHaveBeenCalled();
+  });
+
   it('日志和游戏在后台服务就绪前不请求本地通道', async () => {
     const user = userEvent.setup();
     let resolveStartup: (value: { status: string }) => void;
@@ -240,16 +226,13 @@ describe('App', () => {
 
   it('以中文安全摘要替代英文、协议和机器术语日志，同时保留中文脱敏记录', async () => {
     const user = userEvent.setup();
-    vi.mocked(agentApi.getLogTail).mockResolvedValue({
+    vi.mocked(agentApi.getLogTail).mockResolvedValueOnce({
       entries: [
         { level: 'warn', message: '[redacted agent log content]' },
         { level: 'error', message: 'Agent connected to local control' },
         { level: 'error', message: 'local.protocol.nonce_replayed' },
         { level: 'info', message: '127.0.0.1:50051' },
         { level: 'info', message: '已脱敏的运行记录' },
-        { level: 'info', message: '服务注册已开始，正在安全领取凭据' },
-        { level: 'info', message: '服务注册已完成，正在安全重连' },
-        { level: 'warn', message: '服务注册失败（错误码：enrollment.network_failed）' },
       ],
     });
     const app = renderApp();
@@ -257,15 +240,12 @@ describe('App', () => {
 
     await user.click(view.getByRole('button', { name: '日志' }));
     const entries = await view.findAllByRole('listitem');
-    expect(entries).toHaveLength(8);
+    expect(entries).toHaveLength(5);
     expect(entries[0]).toHaveTextContent('警告：该运行记录包含不适合展示的技术内容。');
     expect(entries[1]).toHaveTextContent('错误：该运行记录包含不适合展示的技术内容。');
     expect(entries[2]).toHaveTextContent('错误：该运行记录包含不适合展示的技术内容。');
     expect(entries[3]).toHaveTextContent('信息：该运行记录包含不适合展示的技术内容。');
     expect(entries[4]).toHaveTextContent('信息：已脱敏的运行记录');
-    expect(entries[5]).toHaveTextContent('信息：服务注册已开始，正在安全领取凭据');
-    expect(entries[6]).toHaveTextContent('信息：服务注册已完成，正在安全重连');
-    expect(entries[7]).toHaveTextContent('警告：服务注册失败（错误码：enrollment.network_failed）');
     expect(entries[0]).not.toHaveTextContent('[redacted agent log content]');
     expect(entries[1]).not.toHaveTextContent('Agent connected to local control');
     expect(entries[2]).not.toHaveTextContent('local.protocol.nonce_replayed');

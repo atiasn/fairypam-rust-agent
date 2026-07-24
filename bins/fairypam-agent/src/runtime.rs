@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::path::{Path, PathBuf};
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 use std::sync::atomic::Ordering;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,7 +35,7 @@ use crate::observability::AgentLogRecord;
 use crate::profile_store::ProfileStore;
 
 #[cfg(windows)]
-const PRODUCTION_AUDIT_STATE_DIR: &str = crate::enrollment::AUDIT_ROOT;
+const PRODUCTION_AUDIT_STATE_DIR: &str = r"C:\ProgramData\FairyPam\Agent\audit";
 #[cfg(windows)]
 const LOCAL_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -175,7 +175,7 @@ impl RuntimeConfig {
 
     #[cfg(windows)]
     fn from_enrollment_state() -> Result<Self, AgentError> {
-        let root = PathBuf::from(crate::enrollment::STATE_ROOT);
+        let root = PathBuf::from(r"C:\ProgramData\FairyPam\Agent\enrollment");
         crate::enrollment::ensure_private_directory(&root)?;
         let pointer = load_private_json(&root.join("current.json"))?;
         let generation = enrollment_field(&pointer, "generation")?;
@@ -274,9 +274,12 @@ pub(crate) fn validate_enrollment_candidate(
 
 #[cfg(windows)]
 fn enrollment_state_exists() -> bool {
-    let root = Path::new(crate::enrollment::STATE_ROOT);
+    let root = Path::new(r"C:\ProgramData\FairyPam\Agent\enrollment");
     crate::enrollment::ensure_private_directory(root).is_ok()
-        && crate::enrollment::verify_private_file(&root.join("current.json")).is_ok()
+        && root
+            .join("current.json")
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
 #[cfg(windows)]
@@ -301,26 +304,25 @@ fn enrollment_profile_directory() -> Result<PathBuf, AgentError> {
 
 #[cfg(windows)]
 fn load_private_json(path: &Path) -> Result<serde_json::Value, AgentError> {
-    let mut file = crate::enrollment::open_private_read(path).map_err(|_| {
+    let metadata = path.symlink_metadata().map_err(|_| {
         AgentError::new(
             "runtime.enrollment_invalid",
-            "enrollment state is unavailable or unsafe",
+            "enrollment state is unavailable",
         )
     })?;
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|_| {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment state is not a regular file",
+        ));
+    }
+    serde_json::from_slice(&std::fs::read(path).map_err(|_| {
         AgentError::new(
             "runtime.enrollment_invalid",
             "enrollment state cannot be read",
         )
-    })?;
-    crate::enrollment::verify_private_file(path).map_err(|_| {
-        AgentError::new(
-            "runtime.enrollment_invalid",
-            "enrollment state changed during read",
-        )
-    })?;
-    serde_json::from_slice(&bytes).map_err(|_| {
+    })?)
+    .map_err(|_| {
         AgentError::new(
             "runtime.enrollment_invalid",
             "enrollment state is malformed",
@@ -349,12 +351,18 @@ fn enrollment_field(
 #[cfg(windows)]
 fn private_file(directory: &Path, name: &'static str) -> Result<PathBuf, AgentError> {
     let path = directory.join(name);
-    crate::enrollment::verify_private_file(&path).map_err(|_| {
+    let metadata = path.symlink_metadata().map_err(|_| {
         AgentError::new(
             "runtime.enrollment_invalid",
-            "enrollment credential is unsafe",
+            "enrollment credential is unavailable",
         )
     })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment credential is unsafe",
+        ));
+    }
     Ok(path)
 }
 
@@ -418,7 +426,8 @@ enum RuntimeLogMessage {
     LocalEnvironmentCheckRequested,
     LocalGameScanRequested,
     LocalRegistrationRequested,
-    RegistrationStarted,
+    RegistrationFailed,
+    RegistrationAwaitingConfirmation,
     RegistrationChanged,
     RegistrationCompleted,
 }
@@ -439,7 +448,8 @@ impl RuntimeLogMessage {
         Self::LocalEnvironmentCheckRequested,
         Self::LocalGameScanRequested,
         Self::LocalRegistrationRequested,
-        Self::RegistrationStarted,
+        Self::RegistrationFailed,
+        Self::RegistrationAwaitingConfirmation,
         Self::RegistrationChanged,
         Self::RegistrationCompleted,
     ];
@@ -459,41 +469,17 @@ impl RuntimeLogMessage {
             Self::LocalEnvironmentCheckRequested => "界面请求环境检查",
             Self::LocalGameScanRequested => "界面请求扫描已安装游戏",
             Self::LocalRegistrationRequested => "界面请求注册服务",
-            Self::RegistrationStarted => "服务注册已开始，正在安全领取凭据",
+            Self::RegistrationFailed => "服务注册未完成",
+            Self::RegistrationAwaitingConfirmation => "服务注册正在等待以管理员权限确认",
             Self::RegistrationChanged => "服务注册信息已变更，正在安全重连",
             Self::RegistrationCompleted => "服务注册已完成，正在安全重连",
         }
     }
 }
 
-fn registration_failure_code(code: &str) -> &'static str {
-    match code {
-        "enrollment.elevation_required" => "enrollment.elevation_required",
-        "enrollment.request_invalid" => "enrollment.request_invalid",
-        "enrollment.network_failed" => "enrollment.network_failed",
-        "enrollment.failed" => "enrollment.failed",
-        "runtime.enrollment_invalid" => "runtime.enrollment_invalid",
-        "runtime.state_poisoned" => "runtime.state_poisoned",
-        _ => "enrollment.failed",
-    }
-}
-
 impl RuntimeState {
     fn record(&mut self, level: LogLevel, message: RuntimeLogMessage) {
-        self.record_text(level, message.text());
-    }
-
-    fn record_registration_failure(&mut self, code: &str) {
-        self.record_text(
-            LogLevel::Warn,
-            &format!(
-                "服务注册失败（错误码：{}）",
-                registration_failure_code(code)
-            ),
-        );
-    }
-
-    fn record_text(&mut self, level: LogLevel, message: &str) {
+        let message = message.text();
         if self.logs.len() == 200 {
             self.logs.pop_front();
         }
@@ -602,7 +588,7 @@ impl GrpcSessionDriver {
             let Some(expected) = expected else {
                 return Ok(false);
             };
-            let root = Path::new(crate::enrollment::STATE_ROOT);
+            let root = Path::new(r"C:\ProgramData\FairyPam\Agent\enrollment");
             crate::enrollment::ensure_private_directory(root)?;
             let pointer = load_private_json(&root.join("current.json"))?;
             Ok(enrollment_field(&pointer, "generation")? != expected)
@@ -1067,15 +1053,16 @@ impl SharedRuntime {
         hub_address: &str,
         registration_code: &str,
     ) -> Result<serde_json::Value, AgentError> {
-        // Return while the direct claim runs so this Pipe remains available
-        // for status and retry requests.
+        // Return before the elevated Agent dialogue is shown. This one pipe
+        // remains available for status and retry requests during the bounded
+        // human-confirmation window.
         if self.registration_in_progress.swap(true, Ordering::AcqRel) {
             return Err(AgentError::new(
                 "enrollment.registration_pending",
-                "a Hub registration is already pending",
+                "a Hub registration confirmation is already pending",
             ));
         }
-        self.mark_registration_started();
+        self.mark_registration_pending();
         let runtime = self.clone();
         let hub_address = hub_address.to_owned();
         let registration_code = registration_code.to_owned();
@@ -1086,15 +1073,10 @@ impl SharedRuntime {
         {
             self.registration_in_progress
                 .store(false, Ordering::Release);
-            let error = AgentError::new(
+            return Err(AgentError::new(
                 "enrollment.unavailable",
                 "Hub registration could not be started",
-            );
-            if let Ok(mut state) = self.state.lock() {
-                state.last_error_code = error.code().to_owned();
-                state.record_registration_failure(error.code());
-            }
-            return Err(error);
+            ));
         }
         Ok(registration_pending())
     }
@@ -1106,18 +1088,22 @@ impl SharedRuntime {
             .lock()
             .map(|config| config.awaiting_enrollment)
             .unwrap_or(true);
-        let result = crate::enrollment::register(&hub_address, &registration_code)
-            .and_then(|_| RuntimeConfig::from_enrollment_state())
-            .and_then(|config| self.activate_enrollment(config))
-            .map(|_| {
-                if !was_waiting {
-                    self.request_reconnect();
-                }
-            });
+        let result = crate::enrollment::register_with_confirmation(
+            &hub_address,
+            &registration_code,
+            !was_waiting,
+        )
+        .and_then(|_| RuntimeConfig::from_enrollment_state())
+        .and_then(|config| self.activate_enrollment(config))
+        .map(|_| {
+            if !was_waiting {
+                self.request_reconnect();
+            }
+        });
         if let Err(error) = result {
             if let Ok(mut state) = self.state.lock() {
                 state.last_error_code = error.code().to_owned();
-                state.record_registration_failure(error.code());
+                state.record(LogLevel::Warn, RuntimeLogMessage::RegistrationFailed);
             }
             tracing::warn!(code = error.code(), "Hub registration was not completed");
         }
@@ -1126,10 +1112,13 @@ impl SharedRuntime {
     }
 
     #[cfg(windows)]
-    fn mark_registration_started(&self) {
+    fn mark_registration_pending(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.last_error_code = "runtime.enrollment_registration_pending".to_owned();
-            state.record(LogLevel::Info, RuntimeLogMessage::RegistrationStarted);
+            state.last_error_code = "runtime.enrollment_confirmation_pending".to_owned();
+            state.record(
+                LogLevel::Info,
+                RuntimeLogMessage::RegistrationAwaitingConfirmation,
+            );
         }
     }
 
@@ -1167,7 +1156,9 @@ impl SharedRuntime {
             .as_bool()
             .unwrap_or(false);
         let state = self.state.lock().map_err(lock_error)?;
+        let config = self.config.lock().map_err(lock_error)?;
         Ok(serde_json::json!({
+            "hub_address": if config.awaiting_enrollment { String::new() } else { display_hub_address(&config.transport.control_endpoint) },
             "control": state.control_state.as_str(),
             "frame": state.frame_state.as_str(),
             "capture_active": capture_active,
@@ -1301,12 +1292,22 @@ impl AuditSink for RuntimeAudit {
         };
         let path = state_dir.join("local-control-audit.jsonl");
         let line = format!("{}\n", event.to_json());
-        crate::enrollment::append_private(&path, line.as_bytes()).map_err(|_| {
-            AgentError::new(
-                "local.audit_failed",
-                "local control mutation audit could not be persisted",
-            )
-        })
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                crate::enrollment::restrict_path(&path).map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+                })?;
+                std::io::Write::write_all(&mut file, line.as_bytes())
+            })
+            .map_err(|_| {
+                AgentError::new(
+                    "local.audit_failed",
+                    "local control mutation audit could not be persisted",
+                )
+            })
     }
 }
 
@@ -1834,6 +1835,17 @@ fn required_path(name: &'static str) -> Result<PathBuf, AgentError> {
     Ok(PathBuf::from(required(name)?))
 }
 
+#[cfg(any(windows, test))]
+fn display_hub_address(uri: &Uri) -> String {
+    let Some(host) = uri.host() else {
+        return "unavailable".to_owned();
+    };
+    match uri.port_u16() {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    }
+}
+
 fn map_transport(error: TransportError) -> AgentError {
     AgentError::new(error.code(), error.to_string())
 }
@@ -1932,18 +1944,6 @@ mod tests {
     use fairypam_agent_windows::{IntegrityLevel, VerifiedPipeCaller};
 
     use super::*;
-
-    #[test]
-    fn registration_failure_log_code_is_whitelisted() {
-        assert_eq!(
-            registration_failure_code("enrollment.network_failed"),
-            "enrollment.network_failed"
-        );
-        assert_eq!(
-            registration_failure_code("registration-code=not-for-log"),
-            "enrollment.failed"
-        );
-    }
 
     fn local_caller() -> VerifiedPipeCaller {
         VerifiedPipeCaller {
@@ -2052,11 +2052,12 @@ mod tests {
         let mut local = driver.local_runtime();
 
         assert!(!driver.is_registered().unwrap());
-        assert!(local
-            .execute(&local_caller(), &LocalCommand::GetConnectionStatus)
-            .unwrap()
-            .get("hub_address")
-            .is_none());
+        assert_eq!(
+            local
+                .execute(&local_caller(), &LocalCommand::GetConnectionStatus)
+                .unwrap()["hub_address"],
+            ""
+        );
         let diagnostics = local
             .execute(&local_caller(), &LocalCommand::RunEnvironmentCheck)
             .unwrap();
@@ -2121,11 +2122,12 @@ mod tests {
             .expect("registration state must remain readable");
 
         assert!(driver.is_registered().unwrap());
-        let status = local
-            .execute(&local_caller(), &LocalCommand::GetConnectionStatus)
-            .unwrap();
-        assert!(status.get("hub_address").is_none());
-        assert!(!status.to_string().contains("hub.example"));
+        assert_eq!(
+            local
+                .execute(&local_caller(), &LocalCommand::GetConnectionStatus)
+                .unwrap()["hub_address"],
+            "https://hub.example"
+        );
 
         local.request_reconnect();
         tokio::time::timeout(Duration::from_millis(10), driver.wait_for_reconnect())

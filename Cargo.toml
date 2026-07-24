@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "bins/fairypam-agent",
-    "bins/fairypam-agent-installer",
     "bins/fairypam-agentctl",
     "bins/fairypam-agent-guardian",
     "crates/fairypam-agent-core",

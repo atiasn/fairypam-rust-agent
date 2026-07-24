@@ -13,10 +13,7 @@ import type {
 export const agentApi = {
   ensureLocalAgent: () => invoke<SupportStatus>('ensure_local_agent'),
   getOverview: () => invoke<Overview>('get_overview'),
-  getConnectionStatus: async (): Promise<ConnectionStatus> => {
-    const { control, frame, capture_active } = await invoke<ConnectionStatus>('get_connection_status');
-    return { control, frame, capture_active };
-  },
+  getConnectionStatus: () => invoke<ConnectionStatus>('get_connection_status'),
   runEnvironmentCheck: () => invoke<EnvironmentCheck>('run_environment_check'),
   getLogTail: (lines: number, level: 'error' | 'warn' | 'info') =>
     invoke<LogTail>('get_log_tail', { lines, level }),

@@ -8,7 +8,6 @@ use fairypam_agent_local_client::LocalClientError;
 use fairypam_agent_local_protocol::LocalResponse;
 use fairypam_agent_local_protocol::{LocalCommand, LogLevel};
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::sync::Mutex;
 
 #[cfg(windows)]
 use crate::dto::StatusDto;
@@ -55,7 +54,6 @@ impl From<LocalClientError> for UiCommandError {
 pub struct ProductionGateway {
     #[cfg(windows)]
     pipe_name: &'static str,
-    request_gate: Mutex<()>,
     ui_lifetime_bound: AtomicBool,
 }
 
@@ -64,7 +62,6 @@ impl ProductionGateway {
     pub fn new() -> Self {
         Self {
             pipe_name: DEFAULT_PIPE_NAME,
-            request_gate: Mutex::new(()),
             ui_lifetime_bound: AtomicBool::new(false),
         }
     }
@@ -72,7 +69,6 @@ impl ProductionGateway {
     #[cfg(not(windows))]
     pub fn new() -> Self {
         Self {
-            request_gate: Mutex::new(()),
             ui_lifetime_bound: AtomicBool::new(false),
         }
     }
@@ -85,9 +81,6 @@ impl ProductionGateway {
     ) -> Result<T, UiCommandError> {
         use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
 
-        // ponytail: the production Agent serves one Pipe request per instance;
-        // serialize GUI calls until the server gains safe multi-client support.
-        let _request_gate = self.request_gate.lock().await;
         // Product requests use one authenticated connection each. This keeps a
         // verified but idle client from owning the Agent's only Pipe instance.
         let mut client = LocalClient::new(WindowsNamedPipeClientTransport::new_verified_sibling(
@@ -235,7 +228,7 @@ mod tests {
     use fairypam_agent_local_client::LocalClientError;
     use serde_json::json;
 
-    use super::{decode_response, ProductionGateway, UiCommandError};
+    use super::{decode_response, UiCommandError};
     use crate::dto::{EnvironmentCheckDto, StatusDto};
 
     #[test]
@@ -275,15 +268,5 @@ mod tests {
         assert!(response.registration_ready);
         assert!(!response.registration_pending);
         assert_eq!(response.checks.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn keeps_one_local_pipe_request_in_flight() {
-        let gateway = ProductionGateway::new();
-        let guard = gateway.request_gate.lock().await;
-
-        assert!(gateway.request_gate.try_lock().is_err());
-        drop(guard);
-        assert!(gateway.request_gate.try_lock().is_ok());
     }
 }

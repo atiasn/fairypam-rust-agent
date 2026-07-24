@@ -64,7 +64,7 @@ fn product_gui_has_only_the_fixed_agent_uac_recovery_path() {
         "error.code == \"local.transport.pipe_not_found\"",
         "status: \"agent_ready\".into()",
         "status: \"hub_wait_timeout\".into()",
-        "status.recovery_code == \"runtime.not_registered\"",
+        "status.hub_address.trim().is_empty()",
         "HUB_OBSERVATION_LIMIT",
     ] {
         assert!(

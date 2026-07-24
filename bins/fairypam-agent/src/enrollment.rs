@@ -2,8 +2,6 @@
 //! the authenticated local pipe and is never included in an error or log.
 
 use std::fs;
-use std::io::Write;
-use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +10,7 @@ use fairypam_agent_local_protocol::validate_registration_request;
 use http::Uri;
 use serde_json::{json, Value};
 use windows::core::{HSTRING, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HLOCAL};
+use windows::Win32::Foundation::{CloseHandle, HLOCAL};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
     WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
@@ -25,32 +23,40 @@ use windows::Win32::Security::Authorization::{
     SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, TokenElevation, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-    TOKEN_ELEVATION, TOKEN_QUERY,
+    GetTokenInformation, SetFileSecurityW, TokenElevation, DACL_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, GetFileAttributesW, MoveFileExW, CREATE_NEW, FILE_APPEND_DATA,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, INVALID_FILE_ATTRIBUTES,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_ALWAYS, OPEN_EXISTING,
+    GetFileAttributesW, MoveFileExW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+};
 
-pub(crate) const PRODUCT_STATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent";
-pub(crate) const STATE_PARENT: &str = r"C:\ProgramData\FairyPam.Agent\Agent";
-pub(crate) const STATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\enrollment";
-pub(crate) const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\audit";
-pub(crate) const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
-const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+const STATE_ROOT: &str = r"C:\ProgramData\FairyPam\Agent\enrollment";
+const STATE_PARENT: &str = r"C:\ProgramData\FairyPam\Agent";
+const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam\Agent\audit";
+const LOG_ROOT: &str = r"C:\ProgramData\FairyPam\Agent\logs";
+const PRIVATE_DACL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
 const CLAIM_DEADLINE: Duration = Duration::from_secs(15);
 const CLAIM_OPERATION_TIMEOUT_MS: i32 = 5_000;
-/// The elevated Agent claims the one-time code after the protected Pipe has
-/// authenticated the GUI caller. No desktop confirmation is required.
-pub fn register(hub_address: &str, registration_code: &str) -> Result<(), AgentError> {
+const REPLACEMENT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The Agent owns the whole enrollment transaction: the trusted elevated
+/// confirmation always happens before the Hub receives the one-time code.
+pub fn register_with_confirmation(
+    hub_address: &str,
+    registration_code: &str,
+    replaces_existing_registration: bool,
+) -> Result<(), AgentError> {
     validate_registration_request(hub_address, registration_code).map_err(|_| invalid())?;
+    // The confirmation itself is part of the security boundary. Do not let a
+    // medium-integrity fallback process obtain apparent user consent.
     ensure_elevated()?;
     let deadline = Instant::now() + CLAIM_DEADLINE;
+    confirm_registration(hub_address, replaces_existing_registration, deadline)?;
     register_before(hub_address, registration_code, deadline)
 }
 
@@ -62,6 +68,51 @@ fn register_before(
     let (host, port, path) = claim_target(hub_address)?;
     let payload = claim(&host, port, &path, registration_code, deadline)?;
     persist(&payload)
+}
+
+fn confirm_registration(
+    hub_address: &str,
+    replaces_existing_registration: bool,
+    deadline: Instant,
+) -> Result<(), AgentError> {
+    let uri = hub_address.parse::<Uri>().map_err(|_| invalid())?;
+    let authority = uri.authority().ok_or_else(invalid)?;
+    let host = match authority.port_u16() {
+        Some(port) => format!("{}:{port}", authority.host()),
+        None => authority.host().to_owned(),
+    };
+    let message = if replaces_existing_registration {
+        format!(
+            "FairyPam Agent 已经注册。\n\n是否重新注册到 Hub：\n{host}\n\n此操作将替换当前证书和信任配置。"
+        )
+    } else {
+        format!("是否将 FairyPam Agent 注册到 Hub：\n{host}\n\n只有确认后才会使用一次性注册码。")
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = unsafe {
+            MessageBoxW(
+                None,
+                &HSTRING::from(message),
+                &HSTRING::from("FairyPam 重新注册确认"),
+                MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
+            )
+        };
+        let _ = sender.send(result == IDYES);
+    });
+    let timeout = deadline
+        .saturating_duration_since(Instant::now())
+        .min(REPLACEMENT_CONFIRMATION_TIMEOUT);
+    if receiver
+        .recv_timeout(timeout)
+        .is_ok_and(|accepted| accepted)
+    {
+        return Ok(());
+    }
+    Err(AgentError::new(
+        "enrollment.replacement_cancelled",
+        "Hub registration replacement was not authorized",
+    ))
 }
 
 fn claim_target(value: &str) -> Result<(String, u16, String), AgentError> {
@@ -235,9 +286,13 @@ fn persist(payload: &Value) -> Result<(), AgentError> {
             .as_nanos()
     );
     let directory = root.join(&generation);
-    create_private_directory(&directory)?;
+    fs::create_dir(&directory).map_err(|_| failed())?;
+    if let Err(error) = restrict_path(&directory) {
+        let _ = fs::remove_dir(&directory);
+        return Err(error);
+    }
 
-    let temporary = root.join(format!("current-{generation}.tmp"));
+    let temporary = root.join("current.json.tmp");
     let result = (|| {
         // Credentials live only in their private files; runtime.json contains no PEM material.
         let runtime = json!({
@@ -293,21 +348,8 @@ fn required<'a>(payload: &'a Value, name: &str) -> Result<&'a str, AgentError> {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
-    let mut file = open_private_file(path, GENERIC_WRITE.0, CREATE_NEW)?;
-    file.write_all(bytes).map_err(|_| failed())?;
-    file.sync_all().map_err(|_| failed())?;
-    verify_private_file(path)
-}
-
-pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
-    let mut file = open_private_file(path, FILE_APPEND_DATA.0, OPEN_ALWAYS)?;
-    file.write_all(bytes).map_err(|_| failed())?;
-    file.flush().map_err(|_| failed())?;
-    verify_private_file(path)
-}
-
-pub(crate) fn open_private_read(path: &Path) -> Result<fs::File, AgentError> {
-    open_private_file(path, GENERIC_READ.0, OPEN_EXISTING)
+    fs::write(path, bytes).map_err(|_| failed())?;
+    restrict_path(path)
 }
 
 /// State roots are provisioned by the privileged installer. The running Agent
@@ -322,7 +364,7 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), AgentError> {
     }
 
     verify_nonreparse_directory(Path::new(r"C:\ProgramData"))?;
-    verify_private_directory(Path::new(PRODUCT_STATE_ROOT))?;
+    verify_private_directory(Path::new(r"C:\ProgramData\FairyPam"))?;
     verify_private_directory(Path::new(STATE_PARENT))?;
     verify_private_directory(path)
 }
@@ -341,30 +383,16 @@ fn verify_nonreparse_directory(path: &Path) -> Result<(), AgentError> {
 
 fn verify_private_directory(path: &Path) -> Result<(), AgentError> {
     verify_nonreparse_directory(path)?;
-    private_security(path).then_some(()).ok_or_else(failed)
+    private_dacl(path).then_some(()).ok_or_else(failed)
 }
 
-pub(crate) fn verify_private_file(path: &Path) -> Result<(), AgentError> {
-    let metadata = path.symlink_metadata().map_err(|_| failed())?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(failed());
-    }
-    let attributes = unsafe { GetFileAttributesW(&HSTRING::from(path.to_string_lossy().as_ref())) };
-    if attributes == INVALID_FILE_ATTRIBUTES || attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-        return Err(failed());
-    }
-    private_security(path).then_some(()).ok_or_else(failed)
-}
-
-fn private_security(path: &Path) -> bool {
+fn private_dacl(path: &Path) -> bool {
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     let status = unsafe {
         GetNamedSecurityInfoW(
             &HSTRING::from(path.to_string_lossy().as_ref()),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             None,
             None,
             None,
@@ -380,76 +408,40 @@ fn private_security(path: &Path) -> bool {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
             descriptor,
             SDDL_REVISION_1,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             &mut text,
             None,
         )
     };
     let result = converted.is_ok()
         && unsafe { text.to_string() }
-            .is_ok_and(|value| value == PRIVATE_SDDL || value == "O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)");
+            .is_ok_and(|value| value == PRIVATE_DACL || value == "D:P(A;;FA;;;BA)(A;;FA;;;SY)");
     let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(text.0.cast()))) };
     let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
     result
 }
 
-fn create_private_directory(path: &Path) -> Result<(), AgentError> {
-    with_private_security_attributes(|attributes| unsafe {
-        CreateDirectoryW(
-            &HSTRING::from(path.to_string_lossy().as_ref()),
-            Some(attributes),
-        )
-        .map_err(|_| failed())
-    })?;
-    verify_private_directory(path)
-}
-
-fn open_private_file(
-    path: &Path,
-    access: u32,
-    disposition: windows::Win32::Storage::FileSystem::FILE_CREATION_DISPOSITION,
-) -> Result<fs::File, AgentError> {
-    let handle = with_private_security_attributes(|attributes| unsafe {
-        CreateFileW(
-            &HSTRING::from(path.to_string_lossy().as_ref()),
-            access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            Some(attributes),
-            disposition,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-        .map_err(|_| failed())
-    })?;
-    // SAFETY: CreateFileW returned an owned handle and File assumes exactly that ownership.
-    let file = unsafe { fs::File::from_raw_handle(handle.0) };
-    verify_private_file(path)?;
-    Ok(file)
-}
-
-fn with_private_security_attributes<T>(
-    operation: impl FnOnce(*const SECURITY_ATTRIBUTES) -> Result<T, AgentError>,
-) -> Result<T, AgentError> {
+pub(crate) fn restrict_path(path: &Path) -> Result<(), AgentError> {
     let mut descriptor = Default::default();
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            &HSTRING::from(PRIVATE_SDDL),
+            &HSTRING::from("D:P(A;;FA;;;SY)(A;;FA;;;BA)"),
             SDDL_REVISION_1,
             &mut descriptor,
             None,
         )
     }
     .map_err(|_| failed())?;
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.0,
-        bInheritHandle: false.into(),
+    let result = unsafe {
+        SetFileSecurityW(
+            &HSTRING::from(path.to_string_lossy().as_ref()),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+        .ok()
     };
-    let result = operation(&attributes);
     let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
-    result
+    result.map_err(|_| failed())
 }
 
 fn ensure_elevated() -> Result<(), AgentError> {
