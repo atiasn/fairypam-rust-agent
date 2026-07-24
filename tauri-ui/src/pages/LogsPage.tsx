@@ -12,8 +12,10 @@ const levelLabels = {
 
 const safeLogMessage = /^[\p{Script=Han}\p{P}\p{Zs}]+$/u;
 const unsafeLogMessageFallback = '该运行记录包含不适合展示的技术内容。';
+const registrationFailure = /^服务注册失败（错误码：[a-z][a-z0-9_.-]*）$/u;
 
 function displayLogMessage(message: string) {
+  if (registrationFailure.test(message)) return message;
   // ponytail: only render Chinese text and punctuation; future technical formats use one safe summary.
   return safeLogMessage.test(message) ? message : unsafeLogMessageFallback;
 }
@@ -24,6 +26,8 @@ export function LogsPage({ enabled }: { enabled: boolean }) {
     queryKey: queryKeys.logTail(level),
     queryFn: () => agentApi.getLogTail(100, level),
     enabled,
+    refetchInterval: 1_000,
+    refetchIntervalInBackground: false,
   });
 
   return (
@@ -43,7 +47,7 @@ export function LogsPage({ enabled }: { enabled: boolean }) {
       <ul className="log-list">
         {logs.data?.entries.map((entry, index) => <li key={`${entry.level}-${index}`}><strong>{levelLabels[entry.level]}</strong>：{displayLogMessage(entry.message)}</li>)}
       </ul>
-      <p className="notice">仅显示已脱敏的最近记录，不能选择其他文件或路径。</p>
+      <p className="notice">服务记录会自动刷新，仅显示已脱敏的最近记录，不能选择其他文件或路径。</p>
     </section>
   );
 }

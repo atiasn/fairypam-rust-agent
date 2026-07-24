@@ -197,7 +197,7 @@ async fn observe_hub(state: &ProductionGateway) -> CommandResult<SupportStatusDt
                 status: "ready".into(),
             });
         }
-        if status.hub_address.trim().is_empty() {
+        if status.recovery_code == "runtime.not_registered" {
             return Ok(SupportStatusDto {
                 status: "agent_ready".into(),
             });

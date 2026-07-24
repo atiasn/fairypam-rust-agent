@@ -9,6 +9,20 @@ const WINDOWS_PIPE_SERVER: &str =
     include_str!("../../../crates/fairypam-agent-windows/src/local_pipe.rs");
 const AGENT_ENROLLMENT: &str = include_str!("../../../bins/fairypam-agent/src/enrollment.rs");
 const AGENT_RUNTIME: &str = include_str!("../../../bins/fairypam-agent/src/runtime.rs");
+const INSTALLER_PROVISIONER: &str =
+    include_str!("../../../bins/fairypam-agent-installer/src/main.rs");
+const INSTALLER_LAYOUT_BUILD: &str =
+    include_str!("../../../bins/fairypam-agent-installer/build.rs");
+const NSIS_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
+const NSIS_TEMPLATE: &str = include_str!("../windows/installer.nsi");
+
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .and_then(|(_, tail)| tail.split_once(end))
+        .map(|(section, _)| section)
+        .unwrap_or_else(|| panic!("missing source section: {start} .. {end}"))
+}
 
 #[test]
 fn production_ui_cannot_arm_inject_or_reset_emergency() {
@@ -123,7 +137,7 @@ fn product_uac_and_enrollment_publication_fail_closed() {
         "CLAIM_OPERATION_TIMEOUT_MS",
         "PRODUCTION_AUDIT_STATE_DIR",
         "ensure_private_directory",
-        "restrict_path(&path)",
+        "append_private(&path",
     ] {
         assert!(
             AGENT_ENROLLMENT.contains(required) || AGENT_RUNTIME.contains(required),
@@ -135,10 +149,10 @@ fn product_uac_and_enrollment_publication_fail_closed() {
         "FILE_ATTRIBUTE_REPARSE_POINT",
         "GetNamedSecurityInfoW",
         "STATE_PARENT",
+        "PRODUCT_STATE_ROOT",
         "AUDIT_ROOT",
-        "register_with_confirmation",
+        "pub fn register(",
         "ensure_elevated()?",
-        "REPLACEMENT_CONFIRMATION_TIMEOUT",
     ] {
         assert!(
             AGENT_ENROLLMENT.contains(required),
@@ -146,8 +160,325 @@ fn product_uac_and_enrollment_publication_fail_closed() {
         );
     }
     assert!(!AGENT_ENROLLMENT.contains("fs::create_dir_all(path)"));
+    assert!(!AGENT_ENROLLMENT.contains("MessageBoxW("));
     assert!(AGENT_RUNTIME.contains("registration_pending"));
     assert!(GATEWAY.contains("RegistrationStatusDto"));
+}
+
+#[test]
+fn product_installer_uses_one_fixed_protected_root() {
+    assert!(
+        NSIS_HOOKS.contains("!define FAIRYPAM_INSTALL_DIRECTORY \"FairyPam\""),
+        "the product root must be defined once"
+    );
+    assert!(
+        !NSIS_HOOKS.contains("FAIRYPAM_LEGACY_INSTALL_DIRECTORY"),
+        "the layout must not retain a second migration root"
+    );
+    assert!(
+        NSIS_HOOKS.contains("!define FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY \".fairypam-installer\""),
+        "the bootstrap subtree must be declared beside the fixed product root"
+    );
+    for required in [
+        "installer-hooks.nsh",
+        "FAIRYPAM_INSTALL_DIRECTORY",
+        "FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY",
+        "cargo:rustc-env=FAIRYPAM_INSTALL_DIRECTORY={install_directory}",
+        "cargo:rustc-env=FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY={bootstrap_directory}",
+        "!define FAIRYPAM_INSTALL_ROOT \"$PROGRAMFILES64\\${FAIRYPAM_INSTALL_DIRECTORY}\"",
+        "InstallDir \"${FAIRYPAM_INSTALL_ROOT}\"",
+    ] {
+        assert!(
+            INSTALLER_LAYOUT_BUILD.contains(required) || NSIS_TEMPLATE.contains(required),
+            "missing shared fixed-root contract: {required}"
+        );
+    }
+    for required in [
+        "const INSTALL_DIRECTORY: &str = env!(\"FAIRYPAM_INSTALL_DIRECTORY\");",
+        "const INSTALL_BOOTSTRAP_DIRECTORY: &str = env!(\"FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY\");",
+        "\"--preflight\" => preflight(install_root)",
+        "\"--provision\" => provision(install_root)",
+        "\"--installed-preflight\" => installed_preflight(install_root)",
+        "fn provision(install_root: &std::path::Path)",
+        "fn preflight(install_root: &std::path::Path)",
+        "fn installed_preflight(install_root: &std::path::Path)",
+        "fn verify_bootstrap_install_root(install_root: &std::path::Path)",
+        "fn verify_installed_runtime_root(install_root: &std::path::Path)",
+        "fn verify_install_root(",
+        "expected_helper: &std::path::Path,",
+        "let expected_root = program_files.join(INSTALL_DIRECTORY);",
+        "verify_install_tree(install_root)?;",
+        ".join(INSTALL_BOOTSTRAP_DIRECTORY)",
+        ".join(\"payload\")",
+        ".join(\"resources\")",
+        ".join(\"runtime\")",
+        ".join(\"fairypam-agent-installer.exe\")",
+        "verify_staged_payload_entry(expected_helper, false)?;",
+        "verify_trusted_install_entry(&program_files, true)?;",
+        "trusted_install_owner(sddl)",
+    ] {
+        assert!(
+            INSTALLER_PROVISIONER.contains(required),
+            "missing fixed-root helper guard: {required}"
+        );
+    }
+    for forbidden in [
+        "expected_stage",
+        "verify_install_roots",
+        "verify_legacy_active_tree",
+        ".installing",
+        ".previous",
+        "FairyPam Agent UI",
+    ] {
+        assert!(
+            !INSTALLER_PROVISIONER.contains(forbidden),
+            "helper must not recover a second product slot through: {forbidden}"
+        );
+    }
+
+    for required in [
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+        "!define FAIRYPAM_INSTALL_OWNER_SDDL \"O:BA\"",
+        "!define FAIRYPAM_INSTALL_DACL_SDDL \"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)\"",
+        "!define FAIRYPAM_INSTALL_INHERITED_DACL_SDDL \"D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x1200a9;;;BU)\"",
+        "!define FAIRYPAM_INSTALL_FILE_SDDL \"O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)S:(ML;;NW;;;HI)\"",
+        "!define FAIRYPAM_INSTALL_FILE_DACL_SDDL \"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)\"",
+        "!define FAIRYPAM_INSTALL_PROTECTED_DACL_SECURITY_INFORMATION 0x80000004",
+        "!define FAIRYPAM_INSTALL_DETAIL_FILE_CREATE 0x1000",
+        "!define FAIRYPAM_INSTALL_DETAIL_FILE_ATTRIBUTES 0x2000",
+        "!define FAIRYPAM_INSTALL_DETAIL_FILE_TYPE 0x3000",
+        "!define FAIRYPAM_INSTALL_DETAIL_OWNER 0x4000",
+        "!define FAIRYPAM_INSTALL_DETAIL_DACL 0x5000",
+        "ConvertStringSecurityDescriptorToSecurityDescriptorW(w \"${FAIRYPAM_INSTALL_FILE_SDDL}\"",
+        "StrCpy $FairyPamInstallDir \"${FAIRYPAM_INSTALL_ROOT}\"",
+        "CreateDirectoryW(w \"$FairyPamInstallDir\"",
+        "CreateDirectoryW(w \"${directory}\", p R7) i.R9",
+        "CreateFileW(w \"$FairyPamInstallDir\"",
+        "GetFileAttributesW(w \"$FairyPamInstallDir\")",
+        "FILE_ATTRIBUTE_REPARSE_POINT",
+        "GetNamedSecurityInfoW",
+        "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+        "i ${FAIRYPAM_INSTALL_OWNER_SECURITY_INFORMATION}",
+        "i ${FAIRYPAM_INSTALL_DACL_SECURITY_INFORMATION}",
+        "kernel32::lstrcmpW(p R8, w \"${FAIRYPAM_INSTALL_OWNER_SDDL}\") i.R9",
+        "kernel32::lstrcmpW(p R8, w R4) i.R9",
+        "kernel32::lstrcmpW(p R8, w R3) i.R9",
+        "GetSecurityDescriptorDacl(p R8",
+        "SetNamedSecurityInfoW(w \"${object}\"",
+        "i ${FAIRYPAM_INSTALL_PROTECTED_DACL_SECURITY_INFORMATION}",
+        "StrCpy $R4 \"${FAIRYPAM_INSTALL_DACL_SDDL}\"",
+        "StrCpy $R3 \"${FAIRYPAM_INSTALL_INHERITED_DACL_SDDL}\"",
+        "StrCpy $R4 \"${FAIRYPAM_INSTALL_FILE_DACL_SDDL}\"",
+        "StrCpy $R3 \"\"",
+        "!insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT \"$FairyPamInstallDir\" fairypam_install_untrusted_security",
+        "!insertmacro FAIRYPAM_VERIFY_PROTECTED_OBJECT \"${file}\" ${failure_label}",
+        "!insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY \"$FairyPamBootstrapDir\" fairypam_install_untrusted_security",
+        "!macro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_FILE",
+        "CreateFileW(w \"${file}\", i 0x40000000",
+        "IntOp $R5 $R5 | ${FAIRYPAM_INSTALL_DETAIL_FILE_CREATE}",
+        "IntOp $R5 $R5 | ${FAIRYPAM_INSTALL_DETAIL_FILE_ATTRIBUTES}",
+        "StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_FILE_TYPE}",
+        "StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_OWNER}",
+        "StrCpy $R5 ${FAIRYPAM_INSTALL_DETAIL_DACL}",
+        "SetOutPath $INSTDIR",
+        "!macro NSIS_HOOK_PREPAYLOAD",
+        "--preflight \"$FairyPamInstallDir\"",
+        "--provision \"$FairyPamInstallDir\"",
+        "${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\\payload\\resources\\runtime\\fairypam-agent-installer.exe",
+        "SetOutPath \"$PROGRAMFILES64\"",
+        "CloseHandle(p R6)",
+    ] {
+        assert!(
+            NSIS_HOOKS.contains(required),
+            "missing fixed-root NSIS guard: {required}"
+        );
+    }
+    assert!(
+        !NSIS_HOOKS.contains("(A;OICI;GRGX;;;BU)"),
+        "the installer must compare the canonical file-system read/execute mask"
+    );
+    assert!(
+        !NSIS_HOOKS.contains("*$R8(&w .R9)"),
+        "the installer must not treat an API-owned WCHAR pointer as an unbounded struct member"
+    );
+    assert!(
+        !NSIS_HOOKS.contains("lstrcpynW"),
+        "the installer must compare API-owned SDDL without copying it through an NSIS buffer"
+    );
+    assert!(
+        !NSIS_HOOKS.contains("StrCmp \"$R9\" \"${FAIRYPAM_INSTALL_DACL_SDDL}\""),
+        "the installer must not compare a pointer-derived SDDL through an NSIS register"
+    );
+    assert!(
+        !NSIS_HOOKS.contains("expected_dacl"),
+        "the installer must pass the expected DACL through a stable NSIS register"
+    );
+    assert!(
+        !NSIS_HOOKS.contains("SHCreateDirectoryExW"),
+        "resource directories must be created one level at a time"
+    );
+    assert!(
+        NSIS_TEMPLATE.contains("!insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH \"$FairyPamInstallDir\" fairypam_uninstall_untrusted_root"),
+        "the uninstaller must reject an untrusted product root before deleting declared files"
+    );
+    assert!(
+        NSIS_TEMPLATE.contains("!insertmacro NSIS_HOOK_PREPAYLOAD"),
+        "the template must preflight the live tree before normal payload extraction"
+    );
+    for command in ["--preflight", "--provision"] {
+        assert!(
+            NSIS_HOOKS.contains(&format!(
+                "${{FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}}\\payload\\resources\\runtime\\fairypam-agent-installer.exe\" {command} \"$FairyPamInstallDir\""
+            )),
+            "install must validate through the bootstrap helper: {command}"
+        );
+    }
+    assert!(
+        NSIS_TEMPLATE.contains(
+            "\"$INSTDIR\\resources\\runtime\\fairypam-agent-installer.exe\" --installed-preflight \"$INSTDIR\""
+        ),
+        "uninstall must validate through the installed runtime helper"
+    );
+    for required in [
+        "$INSTDIR\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\\payload\\profiles",
+        "$INSTDIR\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\\payload\\resources",
+        "$INSTDIR\\profiles",
+        "$INSTDIR\\resources",
+    ] {
+        assert!(
+            NSIS_TEMPLATE.contains(required),
+            "the child-first resource list needs an explicit protected parent: {required}"
+        );
+    }
+    assert_eq!(
+        NSIS_TEMPLATE
+            .matches("{{#each resources_ancestors}}")
+            .count(),
+        3,
+        "every resource ancestor must be materialized and verified"
+    );
+    for line in NSIS_TEMPLATE.lines() {
+        assert!(
+            !line.replace("\\\\{{", "").contains("\\{{"),
+            "a Windows path must not escape a Handlebars placeholder: {line}"
+        );
+    }
+    for forbidden in [
+        "RMDir /r",
+        "Rename ",
+        ".installing",
+        ".previous",
+        "Legacy",
+        "fairypam_restore_previous",
+    ] {
+        assert!(
+            !NSIS_HOOKS.contains(forbidden),
+            "the installer must not delete or activate another slot through: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn product_installer_binds_each_command_to_one_helper_phase() {
+    let dispatch = source_between(
+        INSTALLER_PROVISIONER,
+        "let exit_code = match",
+        "const PROGRAM_DATA: &str",
+    );
+    for mapping in [
+        "\"--preflight\" => preflight(install_root)",
+        "\"--provision\" => provision(install_root)",
+        "\"--installed-preflight\" => installed_preflight(install_root)",
+    ] {
+        assert!(
+            dispatch.contains(mapping),
+            "missing command mapping: {mapping}"
+        );
+    }
+
+    let provision = source_between(INSTALLER_PROVISIONER, "fn provision(", "fn preflight(");
+    let preflight = source_between(
+        INSTALLER_PROVISIONER,
+        "fn preflight(",
+        "fn installed_preflight(",
+    );
+    let installed_preflight = source_between(
+        INSTALLER_PROVISIONER,
+        "fn installed_preflight(",
+        "fn verify_bootstrap_install_root(",
+    );
+    assert!(provision.contains("verify_bootstrap_install_root(install_root)"));
+    assert!(preflight.contains("verify_bootstrap_install_root(install_root)"));
+    assert!(installed_preflight.contains("verify_installed_runtime_root(install_root)"));
+    assert!(!provision.contains("verify_installed_runtime_root"));
+    assert!(!preflight.contains("verify_installed_runtime_root"));
+    assert!(!installed_preflight.contains("verify_bootstrap_install_root"));
+
+    let bootstrap = source_between(
+        INSTALLER_PROVISIONER,
+        "fn verify_bootstrap_install_root(",
+        "fn verify_installed_runtime_root(",
+    );
+    for component in [
+        ".join(INSTALL_BOOTSTRAP_DIRECTORY)",
+        ".join(\"payload\")",
+        ".join(\"resources\")",
+        ".join(\"runtime\")",
+        ".join(\"fairypam-agent-installer.exe\")",
+    ] {
+        assert!(
+            bootstrap.contains(component),
+            "bootstrap helper path is missing: {component}"
+        );
+    }
+    assert_eq!(
+        bootstrap
+            .matches("verify_install_root(install_root, &expected_helper)")
+            .count(),
+        1
+    );
+
+    let installed = source_between(
+        INSTALLER_PROVISIONER,
+        "fn verify_installed_runtime_root(",
+        "fn verify_install_root(",
+    );
+    assert!(!installed.contains("INSTALL_BOOTSTRAP_DIRECTORY"));
+    for component in [
+        ".join(\"resources\")",
+        ".join(\"runtime\")",
+        ".join(\"fairypam-agent-installer.exe\")",
+    ] {
+        assert!(
+            installed.contains(component),
+            "installed helper path is missing: {component}"
+        );
+    }
+    assert_eq!(
+        installed
+            .matches("verify_install_root(install_root, &expected_helper)")
+            .count(),
+        1
+    );
+
+    let shared = source_between(
+        INSTALLER_PROVISIONER,
+        "fn verify_install_root(",
+        "fn verify_install_tree(",
+    );
+    let compact = shared.split_whitespace().collect::<String>();
+    let identity_guard = "if!same_windows_path(&std::env::current_exe().map_err(|_|())?,expected_helper){returnErr(());}";
+    let entry_guard = "verify_staged_payload_entry(expected_helper,false)?;";
+    let identity_index = compact
+        .find(identity_guard)
+        .expect("shared verifier must reject a mismatched current executable");
+    let entry_index = compact
+        .find(entry_guard)
+        .expect("shared verifier must verify the matched helper entry");
+    assert!(
+        identity_index < entry_index,
+        "helper identity must be established before its protected entry is accepted"
+    );
 }
 
 #[test]

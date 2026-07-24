@@ -212,15 +212,48 @@ fn registration_audit_and_response_never_echo_credentials() {
         )
         .unwrap();
     let (_, audit) = adapter.into_parts();
-    let evidence = format!("{} {response:?}", audit.0[1].to_json());
+    let audit_json = audit
+        .0
+        .iter()
+        .map(AuditEvent::to_json)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let evidence = format!("{audit_json} {response:?}");
 
     assert_eq!(audit.0[0].result_code, "attempt");
     assert_eq!(audit.0[1].command, "register_hub");
     assert_eq!(audit.0[1].result_code, "pending");
+    assert!(!audit_json.contains("request-2"));
+    assert!(!audit_json.contains("S-1-5-21-owner"));
+    assert!(!audit_json.contains("build-1"));
     assert!(!evidence.contains(hub));
     assert!(!evidence.contains(code));
     assert!(!evidence.contains("certificate"));
     assert!(!evidence.contains("private_key"));
+}
+
+#[test]
+#[cfg(not(windows))]
+fn registration_is_not_dispatched_when_its_audit_cannot_be_persisted() {
+    let mut adapter =
+        LocalControlAdapter::new(owner(), FakeRuntime::default(), FailingAudit, "build-1");
+
+    let response = adapter
+        .handle(
+            &caller(),
+            request(
+                LocalCommand::RegisterHub {
+                    hub_address: "https://hub.example".to_owned(),
+                    registration_code: "fp_enroll_secret_0123456789".to_owned(),
+                },
+                12,
+            ),
+        )
+        .unwrap();
+    let (runtime, _) = adapter.into_parts();
+
+    assert_eq!(runtime.calls, 0);
+    assert_eq!(response.result.unwrap_err().code, "local.audit_failed");
 }
 
 #[test]
@@ -363,50 +396,48 @@ fn invalid_persisted_enrollment_keeps_the_local_repair_path_available() {
 }
 
 #[test]
-fn every_registration_requires_bounded_elevated_user_presence_before_claim() {
+fn registration_claims_directly_without_desktop_confirmation() {
     let runtime = include_str!("../src/runtime.rs");
     let enrollment = include_str!("../src/enrollment.rs");
     let dispatch = runtime
         .find("runtime.finish_registration(hub_address, registration_code)")
-        .expect("the Pipe must delegate confirmation work to a bounded background task");
+        .expect("the Pipe must delegate direct claim work to a bounded background task");
     let pending = runtime
         .find("Ok(registration_pending())")
-        .expect("the Pipe must return a pending DTO before confirmation");
+        .expect("the Pipe must return a pending DTO before the direct claim completes");
     assert!(
         dispatch < pending,
         "background dispatch must precede pending response"
     );
     assert!(runtime.contains("registration_in_progress"));
     let registration = enrollment
-        .split_once("pub fn register_with_confirmation(")
+        .split_once("pub fn register(")
         .and_then(|(_, source)| source.split_once("fn register_before"))
         .map(|(source, _)| source)
         .expect("registration must remain an explicit bounded operation");
-    let confirmation = registration
-        .find("confirm_registration(hub_address, replaces_existing_registration, deadline)?")
-        .expect("every registration must require elevated user presence");
     let claim = registration
         .find("register_before(hub_address, registration_code, deadline)")
-        .expect("the registration code must be consumed only after confirmation");
-
-    assert!(confirmation < claim, "confirmation must precede claim");
+        .expect("the registration code must be consumed by the direct claim");
     let elevated = registration
         .find("ensure_elevated()?")
-        .expect("the confirmation must be shown by an elevated Agent");
-    assert!(
-        elevated < confirmation,
-        "elevation must precede confirmation"
-    );
-    assert!(enrollment.contains("MessageBoxW("));
-    assert!(enrollment.contains("result == IDYES"));
-    assert!(enrollment.contains("REPLACEMENT_CONFIRMATION_TIMEOUT"));
-    assert!(enrollment.contains(".recv_timeout(timeout)"));
-    let confirmation_source = enrollment
-        .split_once("fn confirm_registration")
-        .and_then(|(_, source)| source.split_once("fn claim_target"))
+        .expect("the direct claim must remain elevated");
+    assert!(elevated < claim, "elevation must precede the direct claim");
+    assert!(!enrollment.contains("MessageBoxW("));
+    assert!(!enrollment.contains("REPLACEMENT_CONFIRMATION_TIMEOUT"));
+    assert!(!enrollment.contains("replacement_cancelled"));
+    assert!(runtime.contains("RuntimeLogMessage::RegistrationStarted"));
+    assert!(runtime.contains("record_registration_failure(error.code())"));
+    let registration_finish = runtime
+        .split_once("fn finish_registration(")
+        .and_then(|(_, source)| source.split_once("fn mark_registration_started"))
         .map(|(source, _)| source)
-        .expect("Agent confirmation must remain isolated from the claim secret");
-    assert!(!confirmation_source.contains("registration_code"));
+        .expect("registration failure logging must remain isolated");
+    assert!(registration_finish
+        .contains("tracing::warn!(code = error.code(), \"Hub registration was not completed\")"));
+    assert!(
+        !registration_finish.contains("error = %error"),
+        "registration tracing must not persist dynamic error messages"
+    );
 }
 
 #[test]

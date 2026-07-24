@@ -26,6 +26,22 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": []
+    "icon": [],
+    "resources": {
+      "../../target/release/fairypam-agent.exe": "fairypam-agent.exe",
+      "../../target/release/fairypam-agent-guardian.exe": "fairypam-agent-guardian.exe",
+      "../../target/release/fairypam-agent-installer.exe": "resources/runtime/fairypam-agent-installer.exe",
+      "../../profiles": "profiles"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "skip"
+      },
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "./windows/installer-hooks.nsh",
+        "template": "./windows/installer.nsi"
+      }
+    }
   }
 }

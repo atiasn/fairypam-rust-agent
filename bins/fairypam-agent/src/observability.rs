@@ -20,31 +20,52 @@ const LOG_FILE: &str = "agent.log";
 
 pub struct FixedLog {
     root: PathBuf,
+    private: bool,
 }
 
 impl FixedLog {
+    #[cfg(any(test, not(windows)))]
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, AgentError> {
         let root = root.into();
         let metadata = root.symlink_metadata().map_err(log_root_error)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(log_root_unavailable());
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            private: false,
+        })
+    }
+
+    #[cfg(windows)]
+    fn open_private(root: PathBuf) -> Result<Self, AgentError> {
+        crate::enrollment::ensure_private_directory(&root)?;
+        Ok(Self {
+            root,
+            private: true,
+        })
     }
 
     pub fn append(&self, level: LogLevel, message: &str) -> Result<(), AgentError> {
         let record = AgentLogRecord::new(level, redact_log_line(message));
-        let line = serde_json::to_string(&json!({
+        let mut line = serde_json::to_string(&json!({
             "level": log_level_name(&record.level),
             "message": record.message,
         }))
         .map_err(|_| AgentError::new("local.log_write_failed", "Agent log cannot be encoded"))?;
         self.rotate_if_needed(line.len() as u64 + 1)?;
+        line.push('\n');
+        if self.private {
+            #[cfg(windows)]
+            return crate::enrollment::append_private(&self.path(0), line.as_bytes()).map_err(
+                |_| AgentError::new("local.log_write_failed", "Agent log cannot be persisted"),
+            );
+        }
         fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.path(0))
-            .and_then(|mut file| writeln!(file, "{line}"))
+            .and_then(|mut file| file.write_all(line.as_bytes()))
             .map_err(|_| AgentError::new("local.log_write_failed", "Agent log cannot be persisted"))
     }
 
@@ -52,8 +73,23 @@ impl FixedLog {
         let mut records = Vec::new();
         for index in (0..MAX_LOG_FILES).rev() {
             let path = self.path(index);
-            let Ok(file) = fs::File::open(&path) else {
-                continue;
+            let file = if self.private {
+                #[cfg(windows)]
+                {
+                    match path.symlink_metadata() {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => return Err(log_root_unavailable()),
+                        Ok(_) => crate::enrollment::open_private_read(&path)
+                            .map_err(|_| log_root_unavailable())?,
+                    }
+                }
+                #[cfg(not(windows))]
+                unreachable!("private logs are Windows-only")
+            } else {
+                let Ok(file) = fs::File::open(&path) else {
+                    continue;
+                };
+                file
             };
             for line in BufReader::new(file).lines().map_while(Result::ok) {
                 let value = serde_json::from_str::<Value>(&line).ok();
@@ -69,6 +105,11 @@ impl FixedLog {
                     continue;
                 };
                 records.push(AgentLogRecord::new(level, message));
+            }
+            if self.private {
+                #[cfg(windows)]
+                crate::enrollment::verify_private_file(&path)
+                    .map_err(|_| log_root_unavailable())?;
             }
         }
         Ok(log_tail_json(&records, lines, level))
@@ -108,11 +149,11 @@ impl FixedLog {
 
 #[cfg(windows)]
 pub fn production_log() -> Result<FixedLog, AgentError> {
-    let root = PathBuf::from(r"C:\ProgramData\FairyPam\Agent\logs");
-    crate::enrollment::ensure_private_directory(&root)?;
-    FixedLog::open(root)
+    let root = PathBuf::from(crate::enrollment::LOG_ROOT);
+    FixedLog::open_private(root)
 }
 
+#[cfg(any(test, not(windows)))]
 fn log_root_error(_: std::io::Error) -> AgentError {
     log_root_unavailable()
 }
@@ -708,6 +749,56 @@ mod tests {
         log.append(LogLevel::Info, "rotation check").unwrap();
         assert!(root.join(LOG_FILE).is_file());
         assert!(root.join(format!("{LOG_FILE}.1")).is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persistent_log_keeps_registration_lifecycle_but_never_registration_material() {
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-registration-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let log = FixedLog::open(&root).unwrap();
+        log.append(LogLevel::Info, "服务注册已开始，正在安全领取凭据")
+            .unwrap();
+        log.append(LogLevel::Info, "服务注册已完成，正在安全重连")
+            .unwrap();
+        log.append(
+            LogLevel::Warn,
+            "服务注册失败（错误码：enrollment.network_failed）",
+        )
+        .unwrap();
+        let hub = "https://enroll-7f8c3d.example";
+        let code = "r7Pq9Lm2Vx6Aa1Zz";
+        let pem = "-----BEGIN CERTIFICATE-----Q29kZXg=";
+        log.append(
+            LogLevel::Warn,
+            &format!("registration_code={code}; hub={hub}; certificate={pem}"),
+        )
+        .unwrap();
+
+        let tail = log.tail(10, &LogLevel::Info).unwrap();
+        let entries = tail["entries"].as_array().unwrap();
+        assert_eq!(
+            entries[1]["message"],
+            "服务注册失败（错误码：enrollment.network_failed）"
+        );
+        assert_eq!(entries[2]["message"], "服务注册已完成，正在安全重连");
+        assert_eq!(entries[3]["message"], "服务注册已开始，正在安全领取凭据");
+        let persisted = std::fs::read_to_string(root.join(LOG_FILE)).unwrap();
+        let evidence = format!("{persisted}{tail}");
+        for secret in [hub, code, pem] {
+            assert!(
+                !evidence.contains(secret),
+                "registration material reached the persistent log or GetLogTail"
+            );
+        }
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
