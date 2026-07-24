@@ -437,6 +437,9 @@ dependencies = [
 name = "fairypam-agent-installer"
 version = "0.1.0"
 dependencies = [
+ "fairypam-agent-local-client",
+ "fairypam-agent-local-protocol",
+ "tokio",
  "windows",
 ]
 
