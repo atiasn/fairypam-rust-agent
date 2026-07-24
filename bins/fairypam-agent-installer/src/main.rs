@@ -295,12 +295,8 @@ fn with_pinned_directory<T, E: Copy>(
 
 #[cfg(windows)]
 fn directory_security_sddl(handle: windows::Win32::Foundation::HANDLE) -> Result<String, ()> {
-    use windows::core::PWSTR;
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
-    use windows::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-        SE_FILE_OBJECT,
-    };
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows::Win32::Security::{
         DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR,
@@ -325,6 +321,22 @@ fn directory_security_sddl(handle: windows::Win32::Foundation::HANDLE) -> Result
     if status.0 != 0 {
         return Err(());
     }
+    let result = security_descriptor_sddl(descriptor, information);
+    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
+    result
+}
+
+#[cfg(windows)]
+fn security_descriptor_sddl(
+    descriptor: windows::Win32::Security::PSECURITY_DESCRIPTOR,
+    information: windows::Win32::Security::OBJECT_SECURITY_INFORMATION,
+) -> Result<String, ()> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+    };
+
     let mut text = PWSTR::null();
     let converted = unsafe {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
@@ -339,7 +351,6 @@ fn directory_security_sddl(handle: windows::Win32::Foundation::HANDLE) -> Result
         .map_err(|_| ())
         .and_then(|_| unsafe { text.to_string().map_err(|_| ()) });
     let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
-    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
     result
 }
 
@@ -402,14 +413,32 @@ fn private_security_sddl(value: &str) -> Result<(), ()> {
 #[cfg(windows)]
 fn legacy_directory_security(value: &str) -> Result<(), ()> {
     let user_sid = current_user_sid()?;
-    allowed_legacy_directory_security(value, &user_sid)
-        .then_some(())
-        .ok_or(())
+    let actual = canonical_directory_security_sddl(value)?;
+    for expected in legacy_directory_security_variants(&user_sid) {
+        if canonical_directory_security_sddl(&expected)? == actual {
+            return Ok(());
+        }
+    }
+    Err(())
 }
 
-fn allowed_legacy_directory_security(value: &str, user_sid: &str) -> bool {
+fn legacy_directory_security_variants(user_sid: &str) -> [String; 2] {
     let acl = format!("(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;{user_sid})");
-    value == format!("O:BAD:P{acl}") || value == format!("O:BAD:PAI{acl}")
+    [format!("O:BAD:P{acl}"), format!("O:BAD:PAI{acl}")]
+}
+
+#[cfg(windows)]
+fn canonical_directory_security_sddl(value: &str) -> Result<String, ()> {
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let information = OWNER_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | PROTECTED_DACL_SECURITY_INFORMATION;
+    with_security_descriptor(value, |descriptor| {
+        security_descriptor_sddl(descriptor, information)
+    })
 }
 
 #[cfg(windows)]
@@ -755,15 +784,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_state_acl_allows_only_the_exact_installing_user_shape() {
+    fn legacy_state_acl_generates_only_the_exact_installing_user_shapes() {
         let user = "S-1-5-21-1-2-3-1001";
-        assert!(allowed_legacy_directory_security(
-            "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",
-            user,
+        let allowed = legacy_directory_security_variants(user);
+        assert!(allowed.contains(
+            &"O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)".to_owned()
         ));
-        assert!(allowed_legacy_directory_security(
-            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",
-            user,
+        assert!(allowed.contains(
+            &"O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)".to_owned()
         ));
         for rejected in [
             "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;WD)",
@@ -771,7 +799,24 @@ mod tests {
             "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;;FR;;;BU)",
             "O:BUD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",
         ] {
-            assert!(!allowed_legacy_directory_security(rejected, user));
+            assert!(!allowed.contains(&rejected.to_owned()));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_state_acl_validator_preserves_the_exact_windows_boundary() {
+        let user_sid = current_user_sid().unwrap();
+        for allowed in legacy_directory_security_variants(&user_sid) {
+            assert!(legacy_directory_security(&allowed).is_ok());
+        }
+        for rejected in [
+            format!("O:BUD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;{user_sid})"),
+            "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;WD)".to_owned(),
+            "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;S-1-5-18)".to_owned(),
+            format!("O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;{user_sid})(A;;FR;;;BU)"),
+        ] {
+            assert!(legacy_directory_security(&rejected).is_err());
         }
     }
 
