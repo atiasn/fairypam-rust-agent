@@ -15,6 +15,7 @@ fn main() {
             let install_root = std::path::Path::new(&install_root);
             match command.to_string_lossy().as_ref() {
                 "--preflight" => preflight(install_root),
+                "--prepare-install" => with_install_transaction(|| prepare_install(install_root)),
                 "--provision" => with_install_transaction(|| provision(install_root)),
                 "--installed-preflight" => installed_preflight(install_root),
                 "--launch-agent-task" => launch_agent_task(install_root),
@@ -413,7 +414,42 @@ fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
 #[cfg(windows)]
 fn preflight(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
-    verify_bootstrap_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)
+    verify_bootstrap_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    verify_existing_state_for_install()
+}
+
+#[cfg(windows)]
+fn verify_existing_state_for_install() -> Result<(), ProvisionFailure> {
+    for (path, failure, allow_legacy) in [
+        (PRODUCT_ROOT, ProvisionFailure::ProductRoot, true),
+        (AGENT_ROOT, ProvisionFailure::AgentRoot, true),
+        (ENROLLMENT_ROOT, ProvisionFailure::Enrollment, false),
+        (AUDIT_ROOT, ProvisionFailure::Audit, false),
+        (LOG_ROOT, ProvisionFailure::Logs, true),
+    ] {
+        let path = std::path::Path::new(path);
+        match path.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(failure),
+            Ok(_) => {}
+        }
+        verify_nonreparse_directory(path).map_err(|_| failure)?;
+        let sddl = security_sddl(path).map_err(|_| failure)?;
+        if private_security_sddl(&sddl).is_err()
+            && (!allow_legacy || legacy_directory_security(&sddl).is_err())
+        {
+            return Err(failure);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_install(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
+    verify_bootstrap_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    with_task_scheduler(|folder| stop_fixed_tasks_for_install(folder, install_root))
+        .map_err(task_failure)
 }
 
 #[cfg(windows)]
@@ -813,6 +849,53 @@ fn run_fixed_task(
             .map_err(|_| TaskError::Operation)
     })
     .map_err(task_failure)
+}
+
+#[cfg(windows)]
+fn stop_fixed_tasks_for_install(
+    folder: &windows::Win32::System::TaskScheduler::ITaskFolder,
+    install_root: &std::path::Path,
+) -> Result<(), TaskError> {
+    use windows::core::BSTR;
+    use windows::Win32::Foundation::VARIANT_BOOL;
+    use windows::Win32::System::TaskScheduler::{TASK_STATE_QUEUED, TASK_STATE_RUNNING};
+
+    let mut registered_tasks = Vec::new();
+    for task in [FixedTask::Ui, FixedTask::Agent] {
+        match unsafe { folder.GetTask(&BSTR::from(task.name())) } {
+            Ok(registered) => {
+                unsafe { registered.SetEnabled(VARIANT_BOOL(0)) }
+                    .map_err(|_| TaskError::Operation)?;
+                if matches!(
+                    unsafe { registered.State() }.map_err(|_| TaskError::Operation)?,
+                    TASK_STATE_RUNNING | TASK_STATE_QUEUED
+                ) {
+                    unsafe { registered.Stop(0) }.map_err(|_| TaskError::Operation)?;
+                }
+                registered_tasks.push(registered);
+            }
+            Err(error) if is_task_missing(&error) => {}
+            Err(_) => return Err(TaskError::Operation),
+        }
+    }
+    for registered in registered_tasks {
+        for _ in 0..50 {
+            if !matches!(
+                unsafe { registered.State() }.map_err(|_| TaskError::Operation)?,
+                TASK_STATE_RUNNING | TASK_STATE_QUEUED
+            ) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if matches!(
+            unsafe { registered.State() }.map_err(|_| TaskError::Operation)?,
+            TASK_STATE_RUNNING | TASK_STATE_QUEUED
+        ) {
+            return Err(TaskError::Operation);
+        }
+    }
+    wait_for_agent_processes_to_exit(install_root)
 }
 
 #[cfg(windows)]

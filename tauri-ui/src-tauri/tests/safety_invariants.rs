@@ -578,6 +578,7 @@ fn local_identity_contract_verifies_peer_and_install_root_before_sensitive_actio
 fn installer_owns_fixed_task_registration_and_bounded_recovery() {
     for required in [
         "\"--launch-agent-task\" => launch_agent_task(install_root)",
+        "\"--prepare-install\" => with_install_transaction",
         "\"--run-agent-task\" => with_install_transaction",
         "\"--restart-agent-task\" => with_install_transaction",
         "\"--run-ui-task\" =>",
@@ -615,6 +616,7 @@ fn installer_owns_fixed_task_registration_and_bounded_recovery() {
         "LocalCommand::ShutdownAgent",
         "LastTaskResult",
         "wait_for_agent_processes_to_exit",
+        "stop_fixed_tasks_for_install",
         "restore_fixed_tasks",
     ] {
         assert!(

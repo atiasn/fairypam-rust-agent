@@ -318,6 +318,12 @@ fairypam_open_existing_install:
     StrCpy $R3 $0
     Goto fairypam_install_helper_failed
   ${EndIf}
+  ExecWait '"$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources\runtime\fairypam-agent-installer.exe" --prepare-install "$FairyPamInstallDir"' $0
+  IfErrors fairypam_install_validation_failed 0
+  ${If} $0 != 0
+    StrCpy $R3 $0
+    Goto fairypam_install_helper_failed
+  ${EndIf}
   SetOutPath "$FairyPamInstallDir"
 !macroend
 
