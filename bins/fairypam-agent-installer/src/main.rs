@@ -224,7 +224,7 @@ fn fixed_task_security_variants(user_sid: &str) -> [String; 6] {
     let administrators = "(A;;FA;;;BA)";
     let user = format!("(A;;FRFX;;;{user_sid})");
     [
-        format!("D:P{system}{administrators}{user}"),
+        format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;{user_sid})"),
         format!("D:P{system}{user}{administrators}"),
         format!("D:P{administrators}{system}{user}"),
         format!("D:P{administrators}{user}{system}"),
