@@ -107,8 +107,8 @@ impl FixedTask {
 
     fn uri(self) -> &'static str {
         match self {
-            Self::Agent => r"\FairyPam\Agent",
-            Self::Ui => r"\FairyPam\AgentUI",
+            Self::Agent => r"\FairyPam Agent",
+            Self::Ui => r"\FairyPam Agent UI",
         }
     }
 
@@ -1751,9 +1751,11 @@ mod tests {
             assert!(xml.contains(&fixed_task_security(sid)));
         }
         assert!(agent.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(agent.contains("<URI>\\FairyPam Agent</URI>"));
         assert!(agent.contains("<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count>"));
         assert!(agent.contains(r"C:\Program Files\FairyPam\fairypam-agent.exe"));
         assert!(ui.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(ui.contains("<URI>\\FairyPam Agent UI</URI>"));
         assert!(!ui.contains("<RestartOnFailure>"));
         assert!(ui.contains(r"C:\Program Files\FairyPam\fairypam-agent-tauri-ui.exe"));
     }
