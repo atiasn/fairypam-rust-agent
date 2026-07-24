@@ -802,6 +802,9 @@ fn run_fixed_task(
             if matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
                 return Err(TaskError::Operation);
             }
+            if task == FixedTask::Agent {
+                wait_for_agent_processes_to_exit(install_root)?;
+            }
         } else if matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
             return Ok(());
         }
