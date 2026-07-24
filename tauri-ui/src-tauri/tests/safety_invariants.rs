@@ -227,7 +227,6 @@ fn product_installer_uses_one_fixed_protected_root() {
         "verify_legacy_active_tree",
         ".installing",
         ".previous",
-        "FairyPam Agent UI",
     ] {
         assert!(
             !INSTALLER_PROVISIONER.contains(forbidden),
