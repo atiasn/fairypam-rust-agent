@@ -1090,27 +1090,27 @@ fn managed_process_is_running(
                         entry.th32ProcessID,
                     )
                 } {
-                    Ok(process) => process,
-                    Err(error) if error.code().0 as u32 == 0x8007_0057 => {
-                        continue;
-                    }
+                    Ok(process) => Some(process),
+                    Err(error) if error.code().0 as u32 == 0x8007_0057 => None,
                     Err(_) => return Err(TaskError::Rollback),
                 };
-                let mut image = vec![0_u16; 32_768];
-                let mut image_length = image.len() as u32;
-                let query = unsafe {
-                    QueryFullProcessImageNameW(
-                        process,
-                        PROCESS_NAME_WIN32,
-                        PWSTR(image.as_mut_ptr()),
-                        &mut image_length,
-                    )
-                };
-                let _ = unsafe { CloseHandle(process) };
-                query.map_err(|_| TaskError::Rollback)?;
-                let image = String::from_utf16_lossy(&image[..image_length as usize]);
-                if same_windows_path(std::path::Path::new(&image), &expected) {
-                    return Ok(true);
+                if let Some(process) = process {
+                    let mut image = vec![0_u16; 32_768];
+                    let mut image_length = image.len() as u32;
+                    let query = unsafe {
+                        QueryFullProcessImageNameW(
+                            process,
+                            PROCESS_NAME_WIN32,
+                            PWSTR(image.as_mut_ptr()),
+                            &mut image_length,
+                        )
+                    };
+                    let _ = unsafe { CloseHandle(process) };
+                    query.map_err(|_| TaskError::Rollback)?;
+                    let image = String::from_utf16_lossy(&image[..image_length as usize]);
+                    if same_windows_path(std::path::Path::new(&image), &expected) {
+                        return Ok(true);
+                    }
                 }
             }
             if let Err(error) = unsafe { Process32NextW(snapshot, &mut entry) } {
