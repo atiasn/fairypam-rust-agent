@@ -71,10 +71,15 @@ enum ProvisionFailure {
     Logs = 9,
     Rollback = 10,
     TaskMissing = 12,
-    TaskInvalid = 13,
+    TaskInvalidRegistration = 13,
     TaskOperation = 14,
     TaskRollback = 15,
     Transaction = 16,
+    TaskInvalidPrincipal = 17,
+    TaskInvalidSettings = 18,
+    TaskInvalidTrigger = 19,
+    TaskInvalidAction = 20,
+    TaskInvalidSecurity = 21,
 }
 
 #[cfg(any(windows, test))]
@@ -128,7 +133,12 @@ impl FixedTask {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TaskError {
     Missing,
-    Invalid,
+    InvalidRegistration,
+    InvalidPrincipal,
+    InvalidSettings,
+    InvalidTrigger,
+    InvalidAction,
+    InvalidSecurity,
     Operation,
     Rollback,
 }
@@ -137,7 +147,12 @@ enum TaskError {
 fn task_failure(error: TaskError) -> ProvisionFailure {
     match error {
         TaskError::Missing => ProvisionFailure::TaskMissing,
-        TaskError::Invalid => ProvisionFailure::TaskInvalid,
+        TaskError::InvalidRegistration => ProvisionFailure::TaskInvalidRegistration,
+        TaskError::InvalidPrincipal => ProvisionFailure::TaskInvalidPrincipal,
+        TaskError::InvalidSettings => ProvisionFailure::TaskInvalidSettings,
+        TaskError::InvalidTrigger => ProvisionFailure::TaskInvalidTrigger,
+        TaskError::InvalidAction => ProvisionFailure::TaskInvalidAction,
+        TaskError::InvalidSecurity => ProvisionFailure::TaskInvalidSecurity,
         TaskError::Operation => ProvisionFailure::TaskOperation,
         TaskError::Rollback => ProvisionFailure::TaskRollback,
     }
@@ -546,7 +561,7 @@ fn validate_fixed_task(
         .map_err(|_| TaskError::Operation)?
         .as_bool()
     {
-        return Err(TaskError::Invalid);
+        return Err(TaskError::InvalidRegistration);
     }
 
     let definition = unsafe { registered.Definition() }.map_err(|_| TaskError::Operation)?;
@@ -557,7 +572,7 @@ fn validate_fixed_task(
     unsafe { registration.URI(&mut uri) }.map_err(|_| TaskError::Operation)?;
     unsafe { registration.Source(&mut source) }.map_err(|_| TaskError::Operation)?;
     if uri != task.uri() || source != "FairyPam Installer" {
-        return Err(TaskError::Invalid);
+        return Err(TaskError::InvalidRegistration);
     }
 
     let principal = unsafe { definition.Principal() }.map_err(|_| TaskError::Operation)?;
@@ -576,7 +591,7 @@ fn validate_fixed_task(
         || logon != TASK_LOGON_INTERACTIVE_TOKEN
         || run_level != expected_run_level
     {
-        return Err(TaskError::Invalid);
+        return Err(TaskError::InvalidPrincipal);
     }
 
     let settings = unsafe { definition.Settings() }.map_err(|_| TaskError::Operation)?;
@@ -599,18 +614,18 @@ fn validate_fixed_task(
         || instances != TASK_INSTANCES_IGNORE_NEW
         || !restart_is_valid
     {
-        return Err(TaskError::Invalid);
+        return Err(TaskError::InvalidSettings);
     }
 
     let triggers = unsafe { definition.Triggers() }.map_err(|_| TaskError::Operation)?;
     let mut trigger_count = 0;
     unsafe { triggers.Count(&mut trigger_count) }.map_err(|_| TaskError::Operation)?;
     if trigger_count != 1 {
-        return Err(TaskError::Invalid);
+        return Err(TaskError::InvalidTrigger);
     }
     let trigger: ILogonTrigger = unsafe { triggers.get_Item(1) }
         .and_then(|trigger| trigger.cast())
-        .map_err(|_| TaskError::Invalid)?;
+        .map_err(|_| TaskError::InvalidTrigger)?;
     let mut trigger_user = BSTR::default();
     let mut trigger_delay = BSTR::default();
     let mut trigger_enabled = VARIANT_BOOL::default();
@@ -618,18 +633,18 @@ fn validate_fixed_task(
     unsafe { trigger.Delay(&mut trigger_delay) }.map_err(|_| TaskError::Operation)?;
     unsafe { trigger.Enabled(&mut trigger_enabled) }.map_err(|_| TaskError::Operation)?;
     if trigger_user != user_sid || !trigger_delay.is_empty() || !trigger_enabled.as_bool() {
-        return Err(TaskError::Invalid);
+        return Err(TaskError::InvalidTrigger);
     }
 
     let actions = unsafe { definition.Actions() }.map_err(|_| TaskError::Operation)?;
     let mut action_count = 0;
     unsafe { actions.Count(&mut action_count) }.map_err(|_| TaskError::Operation)?;
     if action_count != 1 {
-        return Err(TaskError::Invalid);
+        return Err(TaskError::InvalidAction);
     }
     let action: IExecAction = unsafe { actions.get_Item(1) }
         .and_then(|action| action.cast())
-        .map_err(|_| TaskError::Invalid)?;
+        .map_err(|_| TaskError::InvalidAction)?;
     let mut path = BSTR::default();
     let mut arguments = BSTR::default();
     let mut working_directory = BSTR::default();
@@ -645,7 +660,7 @@ fn validate_fixed_task(
             install_root,
         )
     {
-        return Err(TaskError::Invalid);
+        return Err(TaskError::InvalidAction);
     }
 
     let security_information = DACL_SECURITY_INFORMATION.0 as i32;
@@ -654,7 +669,7 @@ fn validate_fixed_task(
     if canonical_task_security_sddl(&actual_security.to_string())?
         != canonical_task_security_sddl(&fixed_task_security(user_sid))?
     {
-        return Err(TaskError::Invalid);
+        return Err(TaskError::InvalidSecurity);
     }
     Ok(registered)
 }
@@ -667,7 +682,7 @@ fn canonical_task_security_sddl(value: &str) -> Result<String, TaskError> {
     with_security_descriptor(value, |descriptor| {
         security_descriptor_sddl(descriptor, information)
     })
-    .map_err(|_| TaskError::Invalid)
+    .map_err(|_| TaskError::InvalidSecurity)
 }
 
 #[cfg(windows)]
