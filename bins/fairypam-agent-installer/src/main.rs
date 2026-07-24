@@ -331,9 +331,7 @@ fn launch_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFail
                 let _ = child.kill();
                 return Err(ProvisionFailure::TaskOperation);
             }
-            let status = child
-                .wait()
-                .map_err(|_| ProvisionFailure::TaskOperation)?;
+            let status = child.wait().map_err(|_| ProvisionFailure::TaskOperation)?;
             if status.success() {
                 return Ok(());
             }
@@ -352,7 +350,7 @@ fn kill_on_close_job() -> Result<windows::Win32::Foundation::HANDLE, ProvisionFa
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::JobObjects::{
-        CreateJobObjectW, SetInformationJobObject, JobObjectExtendedLimitInformation,
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
