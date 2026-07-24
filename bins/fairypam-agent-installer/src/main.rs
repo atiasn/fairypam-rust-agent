@@ -587,7 +587,8 @@ fn validate_fixed_task(
     } else {
         TASK_RUNLEVEL_LUA
     };
-    if principal_user != user_sid
+    if !task_identity_matches_sid(&principal_user.to_string(), user_sid)
+        .map_err(|_| TaskError::InvalidPrincipal)?
         || logon != TASK_LOGON_INTERACTIVE_TOKEN
         || run_level != expected_run_level
     {
@@ -632,7 +633,11 @@ fn validate_fixed_task(
     unsafe { trigger.UserId(&mut trigger_user) }.map_err(|_| TaskError::Operation)?;
     unsafe { trigger.Delay(&mut trigger_delay) }.map_err(|_| TaskError::Operation)?;
     unsafe { trigger.Enabled(&mut trigger_enabled) }.map_err(|_| TaskError::Operation)?;
-    if trigger_user != user_sid || !trigger_delay.is_empty() || !trigger_enabled.as_bool() {
+    if !task_identity_matches_sid(&trigger_user.to_string(), user_sid)
+        .map_err(|_| TaskError::InvalidTrigger)?
+        || !trigger_delay.is_empty()
+        || !trigger_enabled.as_bool()
+    {
         return Err(TaskError::InvalidTrigger);
     }
 
@@ -1290,12 +1295,64 @@ fn validated_task_user_sid(interactive_sid: String, process_sid: String) -> Resu
 }
 
 #[cfg(windows)]
-fn interactive_session_user_sid() -> Result<String, ()> {
+fn account_sid(account: &str) -> Result<String, ()> {
     use windows::core::{HSTRING, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows::Win32::Security::{LookupAccountNameW, PSID, SID_NAME_USE};
-    use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSDomainName, WTSUserName};
+
+    let account = HSTRING::from(account);
+    let mut sid_bytes = 0;
+    let mut domain_characters = 0;
+    let mut sid_type = SID_NAME_USE::default();
+    let _ = unsafe {
+        LookupAccountNameW(
+            PCWSTR::null(),
+            &account,
+            None,
+            &mut sid_bytes,
+            None,
+            &mut domain_characters,
+            &mut sid_type,
+        )
+    };
+    if sid_bytes == 0 {
+        return Err(());
+    }
+    let mut sid = vec![0_u8; sid_bytes as usize];
+    let mut referenced_domain = vec![0_u16; domain_characters.max(1) as usize];
+    unsafe {
+        LookupAccountNameW(
+            PCWSTR::null(),
+            &account,
+            Some(PSID(sid.as_mut_ptr().cast())),
+            &mut sid_bytes,
+            Some(PWSTR(referenced_domain.as_mut_ptr())),
+            &mut domain_characters,
+            &mut sid_type,
+        )
+    }
+    .map_err(|_| ())?;
+    let mut text = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(PSID(sid.as_mut_ptr().cast()), &mut text) }.map_err(|_| ())?;
+    let result = unsafe { text.to_string().map_err(|_| ()) };
+    let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+    result
+}
+
+#[cfg(windows)]
+fn task_identity_matches_sid(identity: &str, expected_sid: &str) -> Result<bool, ()> {
+    if identity.eq_ignore_ascii_case(expected_sid) {
+        return Ok(true);
+    }
+    Ok(account_sid(identity)?.eq_ignore_ascii_case(expected_sid))
+}
+
+#[cfg(windows)]
+fn interactive_session_user_sid() -> Result<String, ()> {
+    use windows::Win32::System::RemoteDesktop::{
+        ProcessIdToSessionId, WTSDomainName, WTSUserName,
+    };
     use windows::Win32::System::Threading::GetCurrentProcessId;
 
     fn session_value(
@@ -1336,43 +1393,7 @@ fn interactive_session_user_sid() -> Result<String, ()> {
     } else {
         format!(r"{domain}\{user}")
     };
-    let account = HSTRING::from(account);
-    let mut sid_bytes = 0;
-    let mut domain_characters = 0;
-    let mut sid_type = SID_NAME_USE::default();
-    let _ = unsafe {
-        LookupAccountNameW(
-            PCWSTR::null(),
-            &account,
-            None,
-            &mut sid_bytes,
-            None,
-            &mut domain_characters,
-            &mut sid_type,
-        )
-    };
-    if sid_bytes == 0 {
-        return Err(());
-    }
-    let mut sid = vec![0_u8; sid_bytes as usize];
-    let mut referenced_domain = vec![0_u16; domain_characters.max(1) as usize];
-    unsafe {
-        LookupAccountNameW(
-            PCWSTR::null(),
-            &account,
-            Some(PSID(sid.as_mut_ptr().cast())),
-            &mut sid_bytes,
-            Some(PWSTR(referenced_domain.as_mut_ptr())),
-            &mut domain_characters,
-            &mut sid_type,
-        )
-    }
-    .map_err(|_| ())?;
-    let mut text = PWSTR::null();
-    unsafe { ConvertSidToStringSidW(PSID(sid.as_mut_ptr().cast()), &mut text) }.map_err(|_| ())?;
-    let result = unsafe { text.to_string().map_err(|_| ()) };
-    let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
-    result
+    account_sid(&account)
 }
 
 #[cfg(windows)]
