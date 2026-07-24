@@ -1818,9 +1818,8 @@ mod tests {
         assert!(agent.contains("<RunLevel>HighestAvailable</RunLevel>"));
         assert!(agent.contains("<URI>\\FairyPam Agent</URI>"));
         assert!(agent.contains("<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count>"));
-        assert!(agent.contains(
-            r"C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe"
-        ));
+        assert!(agent
+            .contains(r"C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe"));
         assert!(agent.contains(
             r#"<Arguments>--launch-agent-task &quot;C:\Program Files\FairyPam&quot;</Arguments>"#
         ));
