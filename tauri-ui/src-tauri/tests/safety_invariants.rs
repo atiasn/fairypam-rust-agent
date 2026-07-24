@@ -577,6 +577,7 @@ fn local_identity_contract_verifies_peer_and_install_root_before_sensitive_actio
 #[test]
 fn installer_owns_fixed_task_registration_and_bounded_recovery() {
     for required in [
+        "\"--launch-agent-task\" => launch_agent_task(install_root)",
         "\"--run-agent-task\" => with_install_transaction",
         "\"--restart-agent-task\" => with_install_transaction",
         "\"--run-ui-task\" =>",
@@ -597,6 +598,9 @@ fn installer_owns_fixed_task_registration_and_bounded_recovery() {
         "FairyPam Agent",
         "FairyPam Agent UI",
         "fairypam-agent.exe",
+        "resources\\runtime\\fairypam-agent-installer.exe",
+        "fn launch_agent_task(",
+        ".status()",
         "fairypam-agent-tauri-ui.exe",
         "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;",
         "Global\\FairyPam.Agent.InstallTransaction.v1",

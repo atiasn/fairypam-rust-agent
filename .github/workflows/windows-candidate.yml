@@ -312,6 +312,34 @@ jobs:
           $profiles = Join-Path $installRoot 'profiles'
           if (-not (Test-Path -LiteralPath $profiles -PathType Container)) { throw "missing installed profiles directory: $profiles" }
 
+      - name: Smoke fixed Agent task crash recovery
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction Stop)
+          if ($agents.Count -ne 1) { throw "expected one installed Agent, found $($agents.Count)" }
+          $originalPid = $agents[0].Id
+          $agentProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $originalPid"
+          $launcherProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($agentProcess.ParentProcessId)"
+          if ($launcherProcess.ExecutablePath -cne 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe') {
+            throw "fixed Agent task did not use the protected launcher helper: $($launcherProcess.ExecutablePath)"
+          }
+
+          Stop-Process -Id $originalPid -Force
+          $deadline = [DateTime]::UtcNow.AddSeconds(90)
+          do {
+            Start-Sleep -Seconds 2
+            $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
+            $replacement = @($agents | Where-Object { $_.Id -ne $originalPid })
+          } while ($replacement.Count -ne 1 -and [DateTime]::UtcNow -lt $deadline)
+          if ($agents.Count -ne 1 -or $replacement.Count -ne 1) {
+            throw "Task Scheduler did not recover exactly one Agent after forced termination"
+          }
+          $task = Get-ScheduledTask -TaskName 'FairyPam Agent'
+          if ($task.State -ne 'Running') {
+            throw "recovered Agent task is not running: $($task.State)"
+          }
+
       - name: Smoke trusted NSIS product reinstall
         shell: pwsh
         run: |

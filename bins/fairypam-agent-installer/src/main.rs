@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! Fixed-path, installer-only validation and production state provisioning.
 
 #[cfg(not(windows))]
@@ -15,6 +17,7 @@ fn main() {
                 "--preflight" => preflight(install_root),
                 "--provision" => with_install_transaction(|| provision(install_root)),
                 "--installed-preflight" => installed_preflight(install_root),
+                "--launch-agent-task" => launch_agent_task(install_root),
                 "--run-agent-task" => with_install_transaction(|| {
                     run_fixed_task(install_root, FixedTask::Agent, false)
                 }),
@@ -100,8 +103,18 @@ impl FixedTask {
 
     fn executable(self) -> &'static str {
         match self {
-            Self::Agent => "fairypam-agent.exe",
+            Self::Agent => r"resources\runtime\fairypam-agent-installer.exe",
             Self::Ui => "fairypam-agent-tauri-ui.exe",
+        }
+    }
+
+    fn arguments(self, install_root: &std::path::Path) -> String {
+        match self {
+            Self::Agent => format!(
+                r#"--launch-agent-task "{}""#,
+                install_root.to_string_lossy()
+            ),
+            Self::Ui => String::new(),
         }
     }
 
@@ -239,6 +252,7 @@ fn fixed_task_xml(install_root: &std::path::Path, user_sid: &str, task: FixedTas
         .to_string_lossy()
         .trim_end_matches(['\\', '/'])
         .replace('/', "\\");
+    let arguments = xml_escape(&task.arguments(std::path::Path::new(&working_directory)));
     let executable = xml_escape(&format!(r"{working_directory}\{}", task.executable()));
     let working_directory = xml_escape(&working_directory);
     let user_sid = xml_escape(user_sid);
@@ -282,6 +296,7 @@ fn fixed_task_xml(install_root: &std::path::Path, user_sid: &str, task: FixedTas
   <Actions Context="Author">
     <Exec>
       <Command>{executable}</Command>
+      <Arguments>{arguments}</Arguments>
       <WorkingDirectory>{working_directory}</WorkingDirectory>
     </Exec>
   </Actions>
@@ -300,6 +315,20 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(windows)]
+fn launch_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
+    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    let status = std::process::Command::new(install_root.join("fairypam-agent.exe"))
+        .current_dir(install_root)
+        .status()
+        .map_err(|_| ProvisionFailure::TaskOperation)?;
+    status
+        .success()
+        .then_some(())
+        .ok_or(ProvisionFailure::TaskOperation)
 }
 
 #[cfg(windows)]
@@ -674,7 +703,7 @@ fn validate_fixed_task(
     if !same_windows_path(
         std::path::Path::new(&path.to_string()),
         &install_root.join(task.executable()),
-    ) || !arguments.is_empty()
+    ) || arguments.to_string() != task.arguments(install_root)
         || !same_windows_path(
             std::path::Path::new(&working_directory.to_string()),
             install_root,
@@ -1789,10 +1818,16 @@ mod tests {
         assert!(agent.contains("<RunLevel>HighestAvailable</RunLevel>"));
         assert!(agent.contains("<URI>\\FairyPam Agent</URI>"));
         assert!(agent.contains("<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count>"));
-        assert!(agent.contains(r"C:\Program Files\FairyPam\fairypam-agent.exe"));
+        assert!(agent.contains(
+            r"C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe"
+        ));
+        assert!(agent.contains(
+            r#"<Arguments>--launch-agent-task &quot;C:\Program Files\FairyPam&quot;</Arguments>"#
+        ));
         assert!(ui.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(ui.contains("<URI>\\FairyPam Agent UI</URI>"));
         assert!(!ui.contains("<RestartOnFailure>"));
+        assert!(ui.contains("<Arguments></Arguments>"));
         assert!(ui.contains(r"C:\Program Files\FairyPam\fairypam-agent-tauri-ui.exe"));
     }
 
