@@ -433,7 +433,7 @@ impl RuntimeLogMessage {
         Self::FrameConnectionEstablished,
         Self::EnrollmentRefreshFailed,
         Self::SessionCleared,
-            Self::LocalShutdownRequested,
+        Self::LocalShutdownRequested,
         Self::LocalUiBound,
         Self::LocalUiShutdownRequested,
         Self::LocalEnvironmentCheckRequested,

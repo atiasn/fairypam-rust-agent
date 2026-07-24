@@ -195,11 +195,7 @@ fn fixed_task_security(user_sid: &str) -> String {
 }
 
 #[cfg(any(windows, test))]
-fn fixed_task_xml(
-    install_root: &std::path::Path,
-    user_sid: &str,
-    task: FixedTask,
-) -> String {
+fn fixed_task_xml(install_root: &std::path::Path, user_sid: &str, task: FixedTask) -> String {
     let working_directory = install_root
         .to_string_lossy()
         .trim_end_matches(['\\', '/'])
@@ -350,9 +346,7 @@ impl Drop for ComApartment {
 
 #[cfg(windows)]
 fn with_task_scheduler<T>(
-    operation: impl FnOnce(
-        &windows::Win32::System::TaskScheduler::ITaskFolder,
-    ) -> Result<T, TaskError>,
+    operation: impl FnOnce(&windows::Win32::System::TaskScheduler::ITaskFolder) -> Result<T, TaskError>,
 ) -> Result<T, TaskError> {
     use windows::core::BSTR;
     use windows::Win32::System::Com::{
@@ -369,10 +363,9 @@ fn with_task_scheduler<T>(
         unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) }
             .map_err(|_| TaskError::Operation)?;
     let empty = VARIANT::default();
-    unsafe { service.Connect(&empty, &empty, &empty, &empty) }
-        .map_err(|_| TaskError::Operation)?;
-    let folder = unsafe { service.GetFolder(&BSTR::from(r"\")) }
-        .map_err(|_| TaskError::Operation)?;
+    unsafe { service.Connect(&empty, &empty, &empty, &empty) }.map_err(|_| TaskError::Operation)?;
+    let folder =
+        unsafe { service.GetFolder(&BSTR::from(r"\")) }.map_err(|_| TaskError::Operation)?;
     operation(&folder)
 }
 
@@ -392,12 +385,8 @@ fn provision_fixed_tasks(install_root: &std::path::Path) -> Result<(), TaskError
                     agent = Some(registered);
                 }
             }
-            unsafe {
-                agent
-                    .ok_or(TaskError::Operation)?
-                    .Run(&VARIANT::default())
-            }
-            .map_err(|_| TaskError::Operation)?;
+            unsafe { agent.ok_or(TaskError::Operation)?.Run(&VARIANT::default()) }
+                .map_err(|_| TaskError::Operation)?;
             Ok(())
         })();
         if result.is_err() && restore_fixed_tasks(folder, &backups).is_err() {
@@ -415,8 +404,7 @@ fn capture_fixed_tasks(
     use windows::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
     use windows::Win32::System::TaskScheduler::{TASK_STATE_QUEUED, TASK_STATE_RUNNING};
 
-    let security_information =
-        (OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION).0 as i32;
+    let security_information = (OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION).0 as i32;
     [FixedTask::Agent, FixedTask::Ui]
         .into_iter()
         .map(
@@ -426,11 +414,9 @@ fn capture_fixed_tasks(
                     xml: unsafe { registered.Xml() }
                         .map_err(|_| TaskError::Operation)?
                         .to_string(),
-                    security: unsafe {
-                        registered.GetSecurityDescriptor(security_information)
-                    }
-                    .map_err(|_| TaskError::Operation)?
-                    .to_string(),
+                    security: unsafe { registered.GetSecurityDescriptor(security_information) }
+                        .map_err(|_| TaskError::Operation)?
+                        .to_string(),
                     was_running: matches!(
                         unsafe { registered.State() }.map_err(|_| TaskError::Operation)?,
                         TASK_STATE_RUNNING | TASK_STATE_QUEUED
@@ -481,19 +467,15 @@ fn restore_fixed_tasks(
             continue;
         };
         if unsafe {
-            restored.SetSecurityDescriptor(
-                &BSTR::from(&backup.security),
-                TASK_DONT_ADD_PRINCIPAL_ACE.0,
-            )
+            restored
+                .SetSecurityDescriptor(&BSTR::from(&backup.security), TASK_DONT_ADD_PRINCIPAL_ACE.0)
         }
         .is_err()
         {
             failed = true;
             continue;
         }
-        if backup.was_running
-            && unsafe { restored.Run(&VARIANT::default()) }.is_err()
-        {
+        if backup.was_running && unsafe { restored.Run(&VARIANT::default()) }.is_err() {
             failed = true;
         }
     }
@@ -542,7 +524,7 @@ fn validate_fixed_task(
     user_sid: &str,
     task: FixedTask,
 ) -> Result<windows::Win32::System::TaskScheduler::IRegisteredTask, TaskError> {
-    use windows::core::{BSTR, Interface};
+    use windows::core::{Interface, BSTR};
     use windows::Win32::Foundation::VARIANT_BOOL;
     use windows::Win32::Security::DACL_SECURITY_INFORMATION;
     use windows::Win32::System::TaskScheduler::{
@@ -600,13 +582,11 @@ fn validate_fixed_task(
     let mut instances = Default::default();
     let mut restart_count = 0;
     let mut restart_interval = BSTR::default();
-    unsafe { settings.AllowDemandStart(&mut allow_demand) }
-        .map_err(|_| TaskError::Operation)?;
+    unsafe { settings.AllowDemandStart(&mut allow_demand) }.map_err(|_| TaskError::Operation)?;
     unsafe { settings.Enabled(&mut enabled) }.map_err(|_| TaskError::Operation)?;
     unsafe { settings.MultipleInstances(&mut instances) }.map_err(|_| TaskError::Operation)?;
     unsafe { settings.RestartCount(&mut restart_count) }.map_err(|_| TaskError::Operation)?;
-    unsafe { settings.RestartInterval(&mut restart_interval) }
-        .map_err(|_| TaskError::Operation)?;
+    unsafe { settings.RestartInterval(&mut restart_interval) }.map_err(|_| TaskError::Operation)?;
     let restart_is_valid = match task {
         FixedTask::Agent => restart_count == 3 && restart_interval.to_string() == "PT1M",
         FixedTask::Ui => restart_count == 0,
@@ -655,8 +635,7 @@ fn validate_fixed_task(
     let mut working_directory = BSTR::default();
     unsafe { action.Path(&mut path) }.map_err(|_| TaskError::Operation)?;
     unsafe { action.Arguments(&mut arguments) }.map_err(|_| TaskError::Operation)?;
-    unsafe { action.WorkingDirectory(&mut working_directory) }
-        .map_err(|_| TaskError::Operation)?;
+    unsafe { action.WorkingDirectory(&mut working_directory) }.map_err(|_| TaskError::Operation)?;
     if !same_windows_path(
         std::path::Path::new(&path.to_string()),
         &install_root.join(task.executable()),
@@ -812,9 +791,7 @@ fn delete_fixed_tasks(
 }
 
 #[cfg(windows)]
-fn request_agent_maintenance_shutdown(
-    install_root: &std::path::Path,
-) -> Result<(), TaskError> {
+fn request_agent_maintenance_shutdown(install_root: &std::path::Path) -> Result<(), TaskError> {
     use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
     use fairypam_agent_local_protocol::LocalCommand;
 
@@ -839,9 +816,7 @@ fn request_agent_maintenance_shutdown(
 }
 
 #[cfg(windows)]
-fn wait_for_agent_processes_to_exit(
-    install_root: &std::path::Path,
-) -> Result<(), TaskError> {
+fn wait_for_agent_processes_to_exit(install_root: &std::path::Path) -> Result<(), TaskError> {
     for _ in 0..100 {
         if !agent_process_is_running(install_root)? {
             return Ok(());
@@ -1310,9 +1285,7 @@ fn interactive_session_user_sid() -> Result<String, ()> {
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows::Win32::Security::{LookupAccountNameW, PSID, SID_NAME_USE};
-    use windows::Win32::System::RemoteDesktop::{
-        ProcessIdToSessionId, WTSDomainName, WTSUserName,
-    };
+    use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSDomainName, WTSUserName};
     use windows::Win32::System::Threading::GetCurrentProcessId;
 
     fn session_value(
