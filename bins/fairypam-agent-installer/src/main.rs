@@ -614,10 +614,7 @@ fn validate_fixed_task(
     unsafe { trigger.UserId(&mut trigger_user) }.map_err(|_| TaskError::Operation)?;
     unsafe { trigger.Delay(&mut trigger_delay) }.map_err(|_| TaskError::Operation)?;
     unsafe { trigger.Enabled(&mut trigger_enabled) }.map_err(|_| TaskError::Operation)?;
-    if trigger_user != user_sid
-        || !trigger_delay.is_empty()
-        || !trigger_enabled.as_bool()
-    {
+    if trigger_user != user_sid || !trigger_delay.is_empty() || !trigger_enabled.as_bool() {
         return Err(TaskError::Invalid);
     }
 
