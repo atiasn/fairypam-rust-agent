@@ -38,7 +38,7 @@ const ENROLLMENT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\enrollment";
 const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\audit";
 #[cfg(windows)]
 const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 #[cfg(windows)]
 const INSTALL_DIRECTORY: &str = env!("FAIRYPAM_INSTALL_DIRECTORY");
@@ -403,11 +403,17 @@ fn set_directory_security(
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn private_security_sddl(value: &str) -> Result<(), ()> {
-    (value == PRIVATE_SDDL || value == "O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)")
-        .then_some(())
-        .ok_or(())
+    (matches!(
+        value,
+        PRIVATE_SDDL
+            | "O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)"
+            | "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)"
+            | "O:BAD:PAI(A;;FA;;;BA)(A;;FA;;;SY)"
+    ))
+    .then_some(())
+    .ok_or(())
 }
 
 #[cfg(windows)]
@@ -545,7 +551,7 @@ fn with_security_descriptor<T>(
 fn verify_private_directory(path: &std::path::Path) -> Result<(), ()> {
     verify_nonreparse_directory(path)?;
     security_sddl(path)
-        .is_ok_and(|value| value == PRIVATE_SDDL || value == "O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)")
+        .is_ok_and(|value| private_security_sddl(&value).is_ok())
         .then_some(())
         .ok_or(())
 }
@@ -800,6 +806,26 @@ mod tests {
             "O:BUD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",
         ] {
             assert!(!allowed.contains(&rejected.to_owned()));
+        }
+    }
+
+    #[test]
+    fn private_state_acl_accepts_only_the_exact_protected_shapes() {
+        for allowed in [
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)",
+            "O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)",
+            "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)",
+            "O:BAD:PAI(A;;FA;;;BA)(A;;FA;;;SY)",
+        ] {
+            assert!(private_security_sddl(allowed).is_ok());
+        }
+        for rejected in [
+            "O:BAD:AI(A;;FA;;;SY)(A;;FA;;;BA)",
+            "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)",
+            "O:BUD:PAI(A;;FA;;;SY)(A;;FA;;;BA)",
+            "O:BAD:PAI(A;ID;FA;;;SY)(A;;FA;;;BA)",
+        ] {
+            assert!(private_security_sddl(rejected).is_err());
         }
     }
 
