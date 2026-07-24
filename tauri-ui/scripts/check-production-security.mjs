@@ -39,10 +39,22 @@ for (const forbidden of ['fn invoke', 'fn exec', 'fn spawn', 'fn read_file', 'se
 }
 
 for (const required of [
-  'for path in [&gui, &agent]',
+  'for path in [&gui, &helper]',
   'verify_protected_program_files_path(path)',
+  'std::process::Command::new',
+  'ShellExecuteExW',
+  'SEE_MASK_NOCLOSEPROCESS',
+  'verify_repair_helper_signature(&helper)?',
+  'WinVerifyTrust',
+  'WINTRUST_ACTION_GENERIC_VERIFY_V2',
+  'WTD_STATEACTION_CLOSE',
+  'FAIRYPAM_ALLOW_UNSIGNED_CANDIDATE_REPAIR',
+  '"--repair-tasks"',
 ]) {
-  if (!commandSource.includes(required)) fail(`missing fixed UAC target guard ${required}`);
+  if (!commandSource.includes(required)) fail(`missing fixed task-helper guard ${required}`);
+}
+if (commandSource.includes('fairypam-agent.exe')) {
+  fail('GUI must not launch the Agent executable directly');
 }
 for (const required of [
   'protected_install_chain',

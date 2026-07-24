@@ -18,6 +18,8 @@ pub use dpi::{physical_to_logical, validate_dpi};
 #[cfg(windows)]
 pub use local_pipe::verify_fixed_gui_caller;
 #[cfg(windows)]
+pub use local_pipe::verify_fixed_installer_caller;
+#[cfg(windows)]
 pub use local_pipe::{
     current_process_pipe_owner, WindowsNamedPipeServer, WindowsPipeIdentityProvider,
 };

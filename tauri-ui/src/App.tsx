@@ -33,6 +33,7 @@ function startupLabel(status: string | undefined, isPending: boolean, isError: b
 
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
+  const [recoveryAction, setRecoveryAction] = useState<'restart' | 'repair'>();
   const startup = useQuery({
     queryKey: queryKeys.startup,
     queryFn: agentApi.ensureLocalAgent,
@@ -46,6 +47,23 @@ export default function App() {
       dispatch({ type: 'ExplicitEmergency', code: 'agent.guardian.emergency' });
     }
   }, [dispatch, queries.overview.data?.status.state]);
+
+  const recoverAgent = async (
+    action: 'restart' | 'repair',
+    operation: () => Promise<unknown>,
+  ) => {
+    if (recoveryAction) return;
+    setRecoveryAction(action);
+    try {
+      await operation();
+      await startup.refetch();
+      await Promise.all([queries.overview.refetch(), queries.environment.refetch()]);
+    } catch {
+      // The existing startup error remains visible and keeps Repair available.
+    } finally {
+      setRecoveryAction(undefined);
+    }
+  };
 
   const common = {
     connection,
@@ -61,6 +79,13 @@ export default function App() {
         }
       });
     },
+    restartAgent: () => {
+      void recoverAgent('restart', agentApi.restartLocalAgent);
+    },
+    repairAgent: () => {
+      void recoverAgent('repair', agentApi.repairAgentTasks);
+    },
+    recoveryAction,
   };
   const agentReady = startup.isSuccess && queries.overview.isSuccess;
 

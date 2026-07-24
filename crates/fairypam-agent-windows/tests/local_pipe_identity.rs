@@ -120,6 +120,9 @@ fn register_hub_gui_proof_is_server_side_and_fails_closed_before_runtime_dispatc
     let caller_guard = adapter
         .find("if requires_fixed_gui(&request.command)")
         .expect("privileged local commands must verify the fixed product GUI");
+    let installer_guard = adapter
+        .find("verify_fixed_installer_caller(caller.pid)")
+        .expect("maintenance shutdown must verify the fixed installer");
     let nonce_guard = adapter
         .find("self.nonces.accept(request.nonce)")
         .expect("requests must pass replay protection");
@@ -128,4 +131,6 @@ fn register_hub_gui_proof_is_server_side_and_fails_closed_before_runtime_dispatc
         .expect("validated requests must reach the runtime");
     assert!(caller_guard < nonce_guard);
     assert!(caller_guard < runtime_dispatch);
+    assert!(installer_guard < nonce_guard);
+    assert!(installer_guard < runtime_dispatch);
 }

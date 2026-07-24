@@ -412,7 +412,7 @@ enum RuntimeLogMessage {
     FrameConnectionEstablished,
     EnrollmentRefreshFailed,
     SessionCleared,
-    GuiSessionEnded,
+    LocalShutdownRequested,
     LocalUiBound,
     LocalUiShutdownRequested,
     LocalEnvironmentCheckRequested,
@@ -433,7 +433,7 @@ impl RuntimeLogMessage {
         Self::FrameConnectionEstablished,
         Self::EnrollmentRefreshFailed,
         Self::SessionCleared,
-        Self::GuiSessionEnded,
+            Self::LocalShutdownRequested,
         Self::LocalUiBound,
         Self::LocalUiShutdownRequested,
         Self::LocalEnvironmentCheckRequested,
@@ -453,7 +453,7 @@ impl RuntimeLogMessage {
             Self::FrameConnectionEstablished => "画面服务已准备就绪",
             Self::EnrollmentRefreshFailed => "注册信息刷新失败，连接将保持安全关闭",
             Self::SessionCleared => "连接已重置，正在重新连接",
-            Self::GuiSessionEnded => "界面会话结束，后台服务正在安全停止",
+            Self::LocalShutdownRequested => "后台服务收到安全停止请求",
             Self::LocalUiBound => "界面已连接到后台服务",
             Self::LocalUiShutdownRequested => "界面请求安全停止后台服务",
             Self::LocalEnvironmentCheckRequested => "界面请求环境检查",
@@ -903,7 +903,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
             result = driver.wait_until_registered() => result?,
             _ = driver.gui_shutdown.cancelled() => {
                 local_control.abort();
-                return shutdown_from_gui_lifecycle(&driver, &mut supervisor);
+                return shutdown_from_local_request(&driver, &mut supervisor);
             }
             result = &mut local_control => return match result {
                 Ok(never) => match never {},
@@ -919,7 +919,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
             _ = driver.gui_shutdown.cancelled() => {
                 drop(supervisor_run);
                 local_control.abort();
-                return shutdown_from_gui_lifecycle(&driver, &mut supervisor);
+                return shutdown_from_local_request(&driver, &mut supervisor);
             }
             result = &mut local_control => match result {
                 Ok(never) => match never {},
@@ -936,15 +936,15 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
 }
 
 #[cfg(windows)]
-fn shutdown_from_gui_lifecycle(
+fn shutdown_from_local_request(
     driver: &GrpcSessionDriver,
     supervisor: &mut SessionSupervisor<RuntimeSafetyHooks>,
 ) -> Result<(), AgentError> {
     let reason = driver.gui_lifetime.exit_reason().ok().flatten();
     if let Ok(mut state) = driver.state.lock() {
-        state.record(LogLevel::Info, RuntimeLogMessage::GuiSessionEnded);
+        state.record(LogLevel::Info, RuntimeLogMessage::LocalShutdownRequested);
     }
-    tracing::info!(?reason, "GUI lifecycle requested safe Agent shutdown");
+    tracing::info!(?reason, "local control requested safe Agent shutdown");
     let _ = supervisor.handle_control_failure()?;
     Ok(())
 }
@@ -964,7 +964,7 @@ impl AgentInstance {
         };
 
         let handle =
-            unsafe { CreateMutexW(None, false, &HSTRING::from(r"Local\FairyPam.Agent.v1")) }
+            unsafe { CreateMutexW(None, false, &HSTRING::from(r"Global\FairyPam.Agent.v1")) }
                 .map_err(|error| {
                     AgentError::new("runtime.instance_unavailable", error.to_string())
                 })?;
@@ -1012,7 +1012,8 @@ impl LocalControlRuntime for SharedRuntime {
                 Ok(serde_json::json!({"state": "bound"}))
             }
             LocalCommand::ShutdownAgent => {
-                self.gui_lifetime.request_shutdown(caller.pid)?;
+                self.execution.lock().map_err(lock_error)?.reset()?;
+                self.gui_lifetime.request_maintenance_shutdown()?;
                 Ok(serde_json::json!({"state": "shutting_down"}))
             }
             LocalCommand::GetConnectionStatus => self.connection_status(),

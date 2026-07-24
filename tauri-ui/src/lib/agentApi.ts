@@ -12,6 +12,8 @@ import type {
 
 export const agentApi = {
   ensureLocalAgent: () => invoke<SupportStatus>('ensure_local_agent'),
+  restartLocalAgent: () => invoke<SupportStatus>('restart_local_agent'),
+  repairAgentTasks: () => invoke<SupportStatus>('repair_agent_tasks'),
   getOverview: () => invoke<Overview>('get_overview'),
   getConnectionStatus: async (): Promise<ConnectionStatus> => {
     const { control, frame, capture_active } = await invoke<ConnectionStatus>('get_connection_status');

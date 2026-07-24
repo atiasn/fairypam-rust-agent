@@ -6,6 +6,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('./lib/agentApi', () => ({
   agentApi: {
     ensureLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
+    restartLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
+    repairAgentTasks: vi.fn().mockResolvedValue({ status: 'ready' }),
     getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false }, doctor: { profiles: ['signed-profile'], runtime: 'dry_run' } }),
     getConnectionStatus: vi.fn().mockResolvedValue({ control: 'connected', frame: 'connected', capture_active: false }),
     runEnvironmentCheck: vi.fn().mockResolvedValue({ registration_ready: true, registration_pending: false, checks: [] }),
@@ -119,9 +121,11 @@ describe('App', () => {
     await user.clear(view.getByLabelText('服务地址'));
     await user.type(view.getByLabelText('服务地址'), 'https://register.example');
     await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
-    vi.mocked(agentApi.runEnvironmentCheck)
-      .mockResolvedValueOnce({ registration_ready: true, registration_pending: true, checks: [] })
-      .mockResolvedValueOnce({ registration_ready: true, registration_pending: false, checks: [{ id: 'certificate', status: 'available', code: 'runtime.certificate_files_available', recovery: '无需操作' }] });
+    vi.mocked(agentApi.runEnvironmentCheck).mockResolvedValue({
+      registration_ready: true,
+      registration_pending: false,
+      checks: [{ id: 'certificate', status: 'available', code: 'runtime.certificate_files_available', recovery: '无需操作' }],
+    });
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
     expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
     expect(await view.findByText('注册已完成，正在连接服务。')).toBeInTheDocument();
@@ -215,6 +219,24 @@ describe('App', () => {
     await user.click(view.getByRole('button', { name: '连接与注册' }));
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
     expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
+  });
+
+  it('后台服务异常时仅在用户选择修复后请求系统确认', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.ensureLocalAgent).mockRejectedValueOnce({
+      code: 'startup.agent_repair_required',
+      message: '需要修复',
+    });
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByRole('button', { name: '修复后台服务' })).toBeInTheDocument();
+    expect(view.getByRole('button', { name: '重启后台服务' })).toBeInTheDocument();
+    expect(agentApi.repairAgentTasks).not.toHaveBeenCalled();
+
+    await user.click(view.getByRole('button', { name: '修复后台服务' }));
+    expect(agentApi.repairAgentTasks).toHaveBeenCalledOnce();
+    expect(agentApi.restartLocalAgent).not.toHaveBeenCalled();
   });
 
   it('日志和游戏在后台服务就绪前不请求本地通道', async () => {

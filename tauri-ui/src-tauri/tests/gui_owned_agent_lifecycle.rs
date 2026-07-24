@@ -2,53 +2,44 @@ const APP: &str = include_str!("../src/app.rs");
 const COMMANDS: &str = include_str!("../src/commands.rs");
 const GATEWAY: &str = include_str!("../src/local_gateway.rs");
 const SINGLE_INSTANCE: &str = include_str!("../src/gui_single_instance.rs");
+const AGENT_RUNTIME: &str = include_str!("../../../bins/fairypam-agent/src/runtime.rs");
 
 #[test]
-fn primary_gui_binds_the_agent_and_tray_exit_only_shuts_down_that_binding() {
-    assert!(COMMANDS.contains("bind_ui_lifetime"));
-    assert!(GATEWAY.contains("LocalCommand::BindUiLifetime"));
-    assert!(GATEWAY.contains("LocalCommand::ShutdownAgent"));
-    assert!(GATEWAY.contains("ui_lifetime_bound"));
-    assert!(APP.contains("shutdown_bound_agent_then_exit"));
-    assert!(APP.contains("SHUTDOWN_GRACE"));
-    assert!(!APP.contains("\"exit-ui\" => app.exit(0)"));
+fn resident_agent_is_not_bound_to_or_stopped_with_the_gui() {
+    assert!(!COMMANDS.contains("bind_ui_lifetime"));
+    assert!(!GATEWAY.contains("LocalCommand::BindUiLifetime"));
+    assert!(!GATEWAY.contains("LocalCommand::ShutdownAgent"));
+    assert!(!GATEWAY.contains("ui_lifetime_bound"));
+    assert!(!APP.contains("shutdown_bound_agent_then_exit"));
+    assert!(!APP.contains("SHUTDOWN_GRACE"));
+    assert!(APP.contains("\"exit-ui\" => app.exit(0)"));
 }
 
 #[test]
-fn restart_after_exact_pipe_not_found_clears_the_cached_binding_before_uac() {
+fn missing_pipe_runs_only_the_fixed_task_without_agent_uac() {
     let pipe_not_found = COMMANDS
         .find("Err(error) if error.code == \"local.transport.pipe_not_found\" => {")
         .expect("startup must keep the exact pipe-not-found branch");
-    let clear_binding = COMMANDS
-        .find("state.clear_ui_lifetime_binding()")
-        .expect("a restarted Agent must invalidate the prior GUI binding");
     let launch = COMMANDS
-        .find("launch_fixed_agent()?")
-        .expect("the fixed UAC launch must remain present");
+        .find("run_fixed_helper(\"--run-agent-task\")?")
+        .expect("startup must invoke the fixed Agent task");
 
-    assert!(pipe_not_found < clear_binding && clear_binding < launch);
-    assert!(GATEWAY.contains("fn clear_ui_lifetime_binding(&self)"));
+    assert!(pipe_not_found < launch);
+    assert!(COMMANDS.contains("fairypam-agent-installer.exe"));
+    assert!(COMMANDS.contains("std::process::Command::new"));
+    assert!(!COMMANDS.contains("fixed_agent_path"));
 }
 
 #[test]
-fn already_bound_agent_retries_without_requesting_uac_then_returns_repair_result() {
-    let responsive_agent = COMMANDS
-        .find("Ok(_) => return bind_existing_agent(&state).await")
-        .expect("a responsive Agent must use the existing-Agent recovery path");
-    let recovery = COMMANDS
-        .find("async fn bind_existing_agent")
-        .expect("already-bound recovery must be isolated from UAC startup");
-    let launch = COMMANDS
-        .find("fn launch_fixed_agent")
-        .expect("the fixed UAC launch must remain present");
-    let recovery_body = &COMMANDS[recovery..launch];
-
-    assert!(responsive_agent < recovery && recovery < launch);
-    assert!(recovery_body.contains("GUI_LIFECYCLE_RECOVERY_LIMIT"));
-    assert!(recovery_body.contains("local.lifecycle.already_bound"));
-    assert!(recovery_body.contains("state.bind_ui_lifetime().await"));
-    assert!(recovery_body.contains("startup.agent_repair_required"));
-    assert!(!recovery_body.contains("launch_fixed_agent"));
+fn restart_is_task_owned_and_only_repair_elevates_the_fixed_helper() {
+    assert!(COMMANDS.contains("run_fixed_helper(\"--restart-agent-task\")"));
+    assert!(COMMANDS.contains("run_repair_helper"));
+    assert!(COMMANDS.contains("\"--repair-tasks\""));
+    assert!(COMMANDS.contains("ShellExecuteExW"));
+    assert!(COMMANDS.contains("SEE_MASK_NOCLOSEPROCESS"));
+    assert!(COMMANDS.contains("HSTRING::from(\"runas\")"));
+    assert!(COMMANDS.contains("\"startup.agent_repair_required\""));
+    assert!(!COMMANDS.contains("fairypam-agent.exe"));
 }
 
 #[test]
@@ -59,6 +50,18 @@ fn second_gui_instance_only_activates_the_primary_window() {
     assert!(SINGLE_INSTANCE.contains("ERROR_ALREADY_EXISTS"));
     assert!(SINGLE_INSTANCE.contains("FindWindowW"));
     assert!(SINGLE_INSTANCE.contains("SetForegroundWindow"));
+}
+
+#[test]
+fn agent_single_instance_is_device_wide_and_acquired_before_runtime_side_effects() {
+    assert!(AGENT_RUNTIME.contains(r#"r"Global\FairyPam.Agent.v1""#));
+    let acquire = AGENT_RUNTIME
+        .find("let _instance = AgentInstance::acquire()")
+        .expect("Agent must acquire its instance lock");
+    let driver = AGENT_RUNTIME
+        .find("let driver = GrpcSessionDriver::new(config)")
+        .expect("Agent runtime must create its driver");
+    assert!(acquire < driver);
 }
 
 #[test]

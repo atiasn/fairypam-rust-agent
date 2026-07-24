@@ -14,6 +14,9 @@ type Props = {
   overview: UseQueryResult<Overview>;
   startup: UseQueryResult<SupportStatus>;
   retryStartup: () => void;
+  restartAgent: () => void;
+  repairAgent: () => void;
+  recoveryAction?: 'restart' | 'repair';
 };
 
 function connectionStatusLabel(status: string) {
@@ -26,7 +29,17 @@ function connectionStatusLabel(status: string) {
   return labels[status.toLowerCase()] ?? '正在确认';
 }
 
-export function ConnectionPage({ canMutate, connection, environment, overview, startup, retryStartup }: Props) {
+export function ConnectionPage({
+  canMutate,
+  connection,
+  environment,
+  overview,
+  startup,
+  retryStartup,
+  restartAgent,
+  repairAgent,
+  recoveryAction,
+}: Props) {
   const [registrationStatus, setRegistrationStatus] = useState<'idle' | 'submitting' | 'submitted' | 'completed' | 'error'>('idle');
   const [registrationPendingAt, setRegistrationPendingAt] = useState(0);
   const status = useQuery({
@@ -143,7 +156,15 @@ export function ConnectionPage({ canMutate, connection, environment, overview, s
         {!startup.isSuccess && <p role="status">请先等待后台服务就绪，再提交注册。</p>}
         <p className="notice">注册码只会通过受保护的通道提交，界面不会保存它。</p>
       </section>
-      {(startup.isError || overview.isError) && <button onClick={retryStartup} type="button">重试启动</button>}
+      <div className="actions">
+        <button disabled={Boolean(recoveryAction)} onClick={restartAgent} type="button">重启后台服务</button>
+        {(startup.isError || overview.isError) && (
+          <>
+            <button disabled={Boolean(recoveryAction)} onClick={repairAgent} type="button">修复后台服务</button>
+            <button disabled={Boolean(recoveryAction)} onClick={retryStartup} type="button">重试启动</button>
+          </>
+        )}
+      </div>
     </>
   );
 }

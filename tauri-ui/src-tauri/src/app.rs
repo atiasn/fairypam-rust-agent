@@ -5,15 +5,12 @@ use tauri::{
     Manager, WindowEvent,
 };
 
-use std::time::Duration;
-
 use crate::{
     commands,
     gui_single_instance::{GuiInstance, GuiSingleInstance},
     local_gateway::ProductionGateway,
 };
 
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const BLOCK_PAGE_SURFACES: &str = "for (const event of ['contextmenu', 'dragenter', 'dragover', 'drop']) { window.addEventListener(event, (value) => value.preventDefault(), { capture: true }); }";
 
 pub fn run() -> tauri::Result<()> {
@@ -43,6 +40,8 @@ pub fn run() -> tauri::Result<()> {
             commands::scan_installed_games,
             commands::register_hub,
             commands::ensure_local_agent,
+            commands::restart_local_agent,
+            commands::repair_agent_tasks,
         ])
         .setup(|app| {
             let main_config = &app.config().app.windows[0];
@@ -63,7 +62,7 @@ pub fn run() -> tauri::Result<()> {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show-main" => show_main_window(app),
-                    "exit-ui" => shutdown_bound_agent_then_exit(app),
+                    "exit-ui" => app.exit(0),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -108,16 +107,6 @@ fn disable_default_context_menu(window: &tauri::WebviewWindow) {
                 }
             }
         }
-    });
-}
-
-fn shutdown_bound_agent_then_exit(app: &tauri::AppHandle) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let gateway = app.state::<ProductionGateway>();
-        let _ = gateway.shutdown_bound_agent().await;
-        tokio::time::sleep(SHUTDOWN_GRACE).await;
-        app.exit(0);
     });
 }
 

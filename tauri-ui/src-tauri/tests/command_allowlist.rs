@@ -13,6 +13,8 @@ fn registered_build_and_capability_surfaces_match() {
         "scan_installed_games",
         "register_hub",
         "ensure_local_agent",
+        "restart_local_agent",
+        "repair_agent_tasks",
     ] {
         assert!(
             COMMANDS.contains(command),
@@ -53,14 +55,16 @@ fn command_surface_has_no_generic_bridge_or_removed_runtime_controls() {
 }
 
 #[test]
-fn product_gui_has_only_the_fixed_agent_uac_recovery_path() {
+fn product_gui_uses_fixed_tasks_and_elevates_only_the_repair_helper() {
     let source = include_str!("../src/commands.rs");
     for required in [
-        "ShellExecuteW",
-        "fixed_agent_path",
-        "fairypam-agent.exe",
-        "HSTRING::new()",
-        "SW_HIDE",
+        "fairypam-agent-installer.exe",
+        "run_fixed_helper(\"--run-agent-task\")",
+        "run_fixed_helper(\"--restart-agent-task\")",
+        "\"--repair-tasks\"",
+        "ShellExecuteExW",
+        "SEE_MASK_NOCLOSEPROCESS",
+        "HSTRING::from(\"runas\")",
         "error.code == \"local.transport.pipe_not_found\"",
         "status: \"agent_ready\".into()",
         "status: \"hub_wait_timeout\".into()",
@@ -81,6 +85,7 @@ fn product_gui_has_only_the_fixed_agent_uac_recovery_path() {
         "complete_enrollment",
         "schtasks",
         "SW_SHOWNORMAL",
+        "fairypam-agent.exe",
     ] {
         assert!(
             !source.contains(forbidden),

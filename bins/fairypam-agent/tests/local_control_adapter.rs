@@ -64,9 +64,9 @@ fn gui_lifecycle_commands_remain_privileged_mutations() {
     let source = include_str!("../src/local_control.rs");
 
     assert!(source.contains("| LocalCommand::BindUiLifetime"));
-    assert!(source.contains("| LocalCommand::ShutdownAgent"));
     assert!(source.contains("| LocalCommand::RegisterHub { .. }"));
     assert!(source.contains("if requires_fixed_gui(&request.command)"));
+    assert!(source.contains("verify_fixed_installer_caller(caller.pid)"));
 }
 
 #[test]

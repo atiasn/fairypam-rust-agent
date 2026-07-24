@@ -182,6 +182,8 @@ jobs:
 
       - name: Test and build the product installer
         shell: pwsh
+        env:
+          FAIRYPAM_ALLOW_UNSIGNED_CANDIDATE_REPAIR: '1'
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           cargo build --release --locked -p fairypam-agent -p fairypam-agent-guardian -p fairypam-agent-installer

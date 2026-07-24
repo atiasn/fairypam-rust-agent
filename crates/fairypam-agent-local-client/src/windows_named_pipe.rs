@@ -42,7 +42,8 @@ use crate::{windows_path_is_within, LocalClientError, LocalTransport};
 /// APIs and does not pull in the Agent's input, capture or server crate.
 pub struct WindowsNamedPipeClientTransport {
     pipe_name: String,
-    expected_server_sibling: Option<String>,
+    expected_server_path: Result<Option<std::path::PathBuf>, ()>,
+    require_nonwritable_server: bool,
     pipe: Option<NamedPipeClient>,
 }
 
@@ -50,7 +51,8 @@ impl WindowsNamedPipeClientTransport {
     pub fn new(pipe_name: impl Into<String>) -> Self {
         Self {
             pipe_name: pipe_name.into(),
-            expected_server_sibling: None,
+            expected_server_path: Ok(None),
+            require_nonwritable_server: false,
             pipe: None,
         }
     }
@@ -59,9 +61,29 @@ impl WindowsNamedPipeClientTransport {
         pipe_name: impl Into<String>,
         expected_server_sibling: impl Into<String>,
     ) -> Self {
+        let expected_server_path = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|directory| directory.to_path_buf()))
+            .map(|directory| Some(directory.join(expected_server_sibling.into())))
+            .ok_or(());
         Self {
             pipe_name: pipe_name.into(),
-            expected_server_sibling: Some(expected_server_sibling.into()),
+            expected_server_path,
+            require_nonwritable_server: true,
+            pipe: None,
+        }
+    }
+
+    /// Used only by the elevated fixed installer after it validates the full
+    /// protected install tree; its admin token is expected to write Program Files.
+    pub fn new_verified_maintenance_path(
+        pipe_name: impl Into<String>,
+        expected_server_path: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            pipe_name: pipe_name.into(),
+            expected_server_path: Ok(Some(expected_server_path.into())),
+            require_nonwritable_server: false,
             pipe: None,
         }
     }
@@ -79,8 +101,18 @@ impl LocalTransport for WindowsNamedPipeClientTransport {
             let pipe = ClientOptions::new()
                 .open(&self.pipe_name)
                 .map_err(pipe_error)?;
-            if let Some(expected_server_sibling) = &self.expected_server_sibling {
-                verify_fixed_agent_server(&pipe, expected_server_sibling)?;
+            match &self.expected_server_path {
+                Ok(Some(expected_server_path)) => {
+                    verify_fixed_agent_server(
+                        &pipe,
+                        expected_server_path,
+                        self.require_nonwritable_server,
+                    )?;
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    return Err(LocalClientError::identity("server_image_unavailable"));
+                }
             }
             self.pipe = Some(pipe);
         }
@@ -141,7 +173,8 @@ struct ProcessIdentity {
 /// artifact directory.
 fn verify_fixed_agent_server(
     pipe: &NamedPipeClient,
-    expected_server_sibling: &str,
+    expected_server_path: &Path,
+    require_nonwritable_server: bool,
 ) -> Result<(), LocalClientError> {
     let mut pid = 0;
     unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut pid) }
@@ -152,12 +185,6 @@ fn verify_fixed_agent_server(
 
     let server = process_identity(pid)?;
     let current = current_process_identity()?;
-    let expected = std::env::current_exe()
-        .map_err(|_| LocalClientError::identity("server_image_unavailable"))?
-        .parent()
-        .map(|directory| directory.join(expected_server_sibling))
-        .ok_or_else(|| LocalClientError::identity("server_image_unavailable"))?;
-
     if server.user_sid != current.user_sid {
         return Err(LocalClientError::identity("server_sid_mismatch"));
     }
@@ -176,10 +203,12 @@ fn verify_fixed_agent_server(
     if server.integrity_rid < SECURITY_MANDATORY_HIGH_RID as u32 || !server.elevated {
         return Err(LocalClientError::identity("server_integrity_mismatch"));
     }
-    if !same_windows_path(&expected.to_string_lossy(), &server.image) {
+    if !same_windows_path(&expected_server_path.to_string_lossy(), &server.image) {
         return Err(LocalClientError::identity("server_image_mismatch"));
     }
-    verify_protected_program_files_path(Path::new(&server.image))?;
+    if require_nonwritable_server {
+        verify_protected_program_files_path(Path::new(&server.image))?;
+    }
     Ok(())
 }
 

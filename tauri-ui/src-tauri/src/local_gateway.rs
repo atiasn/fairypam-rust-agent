@@ -1,7 +1,4 @@
-use std::{
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use std::time::Duration;
 
 use fairypam_agent_local_client::LocalClientError;
 #[cfg(any(windows, test))]
@@ -56,7 +53,6 @@ pub struct ProductionGateway {
     #[cfg(windows)]
     pipe_name: &'static str,
     request_gate: Mutex<()>,
-    ui_lifetime_bound: AtomicBool,
 }
 
 impl ProductionGateway {
@@ -65,7 +61,6 @@ impl ProductionGateway {
         Self {
             pipe_name: DEFAULT_PIPE_NAME,
             request_gate: Mutex::new(()),
-            ui_lifetime_bound: AtomicBool::new(false),
         }
     }
 
@@ -73,7 +68,6 @@ impl ProductionGateway {
     pub fn new() -> Self {
         Self {
             request_gate: Mutex::new(()),
-            ui_lifetime_bound: AtomicBool::new(false),
         }
     }
 
@@ -135,32 +129,6 @@ impl ProductionGateway {
             status: self.request(LocalCommand::Status).await?,
             doctor: self.request(LocalCommand::Doctor).await?,
         })
-    }
-
-    pub async fn bind_ui_lifetime(&self) -> Result<(), UiCommandError> {
-        if self.ui_lifetime_bound.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        self.request::<serde_json::Value>(LocalCommand::BindUiLifetime)
-            .await?;
-        self.ui_lifetime_bound.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    pub(crate) fn clear_ui_lifetime_binding(&self) {
-        self.ui_lifetime_bound.store(false, Ordering::Release);
-    }
-
-    pub async fn shutdown_bound_agent(&self) -> Result<(), UiCommandError> {
-        if !self.ui_lifetime_bound.load(Ordering::Acquire) {
-            return Err(UiCommandError::unavailable(
-                "local.lifecycle.not_bound",
-                "the current GUI has not bound the FairyPam Agent",
-            ));
-        }
-        self.request::<serde_json::Value>(LocalCommand::ShutdownAgent)
-            .await
-            .map(|_| ())
     }
 
     #[cfg(windows)]

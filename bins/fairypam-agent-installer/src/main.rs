@@ -13,8 +13,19 @@ fn main() {
             let install_root = std::path::Path::new(&install_root);
             match command.to_string_lossy().as_ref() {
                 "--preflight" => preflight(install_root),
-                "--provision" => provision(install_root),
+                "--provision" => with_install_transaction(|| provision(install_root)),
                 "--installed-preflight" => installed_preflight(install_root),
+                "--run-agent-task" => with_install_transaction(|| {
+                    run_fixed_task(install_root, FixedTask::Agent, false)
+                }),
+                "--restart-agent-task" => with_install_transaction(|| {
+                    run_fixed_task(install_root, FixedTask::Agent, true)
+                }),
+                "--run-ui-task" => {
+                    with_install_transaction(|| run_fixed_task(install_root, FixedTask::Ui, false))
+                }
+                "--repair-tasks" => with_install_transaction(|| repair_fixed_tasks(install_root)),
+                "--remove-tasks" => with_install_transaction(|| remove_fixed_tasks(install_root)),
                 _ => Err(ProvisionFailure::InstallRoots),
             }
             .map_or_else(|failure| failure as i32, |_| 0)
@@ -59,6 +70,201 @@ enum ProvisionFailure {
     Audit = 8,
     Logs = 9,
     Rollback = 10,
+    Tasks = 11,
+    TaskMissing = 12,
+    TaskInvalid = 13,
+    TaskOperation = 14,
+    TaskRollback = 15,
+    Transaction = 16,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixedTask {
+    Agent,
+    Ui,
+}
+
+#[cfg(any(windows, test))]
+impl FixedTask {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Agent => "FairyPam Agent",
+            Self::Ui => "FairyPam Agent UI",
+        }
+    }
+
+    fn executable(self) -> &'static str {
+        match self {
+            Self::Agent => "fairypam-agent.exe",
+            Self::Ui => "fairypam-agent-tauri-ui.exe",
+        }
+    }
+
+    fn uri(self) -> &'static str {
+        match self {
+            Self::Agent => r"\FairyPam\Agent",
+            Self::Ui => r"\FairyPam\AgentUI",
+        }
+    }
+
+    fn run_level(self) -> &'static str {
+        match self {
+            Self::Agent => "HighestAvailable",
+            Self::Ui => "LeastPrivilege",
+        }
+    }
+
+    fn restart(self) -> &'static str {
+        match self {
+            Self::Agent => {
+                "<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>"
+            }
+            Self::Ui => "",
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskError {
+    Missing,
+    Invalid,
+    Operation,
+    Rollback,
+}
+
+#[cfg(windows)]
+struct FixedTaskBackup {
+    task: FixedTask,
+    xml: String,
+    security: String,
+    was_running: bool,
+}
+
+#[cfg(windows)]
+struct InstallTransaction(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl InstallTransaction {
+    fn acquire() -> Result<Self, ProvisionFailure> {
+        use windows::core::HSTRING;
+        use windows::Win32::{
+            Foundation::{CloseHandle, WAIT_ABANDONED_0, WAIT_OBJECT_0},
+            System::Threading::{CreateMutexW, WaitForSingleObject},
+        };
+
+        let handle = unsafe {
+            CreateMutexW(
+                None,
+                false,
+                &HSTRING::from(r"Global\FairyPam.Agent.InstallTransaction.v1"),
+            )
+        }
+        .map_err(|_| ProvisionFailure::Transaction)?;
+        let wait = unsafe { WaitForSingleObject(handle, 0) };
+        if !matches!(wait, WAIT_OBJECT_0 | WAIT_ABANDONED_0) {
+            let _ = unsafe { CloseHandle(handle) };
+            return Err(ProvisionFailure::Transaction);
+        }
+        Ok(Self(handle))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InstallTransaction {
+    fn drop(&mut self) {
+        use windows::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
+
+        let _ = unsafe { ReleaseMutex(self.0) };
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn with_install_transaction<T>(
+    operation: impl FnOnce() -> Result<T, ProvisionFailure>,
+) -> Result<T, ProvisionFailure> {
+    let _transaction = InstallTransaction::acquire()?;
+    operation()
+}
+
+#[cfg(any(windows, test))]
+fn fixed_task_security(user_sid: &str) -> String {
+    format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;{user_sid})")
+}
+
+#[cfg(any(windows, test))]
+fn fixed_task_xml(
+    install_root: &std::path::Path,
+    user_sid: &str,
+    task: FixedTask,
+) -> String {
+    let working_directory = install_root
+        .to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\");
+    let executable = xml_escape(&format!(r"{working_directory}\{}", task.executable()));
+    let working_directory = xml_escape(&working_directory);
+    let user_sid = xml_escape(user_sid);
+    let security = xml_escape(&fixed_task_security(&user_sid));
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <URI>{uri}</URI>
+    <SecurityDescriptor>{security}</SecurityDescriptor>
+    <Source>FairyPam Installer</Source>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user_sid}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user_sid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>{run_level}</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    {restart}
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{executable}</Command>
+      <WorkingDirectory>{working_directory}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>"#,
+        uri = task.uri(),
+        run_level = task.run_level(),
+        restart = task.restart(),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 #[cfg(windows)]
@@ -87,6 +293,14 @@ fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
             }
         }
     }
+    if let Err(error) = provision_fixed_tasks(install_root) {
+        let rollback_failed = rollback_directory_changes(&changes).is_err();
+        return if error == TaskError::Rollback || rollback_failed {
+            Err(ProvisionFailure::Rollback)
+        } else {
+            Err(ProvisionFailure::Tasks)
+        };
+    }
     Ok(())
 }
 
@@ -100,6 +314,638 @@ fn preflight(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
 fn installed_preflight(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
     verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)
+}
+
+#[cfg(windows)]
+fn repair_fixed_tasks(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
+    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    provision_fixed_tasks(install_root).map_err(|error| {
+        if error == TaskError::Rollback {
+            ProvisionFailure::TaskRollback
+        } else {
+            ProvisionFailure::Tasks
+        }
+    })
+}
+
+#[cfg(windows)]
+fn remove_fixed_tasks(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
+    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    task_user_sid().map_err(|_| ProvisionFailure::TaskOperation)?;
+    with_task_scheduler(|folder| delete_fixed_tasks(folder, install_root))
+        .map_err(|_| ProvisionFailure::TaskRollback)
+}
+
+#[cfg(windows)]
+struct ComApartment;
+
+#[cfg(windows)]
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
+}
+
+#[cfg(windows)]
+fn with_task_scheduler<T>(
+    operation: impl FnOnce(
+        &windows::Win32::System::TaskScheduler::ITaskFolder,
+    ) -> Result<T, TaskError>,
+) -> Result<T, TaskError> {
+    use windows::core::BSTR;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+    };
+    use windows::Win32::System::TaskScheduler::{ITaskService, TaskScheduler};
+    use windows::Win32::System::Variant::VARIANT;
+
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .map_err(|_| TaskError::Operation)?;
+    let _apartment = ComApartment;
+    let service: ITaskService =
+        unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|_| TaskError::Operation)?;
+    let empty = VARIANT::default();
+    unsafe { service.Connect(&empty, &empty, &empty, &empty) }
+        .map_err(|_| TaskError::Operation)?;
+    let folder = unsafe { service.GetFolder(&BSTR::from(r"\")) }
+        .map_err(|_| TaskError::Operation)?;
+    operation(&folder)
+}
+
+#[cfg(windows)]
+fn provision_fixed_tasks(install_root: &std::path::Path) -> Result<(), TaskError> {
+    use windows::Win32::System::Variant::VARIANT;
+
+    let user_sid = task_user_sid().map_err(|_| TaskError::Operation)?;
+    with_task_scheduler(|folder| {
+        let backups = capture_fixed_tasks(folder)?;
+        let result = (|| {
+            let mut agent = None;
+            for task in [FixedTask::Agent, FixedTask::Ui] {
+                register_fixed_task(folder, install_root, &user_sid, task)?;
+                let registered = validate_fixed_task(folder, install_root, &user_sid, task)?;
+                if task == FixedTask::Agent {
+                    agent = Some(registered);
+                }
+            }
+            unsafe {
+                agent
+                    .ok_or(TaskError::Operation)?
+                    .Run(&VARIANT::default())
+            }
+            .map_err(|_| TaskError::Operation)?;
+            Ok(())
+        })();
+        if result.is_err() && restore_fixed_tasks(folder, &backups).is_err() {
+            return Err(TaskError::Rollback);
+        }
+        result
+    })
+}
+
+#[cfg(windows)]
+fn capture_fixed_tasks(
+    folder: &windows::Win32::System::TaskScheduler::ITaskFolder,
+) -> Result<Vec<Option<FixedTaskBackup>>, TaskError> {
+    use windows::core::BSTR;
+    use windows::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
+    use windows::Win32::System::TaskScheduler::{TASK_STATE_QUEUED, TASK_STATE_RUNNING};
+
+    let security_information =
+        (OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION).0 as i32;
+    [FixedTask::Agent, FixedTask::Ui]
+        .into_iter()
+        .map(
+            |task| match unsafe { folder.GetTask(&BSTR::from(task.name())) } {
+                Ok(registered) => Ok(Some(FixedTaskBackup {
+                    task,
+                    xml: unsafe { registered.Xml() }
+                        .map_err(|_| TaskError::Operation)?
+                        .to_string(),
+                    security: unsafe {
+                        registered.GetSecurityDescriptor(security_information)
+                    }
+                    .map_err(|_| TaskError::Operation)?
+                    .to_string(),
+                    was_running: matches!(
+                        unsafe { registered.State() }.map_err(|_| TaskError::Operation)?,
+                        TASK_STATE_RUNNING | TASK_STATE_QUEUED
+                    ),
+                })),
+                Err(error) if is_task_missing(&error) => Ok(None),
+                Err(_) => Err(TaskError::Operation),
+            },
+        )
+        .collect()
+}
+
+#[cfg(windows)]
+fn restore_fixed_tasks(
+    folder: &windows::Win32::System::TaskScheduler::ITaskFolder,
+    backups: &[Option<FixedTaskBackup>],
+) -> Result<(), TaskError> {
+    use windows::core::BSTR;
+    use windows::Win32::System::TaskScheduler::{
+        TASK_CREATE_OR_UPDATE, TASK_DONT_ADD_PRINCIPAL_ACE, TASK_LOGON_INTERACTIVE_TOKEN,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+
+    let mut failed = false;
+    for task in [FixedTask::Ui, FixedTask::Agent] {
+        if let Ok(registered) = unsafe { folder.GetTask(&BSTR::from(task.name())) } {
+            let _ = unsafe { registered.Stop(0) };
+        }
+        if let Err(error) = unsafe { folder.DeleteTask(&BSTR::from(task.name()), 0) } {
+            failed |= !is_task_missing(&error);
+        }
+    }
+    let empty = VARIANT::default();
+    for backup in backups.iter().flatten() {
+        let restored = unsafe {
+            folder.RegisterTask(
+                &BSTR::from(backup.task.name()),
+                &BSTR::from(&backup.xml),
+                TASK_CREATE_OR_UPDATE.0 | TASK_DONT_ADD_PRINCIPAL_ACE.0,
+                &empty,
+                &empty,
+                TASK_LOGON_INTERACTIVE_TOKEN,
+                &empty,
+            )
+        };
+        let Ok(restored) = restored else {
+            failed = true;
+            continue;
+        };
+        if unsafe {
+            restored.SetSecurityDescriptor(
+                &BSTR::from(&backup.security),
+                TASK_DONT_ADD_PRINCIPAL_ACE.0,
+            )
+        }
+        .is_err()
+        {
+            failed = true;
+            continue;
+        }
+        if backup.was_running
+            && unsafe { restored.Run(&VARIANT::default()) }.is_err()
+        {
+            failed = true;
+        }
+    }
+    (!failed).then_some(()).ok_or(TaskError::Rollback)
+}
+
+#[cfg(windows)]
+fn register_fixed_task(
+    folder: &windows::Win32::System::TaskScheduler::ITaskFolder,
+    install_root: &std::path::Path,
+    user_sid: &str,
+    task: FixedTask,
+) -> Result<(), TaskError> {
+    use windows::core::BSTR;
+    use windows::Win32::System::TaskScheduler::{
+        TASK_CREATE_OR_UPDATE, TASK_DONT_ADD_PRINCIPAL_ACE, TASK_LOGON_INTERACTIVE_TOKEN,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+
+    let empty = VARIANT::default();
+    let registered = unsafe {
+        folder.RegisterTask(
+            &BSTR::from(task.name()),
+            &BSTR::from(fixed_task_xml(install_root, user_sid, task)),
+            TASK_CREATE_OR_UPDATE.0 | TASK_DONT_ADD_PRINCIPAL_ACE.0,
+            &empty,
+            &empty,
+            TASK_LOGON_INTERACTIVE_TOKEN,
+            &empty,
+        )
+    }
+    .map_err(|_| TaskError::Operation)?;
+    unsafe {
+        registered.SetSecurityDescriptor(
+            &BSTR::from(fixed_task_security(user_sid)),
+            TASK_DONT_ADD_PRINCIPAL_ACE.0,
+        )
+    }
+    .map_err(|_| TaskError::Operation)
+}
+
+#[cfg(windows)]
+fn validate_fixed_task(
+    folder: &windows::Win32::System::TaskScheduler::ITaskFolder,
+    install_root: &std::path::Path,
+    user_sid: &str,
+    task: FixedTask,
+) -> Result<windows::Win32::System::TaskScheduler::IRegisteredTask, TaskError> {
+    use windows::core::{BSTR, Interface};
+    use windows::Win32::Foundation::VARIANT_BOOL;
+    use windows::Win32::Security::DACL_SECURITY_INFORMATION;
+    use windows::Win32::System::TaskScheduler::{
+        IExecAction, ILogonTrigger, TASK_INSTANCES_IGNORE_NEW, TASK_LOGON_INTERACTIVE_TOKEN,
+        TASK_RUNLEVEL_HIGHEST, TASK_RUNLEVEL_LUA,
+    };
+
+    let registered = unsafe { folder.GetTask(&BSTR::from(task.name())) }.map_err(|error| {
+        if is_task_missing(&error) {
+            TaskError::Missing
+        } else {
+            TaskError::Operation
+        }
+    })?;
+    if !unsafe { registered.Enabled() }
+        .map_err(|_| TaskError::Operation)?
+        .as_bool()
+    {
+        return Err(TaskError::Invalid);
+    }
+
+    let definition = unsafe { registered.Definition() }.map_err(|_| TaskError::Operation)?;
+    let registration =
+        unsafe { definition.RegistrationInfo() }.map_err(|_| TaskError::Operation)?;
+    let mut uri = BSTR::default();
+    let mut source = BSTR::default();
+    unsafe { registration.URI(&mut uri) }.map_err(|_| TaskError::Operation)?;
+    unsafe { registration.Source(&mut source) }.map_err(|_| TaskError::Operation)?;
+    if uri.to_string() != task.uri() || source.to_string() != "FairyPam Installer" {
+        return Err(TaskError::Invalid);
+    }
+
+    let principal = unsafe { definition.Principal() }.map_err(|_| TaskError::Operation)?;
+    let mut principal_user = BSTR::default();
+    let mut logon = Default::default();
+    let mut run_level = Default::default();
+    unsafe { principal.UserId(&mut principal_user) }.map_err(|_| TaskError::Operation)?;
+    unsafe { principal.LogonType(&mut logon) }.map_err(|_| TaskError::Operation)?;
+    unsafe { principal.RunLevel(&mut run_level) }.map_err(|_| TaskError::Operation)?;
+    let expected_run_level = if task == FixedTask::Agent {
+        TASK_RUNLEVEL_HIGHEST
+    } else {
+        TASK_RUNLEVEL_LUA
+    };
+    if principal_user.to_string() != user_sid
+        || logon != TASK_LOGON_INTERACTIVE_TOKEN
+        || run_level != expected_run_level
+    {
+        return Err(TaskError::Invalid);
+    }
+
+    let settings = unsafe { definition.Settings() }.map_err(|_| TaskError::Operation)?;
+    let mut allow_demand = VARIANT_BOOL::default();
+    let mut enabled = VARIANT_BOOL::default();
+    let mut instances = Default::default();
+    let mut restart_count = 0;
+    let mut restart_interval = BSTR::default();
+    unsafe { settings.AllowDemandStart(&mut allow_demand) }
+        .map_err(|_| TaskError::Operation)?;
+    unsafe { settings.Enabled(&mut enabled) }.map_err(|_| TaskError::Operation)?;
+    unsafe { settings.MultipleInstances(&mut instances) }.map_err(|_| TaskError::Operation)?;
+    unsafe { settings.RestartCount(&mut restart_count) }.map_err(|_| TaskError::Operation)?;
+    unsafe { settings.RestartInterval(&mut restart_interval) }
+        .map_err(|_| TaskError::Operation)?;
+    let restart_is_valid = match task {
+        FixedTask::Agent => restart_count == 3 && restart_interval.to_string() == "PT1M",
+        FixedTask::Ui => restart_count == 0,
+    };
+    if !allow_demand.as_bool()
+        || !enabled.as_bool()
+        || instances != TASK_INSTANCES_IGNORE_NEW
+        || !restart_is_valid
+    {
+        return Err(TaskError::Invalid);
+    }
+
+    let triggers = unsafe { definition.Triggers() }.map_err(|_| TaskError::Operation)?;
+    let mut trigger_count = 0;
+    unsafe { triggers.Count(&mut trigger_count) }.map_err(|_| TaskError::Operation)?;
+    if trigger_count != 1 {
+        return Err(TaskError::Invalid);
+    }
+    let trigger: ILogonTrigger = unsafe { triggers.get_Item(1) }
+        .and_then(|trigger| trigger.cast())
+        .map_err(|_| TaskError::Invalid)?;
+    let mut trigger_user = BSTR::default();
+    let mut trigger_delay = BSTR::default();
+    let mut trigger_enabled = VARIANT_BOOL::default();
+    unsafe { trigger.UserId(&mut trigger_user) }.map_err(|_| TaskError::Operation)?;
+    unsafe { trigger.Delay(&mut trigger_delay) }.map_err(|_| TaskError::Operation)?;
+    unsafe { trigger.Enabled(&mut trigger_enabled) }.map_err(|_| TaskError::Operation)?;
+    if trigger_user.to_string() != user_sid
+        || !trigger_delay.is_empty()
+        || !trigger_enabled.as_bool()
+    {
+        return Err(TaskError::Invalid);
+    }
+
+    let actions = unsafe { definition.Actions() }.map_err(|_| TaskError::Operation)?;
+    let mut action_count = 0;
+    unsafe { actions.Count(&mut action_count) }.map_err(|_| TaskError::Operation)?;
+    if action_count != 1 {
+        return Err(TaskError::Invalid);
+    }
+    let action: IExecAction = unsafe { actions.get_Item(1) }
+        .and_then(|action| action.cast())
+        .map_err(|_| TaskError::Invalid)?;
+    let mut path = BSTR::default();
+    let mut arguments = BSTR::default();
+    let mut working_directory = BSTR::default();
+    unsafe { action.Path(&mut path) }.map_err(|_| TaskError::Operation)?;
+    unsafe { action.Arguments(&mut arguments) }.map_err(|_| TaskError::Operation)?;
+    unsafe { action.WorkingDirectory(&mut working_directory) }
+        .map_err(|_| TaskError::Operation)?;
+    if !same_windows_path(
+        std::path::Path::new(&path.to_string()),
+        &install_root.join(task.executable()),
+    ) || !arguments.is_empty()
+        || !same_windows_path(
+            std::path::Path::new(&working_directory.to_string()),
+            install_root,
+        )
+    {
+        return Err(TaskError::Invalid);
+    }
+
+    let security_information = DACL_SECURITY_INFORMATION.0 as i32;
+    let actual_security = unsafe { registered.GetSecurityDescriptor(security_information) }
+        .map_err(|_| TaskError::Operation)?;
+    if canonical_task_security_sddl(&actual_security.to_string())?
+        != canonical_task_security_sddl(&fixed_task_security(user_sid))?
+    {
+        return Err(TaskError::Invalid);
+    }
+    Ok(registered)
+}
+
+#[cfg(windows)]
+fn canonical_task_security_sddl(value: &str) -> Result<String, TaskError> {
+    use windows::Win32::Security::DACL_SECURITY_INFORMATION;
+
+    let information = DACL_SECURITY_INFORMATION;
+    with_security_descriptor(value, |descriptor| {
+        security_descriptor_sddl(descriptor, information)
+    })
+    .map_err(|_| TaskError::Invalid)
+}
+
+#[cfg(windows)]
+fn run_fixed_task(
+    install_root: &std::path::Path,
+    task: FixedTask,
+    restart: bool,
+) -> Result<(), ProvisionFailure> {
+    use windows::Win32::System::TaskScheduler::{TASK_STATE_QUEUED, TASK_STATE_RUNNING};
+    use windows::Win32::System::Variant::VARIANT;
+
+    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    let user_sid = task_user_sid().map_err(|_| ProvisionFailure::TaskOperation)?;
+    with_task_scheduler(|folder| {
+        let registered = validate_fixed_task(folder, install_root, &user_sid, task)?;
+        let state = unsafe { registered.State() }.map_err(|_| TaskError::Operation)?;
+        if restart && matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
+            unsafe { registered.Stop(0) }.map_err(|_| TaskError::Operation)?;
+            for _ in 0..50 {
+                let state = unsafe { registered.State() }.map_err(|_| TaskError::Operation)?;
+                if !matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let state = unsafe { registered.State() }.map_err(|_| TaskError::Operation)?;
+            if matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
+                return Err(TaskError::Operation);
+            }
+        } else if matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
+            return Ok(());
+        }
+        unsafe { registered.Run(&VARIANT::default()) }
+            .map(|_| ())
+            .map_err(|_| TaskError::Operation)
+    })
+    .map_err(|error| match error {
+        TaskError::Missing => ProvisionFailure::TaskMissing,
+        TaskError::Invalid => ProvisionFailure::TaskInvalid,
+        TaskError::Operation => ProvisionFailure::TaskOperation,
+        TaskError::Rollback => ProvisionFailure::TaskRollback,
+    })
+}
+
+#[cfg(windows)]
+fn delete_fixed_tasks(
+    folder: &windows::Win32::System::TaskScheduler::ITaskFolder,
+    install_root: &std::path::Path,
+) -> Result<(), TaskError> {
+    use windows::core::BSTR;
+    use windows::Win32::Foundation::VARIANT_BOOL;
+    use windows::Win32::System::TaskScheduler::{TASK_STATE_QUEUED, TASK_STATE_RUNNING};
+
+    let backups = capture_fixed_tasks(folder)?;
+    let result = (|| {
+        let mut registered_tasks = Vec::new();
+        for task in [FixedTask::Ui, FixedTask::Agent] {
+            match unsafe { folder.GetTask(&BSTR::from(task.name())) } {
+                Ok(registered) => {
+                    unsafe { registered.SetEnabled(VARIANT_BOOL(0)) }
+                        .map_err(|_| TaskError::Rollback)?;
+                    registered_tasks.push((task, registered));
+                }
+                Err(error) if is_task_missing(&error) => {}
+                Err(_) => return Err(TaskError::Rollback),
+            }
+        }
+        if agent_process_is_running(install_root)? {
+            request_agent_maintenance_shutdown(install_root)?;
+            let agent = registered_tasks
+                .iter()
+                .find(|(task, _)| *task == FixedTask::Agent)
+                .map(|(_, registered)| registered)
+                .ok_or(TaskError::Rollback)?;
+            for _ in 0..100 {
+                let state = unsafe { agent.State() }.map_err(|_| TaskError::Rollback)?;
+                if !matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let state = unsafe { agent.State() }.map_err(|_| TaskError::Rollback)?;
+            let result = unsafe { agent.LastTaskResult() }.map_err(|_| TaskError::Rollback)?;
+            if matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) || result != 0 {
+                return Err(TaskError::Rollback);
+            }
+        }
+        for (_, registered) in &registered_tasks {
+            let state = unsafe { registered.State() }.map_err(|_| TaskError::Rollback)?;
+            if matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
+                unsafe { registered.Stop(0) }.map_err(|_| TaskError::Rollback)?;
+            }
+        }
+        for (_, registered) in &registered_tasks {
+            for _ in 0..50 {
+                let state = unsafe { registered.State() }.map_err(|_| TaskError::Rollback)?;
+                if !matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let state = unsafe { registered.State() }.map_err(|_| TaskError::Rollback)?;
+            if matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
+                return Err(TaskError::Rollback);
+            }
+        }
+        wait_for_agent_processes_to_exit(install_root)?;
+        for (task, _) in registered_tasks {
+            if let Err(error) = unsafe { folder.DeleteTask(&BSTR::from(task.name()), 0) } {
+                if !is_task_missing(&error) {
+                    return Err(TaskError::Rollback);
+                }
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() && restore_fixed_tasks(folder, &backups).is_err() {
+        return Err(TaskError::Rollback);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn request_agent_maintenance_shutdown(
+    install_root: &std::path::Path,
+) -> Result<(), TaskError> {
+    use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
+    use fairypam_agent_local_protocol::LocalCommand;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|_| TaskError::Rollback)?;
+    let mut client = LocalClient::new(
+        WindowsNamedPipeClientTransport::new_verified_maintenance_path(
+            r"\\.\pipe\FairyPam.Agent.v1",
+            install_root.join("fairypam-agent.exe"),
+        ),
+    );
+    // The Agent cancels its Pipe server while replying. Task state and the
+    // process exit code below are the authoritative cleanup receipt.
+    let _ = runtime.block_on(client.request(
+        LocalCommand::ShutdownAgent,
+        std::time::Duration::from_secs(5),
+    ));
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_agent_processes_to_exit(
+    install_root: &std::path::Path,
+) -> Result<(), TaskError> {
+    for _ in 0..100 {
+        if !agent_process_is_running(install_root)? {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(TaskError::Rollback)
+}
+
+#[cfg(windows)]
+fn agent_process_is_running(install_root: &std::path::Path) -> Result<bool, TaskError> {
+    use windows::core::PWSTR;
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+        System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|_| TaskError::Rollback)?;
+    let result = (|| {
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if let Err(error) = unsafe { Process32FirstW(snapshot, &mut entry) } {
+            return if is_no_more_files(&error) {
+                Ok(false)
+            } else {
+                Err(TaskError::Rollback)
+            };
+        }
+        loop {
+            let length = entry
+                .szExeFile
+                .iter()
+                .position(|character| *character == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let executable = String::from_utf16_lossy(&entry.szExeFile[..length]);
+            let expected = if executable.eq_ignore_ascii_case("fairypam-agent.exe") {
+                Some(install_root.join("fairypam-agent.exe"))
+            } else if executable.eq_ignore_ascii_case("fairypam-agent-guardian.exe") {
+                Some(install_root.join("fairypam-agent-guardian.exe"))
+            } else {
+                None
+            };
+            if let Some(expected) = expected {
+                let process = match unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION,
+                        false,
+                        entry.th32ProcessID,
+                    )
+                } {
+                    Ok(process) => process,
+                    Err(error) if error.code().0 as u32 == 0x8007_0057 => {
+                        continue;
+                    }
+                    Err(_) => return Err(TaskError::Rollback),
+                };
+                let mut image = vec![0_u16; 32_768];
+                let mut image_length = image.len() as u32;
+                let query = unsafe {
+                    QueryFullProcessImageNameW(
+                        process,
+                        PROCESS_NAME_WIN32,
+                        PWSTR(image.as_mut_ptr()),
+                        &mut image_length,
+                    )
+                };
+                let _ = unsafe { CloseHandle(process) };
+                query.map_err(|_| TaskError::Rollback)?;
+                let image = String::from_utf16_lossy(&image[..image_length as usize]);
+                if same_windows_path(std::path::Path::new(&image), &expected) {
+                    return Ok(true);
+                }
+            }
+            if let Err(error) = unsafe { Process32NextW(snapshot, &mut entry) } {
+                return if is_no_more_files(&error) {
+                    Ok(false)
+                } else {
+                    Err(TaskError::Rollback)
+                };
+            }
+        }
+    })();
+    let _ = unsafe { CloseHandle(snapshot) };
+    result
+}
+
+#[cfg(windows)]
+fn is_no_more_files(error: &windows::core::Error) -> bool {
+    error.code().0 as u32 == 0x8007_0012
+}
+
+#[cfg(windows)]
+fn is_task_missing(error: &windows::core::Error) -> bool {
+    matches!(error.code().0 as u32, 0x8007_0002 | 0x8004_130f)
 }
 
 #[cfg(windows)]
@@ -418,7 +1264,7 @@ fn private_security_sddl(value: &str) -> Result<(), ()> {
 
 #[cfg(windows)]
 fn legacy_directory_security(value: &str) -> Result<(), ()> {
-    let user_sid = current_user_sid()?;
+    let user_sid = task_user_sid()?;
     let actual = canonical_directory_security_sddl(value)?;
     for expected in legacy_directory_security_variants(&user_sid) {
         if canonical_directory_security_sddl(&expected)? == actual {
@@ -448,7 +1294,106 @@ fn canonical_directory_security_sddl(value: &str) -> Result<String, ()> {
 }
 
 #[cfg(windows)]
-fn current_user_sid() -> Result<String, ()> {
+fn task_user_sid() -> Result<String, ()> {
+    validated_task_user_sid(interactive_session_user_sid()?, process_user_sid()?)
+}
+
+fn validated_task_user_sid(interactive_sid: String, process_sid: String) -> Result<String, ()> {
+    (interactive_sid == process_sid)
+        .then_some(interactive_sid)
+        .ok_or(())
+}
+
+#[cfg(windows)]
+fn interactive_session_user_sid() -> Result<String, ()> {
+    use windows::core::{HSTRING, PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{LookupAccountNameW, PSID, SID_NAME_USE};
+    use windows::Win32::System::RemoteDesktop::{
+        ProcessIdToSessionId, WTSDomainName, WTSUserName,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+
+    fn session_value(
+        session_id: u32,
+        class: windows::Win32::System::RemoteDesktop::WTS_INFO_CLASS,
+    ) -> Result<String, ()> {
+        use windows::core::PWSTR;
+        use windows::Win32::System::RemoteDesktop::{
+            WTSFreeMemory, WTSQuerySessionInformationW, WTS_CURRENT_SERVER_HANDLE,
+        };
+
+        let mut buffer = PWSTR::null();
+        let mut bytes = 0;
+        unsafe {
+            WTSQuerySessionInformationW(
+                Some(WTS_CURRENT_SERVER_HANDLE),
+                session_id,
+                class,
+                &mut buffer,
+                &mut bytes,
+            )
+        }
+        .map_err(|_| ())?;
+        let result = unsafe { buffer.to_string().map_err(|_| ()) };
+        unsafe { WTSFreeMemory(buffer.0.cast()) };
+        result
+    }
+
+    let mut session_id = 0;
+    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) }.map_err(|_| ())?;
+    let user = session_value(session_id, WTSUserName)?;
+    if user.is_empty() {
+        return Err(());
+    }
+    let domain = session_value(session_id, WTSDomainName)?;
+    let account = if domain.is_empty() {
+        user
+    } else {
+        format!(r"{domain}\{user}")
+    };
+    let account = HSTRING::from(account);
+    let mut sid_bytes = 0;
+    let mut domain_characters = 0;
+    let mut sid_type = SID_NAME_USE::default();
+    let _ = unsafe {
+        LookupAccountNameW(
+            PCWSTR::null(),
+            &account,
+            None,
+            &mut sid_bytes,
+            None,
+            &mut domain_characters,
+            &mut sid_type,
+        )
+    };
+    if sid_bytes == 0 {
+        return Err(());
+    }
+    let mut sid = vec![0_u8; sid_bytes as usize];
+    let mut referenced_domain = vec![0_u16; domain_characters.max(1) as usize];
+    unsafe {
+        LookupAccountNameW(
+            PCWSTR::null(),
+            &account,
+            Some(PSID(sid.as_mut_ptr().cast())),
+            &mut sid_bytes,
+            Some(PWSTR(referenced_domain.as_mut_ptr())),
+            &mut domain_characters,
+            &mut sid_type,
+        )
+    }
+    .map_err(|_| ())?;
+    let mut text = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(PSID(sid.as_mut_ptr().cast()), &mut text) }.map_err(|_| ())?;
+    let result = unsafe { text.to_string().map_err(|_| ()) };
+    let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+    result
+}
+
+#[cfg(windows)]
+fn process_user_sid() -> Result<String, ()> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -810,6 +1755,41 @@ mod tests {
     }
 
     #[test]
+    fn fixed_tasks_are_single_instance_logon_tasks_with_bounded_agent_restart() {
+        let root = std::path::Path::new(r"C:\Program Files\FairyPam");
+        let sid = "S-1-5-21-1-2-3-1001";
+        let agent = fixed_task_xml(root, sid, FixedTask::Agent);
+        let ui = fixed_task_xml(root, sid, FixedTask::Ui);
+
+        for xml in [&agent, &ui] {
+            assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+            assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+            assert!(xml.contains("<LogonTrigger>"));
+            assert!(xml.contains(&fixed_task_security(sid)));
+        }
+        assert!(agent.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(agent.contains("<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count>"));
+        assert!(agent.contains(r"C:\Program Files\FairyPam\fairypam-agent.exe"));
+        assert!(ui.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(!ui.contains("<RestartOnFailure>"));
+        assert!(ui.contains(r"C:\Program Files\FairyPam\fairypam-agent-tauri-ui.exe"));
+    }
+
+    #[test]
+    fn fixed_tasks_reject_over_the_shoulder_admin_credentials() {
+        let interactive = "S-1-5-21-1-2-3-1001".to_owned();
+        assert_eq!(
+            validated_task_user_sid(interactive.clone(), interactive.clone()),
+            Ok(interactive)
+        );
+        assert!(validated_task_user_sid(
+            "S-1-5-21-1-2-3-1001".to_owned(),
+            "S-1-5-21-1-2-3-500".to_owned(),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn private_state_acl_accepts_only_the_exact_protected_shapes() {
         for allowed in [
             "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)",
@@ -832,7 +1812,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn legacy_state_acl_validator_preserves_the_exact_windows_boundary() {
-        let user_sid = current_user_sid().unwrap();
+        let user_sid = task_user_sid().unwrap();
         for allowed in legacy_directory_security_variants(&user_sid) {
             assert!(legacy_directory_security(&allowed).is_ok());
         }

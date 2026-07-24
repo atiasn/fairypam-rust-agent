@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuiExitReason {
     ExplicitShutdown,
+    MaintenanceShutdown,
     ProcessExited,
     WatcherFailed,
 }
@@ -40,6 +41,11 @@ impl LifecycleState {
         self.require_bound_pid(pid)?;
         self.exit_reason = Some(GuiExitReason::ExplicitShutdown);
         Ok(GuiExitReason::ExplicitShutdown)
+    }
+
+    pub fn request_maintenance_shutdown(&mut self) -> GuiExitReason {
+        self.exit_reason = Some(GuiExitReason::MaintenanceShutdown);
+        GuiExitReason::MaintenanceShutdown
     }
 
     pub fn process_exited(&mut self, pid: u32) {
@@ -121,6 +127,16 @@ impl GuiLifetime {
             .lock()
             .map_err(lock_error)?
             .request_shutdown(pid)?;
+        self.shutdown.cancel();
+        Ok(reason)
+    }
+
+    pub fn request_maintenance_shutdown(&self) -> Result<GuiExitReason, AgentError> {
+        let reason = self
+            .state
+            .lock()
+            .map_err(lock_error)?
+            .request_maintenance_shutdown();
         self.shutdown.cancel();
         Ok(reason)
     }

@@ -172,6 +172,14 @@ impl LocalIdentityError {
     }
 
     #[cfg(windows)]
+    fn installer_image_mismatch() -> Self {
+        Self::new(
+            "local.identity.installer_image_mismatch",
+            "Agent maintenance requires the fixed FairyPam installer helper",
+        )
+    }
+
+    #[cfg(windows)]
     fn install_root_mismatch() -> Self {
         Self::new(
             "local.identity.install_root_mismatch",
@@ -252,6 +260,37 @@ pub fn verify_fixed_gui_caller(pid: u32) -> Result<(), LocalIdentityError> {
         }
         if !protected_program_files_path(&image, process)? {
             return Err(LocalIdentityError::install_root_mismatch());
+        }
+        Ok(())
+    })();
+    let _ = unsafe { CloseHandle(process) };
+    result
+}
+
+#[cfg(windows)]
+pub fn verify_fixed_installer_caller(pid: u32) -> Result<(), LocalIdentityError> {
+    if pid == 0 {
+        return Err(LocalIdentityError::invalid_handle());
+    }
+    let agent =
+        std::env::current_exe().map_err(|_| LocalIdentityError::installer_image_mismatch())?;
+    let expected = agent
+        .parent()
+        .map(|directory| {
+            directory
+                .join("resources")
+                .join("runtime")
+                .join("fairypam-agent-installer.exe")
+        })
+        .ok_or_else(LocalIdentityError::installer_image_mismatch)?;
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(windows_identity_error)?;
+    let result = (|| {
+        let image = process_image(process)?;
+        if crate::normalize_process_path(&expected.to_string_lossy())
+            != crate::normalize_process_path(&image)
+        {
+            return Err(LocalIdentityError::installer_image_mismatch());
         }
         Ok(())
     })();

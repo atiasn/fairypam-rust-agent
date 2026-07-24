@@ -6,6 +6,8 @@ import { expect, it, vi } from 'vitest';
 vi.mock('./lib/agentApi', () => ({
   agentApi: {
     ensureLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
+    restartLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
+    repairAgentTasks: vi.fn().mockResolvedValue({ status: 'ready' }),
     getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false }, doctor: { profiles: [], runtime: 'dry_run' } }),
     getConnectionStatus: vi.fn().mockResolvedValue({ control: 'offline', frame: 'offline', capture_active: false }),
     runEnvironmentCheck: vi.fn().mockResolvedValue({ registration_ready: true, registration_pending: false, checks: [] }),

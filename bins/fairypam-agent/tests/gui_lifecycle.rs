@@ -65,6 +65,18 @@ fn gui_lifetime_cancels_the_shared_shutdown_signal() {
 }
 
 #[test]
+fn installer_maintenance_shutdown_does_not_require_a_gui_binding() {
+    let shutdown = CancellationToken::new();
+    let lifecycle = GuiLifetime::new(shutdown.clone());
+
+    assert_eq!(
+        lifecycle.request_maintenance_shutdown().unwrap(),
+        GuiExitReason::MaintenanceShutdown
+    );
+    assert!(shutdown.is_cancelled());
+}
+
+#[test]
 fn watcher_setup_failure_cancels_shutdown_with_a_cleanup_reason() {
     let shutdown = CancellationToken::new();
     let lifecycle = GuiLifetime::new_with_watcher(shutdown.clone(), move |_| {

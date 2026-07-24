@@ -5,7 +5,7 @@ use fairypam_agent_local_protocol::{
     LocalCommand, LocalError, LocalResponse, NonceReplayGuard, RequestEnvelope, ResponseEnvelope,
 };
 #[cfg(windows)]
-use fairypam_agent_windows::verify_fixed_gui_caller;
+use fairypam_agent_windows::{verify_fixed_gui_caller, verify_fixed_installer_caller};
 use fairypam_agent_windows::{
     verify_pipe_caller, LocalIdentityError, PipeOwner, VerifiedPipeCaller,
 };
@@ -90,6 +90,20 @@ impl<R: LocalControlRuntime, A: AuditSink> LocalControlAdapter<R, A> {
                     request_id: request.request_id.clone(),
                     caller_sid_hash: sha256_hex(&caller.user_sid),
                     command: "register_hub".to_owned(),
+                    result_code: error.code().to_owned(),
+                    build_id: self.build_id.clone(),
+                    occurred_at: SystemTime::now(),
+                });
+                return Err(error);
+            }
+        }
+        #[cfg(windows)]
+        if matches!(&request.command, LocalCommand::ShutdownAgent) {
+            if let Err(error) = verify_fixed_installer_caller(caller.pid) {
+                let _ = self.audit.record(AuditEvent {
+                    request_id: request.request_id.clone(),
+                    caller_sid_hash: sha256_hex(&caller.user_sid),
+                    command: "shutdown_agent".to_owned(),
                     result_code: error.code().to_owned(),
                     build_id: self.build_id.clone(),
                     occurred_at: SystemTime::now(),
@@ -254,9 +268,7 @@ fn command_name(command: &LocalCommand) -> &'static str {
 fn requires_fixed_gui(command: &LocalCommand) -> bool {
     matches!(
         command,
-        LocalCommand::RegisterHub { .. }
-            | LocalCommand::BindUiLifetime
-            | LocalCommand::ShutdownAgent
+        LocalCommand::RegisterHub { .. } | LocalCommand::BindUiLifetime
     )
 }
 
