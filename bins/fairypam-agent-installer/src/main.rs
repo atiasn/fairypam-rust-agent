@@ -703,7 +703,7 @@ fn validate_fixed_task(
     if !same_windows_path(
         std::path::Path::new(&path.to_string()),
         &install_root.join(task.executable()),
-    ) || arguments.to_string() != task.arguments(install_root)
+    ) || arguments != task.arguments(install_root)
         || !same_windows_path(
             std::path::Path::new(&working_directory.to_string()),
             install_root,
