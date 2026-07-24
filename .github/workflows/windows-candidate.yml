@@ -333,11 +333,28 @@ jobs:
             $replacement = @($agents | Where-Object { $_.Id -ne $originalPid })
           } while ($replacement.Count -ne 1 -and [DateTime]::UtcNow -lt $deadline)
           if ($agents.Count -ne 1 -or $replacement.Count -ne 1) {
-            throw "Task Scheduler did not recover exactly one Agent after forced termination"
+            throw "fixed task helper did not recover exactly one Agent after forced termination"
+          }
+          $replacementProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($replacement[0].Id)"
+          if ($replacementProcess.ParentProcessId -ne $launcherProcess.ProcessId) {
+            throw "recovered Agent did not reuse the fixed task helper"
           }
           $task = Get-ScheduledTask -TaskName 'FairyPam Agent'
           if ($task.State -ne 'Running') {
             throw "recovered Agent task is not running: $($task.State)"
+          }
+
+          $recoveredPid = $replacement[0].Id
+          & 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe' --restart-agent-task 'C:\Program Files\FairyPam'
+          if ($LASTEXITCODE -ne 0) { throw "controlled Agent task restart failed: $LASTEXITCODE" }
+          $deadline = [DateTime]::UtcNow.AddSeconds(30)
+          do {
+            Start-Sleep -Seconds 1
+            $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
+            $restarted = @($agents | Where-Object { $_.Id -ne $recoveredPid })
+          } while (($agents.Count -ne 1 -or $restarted.Count -ne 1) -and [DateTime]::UtcNow -lt $deadline)
+          if ($agents.Count -ne 1 -or $restarted.Count -ne 1) {
+            throw "controlled restart did not produce exactly one replacement Agent"
           }
 
       - name: Smoke trusted NSIS product reinstall

@@ -83,7 +83,13 @@ enum ProvisionFailure {
     TaskInvalidTrigger = 19,
     TaskInvalidAction = 20,
     TaskInvalidSecurity = 21,
+    AgentRestartExhausted = 22,
 }
+
+#[cfg(any(windows, test))]
+const AGENT_RESTART_COUNT: usize = 3;
+#[cfg(any(windows, test))]
+const AGENT_RESTART_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,15 +135,6 @@ impl FixedTask {
         match self {
             Self::Agent => "HighestAvailable",
             Self::Ui => "LeastPrivilege",
-        }
-    }
-
-    fn restart(self) -> &'static str {
-        match self {
-            Self::Agent => {
-                "<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>"
-            }
-            Self::Ui => "",
         }
     }
 }
@@ -291,7 +288,6 @@ fn fixed_task_xml(install_root: &std::path::Path, user_sid: &str, task: FixedTas
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    {restart}
   </Settings>
   <Actions Context="Author">
     <Exec>
@@ -303,7 +299,6 @@ fn fixed_task_xml(install_root: &std::path::Path, user_sid: &str, task: FixedTas
 </Task>"#,
         uri = task.uri(),
         run_level = task.run_level(),
-        restart = task.restart(),
     )
 }
 
@@ -321,14 +316,19 @@ fn xml_escape(value: &str) -> String {
 fn launch_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
     verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
-    let status = std::process::Command::new(install_root.join("fairypam-agent.exe"))
-        .current_dir(install_root)
-        .status()
-        .map_err(|_| ProvisionFailure::TaskOperation)?;
-    status
-        .success()
-        .then_some(())
-        .ok_or(ProvisionFailure::TaskOperation)
+    for restart in 0..=AGENT_RESTART_COUNT {
+        let status = std::process::Command::new(install_root.join("fairypam-agent.exe"))
+            .current_dir(install_root)
+            .status()
+            .map_err(|_| ProvisionFailure::TaskOperation)?;
+        if status.success() {
+            return Ok(());
+        }
+        if restart < AGENT_RESTART_COUNT {
+            std::thread::sleep(AGENT_RESTART_INTERVAL);
+        }
+    }
+    Err(ProvisionFailure::AgentRestartExhausted)
 }
 
 #[cfg(windows)]
@@ -650,10 +650,7 @@ fn validate_fixed_task(
     unsafe { settings.MultipleInstances(&mut instances) }.map_err(|_| TaskError::Operation)?;
     unsafe { settings.RestartCount(&mut restart_count) }.map_err(|_| TaskError::Operation)?;
     unsafe { settings.RestartInterval(&mut restart_interval) }.map_err(|_| TaskError::Operation)?;
-    let restart_is_valid = match task {
-        FixedTask::Agent => restart_count == 3 && restart_interval == "PT1M",
-        FixedTask::Ui => restart_count == 0,
-    };
+    let restart_is_valid = restart_count == 0 && restart_interval.is_empty();
     if !allow_demand.as_bool()
         || !enabled.as_bool()
         || instances != TASK_INSTANCES_IGNORE_NEW
@@ -1817,7 +1814,9 @@ mod tests {
         }
         assert!(agent.contains("<RunLevel>HighestAvailable</RunLevel>"));
         assert!(agent.contains("<URI>\\FairyPam Agent</URI>"));
-        assert!(agent.contains("<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count>"));
+        assert!(!agent.contains("<RestartOnFailure>"));
+        assert_eq!(AGENT_RESTART_COUNT, 3);
+        assert_eq!(AGENT_RESTART_INTERVAL, std::time::Duration::from_secs(60));
         assert!(agent
             .contains(r"C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe"));
         assert!(agent.contains(
