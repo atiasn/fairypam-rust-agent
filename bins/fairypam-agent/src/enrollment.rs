@@ -388,8 +388,7 @@ fn private_security(path: &Path) -> bool {
         )
     };
     let result = converted.is_ok()
-        && unsafe { text.to_string() }
-            .is_ok_and(|value| private_sddl_matches(&value));
+        && unsafe { text.to_string() }.is_ok_and(|value| private_sddl_matches(&value));
     let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(text.0.cast()))) };
     let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
     result
@@ -512,17 +511,11 @@ mod tests {
 
     #[test]
     fn private_sddl_accepts_windows_auto_inherited_marker_without_inherited_aces() {
-        assert!(private_sddl_matches(
-            "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)"
-        ));
-        assert!(!private_sddl_matches(
-            "O:BAD:PAI(A;ID;FA;;;SY)(A;;FA;;;BA)"
-        ));
+        assert!(private_sddl_matches("O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)"));
+        assert!(!private_sddl_matches("O:BAD:PAI(A;ID;FA;;;SY)(A;;FA;;;BA)"));
         assert!(!private_sddl_matches(
             "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"
         ));
-        assert!(!private_sddl_matches(
-            "O:BAD:AI(A;;FA;;;SY)(A;;FA;;;BA)"
-        ));
+        assert!(!private_sddl_matches("O:BAD:AI(A;;FA;;;SY)(A;;FA;;;BA)"));
     }
 }
