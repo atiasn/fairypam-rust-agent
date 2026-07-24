@@ -616,6 +616,7 @@ fn installer_owns_fixed_task_registration_and_bounded_recovery() {
         "LocalCommand::ShutdownAgent",
         "LastTaskResult",
         "wait_for_agent_processes_to_exit",
+        "wait_for_product_processes_to_exit",
         "stop_fixed_tasks_for_install",
         "restore_fixed_tasks",
     ] {

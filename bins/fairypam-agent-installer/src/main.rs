@@ -896,7 +896,7 @@ fn stop_fixed_tasks_for_install(
             return Err(TaskError::Operation);
         }
     }
-    wait_for_agent_processes_to_exit(install_root)
+    wait_for_product_processes_to_exit(install_root)
 }
 
 #[cfg(windows)]
@@ -1004,8 +1004,21 @@ fn request_agent_maintenance_shutdown(install_root: &std::path::Path) -> Result<
 
 #[cfg(windows)]
 fn wait_for_agent_processes_to_exit(install_root: &std::path::Path) -> Result<(), TaskError> {
+    wait_for_managed_processes_to_exit(install_root, false)
+}
+
+#[cfg(windows)]
+fn wait_for_product_processes_to_exit(install_root: &std::path::Path) -> Result<(), TaskError> {
+    wait_for_managed_processes_to_exit(install_root, true)
+}
+
+#[cfg(windows)]
+fn wait_for_managed_processes_to_exit(
+    install_root: &std::path::Path,
+    include_launcher: bool,
+) -> Result<(), TaskError> {
     for _ in 0..100 {
-        if !agent_process_is_running(install_root)? {
+        if !managed_process_is_running(install_root, include_launcher)? {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1015,6 +1028,14 @@ fn wait_for_agent_processes_to_exit(install_root: &std::path::Path) -> Result<()
 
 #[cfg(windows)]
 fn agent_process_is_running(install_root: &std::path::Path) -> Result<bool, TaskError> {
+    managed_process_is_running(install_root, false)
+}
+
+#[cfg(windows)]
+fn managed_process_is_running(
+    install_root: &std::path::Path,
+    include_launcher: bool,
+) -> Result<bool, TaskError> {
     use windows::core::PWSTR;
     use windows::Win32::{
         Foundation::CloseHandle,
@@ -1053,6 +1074,10 @@ fn agent_process_is_running(install_root: &std::path::Path) -> Result<bool, Task
                 Some(install_root.join("fairypam-agent.exe"))
             } else if executable.eq_ignore_ascii_case("fairypam-agent-guardian.exe") {
                 Some(install_root.join("fairypam-agent-guardian.exe"))
+            } else if include_launcher
+                && executable.eq_ignore_ascii_case("fairypam-agent-installer.exe")
+            {
+                Some(install_root.join(FixedTask::Agent.executable()))
             } else {
                 None
             };
