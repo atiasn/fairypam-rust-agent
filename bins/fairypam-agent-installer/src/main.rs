@@ -10,27 +10,36 @@ fn main() {
 #[cfg(windows)]
 fn main() {
     let mut arguments = std::env::args_os().skip(1);
-    let exit_code = match (arguments.next(), arguments.next()) {
-        (Some(command), Some(install_root)) if arguments.next().is_none() => {
+    let exit_code = match (arguments.next(), arguments.next(), arguments.next()) {
+        (Some(command), Some(install_root), extra) if arguments.next().is_none() => {
             let install_root = std::path::Path::new(&install_root);
-            match command.to_string_lossy().as_ref() {
-                "--preflight" => preflight(install_root),
-                "--prepare-install" => with_install_transaction(|| prepare_install(install_root)),
-                "--provision" => with_install_transaction(|| provision(install_root)),
-                "--installed-preflight" => installed_preflight(install_root),
-                "--launch-agent-task" => launch_agent_task(install_root),
-                "--launch-ui-task" => launch_ui_task(install_root),
-                "--run-agent-task" => with_install_transaction(|| {
+            match (command.to_string_lossy().as_ref(), extra.as_deref()) {
+                ("--verify-uninstaller-copy", Some(copy)) => {
+                    verify_uninstaller_copy(install_root, std::path::Path::new(copy))
+                }
+                ("--preflight", None) => preflight(install_root),
+                ("--prepare-install", None) => {
+                    with_install_transaction(|| prepare_install(install_root))
+                }
+                ("--provision", None) => with_install_transaction(|| provision(install_root)),
+                ("--verify-installed-state", None) => installed_preflight(install_root),
+                ("--launch-agent-task", None) => launch_agent_task(install_root),
+                ("--launch-ui-task", None) => launch_ui_task(install_root),
+                ("--run-agent-task", None) => with_install_transaction(|| {
                     run_fixed_task(install_root, FixedTask::Agent, false)
                 }),
-                "--restart-agent-task" => with_install_transaction(|| {
-                    run_fixed_task(install_root, FixedTask::Agent, true)
-                }),
-                "--run-ui-task" => {
+                ("--restart-agent-task", None) => {
+                    with_install_transaction(|| run_fixed_task(install_root, FixedTask::Agent, true))
+                }
+                ("--run-ui-task", None) => {
                     with_install_transaction(|| run_fixed_task(install_root, FixedTask::Ui, false))
                 }
-                "--repair-tasks" => with_install_transaction(|| repair_fixed_tasks(install_root)),
-                "--remove-tasks" => with_install_transaction(|| remove_fixed_tasks(install_root)),
+                ("--repair-tasks", None) => {
+                    with_install_transaction(|| repair_fixed_tasks(install_root))
+                }
+                ("--remove-tasks", None) => {
+                    with_install_transaction(|| remove_fixed_tasks(install_root))
+                }
                 _ => Err(ProvisionFailure::InstallRoots),
             }
             .map_or_else(|failure| failure as i32, |_| 0)
@@ -1360,6 +1369,28 @@ fn installed_preflight(install_root: &std::path::Path) -> Result<(), ProvisionFa
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
     verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
     active_suite(install_root).map(|_| ())
+}
+
+#[cfg(windows)]
+fn verify_uninstaller_copy(
+    install_root: &std::path::Path,
+    uninstaller_copy: &std::path::Path,
+) -> Result<(), ProvisionFailure> {
+    installed_preflight(install_root)?;
+    let metadata = uninstaller_copy
+        .symlink_metadata()
+        .map_err(|_| ProvisionFailure::InstallRoots)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(ProvisionFailure::InstallRoots);
+    }
+    verify_nonreparse_attributes(uninstaller_copy).map_err(|_| ProvisionFailure::InstallRoots)?;
+    let installed_hash = fairypam_agent_suite::sha256_file(&install_root.join("uninstall.exe"))
+        .map_err(|_| ProvisionFailure::InstallRoots)?;
+    let copy_hash = fairypam_agent_suite::sha256_file(uninstaller_copy)
+        .map_err(|_| ProvisionFailure::InstallRoots)?;
+    (installed_hash == copy_hash)
+        .then_some(())
+        .ok_or(ProvisionFailure::InstallRoots)
 }
 
 #[cfg(windows)]

@@ -693,17 +693,16 @@ FunctionEnd
 
 Function un.onInit
   ; Accept the protected original or NSIS's temporary self-delete copy only
-  ; when the copy retains the fixed original installation directory.
+  ; when the copy matches the current protected uninstaller exactly.
   StrCmp "$EXEDIR" "${FAIRYPAM_INSTALL_ROOT}" fairypam_uninstall_root_ok
-  StrCmp "$INSTDIR" "${FAIRYPAM_INSTALL_ROOT}" fairypam_uninstall_root_ok
-  Abort "FairyPam uninstaller must run from its protected installation directory."
+  StrCmp "$INSTDIR" "${FAIRYPAM_INSTALL_ROOT}" 0 fairypam_uninstall_untrusted_root
 fairypam_uninstall_root_ok:
   StrCpy $INSTDIR "${FAIRYPAM_INSTALL_ROOT}"
   StrCpy $FairyPamInstallDir "${FAIRYPAM_INSTALL_ROOT}"
   StrCpy $R3 ""
   !insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH "$FairyPamInstallDir" fairypam_uninstall_untrusted_root
   IfFileExists "$INSTDIR\resources\runtime\fairypam-agent-installer.exe" 0 fairypam_uninstall_untrusted_root
-  ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --installed-preflight "$INSTDIR"' $0
+  ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --verify-uninstaller-copy "$INSTDIR" "$EXEPATH"' $0
   IfErrors fairypam_uninstall_untrusted_root 0
   ${If} $0 != 0
     Goto fairypam_uninstall_untrusted_root

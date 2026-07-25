@@ -15,6 +15,8 @@ const INSTALLER_LAYOUT_BUILD: &str =
     include_str!("../../../bins/fairypam-agent-installer/build.rs");
 const NSIS_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
 const NSIS_TEMPLATE: &str = include_str!("../windows/installer.nsi");
+const PHASE_A_INSTALL_GATE: &str =
+    include_str!("../../../../scripts/cleiagent-phase-a-install-gate.ps1");
 
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -197,7 +199,7 @@ fn product_installer_uses_one_fixed_protected_root() {
         "const INSTALL_BOOTSTRAP_DIRECTORY: &str = env!(\"FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY\");",
         "\"--preflight\" => preflight(install_root)",
         "\"--provision\" => with_install_transaction(|| provision(install_root))",
-        "\"--installed-preflight\" => installed_preflight(install_root)",
+        "(\"--verify-installed-state\", None) => installed_preflight(install_root)",
         "fn provision(install_root: &std::path::Path)",
         "fn preflight(install_root: &std::path::Path)",
         "fn installed_preflight(install_root: &std::path::Path)",
@@ -321,13 +323,18 @@ fn product_installer_uses_one_fixed_protected_root() {
     );
     for required in [
         "StrCmp \"$EXEDIR\" \"${FAIRYPAM_INSTALL_ROOT}\" fairypam_uninstall_root_ok",
-        "StrCmp \"$INSTDIR\" \"${FAIRYPAM_INSTALL_ROOT}\" fairypam_uninstall_root_ok",
+        "StrCmp \"$INSTDIR\" \"${FAIRYPAM_INSTALL_ROOT}\" 0 fairypam_uninstall_untrusted_root",
+        "--verify-uninstaller-copy \"$INSTDIR\" \"$EXEPATH\"",
     ] {
         assert!(
             NSIS_TEMPLATE.contains(required),
-            "uninstall must bind both the protected original and its NSIS self-delete copy: {required}"
+            "uninstall must bind the protected original and exact current self-delete copy: {required}"
         );
     }
+    assert!(
+        !INSTALLER_PROVISIONER.contains("\"--installed-preflight\""),
+        "the legacy uninstaller preflight command must stay revoked so old copies fail closed"
+    );
     assert!(
         NSIS_TEMPLATE.contains("!insertmacro NSIS_HOOK_PREPAYLOAD"),
         "the template must preflight the live tree before normal payload extraction"
@@ -342,7 +349,7 @@ fn product_installer_uses_one_fixed_protected_root() {
     }
     assert!(
         NSIS_TEMPLATE.contains(
-            "\"$INSTDIR\\resources\\runtime\\fairypam-agent-installer.exe\" --installed-preflight \"$INSTDIR\""
+            "\"$INSTDIR\\resources\\runtime\\fairypam-agent-installer.exe\" --verify-uninstaller-copy \"$INSTDIR\" \"$EXEPATH\""
         ),
         "uninstall must validate through the installed runtime helper"
     );
@@ -404,7 +411,7 @@ fn product_installer_binds_each_command_to_one_helper_phase() {
     for mapping in [
         "\"--preflight\" => preflight(install_root)",
         "\"--provision\" => with_install_transaction(|| provision(install_root))",
-        "\"--installed-preflight\" => installed_preflight(install_root)",
+        "(\"--verify-installed-state\", None) => installed_preflight(install_root)",
     ] {
         assert!(
             dispatch.contains(mapping),
@@ -599,15 +606,15 @@ fn local_identity_contract_verifies_peer_and_install_root_before_sensitive_actio
 #[test]
 fn installer_owns_fixed_task_registration_and_bounded_recovery() {
     for required in [
-        "\"--launch-agent-task\" => launch_agent_task(install_root)",
-        "\"--prepare-install\" => with_install_transaction",
-        "\"--run-agent-task\" => with_install_transaction",
-        "\"--restart-agent-task\" => with_install_transaction",
-        "\"--run-ui-task\" =>",
+        "(\"--launch-agent-task\", None) => launch_agent_task(install_root)",
+        "(\"--prepare-install\", None) =>",
+        "(\"--run-agent-task\", None) => with_install_transaction",
+        "(\"--restart-agent-task\", None) =>",
+        "(\"--run-ui-task\", None) =>",
         "run_fixed_task(install_root, FixedTask::Ui, false)",
-        "\"--repair-tasks\" => with_install_transaction",
+        "(\"--repair-tasks\", None) =>",
         "repair_fixed_tasks(install_root)",
-        "\"--remove-tasks\" => with_install_transaction",
+        "(\"--remove-tasks\", None) =>",
         "remove_fixed_tasks(install_root)",
         "TASK_CREATE_OR_UPDATE",
         "TASK_DONT_ADD_PRINCIPAL_ACE",
@@ -663,6 +670,34 @@ fn installer_owns_fixed_task_registration_and_bounded_recovery() {
     assert!(
         !NSIS_TEMPLATE.contains("nsis_tauri_utils::RunAsUser \"$INSTDIR\\${MAINBINARYNAME}.exe\"")
     );
+}
+
+#[test]
+fn phase_a_acl_probe_accepts_only_protected_inputs_and_task_terminal_success() {
+    for required in [
+        "ordinary-user-acl-",
+        "/setowner '*S-1-5-32-544' /T /Q",
+        "\"*$($userSid):(OI)(CI)(RX)\"",
+        "O:BA",
+        "$registered.SetSecurityDescriptor($taskSecurity, 16)",
+        "Assert-ProbeTask -Task $registered",
+        "$info.LastRunTime -gt $initialRunTime",
+        "$info.LastTaskResult -ne 0",
+        "$probeTaskWriteDenied",
+        "$configWriteDenied",
+        "$scriptWriteDenied",
+    ] {
+        assert!(
+            PHASE_A_INSTALL_GATE.contains(required),
+            "missing fail-closed Phase A ACL probe contract: {required}"
+        );
+    }
+    for forbidden in ["result.json", "ProfileList", "AppData\\Local"] {
+        assert!(
+            !PHASE_A_INSTALL_GATE.contains(forbidden),
+            "ordinary-user ACL probe must not trust user-writable evidence: {forbidden}"
+        );
+    }
 }
 
 #[test]
