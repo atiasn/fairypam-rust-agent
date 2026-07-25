@@ -367,9 +367,8 @@ fn product_installer_uses_one_fixed_protected_root() {
         "only the protected bootstrap staging directory may be recursively removed"
     );
     assert!(
-        NSIS_HOOKS.contains(
-            "RMDir /r \"$FairyPamInstallDir\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\""
-        ),
+        NSIS_HOOKS
+            .contains("RMDir /r \"$FairyPamInstallDir\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\""),
         "recursive removal must target only the protected bootstrap staging directory"
     );
     for forbidden in [
