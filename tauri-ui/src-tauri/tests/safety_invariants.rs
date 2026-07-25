@@ -622,6 +622,7 @@ fn installer_owns_fixed_task_registration_and_bounded_recovery() {
         "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;",
         "Global\\FairyPam.Agent.InstallTransaction.v1",
         "SetEnabled(VARIANT_BOOL(0))",
+        "SetEnabled(VARIANT_BOOL(-1))",
         "interactive_session_user_sid",
         "validated_task_user_sid",
         "WTSQuerySessionInformationW",

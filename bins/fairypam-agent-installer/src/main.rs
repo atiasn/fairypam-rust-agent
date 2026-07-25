@@ -58,6 +58,9 @@ const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
 const UPDATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\updates";
 #[cfg(any(windows, test))]
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+#[cfg(any(windows, test))]
+const INSTALL_DIRECTORY_SDDL: &str =
+    "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 #[cfg(windows)]
 const INSTALL_DIRECTORY: &str = env!("FAIRYPAM_INSTALL_DIRECTORY");
 #[cfg(windows)]
@@ -1052,6 +1055,7 @@ impl InstallActivation {
             .map_err(|_| ProvisionFailure::InstallRoots)?;
         let versions = install_root.join("versions");
         std::fs::create_dir_all(&versions).map_err(|_| ProvisionFailure::InstallRoots)?;
+        protect_install_directory(&versions)?;
         let version_root = versions.join(&manifest.build_id);
         let created_version = match version_root.symlink_metadata() {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1095,6 +1099,12 @@ impl InstallActivation {
             }
             _ => return Err(ProvisionFailure::InstallRoots),
         };
+        if protect_manifest_directories(&version_root, &manifest).is_err() {
+            if created_version && std::fs::remove_dir_all(&version_root).is_err() {
+                return Err(ProvisionFailure::Rollback);
+            }
+            return Err(ProvisionFailure::InstallRoots);
+        }
         let pointer_path = install_root.join(CURRENT_POINTER_FILE);
         let previous_pointer = match pointer_path.symlink_metadata() {
             Ok(metadata)
@@ -1162,6 +1172,51 @@ impl InstallActivation {
         }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn protect_manifest_directories(
+    version_root: &std::path::Path,
+    manifest: &fairypam_agent_suite::SuiteManifest,
+) -> Result<(), ProvisionFailure> {
+    use fairypam_agent_suite::MemberScope;
+    use std::path::Component;
+
+    protect_install_directory(version_root)?;
+    for member in manifest
+        .members
+        .iter()
+        .filter(|member| member.scope == MemberScope::Versioned)
+    {
+        let destination = version_root.join(member.path.replace('/', "\\"));
+        let parent = destination.parent().ok_or(ProvisionFailure::InstallRoots)?;
+        let relative = parent
+            .strip_prefix(version_root)
+            .map_err(|_| ProvisionFailure::InstallRoots)?;
+        let mut current = version_root.to_path_buf();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                return Err(ProvisionFailure::InstallRoots);
+            };
+            current.push(component);
+            protect_install_directory(&current)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn protect_install_directory(path: &std::path::Path) -> Result<(), ProvisionFailure> {
+    with_pinned_directory(path, ProvisionFailure::InstallRoots, |handle| {
+        set_directory_security(handle, INSTALL_DIRECTORY_SDDL)
+            .and_then(|_| protected_install_directory_security(&directory_security_sddl(handle)?))
+            .map_err(|_| ProvisionFailure::InstallRoots)
+    })
+}
+
+#[cfg(any(windows, test))]
+fn protected_install_directory_security(value: &str) -> Result<(), ()> {
+    (value == INSTALL_DIRECTORY_SDDL).then_some(()).ok_or(())
 }
 
 #[cfg(windows)]
@@ -1444,6 +1499,7 @@ fn restore_fixed_tasks(
     backups: &[Option<FixedTaskBackup>],
 ) -> Result<(), TaskError> {
     use windows::core::BSTR;
+    use windows::Win32::Foundation::VARIANT_BOOL;
     use windows::Win32::System::TaskScheduler::{
         TASK_CREATE_OR_UPDATE, TASK_DONT_ADD_PRINCIPAL_ACE, TASK_LOGON_INTERACTIVE_TOKEN,
     };
@@ -1481,6 +1537,10 @@ fn restore_fixed_tasks(
         }
         .is_err()
         {
+            failed = true;
+            continue;
+        }
+        if unsafe { restored.SetEnabled(VARIANT_BOOL(-1)) }.is_err() {
             failed = true;
             continue;
         }
@@ -2922,6 +2982,17 @@ mod tests {
             "O:BAD:PAI(A;ID;FA;;;SY)(A;;FA;;;BA)",
         ] {
             assert!(private_security_sddl(rejected).is_err());
+        }
+    }
+
+    #[test]
+    fn product_directories_require_the_exact_explicit_acl() {
+        assert!(protected_install_directory_security(INSTALL_DIRECTORY_SDDL).is_ok());
+        for rejected in [
+            "O:BAD:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x1200a9;;;BU)",
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICI;FW;;;WD)",
+        ] {
+            assert!(protected_install_directory_security(rejected).is_err());
         }
     }
 
