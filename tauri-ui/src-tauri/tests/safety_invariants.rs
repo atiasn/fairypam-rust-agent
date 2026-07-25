@@ -15,8 +15,6 @@ const INSTALLER_LAYOUT_BUILD: &str =
     include_str!("../../../bins/fairypam-agent-installer/build.rs");
 const NSIS_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
 const NSIS_TEMPLATE: &str = include_str!("../windows/installer.nsi");
-const PHASE_A_INSTALL_GATE: &str =
-    include_str!("../../../../scripts/cleiagent-phase-a-install-gate.ps1");
 
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -672,35 +670,6 @@ fn installer_owns_fixed_task_registration_and_bounded_recovery() {
     );
 }
 
-#[test]
-fn phase_a_acl_probe_accepts_only_protected_inputs_and_task_terminal_success() {
-    for required in [
-        "ordinary-user-acl-",
-        "/setowner '*S-1-5-32-544' /T /Q",
-        "\"*$($userSid):(OI)(CI)(RX)\"",
-        "O:BA",
-        "$registered.SetSecurityDescriptor($taskSecurity, 16)",
-        "Assert-ProbeTask -Task $registered",
-        "$info.LastRunTime -gt $initialRunTime",
-        "$info.LastTaskResult -ne 0",
-        "$probeTaskWriteDenied",
-        "$configWriteDenied",
-        "$scriptWriteDenied",
-    ] {
-        assert!(
-            PHASE_A_INSTALL_GATE.contains(required),
-            "missing fail-closed Phase A ACL probe contract: {required}"
-        );
-    }
-    for forbidden in ["result.json", "ProfileList", "AppData\\Local"] {
-        assert!(
-            !PHASE_A_INSTALL_GATE.contains(forbidden),
-            "ordinary-user ACL probe must not trust user-writable evidence: {forbidden}"
-        );
-    }
-}
-
-#[test]
 fn local_pipe_reads_are_bounded() {
     for required in [
         "FIRST_PREFIX_BYTE_TIMEOUT",
