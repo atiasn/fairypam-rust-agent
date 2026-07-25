@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent-local-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fairypam-agent-local-protocol",
  "getrandom 0.3.4",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent-local-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "http",
  "serde",
