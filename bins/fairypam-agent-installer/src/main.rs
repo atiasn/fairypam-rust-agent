@@ -696,7 +696,8 @@ impl UpdateActivation {
             std::fs::remove_file(UPDATE_SETTLING_PATH).map_err(|_| ProvisionFailure::Rollback)?;
             return Ok(SettlingResume::None);
         }
-        if plan != SettlingPlan::ResumeTarget || active.pointer.build_id != request.target_build_id {
+        let target_is_active = active.pointer.build_id == request.target_build_id;
+        if plan != SettlingPlan::ResumeTarget || !target_is_active {
             return Err(ProvisionFailure::Rollback);
         }
         verify_authenticode_publisher(
