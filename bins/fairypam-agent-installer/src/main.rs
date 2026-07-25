@@ -61,6 +61,9 @@ const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 #[cfg(any(windows, test))]
 const INSTALL_DIRECTORY_SDDL: &str =
     "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+#[cfg(any(windows, test))]
+const INSTALL_DIRECTORY_AUTO_INHERITED_SDDL: &str =
+    "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 #[cfg(windows)]
 const INSTALL_DIRECTORY: &str = env!("FAIRYPAM_INSTALL_DIRECTORY");
 #[cfg(windows)]
@@ -1216,7 +1219,12 @@ fn protect_install_directory(path: &std::path::Path) -> Result<(), ProvisionFail
 
 #[cfg(any(windows, test))]
 fn protected_install_directory_security(value: &str) -> Result<(), ()> {
-    (value == INSTALL_DIRECTORY_SDDL).then_some(()).ok_or(())
+    (matches!(
+        value,
+        INSTALL_DIRECTORY_SDDL | INSTALL_DIRECTORY_AUTO_INHERITED_SDDL
+    ))
+    .then_some(())
+    .ok_or(())
 }
 
 #[cfg(windows)]
@@ -2987,7 +2995,12 @@ mod tests {
 
     #[test]
     fn product_directories_require_the_exact_explicit_acl() {
-        assert!(protected_install_directory_security(INSTALL_DIRECTORY_SDDL).is_ok());
+        for allowed in [
+            INSTALL_DIRECTORY_SDDL,
+            INSTALL_DIRECTORY_AUTO_INHERITED_SDDL,
+        ] {
+            assert!(protected_install_directory_security(allowed).is_ok());
+        }
         for rejected in [
             "O:BAD:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x1200a9;;;BU)",
             "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICI;FW;;;WD)",

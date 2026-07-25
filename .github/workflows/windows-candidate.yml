@@ -457,7 +457,10 @@ jobs:
               throw "legacy ACL fixture was not installed: $target ($actual)"
             }
           }
-          $protectedDacl = 'D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
+          $protectedDacls = @(
+            'D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)',
+            'D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
+          )
           $protectedDirectories = @(
             $installRoot,
             (Join-Path $installRoot 'versions'),
@@ -474,7 +477,7 @@ jobs:
           )
           foreach ($target in $protectedDirectories) {
             $actual = (Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl
-            if (-not $actual.Contains($protectedDacl) -or $actual.Contains('ID;')) {
+            if (-not ($protectedDacls | Where-Object { $actual.Contains($_) }) -or $actual.Contains('ID;')) {
               throw "trusted reinstall retained a non-protected ACL: $target ($actual)"
             }
           }
