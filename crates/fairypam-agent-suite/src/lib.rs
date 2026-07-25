@@ -601,11 +601,13 @@ fn authenticode_identity_matches(
     allowed_publisher: &str,
     allowed_thumbprint: &str,
 ) -> bool {
-    identity.split_once('\n').is_some_and(|(subject, thumbprint)| {
-        status_success
-            && subject == allowed_publisher
-            && thumbprint.eq_ignore_ascii_case(allowed_thumbprint)
-    })
+    identity
+        .split_once('\n')
+        .is_some_and(|(subject, thumbprint)| {
+            status_success
+                && subject == allowed_publisher
+                && thumbprint.eq_ignore_ascii_case(allowed_thumbprint)
+        })
 }
 
 pub fn sha256_file(path: &Path) -> Result<String, SuiteError> {

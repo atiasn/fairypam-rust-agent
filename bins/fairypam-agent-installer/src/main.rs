@@ -696,9 +696,7 @@ impl UpdateActivation {
             std::fs::remove_file(UPDATE_SETTLING_PATH).map_err(|_| ProvisionFailure::Rollback)?;
             return Ok(SettlingResume::None);
         }
-        if plan != SettlingPlan::ResumeTarget
-            || active.pointer.build_id != request.target_build_id
-        {
+        if plan != SettlingPlan::ResumeTarget || active.pointer.build_id != request.target_build_id {
             return Err(ProvisionFailure::Rollback);
         }
         verify_authenticode_publisher(
@@ -3142,18 +3140,14 @@ mod tests {
             "target"
         )
         .is_err());
-        assert!(
-            settling_plan("target_verifying", None, "other", "source", "target").is_err()
-        );
+        assert!(settling_plan("target_verifying", None, "other", "source", "target").is_err());
     }
 
     #[cfg(windows)]
     #[test]
     fn switch_and_rollback_pointer_failures_are_fail_closed() {
-        let root = std::env::temp_dir().join(format!(
-            "fairypam-pointer-fault-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("fairypam-pointer-fault-{}", std::process::id()));
         let pointer = root.join("current.json");
         std::fs::create_dir_all(&pointer).unwrap();
 
