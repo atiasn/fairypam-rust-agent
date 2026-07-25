@@ -188,6 +188,13 @@ impl CommandExecutor {
             LocalCommand::Status => Ok(json!({
                 "state": if self.binding.is_some() { "TargetLocked" } else { "ConnectedIdle" },
                 "capture_active": self.capture.is_some(),
+                "build_id": option_env!("FAIRYPAM_BUILD_ID").unwrap_or("unknown"),
+                "suite_version": env!("CARGO_PKG_VERSION"),
+                "guardian_state": if self.binding.is_none() && self.capture.is_none() {
+                    "idle_no_holds"
+                } else {
+                    "active"
+                },
             })),
             LocalCommand::Doctor => {
                 Ok(json!({"profiles": self.profiles.ids(), "runtime": "dry_run"}))
@@ -456,6 +463,10 @@ impl CommandExecutor {
                 code: "agent.dry_run_only".into(),
                 message: "production Agent has no local Arm authority".into(),
             }),
+            Some(Payload::UpdateDirective(_)) => Err(AgentError::new(
+                "execution.update_wrong_layer",
+                "update directives are handled by the runtime lifecycle",
+            )),
             Some(Payload::Hello(_)) | None => Err(AgentError::new(
                 "protocol.command_invalid",
                 "HubHello is not an executable command",

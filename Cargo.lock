@@ -404,6 +404,7 @@ dependencies = [
  "fairypam-agent-input",
  "fairypam-agent-local-protocol",
  "fairypam-agent-protocol",
+ "fairypam-agent-suite",
  "fairypam-agent-transport",
  "fairypam-agent-windows",
  "http",
@@ -431,16 +432,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "fairypam-agent-installer"
-version = "0.1.0"
-dependencies = [
- "fairypam-agent-local-client",
- "fairypam-agent-local-protocol",
- "tokio",
- "windows",
 ]
 
 [[package]]
@@ -486,6 +477,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fairypam-agent-installer"
+version = "0.1.0"
+dependencies = [
+ "fairypam-agent-local-client",
+ "fairypam-agent-local-protocol",
+ "fairypam-agent-suite",
+ "serde_json",
+ "tokio",
+ "windows",
+]
+
+[[package]]
 name = "fairypam-agent-local-client"
 version = "0.1.0"
 dependencies = [
@@ -518,6 +521,18 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "fairypam-agent-suite"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "zip",
 ]
 
 [[package]]

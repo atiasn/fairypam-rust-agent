@@ -16,6 +16,7 @@ fairypam-agent-input = { path = "../../crates/fairypam-agent-input" }
 fairypam-agent-dev-automation = { path = "../../crates/fairypam-agent-dev-automation", optional = true }
 fairypam-agent-local-protocol = { path = "../../crates/fairypam-agent-local-protocol" }
 fairypam-agent-protocol = { path = "../../crates/fairypam-agent-protocol" }
+fairypam-agent-suite = { path = "../../crates/fairypam-agent-suite" }
 fairypam-agent-transport = { path = "../../crates/fairypam-agent-transport" }
 fairypam-agent-windows = { path = "../../crates/fairypam-agent-windows" }
 http = "1"

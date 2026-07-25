@@ -184,9 +184,11 @@ jobs:
         shell: pwsh
         env:
           FAIRYPAM_ALLOW_UNSIGNED_CANDIDATE_REPAIR: '1'
+          FAIRYPAM_BUILD_ID: product-installer-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build --release --locked -p fairypam-agent -p fairypam-agent-guardian -p fairypam-agent-installer
+          $env:FAIRYPAM_BUILD_COMMIT = (Get-Content SOURCE_COMMIT -Raw).Trim()
+          cargo build --release --locked -p fairypam-agent -p fairypam-agent-guardian -p fairypam-agent-installer -p fairypam-agent-suite
           Push-Location tauri-ui
           try {
             npm ci
@@ -207,7 +209,23 @@ jobs:
               Pop-Location
             }
 
-            npm run tauri build -- --bundles nsis
+            npm run tauri build -- --no-bundle
+            $suiteVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+            $builtAt = [DateTime]::UtcNow.ToString('o')
+            ..\target\release\fairypam-build-suite.exe `
+              --build-id $env:FAIRYPAM_BUILD_ID `
+              --source-commit $env:FAIRYPAM_BUILD_COMMIT `
+              --suite-version $suiteVersion `
+              --built-at $builtAt `
+              --build-origin 'github-actions/windows-candidate.yml' `
+              --output ..\target\suite\BUILD-MANIFEST.json `
+              --package ..\target\suite\fairypam-agent-update-windows.zip `
+              --agent ..\target\release\fairypam-agent.exe `
+              --guardian ..\target\release\fairypam-agent-guardian.exe `
+              --gui src-tauri\target\release\fairypam-agent-tauri-ui.exe `
+              --helper ..\target\release\fairypam-agent-installer.exe `
+              --profiles ..\profiles
+            npm run tauri bundle -- --bundles nsis
             npm run check:command-surface
             git diff --exit-code -- src-tauri/Cargo.lock
           }
@@ -227,11 +245,9 @@ jobs:
           if ($installer.ExitCode -ne 0) {
             $bootstrapHelper = Join-Path $installRoot '.fairypam-installer\payload\resources\runtime\fairypam-agent-installer.exe'
             $requiredPaths = [ordered]@{
-              ui = Join-Path $installRoot 'fairypam-agent-tauri-ui.exe'
-              agent = Join-Path $installRoot 'fairypam-agent.exe'
-              guardian = Join-Path $installRoot 'fairypam-agent-guardian.exe'
+              current = Join-Path $installRoot 'current.json'
+              versions = Join-Path $installRoot 'versions'
               runtime_helper = Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'
-              profiles = Join-Path $installRoot 'profiles'
               bootstrap_helper = $bootstrapHelper
             }
             foreach ($entry in $requiredPaths.GetEnumerator()) {
@@ -300,17 +316,24 @@ jobs:
             }
             throw "NSIS setup failed with exit code $exitCode"
           }
+          $current = Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
+          $versionRoot = Join-Path $installRoot "versions\$($current.build_id)"
           foreach ($path in @(
-            (Join-Path $installRoot 'fairypam-agent-tauri-ui.exe'),
-            (Join-Path $installRoot 'fairypam-agent.exe'),
-            (Join-Path $installRoot 'fairypam-agent-guardian.exe'),
-            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'),
-            (Join-Path $installRoot '.fairypam-installer\payload\resources\runtime\fairypam-agent-installer.exe')
+            (Join-Path $versionRoot 'BUILD-MANIFEST.json'),
+            (Join-Path $versionRoot 'fairypam-agent-tauri-ui.exe'),
+            (Join-Path $versionRoot 'fairypam-agent.exe'),
+            (Join-Path $versionRoot 'fairypam-agent-guardian.exe'),
+            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe')
           )) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "missing installed product file: $path" }
           }
-          $profiles = Join-Path $installRoot 'profiles'
+          $profiles = Join-Path $versionRoot 'profiles'
           if (-not (Test-Path -LiteralPath $profiles -PathType Container)) { throw "missing installed profiles directory: $profiles" }
+          foreach ($forbidden in @('fairypam-agentctl.exe', 'fairypam-agent-updater.exe')) {
+            if (Get-ChildItem -LiteralPath $installRoot -Recurse -File -Filter $forbidden) {
+              throw "forbidden product member found: $forbidden"
+            }
+          }
 
       - name: Smoke fixed Agent task crash recovery
         shell: pwsh
@@ -432,17 +455,18 @@ jobs:
           $protectedDacl = 'D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
           $protectedDirectories = @(
             $installRoot,
-            (Join-Path $installRoot '.fairypam-installer'),
-            (Join-Path $installRoot '.fairypam-installer\payload'),
-            (Join-Path $installRoot '.fairypam-installer\payload\profiles'),
-            (Join-Path $installRoot '.fairypam-installer\payload\resources'),
-            (Join-Path $installRoot 'profiles'),
+            (Join-Path $installRoot 'versions'),
             (Join-Path $installRoot 'resources')
           )
           $installer = Start-Process -FilePath $setup[0].FullName -ArgumentList '/S' -Wait -PassThru
           if ($installer.ExitCode -ne 0) {
             throw "trusted reinstall failed with exit code $($installer.ExitCode)"
           }
+          $current = Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
+          $protectedDirectories += @(
+            (Join-Path $installRoot "versions\$($current.build_id)"),
+            (Join-Path $installRoot "versions\$($current.build_id)\profiles")
+          )
           foreach ($target in $protectedDirectories) {
             $actual = (Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl
             if (-not $actual.Contains($protectedDacl) -or $actual.Contains('ID;')) {
@@ -475,6 +499,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item $setup[0] dist/fairypam-agent-setup-windows.exe
           $artifact = Get-Item dist/fairypam-agent-setup-windows.exe
+          $manifest = Get-Item target/suite/BUILD-MANIFEST.json
+          $manifestBody = Get-Content $manifest.FullName -Raw | ConvertFrom-Json
           [ordered]@{
             schema_version = 1
             artifact_class = 'product-installer'
@@ -486,9 +512,12 @@ jobs:
             run_attempt = '${{ github.run_attempt }}'
             setup_sha256 = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
             setup_size = $artifact.Length
+            suite_version = $manifestBody.suite_version
+            suite_manifest_sha256 = (Get-FileHash $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+            suite_manifest_size = $manifest.Length
             install_mode = 'perMachine'
             state_root = 'C:\ProgramData\FairyPam.Agent\Agent'
-            layout = @('fairypam-agent-tauri-ui.exe', 'fairypam-agent.exe', 'fairypam-agent-guardian.exe', 'resources/runtime/fairypam-agent-installer.exe', 'profiles/')
+            layout = @('current.json', 'versions/<build-id>/BUILD-MANIFEST.json', 'versions/<build-id>/fairypam-agent-tauri-ui.exe', 'versions/<build-id>/fairypam-agent.exe', 'versions/<build-id>/fairypam-agent-guardian.exe', 'versions/<build-id>/profiles/', 'resources/runtime/fairypam-agent-installer.exe')
           } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 dist/product-installer-receipt.json
 
       - name: Attest product setup provenance

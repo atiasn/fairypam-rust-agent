@@ -268,6 +268,10 @@ fn run_fixed_helper(argument: &'static str) -> CommandResult<()> {
             "startup.agent_repair_required",
             "The FairyPam Agent task is invalid; repair the installation",
         )),
+        Some(22) => Err(UiCommandError::unavailable(
+            "startup.agent_repair_required",
+            "The FairyPam Agent exhausted bounded recovery; repair the installation",
+        )),
         _ => Err(agent_task_failed()),
     }
 }
@@ -372,10 +376,15 @@ fn fixed_helper_path() -> CommandResult<(PathBuf, PathBuf)> {
     let gui = std::env::current_exe().map_err(|_| {
         UiCommandError::unavailable("startup.agent_unavailable", "FairyPam Agent is unavailable")
     })?;
-    let directory = gui.parent().map(|path| path.to_path_buf()).ok_or_else(|| {
+    let version_root = gui.parent().map(|path| path.to_path_buf()).ok_or_else(|| {
         UiCommandError::unavailable("startup.agent_unavailable", "FairyPam Agent is unavailable")
     })?;
-    let helper = directory
+    let versions = version_root.parent().ok_or_else(untrusted_install_root)?;
+    if versions.file_name().and_then(|name| name.to_str()) != Some("versions") {
+        return Err(untrusted_install_root());
+    }
+    let install_root = versions.parent().ok_or_else(untrusted_install_root)?;
+    let helper = install_root
         .join("resources")
         .join("runtime")
         .join("fairypam-agent-installer.exe");
@@ -383,7 +392,7 @@ fn fixed_helper_path() -> CommandResult<(PathBuf, PathBuf)> {
         fairypam_agent_local_client::verify_protected_program_files_path(path)
             .map_err(|_| untrusted_install_root())?;
     }
-    Ok((helper, directory))
+    Ok((helper, install_root.to_path_buf()))
 }
 
 #[cfg(windows)]

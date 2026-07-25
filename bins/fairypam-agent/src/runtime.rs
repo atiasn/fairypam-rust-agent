@@ -517,6 +517,8 @@ pub struct GrpcSessionDriver {
     registration_in_progress: Arc<AtomicBool>,
     gui_shutdown: CancellationToken,
     gui_lifetime: GuiLifetime,
+    #[cfg(windows)]
+    pending_update_activation: Arc<Mutex<Option<fairypam_agent_suite::UpdateRequest>>>,
 }
 
 impl GrpcSessionDriver {
@@ -543,6 +545,8 @@ impl GrpcSessionDriver {
             registration_in_progress: Arc::new(AtomicBool::new(false)),
             gui_lifetime: GuiLifetime::new(gui_shutdown.clone()),
             gui_shutdown,
+            #[cfg(windows)]
+            pending_update_activation: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -622,6 +626,17 @@ impl SessionDriver for GrpcSessionDriver {
                 "Agent is awaiting authenticated Hub registration",
             ));
         }
+        #[cfg(windows)]
+        tokio::select! {
+            _ = cancellation.cancelled() => return Err(cancelled()),
+            result = crate::update::wait_for_settlement() => result?,
+        }
+        #[cfg(windows)]
+        let (last_update_id, last_update_target_build_id, last_update_state, last_update_rollback) =
+            crate::update::last_result();
+        #[cfg(not(windows))]
+        let (last_update_id, last_update_target_build_id, last_update_state, last_update_rollback):
+            (String, String, String, String) = Default::default();
         if let Ok(mut state) = self.state.lock() {
             state.control_state = ConnectionState::Connecting;
             state.frame_state = ConnectionState::Connecting;
@@ -642,6 +657,21 @@ impl SessionDriver for GrpcSessionDriver {
                     protocol_minor: 0,
                     build_commit: config.build_commit.clone(),
                     installed_profile_ids: config.profiles.ids(),
+                    suite_build_id: option_env!("FAIRYPAM_BUILD_ID")
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    signed_update_capable: option_env!("FAIRYPAM_UPDATE_PUBLISHER").is_some()
+                        && option_env!("FAIRYPAM_UPDATE_CERT_THUMBPRINT").is_some(),
+                    update_publisher: option_env!("FAIRYPAM_UPDATE_PUBLISHER")
+                        .unwrap_or("")
+                        .to_owned(),
+                    update_cert_thumbprint: option_env!("FAIRYPAM_UPDATE_CERT_THUMBPRINT")
+                        .unwrap_or("")
+                        .to_ascii_lowercase(),
+                    last_update_id,
+                    last_update_target_build_id,
+                    last_update_state,
+                    last_update_rollback,
                 })),
             })
             .await
@@ -723,6 +753,62 @@ impl SessionDriver for GrpcSessionDriver {
                     let reference = command_reference(&command).ok_or_else(|| {
                         AgentError::new("runtime.command_invalid", "verified command lost CommandRef")
                     })?;
+                    #[cfg(windows)]
+                    if let Some(hub_control_command::Payload::UpdateDirective(directive)) =
+                        command.payload.as_ref()
+                    {
+                        let agent_id = self
+                            .config
+                            .lock()
+                            .map_err(lock_error)?
+                            .transport
+                            .agent_id
+                            .clone();
+                        let directive = directive.clone();
+                        let staged = tokio::task::spawn_blocking(move || {
+                            crate::update::stage(&agent_id, &directive)
+                        })
+                        .await
+                        .map_err(|error| {
+                            AgentError::new("update.stage_join_failed", error.to_string())
+                        })?;
+                        let event = match staged {
+                            Ok(request) => {
+                                let prepared = self
+                                    .execution
+                                    .lock()
+                                    .map_err(lock_error)?
+                                    .reset()
+                                    .and_then(|()| {
+                                        *self
+                                            .pending_update_activation
+                                            .lock()
+                                            .map_err(lock_error)? = Some(request.clone());
+                                        self.gui_lifetime.request_maintenance_shutdown()
+                                    });
+                                match prepared {
+                                    Ok(_) => {
+                                        let result = format!(
+                                            r#"{{"state":"staged","update_id":"{}","target_build_id":"{}"}}"#,
+                                            request.update_id, request.target_build_id
+                                        );
+                                        ack_event(reference, &result)
+                                    }
+                                    Err(error) => {
+                                        *self
+                                            .pending_update_activation
+                                            .lock()
+                                            .map_err(lock_error)? = None;
+                                        crate::update::abort_staged(&request)?;
+                                        nack_event(reference, error.code(), &error.to_string())
+                                    }
+                                }
+                            }
+                            Err(error) => nack_event(reference, error.code(), &error.to_string()),
+                        };
+                        sender.send(event).await.map_err(map_transport)?;
+                        continue;
+                    }
                     let frames = {
                         let state = self.state.lock().map_err(lock_error)?;
                         state.frames.clone().ok_or_else(session_missing)?
@@ -946,6 +1032,14 @@ fn shutdown_from_local_request(
     }
     tracing::info!(?reason, "local control requested safe Agent shutdown");
     let _ = supervisor.handle_control_failure()?;
+    if let Some(request) = driver
+        .pending_update_activation
+        .lock()
+        .map_err(lock_error)?
+        .take()
+    {
+        crate::update::authorize_activation(&request)?;
+    }
     Ok(())
 }
 
@@ -1915,6 +2009,7 @@ fn command_reference(
         Payload::StopSession(value) => value.command.clone(),
         Payload::FocusTarget(value) => value.command.clone(),
         Payload::CloseTarget(value) => value.command.clone(),
+        Payload::UpdateDirective(value) => value.command.clone(),
     }
 }
 

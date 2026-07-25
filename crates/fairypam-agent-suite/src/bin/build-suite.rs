@@ -1,0 +1,219 @@
+use std::collections::BTreeMap;
+use std::env;
+use std::error::Error;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use fairypam_agent_suite::{
+    manifest_sha256, sha256_file, validate_manifest, MemberScope, SuiteManifest, SuiteMember,
+    MANIFEST_FILE, MANIFEST_KIND,
+};
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("fairypam-build-suite: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let options = options(env::args().skip(1))?;
+    let build_id = required(&options, "--build-id")?;
+    let source_commit = required(&options, "--source-commit")?;
+    let suite_version = required(&options, "--suite-version")?;
+    let built_at = required(&options, "--built-at")?;
+    let build_origin = required(&options, "--build-origin")?;
+    let output = PathBuf::from(required(&options, "--output")?);
+
+    let mut members = vec![
+        identity(
+            required_path(&options, "--agent")?,
+            "fairypam-agent.exe",
+            MemberScope::Versioned,
+        )?,
+        identity(
+            required_path(&options, "--guardian")?,
+            "fairypam-agent-guardian.exe",
+            MemberScope::Versioned,
+        )?,
+        identity(
+            required_path(&options, "--gui")?,
+            "fairypam-agent-tauri-ui.exe",
+            MemberScope::Versioned,
+        )?,
+        identity(
+            required_path(&options, "--helper")?,
+            "resources/runtime/fairypam-agent-installer.exe",
+            MemberScope::Stable,
+        )?,
+    ];
+    let profiles = required_path(&options, "--profiles")?;
+    collect_profiles(profiles, profiles, &mut members)?;
+    members.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let manifest = SuiteManifest {
+        schema_version: 1,
+        kind: MANIFEST_KIND.to_owned(),
+        build_id: build_id.to_owned(),
+        source_commit: source_commit.to_ascii_lowercase(),
+        suite_version: suite_version.to_owned(),
+        built_at: built_at.to_owned(),
+        build_origin: build_origin.to_owned(),
+        installer_protocol: fairypam_agent_suite::INSTALLER_PROTOCOL_VERSION,
+        members,
+    };
+    validate_manifest(&manifest)?;
+    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
+    bytes.push(b'\n');
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&output, &bytes)?;
+
+    if let Some(package) = options.get("--package") {
+        write_update_package(Path::new(package), &manifest, &bytes, &options)?;
+    }
+    println!(
+        "{{\"build_id\":\"{}\",\"suite_version\":\"{}\",\"manifest_sha256\":\"{}\"}}",
+        manifest.build_id,
+        manifest.suite_version,
+        manifest_sha256(&bytes)
+    );
+    Ok(())
+}
+
+fn options(arguments: impl Iterator<Item = String>) -> Result<BTreeMap<String, String>, String> {
+    let mut arguments = arguments;
+    let mut options = BTreeMap::new();
+    while let Some(name) = arguments.next() {
+        if !name.starts_with("--") || options.contains_key(&name) {
+            return Err(format!("invalid or duplicate option: {name}"));
+        }
+        let value = arguments
+            .next()
+            .ok_or_else(|| format!("missing value for {name}"))?;
+        options.insert(name, value);
+    }
+    Ok(options)
+}
+
+fn required<'a>(options: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, String> {
+    options
+        .get(name)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing {name}"))
+}
+
+fn required_path<'a>(
+    options: &'a BTreeMap<String, String>,
+    name: &str,
+) -> Result<&'a Path, String> {
+    let path = Path::new(required(options, name)?);
+    path.exists()
+        .then_some(path)
+        .ok_or_else(|| format!("{name} path does not exist: {}", path.display()))
+}
+
+fn identity(path: &Path, logical: &str, scope: MemberScope) -> Result<SuiteMember, Box<dyn Error>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() == 0 {
+        return Err(format!(
+            "suite source is not a non-empty regular file: {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(SuiteMember {
+        path: logical.to_owned(),
+        scope,
+        sha256: sha256_file(path)?,
+        size_bytes: metadata.len(),
+    })
+}
+
+fn collect_profiles(
+    root: &Path,
+    directory: &Path,
+    members: &mut Vec<SuiteMember>,
+) -> Result<(), Box<dyn Error>> {
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            collect_profiles(root, &path, members)?;
+        } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+            let relative = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            members.push(identity(
+                &path,
+                &format!("profiles/{relative}"),
+                MemberScope::Versioned,
+            )?);
+        } else {
+            return Err(format!("profiles contain a non-file entry: {}", path.display()).into());
+        }
+    }
+    Ok(())
+}
+
+fn write_update_package(
+    output: &Path,
+    manifest: &SuiteManifest,
+    manifest_bytes: &[u8],
+    options: &BTreeMap<String, String>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut writer = zip::ZipWriter::new(File::create(output)?);
+    let file_options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    writer.start_file(MANIFEST_FILE, file_options)?;
+    writer.write_all(manifest_bytes)?;
+    for member in manifest
+        .members
+        .iter()
+        .filter(|member| member.scope == MemberScope::Versioned)
+    {
+        let source = source_for_member(member, options)?;
+        writer.start_file(&member.path, file_options)?;
+        let mut source = File::open(source)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..read])?;
+        }
+    }
+    writer.finish()?;
+    Ok(())
+}
+
+fn source_for_member(
+    member: &SuiteMember,
+    options: &BTreeMap<String, String>,
+) -> Result<PathBuf, String> {
+    let source = match member.path.as_str() {
+        "fairypam-agent.exe" => required_path(options, "--agent")?.to_owned(),
+        "fairypam-agent-guardian.exe" => required_path(options, "--guardian")?.to_owned(),
+        "fairypam-agent-tauri-ui.exe" => required_path(options, "--gui")?.to_owned(),
+        path if path.starts_with("profiles/") => {
+            required_path(options, "--profiles")?.join(path.trim_start_matches("profiles/"))
+        }
+        _ => {
+            return Err(format!(
+                "versioned member has no source mapping: {}",
+                member.path
+            ))
+        }
+    };
+    Ok(source)
+}

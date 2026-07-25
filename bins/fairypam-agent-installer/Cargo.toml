@@ -7,6 +7,8 @@ publish.workspace = true
 [target.'cfg(windows)'.dependencies]
 fairypam-agent-local-client = { path = "../../crates/fairypam-agent-local-client" }
 fairypam-agent-local-protocol = { path = "../../crates/fairypam-agent-local-protocol" }
+fairypam-agent-suite = { path = "../../crates/fairypam-agent-suite" }
+serde_json.workspace = true
 tokio = { version = "1", features = ["rt", "time"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",

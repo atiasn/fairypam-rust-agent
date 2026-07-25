@@ -12,6 +12,10 @@ pub mod profile_store;
 pub mod runtime;
 #[cfg(feature = "e2e-live-input")]
 pub mod test_arm;
+#[cfg(windows)]
+mod update;
+#[cfg(any(windows, test))]
+mod update_contract;
 
 pub const fn production_authorization() -> DenyAllAuthorization {
     DenyAllAuthorization

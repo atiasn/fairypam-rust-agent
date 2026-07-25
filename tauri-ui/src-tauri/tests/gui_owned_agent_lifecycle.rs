@@ -39,6 +39,7 @@ fn restart_is_task_owned_and_only_repair_elevates_the_fixed_helper() {
     assert!(COMMANDS.contains("SEE_MASK_NOCLOSEPROCESS"));
     assert!(COMMANDS.contains("HSTRING::from(\"runas\")"));
     assert!(COMMANDS.contains("\"startup.agent_repair_required\""));
+    assert!(COMMANDS.contains("Some(22)"));
     assert!(!COMMANDS.contains("fairypam-agent.exe"));
 }
 

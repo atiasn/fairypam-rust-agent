@@ -252,6 +252,7 @@ fn command_ref(command: &HubControlCommand) -> Option<&CommandRef> {
         Payload::StopSession(value) => value.command.as_ref(),
         Payload::FocusTarget(value) => value.command.as_ref(),
         Payload::CloseTarget(value) => value.command.as_ref(),
+        Payload::UpdateDirective(value) => value.command.as_ref(),
     }
 }
 

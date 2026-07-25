@@ -231,6 +231,7 @@ describe('App', () => {
     const view = within(app.container);
 
     expect(await view.findByRole('button', { name: '修复后台服务' })).toBeInTheDocument();
+    expect(view.getByText('后台服务需要修复')).toBeInTheDocument();
     expect(view.getByRole('button', { name: '重启后台服务' })).toBeInTheDocument();
     expect(agentApi.repairAgentTasks).not.toHaveBeenCalled();
 

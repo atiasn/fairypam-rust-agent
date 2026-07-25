@@ -19,6 +19,7 @@ fn main() {
                 "--provision" => with_install_transaction(|| provision(install_root)),
                 "--installed-preflight" => installed_preflight(install_root),
                 "--launch-agent-task" => launch_agent_task(install_root),
+                "--launch-ui-task" => launch_ui_task(install_root),
                 "--run-agent-task" => with_install_transaction(|| {
                     run_fixed_task(install_root, FixedTask::Agent, false)
                 }),
@@ -53,6 +54,8 @@ const ENROLLMENT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\enrollment";
 const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\audit";
 #[cfg(windows)]
 const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
+#[cfg(windows)]
+const UPDATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\updates";
 #[cfg(any(windows, test))]
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 #[cfg(windows)]
@@ -86,6 +89,8 @@ enum ProvisionFailure {
     TaskInvalidAction = 20,
     TaskInvalidSecurity = 21,
     AgentRestartExhausted = 22,
+    Updates = 23,
+    RepairRequired = 24,
 }
 
 #[cfg(any(windows, test))]
@@ -102,6 +107,7 @@ enum FixedTask {
 
 #[cfg(any(windows, test))]
 impl FixedTask {
+    #[cfg(windows)]
     fn name(self) -> &'static str {
         match self {
             Self::Agent => "FairyPam Agent",
@@ -110,10 +116,7 @@ impl FixedTask {
     }
 
     fn executable(self) -> &'static str {
-        match self {
-            Self::Agent => r"resources\runtime\fairypam-agent-installer.exe",
-            Self::Ui => "fairypam-agent-tauri-ui.exe",
-        }
+        r"resources\runtime\fairypam-agent-installer.exe"
     }
 
     fn arguments(self, install_root: &std::path::Path) -> String {
@@ -122,7 +125,7 @@ impl FixedTask {
                 r#"--launch-agent-task "{}""#,
                 install_root.to_string_lossy()
             ),
-            Self::Ui => String::new(),
+            Self::Ui => format!(r#"--launch-ui-task "{}""#, install_root.to_string_lossy()),
         }
     }
 
@@ -151,6 +154,7 @@ enum TaskError {
     InvalidTrigger,
     InvalidAction,
     InvalidSecurity,
+    AgentRestartExhausted,
     Operation,
     Rollback,
 }
@@ -165,6 +169,7 @@ fn task_failure(error: TaskError) -> ProvisionFailure {
         TaskError::InvalidTrigger => ProvisionFailure::TaskInvalidTrigger,
         TaskError::InvalidAction => ProvisionFailure::TaskInvalidAction,
         TaskError::InvalidSecurity => ProvisionFailure::TaskInvalidSecurity,
+        TaskError::AgentRestartExhausted => ProvisionFailure::AgentRestartExhausted,
         TaskError::Operation => ProvisionFailure::TaskOperation,
         TaskError::Rollback => ProvisionFailure::TaskRollback,
     }
@@ -324,17 +329,69 @@ fn launch_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFail
     verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
     let job = kill_on_close_job()?;
     let result = (|| {
+        let (mut resumed_update, mut recovery) =
+            match UpdateActivation::resume_settling(install_root)? {
+                SettlingResume::None => (None, None),
+                SettlingResume::Target(update) => (Some(update), None),
+                SettlingResume::Recovery(request, state) => (None, Some((request, state))),
+            };
         for restart in 0..=AGENT_RESTART_COUNT {
-            let mut child = std::process::Command::new(install_root.join("fairypam-agent.exe"))
-                .current_dir(install_root)
-                .spawn()
-                .map_err(|_| ProvisionFailure::TaskOperation)?;
+            let update = if resumed_update.is_some() {
+                resumed_update.take()
+            } else if pending_update_exists()? {
+                Some(UpdateActivation::prepare(install_root)?)
+            } else {
+                None
+            };
+            let active = active_suite(install_root)?;
+            let mut child =
+                std::process::Command::new(active.version_root.join("fairypam-agent.exe"))
+                    .current_dir(&active.version_root)
+                    .spawn()
+                    .map_err(|_| ProvisionFailure::TaskOperation)?;
             if unsafe { AssignProcessToJobObject(job, HANDLE(child.as_raw_handle())) }.is_err() {
                 let _ = child.kill();
                 return Err(ProvisionFailure::TaskOperation);
             }
+            if let Some((request, state)) = recovery.take() {
+                if wait_for_agent_health(install_root).is_ok() {
+                    persist_update_result(&request, state, "succeeded")?;
+                    std::fs::remove_file(UPDATE_SETTLING_PATH)
+                        .map_err(|_| ProvisionFailure::Updates)?;
+                    let _ = run_fixed_task(install_root, FixedTask::Ui, false);
+                } else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    persist_update_result(&request, state, "failed")?;
+                    return Err(ProvisionFailure::RepairRequired);
+                }
+            }
+            if let Some(update) = update {
+                if wait_for_agent_health(install_root).is_ok() {
+                    if update.commit().is_ok() {
+                        let _ = run_fixed_task(install_root, FixedTask::Ui, false);
+                    } else {
+                        let request = update.request.clone();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        update.rollback("commit_failed")?;
+                        recovery = Some((request, "commit_failed"));
+                        continue;
+                    }
+                } else {
+                    let request = update.request.clone();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    update.rollback("health_failed")?;
+                    recovery = Some((request, "health_failed"));
+                    continue;
+                }
+            }
             let status = child.wait().map_err(|_| ProvisionFailure::TaskOperation)?;
             if status.success() {
+                if pending_update_exists()? {
+                    continue;
+                }
                 return Ok(());
             }
             if restart < AGENT_RESTART_COUNT {
@@ -345,6 +402,25 @@ fn launch_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFail
     })();
     let _ = unsafe { CloseHandle(job) };
     result
+}
+
+#[cfg(windows)]
+fn launch_ui_task(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    let active = active_suite(install_root)?;
+    std::process::Command::new(active.version_root.join("fairypam-agent-tauri-ui.exe"))
+        .current_dir(active.version_root)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| ProvisionFailure::TaskOperation)
+}
+
+#[cfg(windows)]
+fn active_suite(
+    install_root: &std::path::Path,
+) -> Result<fairypam_agent_suite::ActiveSuite, ProvisionFailure> {
+    fairypam_agent_suite::resolve_active_suite(install_root)
+        .map_err(|_| ProvisionFailure::InstallRoots)
 }
 
 #[cfg(windows)]
@@ -379,35 +455,762 @@ fn kill_on_close_job() -> Result<windows::Win32::Foundation::HANDLE, ProvisionFa
 fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
     verify_bootstrap_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
-    verify_nonreparse_directory(std::path::Path::new(PROGRAM_DATA))
-        .map_err(|_| ProvisionFailure::ProgramData)?;
-    let mut changes = Vec::new();
-    for (path, failure) in [
-        (PRODUCT_ROOT, ProvisionFailure::ProductRoot),
-        (AGENT_ROOT, ProvisionFailure::AgentRoot),
-        (ENROLLMENT_ROOT, ProvisionFailure::Enrollment),
-        (AUDIT_ROOT, ProvisionFailure::Audit),
-        (LOG_ROOT, ProvisionFailure::Logs),
-    ] {
-        match create_or_verify_private_directory(std::path::Path::new(path)) {
-            Ok(change) => changes.push((path, change)),
-            Err(error) => {
-                let rollback_failed = rollback_directory_changes(&changes).is_err();
-                return if error == DirectoryError::Rollback || rollback_failed {
-                    Err(ProvisionFailure::Rollback)
-                } else {
-                    Err(failure)
-                };
+    let activation = InstallActivation::from_flat_payload(install_root)?;
+    let result = (|| {
+        verify_nonreparse_directory(std::path::Path::new(PROGRAM_DATA))
+            .map_err(|_| ProvisionFailure::ProgramData)?;
+        let mut changes = Vec::new();
+        for (path, failure) in [
+            (PRODUCT_ROOT, ProvisionFailure::ProductRoot),
+            (AGENT_ROOT, ProvisionFailure::AgentRoot),
+            (ENROLLMENT_ROOT, ProvisionFailure::Enrollment),
+            (AUDIT_ROOT, ProvisionFailure::Audit),
+            (LOG_ROOT, ProvisionFailure::Logs),
+            (UPDATE_ROOT, ProvisionFailure::Updates),
+        ] {
+            match create_or_verify_private_directory(std::path::Path::new(path)) {
+                Ok(change) => changes.push((path, change)),
+                Err(error) => {
+                    let rollback_failed = rollback_directory_changes(&changes).is_err();
+                    return if error == DirectoryError::Rollback || rollback_failed {
+                        Err(ProvisionFailure::Rollback)
+                    } else {
+                        Err(failure)
+                    };
+                }
             }
         }
+        if let Err(error) = provision_fixed_tasks(install_root) {
+            let rollback_failed = rollback_directory_changes(&changes).is_err();
+            return if rollback_failed {
+                Err(ProvisionFailure::Rollback)
+            } else {
+                Err(task_failure(error))
+            };
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => activation.commit(),
+        Err(failure) => match activation.rollback() {
+            Ok(()) => Err(failure),
+            Err(_) => Err(ProvisionFailure::Rollback),
+        },
     }
-    if let Err(error) = provision_fixed_tasks(install_root) {
-        let rollback_failed = rollback_directory_changes(&changes).is_err();
-        return if rollback_failed {
-            Err(ProvisionFailure::Rollback)
-        } else {
-            Err(task_failure(error))
+}
+
+#[cfg(windows)]
+struct InstallActivation {
+    install_root: std::path::PathBuf,
+    version_root: std::path::PathBuf,
+    manifest: fairypam_agent_suite::SuiteManifest,
+    previous_pointer: Option<Vec<u8>>,
+    created_version: bool,
+}
+
+#[cfg(windows)]
+const PENDING_UPDATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\updates\pending";
+#[cfg(windows)]
+const LAST_ACCEPTED_PATH: &str = r"C:\ProgramData\FairyPam.Agent\Agent\updates\last-accepted.json";
+#[cfg(windows)]
+const LAST_UPDATE_RESULT_PATH: &str =
+    r"C:\ProgramData\FairyPam.Agent\Agent\updates\last-result.json";
+#[cfg(windows)]
+const UPDATE_SETTLING_PATH: &str = r"C:\ProgramData\FairyPam.Agent\Agent\updates\settling.json";
+
+#[cfg(windows)]
+struct UpdateActivation {
+    install_root: std::path::PathBuf,
+    version_root: std::path::PathBuf,
+    previous_pointer: Vec<u8>,
+    previous_last_accepted: Option<Vec<u8>>,
+    request: fairypam_agent_suite::UpdateRequest,
+}
+
+#[cfg(windows)]
+enum SettlingResume {
+    None,
+    Target(UpdateActivation),
+    Recovery(fairypam_agent_suite::UpdateRequest, &'static str),
+}
+
+#[cfg(windows)]
+impl UpdateActivation {
+    fn resume_settling(install_root: &std::path::Path) -> Result<SettlingResume, ProvisionFailure> {
+        use fairypam_agent_suite::{
+            manifest_sha256, read_manifest, validate_active_layout, validate_update_package,
+            validate_update_request, verify_authenticode_publisher, CurrentPointer, MANIFEST_FILE,
         };
+
+        let marker =
+            match read_optional_bounded_regular(std::path::Path::new(UPDATE_SETTLING_PATH))? {
+                Some(bytes) => bytes,
+                None => return Ok(SettlingResume::None),
+            };
+        let value: serde_json::Value =
+            serde_json::from_slice(&marker).map_err(|_| ProvisionFailure::Rollback)?;
+        let request: fairypam_agent_suite::UpdateRequest = serde_json::from_value(
+            value
+                .get("request")
+                .cloned()
+                .ok_or(ProvisionFailure::Rollback)?,
+        )
+        .map_err(|_| ProvisionFailure::Rollback)?;
+        validate_update_request(&request).map_err(|_| ProvisionFailure::Rollback)?;
+        let state = value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProvisionFailure::Rollback)?;
+        let failure_state = value
+            .get("failure_state")
+            .and_then(serde_json::Value::as_str);
+        let previous_pointer: CurrentPointer = serde_json::from_value(
+            value
+                .get("previous_pointer")
+                .cloned()
+                .ok_or(ProvisionFailure::Rollback)?,
+        )
+        .map_err(|_| ProvisionFailure::Rollback)?;
+        let previous_pointer_bytes =
+            serde_json::to_vec(&previous_pointer).map_err(|_| ProvisionFailure::Rollback)?;
+        let previous_last_accepted = match value.get("previous_last_accepted") {
+            Some(serde_json::Value::Null) | None => None,
+            Some(previous) => {
+                Some(serde_json::to_vec(previous).map_err(|_| ProvisionFailure::Rollback)?)
+            }
+        };
+        let previous_accepted_value: serde_json::Value = serde_json::from_slice(
+            previous_last_accepted
+                .as_deref()
+                .ok_or(ProvisionFailure::Rollback)?,
+        )
+        .map_err(|_| ProvisionFailure::Rollback)?;
+        if previous_accepted_value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+            || previous_accepted_value
+                .get("build_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(previous_pointer.build_id.as_str())
+            || previous_accepted_value
+                .get("suite_version")
+                .and_then(serde_json::Value::as_str)
+                != Some(previous_pointer.suite_version.as_str())
+        {
+            return Err(ProvisionFailure::Rollback);
+        }
+        let source_root = install_root.join("versions").join(&request.source_build_id);
+        let (source_manifest, source_manifest_bytes) =
+            read_manifest(&source_root.join(MANIFEST_FILE))
+                .map_err(|_| ProvisionFailure::Rollback)?;
+        if source_manifest.build_id != previous_pointer.build_id
+            || source_manifest.suite_version != previous_pointer.suite_version
+            || manifest_sha256(&source_manifest_bytes) != previous_pointer.manifest_sha256
+        {
+            return Err(ProvisionFailure::Rollback);
+        }
+        validate_active_layout(install_root, &source_root, &source_manifest)
+            .map_err(|_| ProvisionFailure::Rollback)?;
+        let current = fairypam_agent_suite::read_current_pointer(
+            &install_root.join(fairypam_agent_suite::CURRENT_POINTER_FILE),
+        )
+        .map_err(|_| ProvisionFailure::Rollback)?;
+        if state == "rollback_verifying" {
+            let failure_state = match failure_state {
+                Some("health_failed") => "health_failed",
+                Some("commit_failed") => "commit_failed",
+                _ => return Err(ProvisionFailure::Rollback),
+            };
+            let activation = Self {
+                install_root: install_root.to_path_buf(),
+                version_root: install_root.join("versions").join(&request.target_build_id),
+                previous_pointer: previous_pointer_bytes,
+                previous_last_accepted,
+                request,
+            };
+            if current.build_id != activation.request.source_build_id
+                && current.build_id != activation.request.target_build_id
+            {
+                return Err(ProvisionFailure::Rollback);
+            }
+            activation.finish_rollback()?;
+            return Ok(SettlingResume::Recovery(activation.request, failure_state));
+        }
+        let active = active_suite(install_root)?;
+        if active.pointer.build_id == request.source_build_id {
+            for path in [
+                install_root
+                    .join("versions")
+                    .join(format!("{}.pending", request.target_build_id)),
+                install_root.join("versions").join(&request.target_build_id),
+            ] {
+                if path.symlink_metadata().is_ok() {
+                    std::fs::remove_dir_all(path).map_err(|_| ProvisionFailure::Rollback)?;
+                }
+            }
+            if state != "target_verifying" {
+                return Err(ProvisionFailure::Rollback);
+            }
+            std::fs::remove_file(UPDATE_SETTLING_PATH).map_err(|_| ProvisionFailure::Rollback)?;
+            return Ok(SettlingResume::None);
+        }
+        if active.pointer.build_id != request.target_build_id || state != "target_verifying" {
+            return Err(ProvisionFailure::Rollback);
+        }
+        verify_authenticode_publisher(
+            install_root,
+            &active.version_root,
+            &active.manifest,
+            option_env!("FAIRYPAM_UPDATE_PUBLISHER").unwrap_or(""),
+            option_env!("FAIRYPAM_UPDATE_CERT_THUMBPRINT").unwrap_or(""),
+        )
+        .map_err(|_| ProvisionFailure::Rollback)?;
+        if pending_update_exists()? {
+            let verified = validate_update_package(
+                &std::path::Path::new(PENDING_UPDATE_ROOT).join("candidate.zip"),
+                &request.artifact_sha256,
+                request.artifact_size,
+                &request.target_build_id,
+                &request.manifest_sha256,
+            )
+            .map_err(|_| ProvisionFailure::Rollback)?;
+            if verified.manifest.suite_version != request.suite_version {
+                return Err(ProvisionFailure::Rollback);
+            }
+        } else if update_result_matches(&request, "completed", "not_required") {
+            std::fs::remove_file(UPDATE_SETTLING_PATH).map_err(|_| ProvisionFailure::Rollback)?;
+            return Ok(SettlingResume::None);
+        }
+        Ok(SettlingResume::Target(Self {
+            install_root: install_root.to_path_buf(),
+            version_root: active.version_root,
+            previous_pointer: previous_pointer_bytes,
+            previous_last_accepted,
+            request,
+        }))
+    }
+
+    fn prepare(install_root: &std::path::Path) -> Result<Self, ProvisionFailure> {
+        use fairypam_agent_suite::{
+            compare_versions, extract_update_package, manifest_sha256, validate_update_package,
+            validate_update_request, verify_authenticode_publisher, CurrentPointer, MANIFEST_FILE,
+        };
+
+        verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+        verify_private_update_root()?;
+        wait_for_agent_processes_to_exit(install_root).map_err(task_failure)?;
+        let pending = std::path::Path::new(PENDING_UPDATE_ROOT);
+        let request_bytes = read_bounded_regular(&pending.join("request.json"))?;
+        let request: fairypam_agent_suite::UpdateRequest =
+            serde_json::from_slice(&request_bytes).map_err(|_| ProvisionFailure::InstallRoots)?;
+        validate_update_request(&request).map_err(|_| ProvisionFailure::InstallRoots)?;
+        let active = active_suite(install_root)?;
+        if request.source_build_id != active.pointer.build_id {
+            return Err(ProvisionFailure::InstallRoots);
+        }
+        let accepted = last_accepted_version(&active)?;
+        if compare_versions(&request.suite_version, &accepted)
+            .map_err(|_| ProvisionFailure::InstallRoots)?
+            != std::cmp::Ordering::Greater
+        {
+            return Err(ProvisionFailure::InstallRoots);
+        }
+        let package = pending.join("candidate.zip");
+        let verified = validate_update_package(
+            &package,
+            &request.artifact_sha256,
+            request.artifact_size,
+            &request.target_build_id,
+            &request.manifest_sha256,
+        )
+        .map_err(|_| ProvisionFailure::InstallRoots)?;
+        if verified.manifest.suite_version != request.suite_version {
+            return Err(ProvisionFailure::InstallRoots);
+        }
+        let versions = install_root.join("versions");
+        let staged = versions.join(format!("{}.pending", request.target_build_id));
+        let version_root = versions.join(&request.target_build_id);
+        if staged.symlink_metadata().is_ok() || version_root.symlink_metadata().is_ok() {
+            return Err(ProvisionFailure::InstallRoots);
+        }
+        let prepared = (|| {
+            extract_update_package(&package, install_root, &staged, &verified)
+                .map_err(|_| ProvisionFailure::InstallRoots)?;
+            verify_authenticode_publisher(
+                install_root,
+                &staged,
+                &verified.manifest,
+                option_env!("FAIRYPAM_UPDATE_PUBLISHER").unwrap_or(""),
+                option_env!("FAIRYPAM_UPDATE_CERT_THUMBPRINT").unwrap_or(""),
+            )
+            .map_err(|_| ProvisionFailure::InstallRoots)?;
+            let previous_pointer = read_bounded_regular(
+                &install_root.join(fairypam_agent_suite::CURRENT_POINTER_FILE),
+            )?;
+            let previous_last_accepted = Some(read_bounded_regular(std::path::Path::new(
+                LAST_ACCEPTED_PATH,
+            ))?);
+            persist_settling(
+                &request,
+                &previous_pointer,
+                previous_last_accepted.as_deref(),
+                "target_verifying",
+                None,
+            )?;
+            std::fs::rename(&staged, &version_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+            let pointer = CurrentPointer {
+                schema_version: 1,
+                build_id: verified.manifest.build_id.clone(),
+                suite_version: verified.manifest.suite_version.clone(),
+                manifest_sha256: manifest_sha256(&read_bounded_regular(
+                    &version_root.join(MANIFEST_FILE),
+                )?),
+            };
+            replace_pointer(
+                &install_root.join(fairypam_agent_suite::CURRENT_POINTER_FILE),
+                &serde_json::to_vec(&pointer).map_err(|_| ProvisionFailure::InstallRoots)?,
+            )?;
+            if active_suite(install_root).is_err() {
+                replace_pointer(
+                    &install_root.join(fairypam_agent_suite::CURRENT_POINTER_FILE),
+                    &previous_pointer,
+                )
+                .map_err(|_| ProvisionFailure::Rollback)?;
+                return Err(ProvisionFailure::InstallRoots);
+            }
+            Ok((previous_pointer, previous_last_accepted))
+        })();
+        let (previous_pointer, previous_last_accepted) = match prepared {
+            Ok(previous) => previous,
+            Err(error) => {
+                let _ = std::fs::remove_file(UPDATE_SETTLING_PATH);
+                let _ = std::fs::remove_dir_all(&staged);
+                let _ = std::fs::remove_dir_all(&version_root);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            install_root: install_root.to_path_buf(),
+            version_root,
+            previous_pointer,
+            previous_last_accepted,
+            request,
+        })
+    }
+
+    fn commit(&self) -> Result<(), ProvisionFailure> {
+        persist_last_accepted(&self.request.target_build_id, &self.request.suite_version)?;
+        persist_update_result(&self.request, "completed", "not_required")?;
+        std::fs::remove_dir_all(PENDING_UPDATE_ROOT).map_err(|_| ProvisionFailure::InstallRoots)?;
+        std::fs::remove_file(UPDATE_SETTLING_PATH).map_err(|_| ProvisionFailure::InstallRoots)
+    }
+
+    fn rollback(self, failure_state: &'static str) -> Result<(), ProvisionFailure> {
+        persist_settling(
+            &self.request,
+            &self.previous_pointer,
+            self.previous_last_accepted.as_deref(),
+            "rollback_verifying",
+            Some(failure_state),
+        )
+        .map_err(|_| ProvisionFailure::Rollback)?;
+        self.finish_rollback()
+    }
+
+    fn finish_rollback(&self) -> Result<(), ProvisionFailure> {
+        let pointer_path = self
+            .install_root
+            .join(fairypam_agent_suite::CURRENT_POINTER_FILE);
+        let current = fairypam_agent_suite::read_current_pointer(&pointer_path)
+            .map_err(|_| ProvisionFailure::Rollback)?;
+        if current.build_id == self.request.target_build_id {
+            replace_pointer(&pointer_path, &self.previous_pointer)
+                .map_err(|_| ProvisionFailure::Rollback)?;
+        } else if current.build_id != self.request.source_build_id {
+            return Err(ProvisionFailure::Rollback);
+        }
+        for path in [
+            self.install_root
+                .join("versions")
+                .join(format!("{}.pending", self.request.target_build_id)),
+            self.version_root.clone(),
+        ] {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(ProvisionFailure::Rollback),
+            }
+        }
+        let active = active_suite(&self.install_root).map_err(|_| ProvisionFailure::Rollback)?;
+        if active.pointer.build_id != self.request.source_build_id {
+            return Err(ProvisionFailure::Rollback);
+        }
+        restore_optional_file(
+            std::path::Path::new(LAST_ACCEPTED_PATH),
+            self.previous_last_accepted.as_deref(),
+        )
+        .map_err(|_| ProvisionFailure::Rollback)?;
+        match std::fs::remove_dir_all(PENDING_UPDATE_ROOT) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(ProvisionFailure::Rollback),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn pending_update_exists() -> Result<bool, ProvisionFailure> {
+    match std::path::Path::new(PENDING_UPDATE_ROOT)
+        .join("request.json")
+        .symlink_metadata()
+    {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => Err(ProvisionFailure::InstallRoots),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(ProvisionFailure::InstallRoots),
+    }
+}
+
+#[cfg(windows)]
+fn read_bounded_regular(path: &std::path::Path) -> Result<Vec<u8>, ProvisionFailure> {
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|_| ProvisionFailure::InstallRoots)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > fairypam_agent_suite::MAX_MANIFEST_BYTES
+    {
+        return Err(ProvisionFailure::InstallRoots);
+    }
+    std::fs::read(path).map_err(|_| ProvisionFailure::InstallRoots)
+}
+
+#[cfg(windows)]
+fn read_optional_bounded_regular(
+    path: &std::path::Path,
+) -> Result<Option<Vec<u8>>, ProvisionFailure> {
+    match path.symlink_metadata() {
+        Ok(_) => read_bounded_regular(path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(ProvisionFailure::InstallRoots),
+    }
+}
+
+#[cfg(windows)]
+fn restore_optional_file(
+    path: &std::path::Path,
+    previous: Option<&[u8]>,
+) -> Result<(), ProvisionFailure> {
+    match previous {
+        Some(bytes) => replace_pointer(path, bytes).map_err(|_| ProvisionFailure::Rollback),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(ProvisionFailure::Rollback),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn verify_private_update_root() -> Result<(), ProvisionFailure> {
+    let root = std::path::Path::new(UPDATE_ROOT);
+    verify_nonreparse_directory(root).map_err(|_| ProvisionFailure::Updates)?;
+    private_security_sddl(&security_sddl(root).map_err(|_| ProvisionFailure::Updates)?)
+        .map_err(|_| ProvisionFailure::Updates)
+}
+
+#[cfg(windows)]
+fn last_accepted_version(
+    active: &fairypam_agent_suite::ActiveSuite,
+) -> Result<String, ProvisionFailure> {
+    let bytes = read_bounded_regular(std::path::Path::new(LAST_ACCEPTED_PATH))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ProvisionFailure::Updates)?;
+    let build_id = value
+        .get("build_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ProvisionFailure::Updates)?;
+    let suite_version = value
+        .get("suite_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ProvisionFailure::Updates)?;
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || build_id != active.pointer.build_id
+        || suite_version != active.pointer.suite_version
+    {
+        return Err(ProvisionFailure::Updates);
+    }
+    Ok(suite_version.to_owned())
+}
+
+#[cfg(windows)]
+fn persist_last_accepted(build_id: &str, suite_version: &str) -> Result<(), ProvisionFailure> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "build_id": build_id,
+        "suite_version": suite_version,
+    }))
+    .map_err(|_| ProvisionFailure::Updates)?;
+    replace_pointer(std::path::Path::new(LAST_ACCEPTED_PATH), &bytes)
+        .map_err(|_| ProvisionFailure::Updates)
+}
+
+#[cfg(windows)]
+fn persist_update_result(
+    request: &fairypam_agent_suite::UpdateRequest,
+    state: &str,
+    rollback: &str,
+) -> Result<(), ProvisionFailure> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "update_id": request.update_id,
+        "source_build_id": request.source_build_id,
+        "target_build_id": request.target_build_id,
+        "artifact_sha256": request.artifact_sha256,
+        "artifact_size": request.artifact_size,
+        "manifest_sha256": request.manifest_sha256,
+        "state": state,
+        "rollback": rollback,
+    }))
+    .map_err(|_| ProvisionFailure::Updates)?;
+    replace_pointer(std::path::Path::new(LAST_UPDATE_RESULT_PATH), &bytes)
+        .map_err(|_| ProvisionFailure::Updates)
+}
+
+#[cfg(windows)]
+fn update_result_matches(
+    request: &fairypam_agent_suite::UpdateRequest,
+    state: &str,
+    rollback: &str,
+) -> bool {
+    let Ok(Some(bytes)) =
+        read_optional_bounded_regular(std::path::Path::new(LAST_UPDATE_RESULT_PATH))
+    else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        == Some(1)
+        && value.get("update_id").and_then(serde_json::Value::as_str)
+            == Some(request.update_id.as_str())
+        && value
+            .get("target_build_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(request.target_build_id.as_str())
+        && value.get("state").and_then(serde_json::Value::as_str) == Some(state)
+        && value.get("rollback").and_then(serde_json::Value::as_str) == Some(rollback)
+}
+
+#[cfg(windows)]
+fn persist_settling(
+    request: &fairypam_agent_suite::UpdateRequest,
+    previous_pointer: &[u8],
+    previous_last_accepted: Option<&[u8]>,
+    state: &str,
+    failure_state: Option<&str>,
+) -> Result<(), ProvisionFailure> {
+    let previous_pointer: serde_json::Value =
+        serde_json::from_slice(previous_pointer).map_err(|_| ProvisionFailure::Updates)?;
+    let previous_last_accepted: Option<serde_json::Value> = previous_last_accepted
+        .map(serde_json::from_slice)
+        .transpose()
+        .map_err(|_| ProvisionFailure::Updates)?;
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "state": state,
+        "failure_state": failure_state,
+        "request": request,
+        "previous_pointer": previous_pointer,
+        "previous_last_accepted": previous_last_accepted,
+    }))
+    .map_err(|_| ProvisionFailure::Updates)?;
+    replace_pointer(std::path::Path::new(UPDATE_SETTLING_PATH), &bytes)
+        .map_err(|_| ProvisionFailure::Updates)
+}
+
+#[cfg(windows)]
+impl InstallActivation {
+    fn from_flat_payload(install_root: &std::path::Path) -> Result<Self, ProvisionFailure> {
+        use fairypam_agent_suite::{
+            manifest_sha256, read_manifest, validate_flat_layout, validate_installed_layout,
+            CurrentPointer, MemberScope, CURRENT_POINTER_FILE, MANIFEST_FILE,
+        };
+
+        let manifest_path = install_root.join(MANIFEST_FILE);
+        let (manifest, manifest_bytes) =
+            read_manifest(&manifest_path).map_err(|_| ProvisionFailure::InstallRoots)?;
+        validate_flat_layout(install_root, &manifest)
+            .map_err(|_| ProvisionFailure::InstallRoots)?;
+        let versions = install_root.join("versions");
+        std::fs::create_dir_all(&versions).map_err(|_| ProvisionFailure::InstallRoots)?;
+        let version_root = versions.join(&manifest.build_id);
+        let created_version = match version_root.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let pending = versions.join(format!("{}.pending", manifest.build_id));
+                if pending.symlink_metadata().is_ok() {
+                    return Err(ProvisionFailure::InstallRoots);
+                }
+                std::fs::create_dir(&pending).map_err(|_| ProvisionFailure::InstallRoots)?;
+                let staged = (|| {
+                    for member in manifest
+                        .members
+                        .iter()
+                        .filter(|member| member.scope == MemberScope::Versioned)
+                    {
+                        let source = install_root.join(member.path.replace('/', "\\"));
+                        let destination = pending.join(member.path.replace('/', "\\"));
+                        if let Some(parent) = destination.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|_| ProvisionFailure::InstallRoots)?;
+                        }
+                        std::fs::copy(source, destination)
+                            .map_err(|_| ProvisionFailure::InstallRoots)?;
+                    }
+                    std::fs::write(pending.join(MANIFEST_FILE), &manifest_bytes)
+                        .map_err(|_| ProvisionFailure::InstallRoots)?;
+                    validate_installed_layout(install_root, &pending, &manifest)
+                        .map_err(|_| ProvisionFailure::InstallRoots)
+                })();
+                if let Err(error) = staged {
+                    let _ = std::fs::remove_dir_all(&pending);
+                    return Err(error);
+                }
+                std::fs::rename(&pending, &version_root)
+                    .map_err(|_| ProvisionFailure::InstallRoots)?;
+                true
+            }
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                validate_installed_layout(install_root, &version_root, &manifest)
+                    .map_err(|_| ProvisionFailure::InstallRoots)?;
+                false
+            }
+            _ => return Err(ProvisionFailure::InstallRoots),
+        };
+        let pointer_path = install_root.join(CURRENT_POINTER_FILE);
+        let previous_pointer = match pointer_path.symlink_metadata() {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() <= fairypam_agent_suite::MAX_MANIFEST_BYTES =>
+            {
+                Some(std::fs::read(&pointer_path).map_err(|_| ProvisionFailure::InstallRoots)?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            _ => return Err(ProvisionFailure::InstallRoots),
+        };
+        let pointer = CurrentPointer {
+            schema_version: 1,
+            build_id: manifest.build_id.clone(),
+            suite_version: manifest.suite_version.clone(),
+            manifest_sha256: manifest_sha256(&manifest_bytes),
+        };
+        replace_pointer(
+            &pointer_path,
+            &serde_json::to_vec(&pointer).map_err(|_| ProvisionFailure::InstallRoots)?,
+        )?;
+        if verify_install_tree(install_root).is_err() || active_suite(install_root).is_err() {
+            if restore_pointer(&pointer_path, previous_pointer.as_deref()).is_err()
+                || (created_version && std::fs::remove_dir_all(&version_root).is_err())
+            {
+                return Err(ProvisionFailure::Rollback);
+            }
+            return Err(ProvisionFailure::InstallRoots);
+        }
+        Ok(Self {
+            install_root: install_root.to_path_buf(),
+            version_root,
+            manifest,
+            previous_pointer,
+            created_version,
+        })
+    }
+
+    fn commit(self) -> Result<(), ProvisionFailure> {
+        use fairypam_agent_suite::{MemberScope, MANIFEST_FILE};
+        persist_last_accepted(&self.manifest.build_id, &self.manifest.suite_version)?;
+        for member in self
+            .manifest
+            .members
+            .iter()
+            .filter(|member| member.scope == MemberScope::Versioned)
+        {
+            std::fs::remove_file(self.install_root.join(member.path.replace('/', "\\")))
+                .map_err(|_| ProvisionFailure::InstallRoots)?;
+        }
+        std::fs::remove_file(self.install_root.join(MANIFEST_FILE))
+            .map_err(|_| ProvisionFailure::InstallRoots)?;
+        let _ = std::fs::remove_dir(self.install_root.join("profiles"));
+        Ok(())
+    }
+
+    fn rollback(self) -> Result<(), ProvisionFailure> {
+        let pointer = self
+            .install_root
+            .join(fairypam_agent_suite::CURRENT_POINTER_FILE);
+        restore_pointer(&pointer, self.previous_pointer.as_deref())?;
+        if self.created_version {
+            std::fs::remove_dir_all(self.version_root).map_err(|_| ProvisionFailure::Rollback)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn restore_pointer(
+    path: &std::path::Path,
+    previous: Option<&[u8]>,
+) -> Result<(), ProvisionFailure> {
+    match previous {
+        Some(bytes) => replace_pointer(path, bytes).map_err(|_| ProvisionFailure::Rollback),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(ProvisionFailure::Rollback),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn replace_pointer(path: &std::path::Path, bytes: &[u8]) -> Result<(), ProvisionFailure> {
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| ProvisionFailure::InstallRoots)?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| ProvisionFailure::InstallRoots)?;
+    drop(file);
+    let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .is_err()
+    {
+        let _ = std::fs::remove_file(temporary);
+        return Err(ProvisionFailure::InstallRoots);
     }
     Ok(())
 }
@@ -456,13 +1259,15 @@ fn prepare_install(install_root: &std::path::Path) -> Result<(), ProvisionFailur
 #[cfg(windows)]
 fn installed_preflight(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
-    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)
+    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    active_suite(install_root).map(|_| ())
 }
 
 #[cfg(windows)]
 fn repair_fixed_tasks(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
     verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    active_suite(install_root)?;
     provision_fixed_tasks(install_root).map_err(task_failure)
 }
 
@@ -528,6 +1333,7 @@ fn provision_fixed_tasks(install_root: &std::path::Path) -> Result<(), TaskError
             }
             unsafe { agent.ok_or(TaskError::Operation)?.Run(&VARIANT::default()) }
                 .map_err(|_| TaskError::Operation)?;
+            wait_for_agent_health(install_root)?;
             Ok(())
         })();
         if result.is_err() && restore_fixed_tasks(folder, &backups).is_err() {
@@ -535,6 +1341,68 @@ fn provision_fixed_tasks(install_root: &std::path::Path) -> Result<(), TaskError
         }
         result
     })
+}
+
+#[cfg(windows)]
+fn wait_for_agent_health(install_root: &std::path::Path) -> Result<(), TaskError> {
+    use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
+    use fairypam_agent_local_protocol::LocalCommand;
+
+    let active = active_suite(install_root).map_err(|_| TaskError::Operation)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|_| TaskError::Operation)?;
+    for _ in 0..30 {
+        let mut client = LocalClient::new(
+            WindowsNamedPipeClientTransport::new_verified_maintenance_path(
+                r"\\.\pipe\FairyPam.Agent.v1",
+                active.version_root.join("fairypam-agent.exe"),
+            ),
+        );
+        if let Ok(response) = runtime
+            .block_on(client.request(LocalCommand::Status, std::time::Duration::from_secs(1)))
+        {
+            if response.body["build_id"] == active.manifest.build_id
+                && response.body["suite_version"] == active.manifest.suite_version
+                && response.body["guardian_state"] == "idle_no_holds"
+            {
+                return guardian_self_test(&active.version_root);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    Err(TaskError::Operation)
+}
+
+#[cfg(windows)]
+fn guardian_self_test(version_root: &std::path::Path) -> Result<(), TaskError> {
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(version_root.join("fairypam-agent-guardian.exe"))
+        .arg("--self-test")
+        .current_dir(version_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| TaskError::Operation)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) | Err(_) => return Err(TaskError::Operation),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(TaskError::Operation);
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -826,6 +1694,14 @@ fn run_fixed_task(
     with_task_scheduler(|folder| {
         let registered = validate_fixed_task(folder, install_root, &user_sid, task)?;
         let state = unsafe { registered.State() }.map_err(|_| TaskError::Operation)?;
+        if task == FixedTask::Agent
+            && !restart
+            && !matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED)
+            && unsafe { registered.LastTaskResult() }.map_err(|_| TaskError::Operation)?
+                == ProvisionFailure::AgentRestartExhausted as i32
+        {
+            return Err(TaskError::AgentRestartExhausted);
+        }
         if restart && matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
             unsafe { registered.Stop(0) }.map_err(|_| TaskError::Operation)?;
             for _ in 0..50 {
@@ -982,6 +1858,7 @@ fn request_agent_maintenance_shutdown(install_root: &std::path::Path) -> Result<
     use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
     use fairypam_agent_local_protocol::LocalCommand;
 
+    let active = active_suite(install_root).map_err(|_| TaskError::Rollback)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -990,7 +1867,7 @@ fn request_agent_maintenance_shutdown(install_root: &std::path::Path) -> Result<
     let mut client = LocalClient::new(
         WindowsNamedPipeClientTransport::new_verified_maintenance_path(
             r"\\.\pipe\FairyPam.Agent.v1",
-            install_root.join("fairypam-agent.exe"),
+            active.version_root.join("fairypam-agent.exe"),
         ),
     );
     // The Agent cancels its Pipe server while replying. Task state and the
@@ -1052,6 +1929,7 @@ fn managed_process_is_running(
         },
     };
 
+    let version_root = active_version_root_or_legacy(install_root)?;
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
         .map_err(|_| TaskError::Rollback)?;
     let result = (|| {
@@ -1074,9 +1952,9 @@ fn managed_process_is_running(
                 .unwrap_or(entry.szExeFile.len());
             let executable = String::from_utf16_lossy(&entry.szExeFile[..length]);
             let expected = if executable.eq_ignore_ascii_case("fairypam-agent.exe") {
-                Some(install_root.join("fairypam-agent.exe"))
+                Some(version_root.join("fairypam-agent.exe"))
             } else if executable.eq_ignore_ascii_case("fairypam-agent-guardian.exe") {
-                Some(install_root.join("fairypam-agent-guardian.exe"))
+                Some(version_root.join("fairypam-agent-guardian.exe"))
             } else if include_launcher
                 && entry.th32ProcessID != std::process::id()
                 && executable.eq_ignore_ascii_case("fairypam-agent-installer.exe")
@@ -1127,6 +2005,24 @@ fn managed_process_is_running(
     })();
     let _ = unsafe { CloseHandle(snapshot) };
     result
+}
+
+#[cfg(windows)]
+fn active_version_root_or_legacy(
+    install_root: &std::path::Path,
+) -> Result<std::path::PathBuf, TaskError> {
+    match install_root
+        .join(fairypam_agent_suite::CURRENT_POINTER_FILE)
+        .symlink_metadata()
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(install_root.to_path_buf())
+        }
+        Err(_) => Err(TaskError::Rollback),
+        Ok(_) => active_suite(install_root)
+            .map(|suite| suite.version_root)
+            .map_err(|_| TaskError::Rollback),
+    }
 }
 
 #[cfg(windows)]
@@ -1456,8 +2352,13 @@ fn private_security_sddl(value: &str) -> Result<(), ()> {
 #[cfg(windows)]
 fn legacy_directory_security(value: &str) -> Result<(), ()> {
     let user_sid = task_user_sid()?;
+    legacy_directory_security_for_user(value, &user_sid)
+}
+
+#[cfg(windows)]
+fn legacy_directory_security_for_user(value: &str, user_sid: &str) -> Result<(), ()> {
     let actual = canonical_directory_security_sddl(value)?;
-    for expected in legacy_directory_security_variants(&user_sid) {
+    for expected in legacy_directory_security_variants(user_sid) {
         if canonical_directory_security_sddl(&expected)? == actual {
             return Ok(());
         }
@@ -1983,8 +2884,11 @@ mod tests {
         assert!(ui.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(ui.contains("<URI>\\FairyPam Agent UI</URI>"));
         assert!(!ui.contains("<RestartOnFailure>"));
-        assert!(ui.contains("<Arguments></Arguments>"));
-        assert!(ui.contains(r"C:\Program Files\FairyPam\fairypam-agent-tauri-ui.exe"));
+        assert!(ui.contains(
+            r#"<Arguments>--launch-ui-task &quot;C:\Program Files\FairyPam&quot;</Arguments>"#
+        ));
+        assert!(ui
+            .contains(r"C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe"));
     }
 
     #[test]
@@ -2024,9 +2928,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn legacy_state_acl_validator_preserves_the_exact_windows_boundary() {
-        let user_sid = task_user_sid().unwrap();
-        for allowed in legacy_directory_security_variants(&user_sid) {
-            assert!(legacy_directory_security(&allowed).is_ok());
+        let user_sid = "S-1-5-21-1-2-3-1001";
+        for allowed in legacy_directory_security_variants(user_sid) {
+            assert!(legacy_directory_security_for_user(&allowed, user_sid).is_ok());
         }
         for rejected in [
             format!("O:BUD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;{user_sid})"),
@@ -2034,7 +2938,7 @@ mod tests {
             "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;S-1-5-18)".to_owned(),
             format!("O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;{user_sid})(A;;FR;;;BU)"),
         ] {
-            assert!(legacy_directory_security(&rejected).is_err());
+            assert!(legacy_directory_security_for_user(&rejected, user_sid).is_err());
         }
     }
 

@@ -339,9 +339,13 @@ fairypam_open_existing_install:
     StrCpy $R3 $0
     Goto fairypam_install_helper_failed
   ${EndIf}
+  IfFileExists "$FairyPamInstallDir\current.json" 0 fairypam_install_validation_failed
+  IfFileExists "$FairyPamInstallDir\versions\*.*" 0 fairypam_install_validation_failed
+  RMDir /r "$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}"
+  IfFileExists "$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\*.*" fairypam_install_validation_failed 0
 
   ; Leave the product directory before releasing its pinned handle. The final
-  ; layout is already active, so no rename, backup, or residual deletion occurs.
+  ; versioned layout and current pointer are already active.
   SetOutPath "$PROGRAMFILES64"
   StrCpy $R6 $FairyPamInstallHandle
   System::Call 'kernel32::CloseHandle(p R6) i.R9 ?e'

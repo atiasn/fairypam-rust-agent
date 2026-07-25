@@ -14,10 +14,55 @@ enum StdinEvent {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    let result = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => run(),
+        [argument] if argument == "--self-test" => self_test(),
+        _ => Err("guardian arguments are invalid".into()),
+    };
+    if let Err(error) = result {
         eprintln!("guardian fatal: {error}");
         std::process::exit(1);
     }
+}
+
+fn self_test() -> Result<(), String> {
+    use fairypam_agent_guardian_protocol::GuardianRequest;
+
+    let mut monitor = GuardianMonitor::new(SystemReleaseDriver);
+    let now = Instant::now();
+    let pid = std::process::id();
+    for (request, expected) in [
+        (
+            GuardianRequest::RegisterAgent {
+                agent_pid: pid,
+                heartbeat_timeout_ms: 5_000,
+            },
+            GuardianResponse::Ack {},
+        ),
+        (
+            GuardianRequest::Heartbeat { sequence: 0 },
+            GuardianResponse::Ack {},
+        ),
+        (
+            GuardianRequest::Status {},
+            GuardianResponse::Status {
+                agent_pid: Some(pid),
+                committed_hold_count: 0,
+                last_sequence: 0,
+            },
+        ),
+        (
+            GuardianRequest::ReleaseAll {
+                reason: ReleaseReason::EmergencyStop,
+            },
+            GuardianResponse::Ack {},
+        ),
+    ] {
+        if monitor.handle(request, now) != expected {
+            return Err("guardian self-test failed".into());
+        }
+    }
+    Ok(())
 }
 
 fn run() -> Result<(), String> {
@@ -242,6 +287,11 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn installed_binary_self_test_covers_registration_heartbeat_and_release() {
+        self_test().unwrap();
     }
 
     #[test]

@@ -102,6 +102,7 @@ async fn control_mtls_is_agent_bound_and_independent_from_frame_availability() {
                 protocol_minor: 0,
                 build_commit: "test".into(),
                 installed_profile_ids: vec!["fairypam-test-window".into()],
+                ..Default::default()
             })),
         })
         .await

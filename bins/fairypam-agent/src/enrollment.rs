@@ -42,6 +42,7 @@ pub(crate) const STATE_PARENT: &str = r"C:\ProgramData\FairyPam.Agent\Agent";
 pub(crate) const STATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\enrollment";
 pub(crate) const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\audit";
 pub(crate) const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
+pub(crate) const UPDATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\updates";
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 const CLAIM_DEADLINE: Duration = Duration::from_secs(15);
 const CLAIM_OPERATION_TIMEOUT_MS: i32 = 5_000;
@@ -317,7 +318,8 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), AgentError> {
     let enrollment = Path::new(STATE_ROOT);
     let audit = Path::new(AUDIT_ROOT);
     let logs = Path::new(LOG_ROOT);
-    if path != enrollment && path != audit && path != logs {
+    let updates = Path::new(UPDATE_ROOT);
+    if path != enrollment && path != audit && path != logs && path != updates {
         return Err(failed());
     }
 

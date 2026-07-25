@@ -11,6 +11,7 @@ members = [
     "crates/fairypam-agent-local-client",
     "crates/fairypam-agent-local-protocol",
     "crates/fairypam-agent-protocol",
+    "crates/fairypam-agent-suite",
     "crates/fairypam-agent-transport",
     "crates/fairypam-agent-windows",
 ]
@@ -24,6 +25,7 @@ default-members = [
     "crates/fairypam-agent-local-client",
     "crates/fairypam-agent-local-protocol",
     "crates/fairypam-agent-protocol",
+    "crates/fairypam-agent-suite",
     "crates/fairypam-agent-transport",
     "crates/fairypam-agent-windows",
 ]
