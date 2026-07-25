@@ -226,7 +226,7 @@ fn product_installer_uses_one_fixed_protected_root() {
         "verify_install_roots",
         "verify_legacy_active_tree",
         ".installing",
-        ".previous",
+        "\".previous\"",
     ] {
         assert!(
             !INSTALLER_PROVISIONER.contains(forbidden),
@@ -361,8 +361,18 @@ fn product_installer_uses_one_fixed_protected_root() {
             "a Windows path must not escape a Handlebars placeholder: {line}"
         );
     }
+    assert_eq!(
+        NSIS_HOOKS.matches("RMDir /r").count(),
+        1,
+        "only the protected bootstrap staging directory may be recursively removed"
+    );
+    assert!(
+        NSIS_HOOKS.contains(
+            "RMDir /r \"$FairyPamInstallDir\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\""
+        ),
+        "recursive removal must target only the protected bootstrap staging directory"
+    );
     for forbidden in [
-        "RMDir /r",
         "Rename ",
         ".installing",
         ".previous",
@@ -394,7 +404,11 @@ fn product_installer_binds_each_command_to_one_helper_phase() {
         );
     }
 
-    let provision = source_between(INSTALLER_PROVISIONER, "fn provision(", "fn preflight(");
+    let provision = source_between(
+        INSTALLER_PROVISIONER,
+        "fn provision(",
+        "struct InstallActivation",
+    );
     let preflight = source_between(
         INSTALLER_PROVISIONER,
         "fn preflight(",
