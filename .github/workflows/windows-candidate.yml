@@ -189,6 +189,9 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $env:FAIRYPAM_BUILD_COMMIT = (Get-Content SOURCE_COMMIT -Raw).Trim()
           cargo build --release --locked -p fairypam-agent -p fairypam-agent-guardian -p fairypam-agent-installer -p fairypam-agent-suite
+          New-Item -ItemType Directory -Force target\suite | Out-Null
+          '{"schema_version":0,"promotable":false}' |
+            Set-Content -NoNewline -Encoding utf8 target\suite\BUILD-MANIFEST.json
           Push-Location tauri-ui
           try {
             npm ci
