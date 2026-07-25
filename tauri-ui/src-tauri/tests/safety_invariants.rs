@@ -319,6 +319,15 @@ fn product_installer_uses_one_fixed_protected_root() {
         NSIS_TEMPLATE.contains("!insertmacro FAIRYPAM_VERIFY_PROTECTED_DIRECTORY_PATH \"$FairyPamInstallDir\" fairypam_uninstall_untrusted_root"),
         "the uninstaller must reject an untrusted product root before deleting declared files"
     );
+    for required in [
+        "StrCmp \"$EXEDIR\" \"${FAIRYPAM_INSTALL_ROOT}\" fairypam_uninstall_root_ok",
+        "StrCmp \"$INSTDIR\" \"${FAIRYPAM_INSTALL_ROOT}\" fairypam_uninstall_root_ok",
+    ] {
+        assert!(
+            NSIS_TEMPLATE.contains(required),
+            "uninstall must bind both the protected original and its NSIS self-delete copy: {required}"
+        );
+    }
     assert!(
         NSIS_TEMPLATE.contains("!insertmacro NSIS_HOOK_PREPAYLOAD"),
         "the template must preflight the live tree before normal payload extraction"

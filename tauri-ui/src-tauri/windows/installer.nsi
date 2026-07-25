@@ -692,8 +692,10 @@ Function .onInstSuccess
 FunctionEnd
 
 Function un.onInit
-  ; Uninstall only from the fixed protected product root; `_?=` must not redirect deletion.
+  ; Accept the protected original or NSIS's temporary self-delete copy only
+  ; when the copy retains the fixed original installation directory.
   StrCmp "$EXEDIR" "${FAIRYPAM_INSTALL_ROOT}" fairypam_uninstall_root_ok
+  StrCmp "$INSTDIR" "${FAIRYPAM_INSTALL_ROOT}" fairypam_uninstall_root_ok
   Abort "FairyPam uninstaller must run from its protected installation directory."
 fairypam_uninstall_root_ok:
   StrCpy $INSTDIR "${FAIRYPAM_INSTALL_ROOT}"
