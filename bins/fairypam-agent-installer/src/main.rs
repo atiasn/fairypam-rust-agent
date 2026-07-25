@@ -28,9 +28,9 @@ fn main() {
                 ("--run-agent-task", None) => with_install_transaction(|| {
                     run_fixed_task(install_root, FixedTask::Agent, false)
                 }),
-                ("--restart-agent-task", None) => {
-                    with_install_transaction(|| run_fixed_task(install_root, FixedTask::Agent, true))
-                }
+                ("--restart-agent-task", None) => with_install_transaction(|| {
+                    run_fixed_task(install_root, FixedTask::Agent, true)
+                }),
                 ("--run-ui-task", None) => {
                     with_install_transaction(|| run_fixed_task(install_root, FixedTask::Ui, false))
                 }
