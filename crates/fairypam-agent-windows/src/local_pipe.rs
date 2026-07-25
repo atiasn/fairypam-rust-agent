@@ -238,6 +238,28 @@ pub fn fixed_gui_image_matches(expected: &str, actual: &str) -> bool {
     crate::normalize_process_path(expected) == crate::normalize_process_path(actual)
 }
 
+fn fixed_installer_image_matches(agent: &str, actual: &str) -> bool {
+    let Some(agent) = crate::normalize_process_path(agent) else {
+        return false;
+    };
+    let mut components = agent.rsplitn(4, '\\');
+    let (Some("fairypam-agent.exe"), Some(candidate), Some("versions"), Some(install_root)) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return false;
+    };
+    if candidate.is_empty() || install_root.is_empty() {
+        return false;
+    }
+    crate::normalize_process_path(actual)
+        == Some(format!(
+            r"{install_root}\resources\runtime\fairypam-agent-installer.exe"
+        ))
+}
+
 /// RegisterHub is the only local command that carries a registration secret.
 /// Same-user pipe access is sufficient for normal read-only commands, but this
 /// command additionally requires the shipped GUI executable.
@@ -274,22 +296,11 @@ pub fn verify_fixed_installer_caller(pid: u32) -> Result<(), LocalIdentityError>
     }
     let agent =
         std::env::current_exe().map_err(|_| LocalIdentityError::installer_image_mismatch())?;
-    let expected = agent
-        .parent()
-        .map(|directory| {
-            directory
-                .join("resources")
-                .join("runtime")
-                .join("fairypam-agent-installer.exe")
-        })
-        .ok_or_else(LocalIdentityError::installer_image_mismatch)?;
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
         .map_err(windows_identity_error)?;
     let result = (|| {
         let image = process_image(process)?;
-        if crate::normalize_process_path(&expected.to_string_lossy())
-            != crate::normalize_process_path(&image)
-        {
+        if !fixed_installer_image_matches(&agent.to_string_lossy(), &image) {
             return Err(LocalIdentityError::installer_image_mismatch());
         }
         Ok(())
@@ -704,6 +715,28 @@ fn pipe_idle_timeout() -> LocalIdentityError {
 #[cfg(windows)]
 fn utf16_identity_error(error: std::string::FromUtf16Error) -> LocalIdentityError {
     LocalIdentityError::new("local.identity.sid_string_invalid", error.to_string())
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::fixed_installer_image_matches;
+
+    #[test]
+    fn maintenance_accepts_only_the_fixed_helper_for_a_versioned_agent() {
+        let agent = r"\\?\C:\Program Files\FairyPam\versions\candidate-1\fairypam-agent.exe";
+        assert!(fixed_installer_image_matches(
+            agent,
+            r"C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe"
+        ));
+        assert!(!fixed_installer_image_matches(
+            agent,
+            r"C:\Program Files\FairyPam\versions\candidate-1\resources\runtime\fairypam-agent-installer.exe"
+        ));
+        assert!(!fixed_installer_image_matches(
+            r"C:\Program Files\FairyPam\fairypam-agent.exe",
+            r"C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe"
+        ));
+    }
 }
 
 #[cfg(all(test, windows))]
