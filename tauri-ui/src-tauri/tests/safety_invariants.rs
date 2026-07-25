@@ -195,8 +195,8 @@ fn product_installer_uses_one_fixed_protected_root() {
     for required in [
         "const INSTALL_DIRECTORY: &str = env!(\"FAIRYPAM_INSTALL_DIRECTORY\");",
         "const INSTALL_BOOTSTRAP_DIRECTORY: &str = env!(\"FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY\");",
-        "\"--preflight\" => preflight(install_root)",
-        "\"--provision\" => with_install_transaction(|| provision(install_root))",
+        "(\"--preflight\", None) => preflight(install_root)",
+        "(\"--provision\", None) => with_install_transaction(|| provision(install_root))",
         "(\"--verify-installed-state\", None) => installed_preflight(install_root)",
         "fn provision(install_root: &std::path::Path)",
         "fn preflight(install_root: &std::path::Path)",
@@ -407,8 +407,8 @@ fn product_installer_binds_each_command_to_one_helper_phase() {
         "const PROGRAM_DATA: &str",
     );
     for mapping in [
-        "\"--preflight\" => preflight(install_root)",
-        "\"--provision\" => with_install_transaction(|| provision(install_root))",
+        "(\"--preflight\", None) => preflight(install_root)",
+        "(\"--provision\", None) => with_install_transaction(|| provision(install_root))",
         "(\"--verify-installed-state\", None) => installed_preflight(install_root)",
     ] {
         assert!(
@@ -670,6 +670,7 @@ fn installer_owns_fixed_task_registration_and_bounded_recovery() {
     );
 }
 
+#[test]
 fn local_pipe_reads_are_bounded() {
     for required in [
         "FIRST_PREFIX_BYTE_TIMEOUT",
