@@ -213,6 +213,8 @@ jobs:
             }
 
             npm run tauri build -- --no-bundle
+            ..\target\release\fairypam-build-suite.exe `
+              --patch-tauri-nsis src-tauri\target\release\fairypam-agent-tauri-ui.exe
             $suiteVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
             $builtAt = [DateTime]::UtcNow.ToString('o')
             ..\target\release\fairypam-build-suite.exe `

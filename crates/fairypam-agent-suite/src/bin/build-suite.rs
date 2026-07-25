@@ -10,6 +10,9 @@ use fairypam_agent_suite::{
     MANIFEST_FILE, MANIFEST_KIND,
 };
 
+const TAURI_UNKNOWN_BUNDLE_TYPE: &[u8] = b"__TAURI_BUNDLE_TYPE_VAR_UNK";
+const TAURI_NSIS_BUNDLE_TYPE: &[u8] = b"__TAURI_BUNDLE_TYPE_VAR_NSS";
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("fairypam-build-suite: {error}");
@@ -18,7 +21,13 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let options = options(env::args().skip(1))?;
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if let [flag, path] = arguments.as_slice() {
+        if flag == "--patch-tauri-nsis" {
+            return patch_tauri_nsis(Path::new(path));
+        }
+    }
+    let options = options(arguments.into_iter())?;
     let build_id = required(&options, "--build-id")?;
     let source_commit = required(&options, "--source-commit")?;
     let suite_version = required(&options, "--suite-version")?;
@@ -80,6 +89,32 @@ fn run() -> Result<(), Box<dyn Error>> {
         manifest.suite_version,
         manifest_sha256(&bytes)
     );
+    Ok(())
+}
+
+fn patch_tauri_nsis(path: &Path) -> Result<(), Box<dyn Error>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() == 0 {
+        return Err("Tauri GUI is not a non-empty regular file".into());
+    }
+    let mut bytes = fs::read(path)?;
+    patch_tauri_nsis_bytes(&mut bytes)?;
+    let mut file = File::create(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn patch_tauri_nsis_bytes(bytes: &mut [u8]) -> Result<(), String> {
+    let matches = bytes
+        .windows(TAURI_UNKNOWN_BUNDLE_TYPE.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == TAURI_UNKNOWN_BUNDLE_TYPE).then_some(index))
+        .collect::<Vec<_>>();
+    let [index] = matches.as_slice() else {
+        return Err("Tauri GUI must contain exactly one unknown bundle type token".to_owned());
+    };
+    bytes[*index..*index + TAURI_UNKNOWN_BUNDLE_TYPE.len()].copy_from_slice(TAURI_NSIS_BUNDLE_TYPE);
     Ok(())
 }
 
@@ -216,4 +251,27 @@ fn source_for_member(
         }
     };
     Ok(source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patches_exactly_one_tauri_nsis_bundle_type() {
+        let mut bytes = [
+            b"prefix".as_slice(),
+            TAURI_UNKNOWN_BUNDLE_TYPE,
+            b"suffix".as_slice(),
+        ]
+        .concat();
+        patch_tauri_nsis_bytes(&mut bytes).unwrap();
+        assert!(bytes
+            .windows(TAURI_NSIS_BUNDLE_TYPE.len())
+            .any(|window| window == TAURI_NSIS_BUNDLE_TYPE));
+        assert!(patch_tauri_nsis_bytes(&mut bytes).is_err());
+
+        let mut duplicate = [TAURI_UNKNOWN_BUNDLE_TYPE, TAURI_UNKNOWN_BUNDLE_TYPE].concat();
+        assert!(patch_tauri_nsis_bytes(&mut duplicate).is_err());
+    }
 }
