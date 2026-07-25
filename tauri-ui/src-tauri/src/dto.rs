@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 pub struct StatusDto {
     pub state: String,
     pub capture_active: bool,
+    pub build_id: String,
+    pub suite_version: String,
+    pub guardian_state: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -217,6 +217,24 @@ mod tests {
     }
 
     #[test]
+    fn decodes_runtime_status_contract() {
+        let status = decode_response::<StatusDto>(fairypam_agent_local_protocol::LocalResponse {
+            body: json!({
+                "state": "ConnectedIdle",
+                "capture_active": false,
+                "build_id": "product-installer-1-1",
+                "suite_version": "0.1.1",
+                "guardian_state": "idle_no_holds"
+            }),
+        })
+        .expect("GUI status DTO must match the Agent runtime status contract");
+
+        assert_eq!(status.build_id, "product-installer-1-1");
+        assert_eq!(status.suite_version, "0.1.1");
+        assert_eq!(status.guardian_state, "idle_no_holds");
+    }
+
+    #[test]
     fn keeps_transport_error_codes_stable() {
         let error = UiCommandError::from(LocalClientError::pipe_not_found());
 

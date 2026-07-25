@@ -1,6 +1,12 @@
 export type UiCommandError = { code: string; message: string };
 
-export type Status = { state: string; capture_active: boolean };
+export type Status = {
+  state: string;
+  capture_active: boolean;
+  build_id: string;
+  suite_version: string;
+  guardian_state: string;
+};
 export type Doctor = { profiles: string[]; runtime: string };
 export type Overview = { status: Status; doctor: Doctor };
 export type Profiles = { profiles: string[] };

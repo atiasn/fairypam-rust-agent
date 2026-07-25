@@ -8,7 +8,7 @@ vi.mock('./lib/agentApi', () => ({
     ensureLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
     restartLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
     repairAgentTasks: vi.fn().mockResolvedValue({ status: 'ready' }),
-    getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false }, doctor: { profiles: [], runtime: 'dry_run' } }),
+    getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' }, doctor: { profiles: [], runtime: 'dry_run' } }),
     getConnectionStatus: vi.fn().mockResolvedValue({ control: 'offline', frame: 'offline', capture_active: false }),
     runEnvironmentCheck: vi.fn().mockResolvedValue({ registration_ready: true, registration_pending: false, checks: [] }),
     getLogTail: vi.fn().mockResolvedValue({ entries: [] }),
