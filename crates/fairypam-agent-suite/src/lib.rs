@@ -576,16 +576,12 @@ pub fn verify_authenticode_publisher(
                 "publisher output is not UTF-8",
             )
         })?;
-        let Some((subject, thumbprint)) = identity.split_once('\n') else {
-            return Err(SuiteError::new(
-                "suite.authenticode_invalid",
-                "signer identity is incomplete",
-            ));
-        };
-        if !output.status.success()
-            || subject != allowed_publisher
-            || !thumbprint.eq_ignore_ascii_case(allowed_thumbprint)
-        {
+        if !authenticode_identity_matches(
+            output.status.success(),
+            &identity,
+            allowed_publisher,
+            allowed_thumbprint,
+        ) {
             return Err(SuiteError::new(
                 "suite.authenticode_invalid",
                 format!(
@@ -596,6 +592,20 @@ pub fn verify_authenticode_publisher(
         }
     }
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn authenticode_identity_matches(
+    status_success: bool,
+    identity: &str,
+    allowed_publisher: &str,
+    allowed_thumbprint: &str,
+) -> bool {
+    identity.split_once('\n').is_some_and(|(subject, thumbprint)| {
+        status_success
+            && subject == allowed_publisher
+            && thumbprint.eq_ignore_ascii_case(allowed_thumbprint)
+    })
 }
 
 pub fn sha256_file(path: &Path) -> Result<String, SuiteError> {
@@ -837,6 +847,23 @@ mod tests {
         }
     }
 
+    fn package_bytes(manifest: &SuiteManifest, guardian: &[u8]) -> Vec<u8> {
+        let manifest_bytes = serde_json::to_vec(manifest).unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (path, contents) in [
+            (MANIFEST_FILE, manifest_bytes.as_slice()),
+            ("fairypam-agent.exe", b"agent".as_slice()),
+            ("fairypam-agent-guardian.exe", guardian),
+            ("fairypam-agent-tauri-ui.exe", b"gui".as_slice()),
+            ("profiles/default.json", b"profile".as_slice()),
+        ] {
+            writer.start_file(path, options).unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
     #[test]
     fn manifest_rejects_developer_cli_and_missing_product_member() {
         let mut value = manifest();
@@ -864,20 +891,7 @@ mod tests {
     fn update_package_requires_exact_versioned_members_and_outer_identity() {
         let manifest = manifest();
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let options = zip::write::SimpleFileOptions::default();
-        writer.start_file(MANIFEST_FILE, options).unwrap();
-        writer.write_all(&manifest_bytes).unwrap();
-        for (path, contents) in [
-            ("fairypam-agent.exe", b"agent".as_slice()),
-            ("fairypam-agent-guardian.exe", b"guardian".as_slice()),
-            ("fairypam-agent-tauri-ui.exe", b"gui".as_slice()),
-            ("profiles/default.json", b"profile".as_slice()),
-        ] {
-            writer.start_file(path, options).unwrap();
-            writer.write_all(contents).unwrap();
-        }
-        let bytes = writer.finish().unwrap().into_inner();
+        let bytes = package_bytes(&manifest, b"guardian");
         let directory = std::env::temp_dir().join(format!(
             "fairypam-suite-test-{}-{}",
             std::process::id(),
@@ -911,6 +925,31 @@ mod tests {
             .code(),
             "suite.package_identity_mismatch"
         );
+
+        let mixed = package_bytes(&manifest, b"old!!!!!");
+        fs::write(&package, &mixed).unwrap();
+        let verified = validate_update_package(
+            &package,
+            &sha256_bytes(&mixed),
+            mixed.len() as u64,
+            "suite-1",
+            &sha256_bytes(&manifest_bytes),
+        )
+        .unwrap();
+        let destination = directory.join("mixed.pending");
+        let helper = directory
+            .join("resources")
+            .join("runtime")
+            .join("fairypam-agent-installer.exe");
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        fs::write(helper, b"helper").unwrap();
+        assert_eq!(
+            extract_update_package(&package, &directory, &destination, &verified)
+                .unwrap_err()
+                .code(),
+            "suite.member_identity_mismatch"
+        );
+        assert!(!destination.exists());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -924,6 +963,35 @@ mod tests {
             compare_versions("1.2.3-alpha.1", "1.2.3").unwrap(),
             std::cmp::Ordering::Less
         );
+        assert_eq!(
+            compare_versions("1.2.3", "1.2.3").unwrap(),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn authenticode_identity_rejects_wrong_signer() {
+        let publisher = "CN=FairyPam Internal";
+        let thumbprint = "0123456789abcdef0123456789abcdef01234567";
+        let identity = format!("{publisher}\n{thumbprint}");
+        assert!(authenticode_identity_matches(
+            true, &identity, publisher, thumbprint
+        ));
+        assert!(!authenticode_identity_matches(
+            true,
+            "CN=Other\n0123456789abcdef0123456789abcdef01234567",
+            publisher,
+            thumbprint,
+        ));
+        assert!(!authenticode_identity_matches(
+            true,
+            &format!("{publisher}\n{}", "f".repeat(40)),
+            publisher,
+            thumbprint,
+        ));
+        assert!(!authenticode_identity_matches(
+            false, &identity, publisher, thumbprint
+        ));
     }
 
     #[test]

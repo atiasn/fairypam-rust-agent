@@ -540,6 +540,43 @@ enum SettlingResume {
     Recovery(fairypam_agent_suite::UpdateRequest, &'static str),
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettlingPlan {
+    CleanupTarget,
+    ResumeTarget,
+    FinishRollback(&'static str),
+}
+
+#[cfg(any(windows, test))]
+fn settling_plan(
+    state: &str,
+    failure_state: Option<&str>,
+    current_build_id: &str,
+    source_build_id: &str,
+    target_build_id: &str,
+) -> Result<SettlingPlan, ()> {
+    match (state, failure_state, current_build_id) {
+        ("target_verifying", None, current) if current == source_build_id => {
+            Ok(SettlingPlan::CleanupTarget)
+        }
+        ("target_verifying", None, current) if current == target_build_id => {
+            Ok(SettlingPlan::ResumeTarget)
+        }
+        ("rollback_verifying", Some("health_failed"), current)
+            if current == source_build_id || current == target_build_id =>
+        {
+            Ok(SettlingPlan::FinishRollback("health_failed"))
+        }
+        ("rollback_verifying", Some("commit_failed"), current)
+            if current == source_build_id || current == target_build_id =>
+        {
+            Ok(SettlingPlan::FinishRollback("commit_failed"))
+        }
+        _ => Err(()),
+    }
+}
+
 #[cfg(windows)]
 impl UpdateActivation {
     fn resume_settling(install_root: &std::path::Path) -> Result<SettlingResume, ProvisionFailure> {
@@ -622,12 +659,15 @@ impl UpdateActivation {
             &install_root.join(fairypam_agent_suite::CURRENT_POINTER_FILE),
         )
         .map_err(|_| ProvisionFailure::Rollback)?;
-        if state == "rollback_verifying" {
-            let failure_state = match failure_state {
-                Some("health_failed") => "health_failed",
-                Some("commit_failed") => "commit_failed",
-                _ => return Err(ProvisionFailure::Rollback),
-            };
+        let plan = settling_plan(
+            state,
+            failure_state,
+            &current.build_id,
+            &request.source_build_id,
+            &request.target_build_id,
+        )
+        .map_err(|_| ProvisionFailure::Rollback)?;
+        if let SettlingPlan::FinishRollback(failure_state) = plan {
             let activation = Self {
                 install_root: install_root.to_path_buf(),
                 version_root: install_root.join("versions").join(&request.target_build_id),
@@ -635,16 +675,14 @@ impl UpdateActivation {
                 previous_last_accepted,
                 request,
             };
-            if current.build_id != activation.request.source_build_id
-                && current.build_id != activation.request.target_build_id
-            {
-                return Err(ProvisionFailure::Rollback);
-            }
             activation.finish_rollback()?;
             return Ok(SettlingResume::Recovery(activation.request, failure_state));
         }
         let active = active_suite(install_root)?;
-        if active.pointer.build_id == request.source_build_id {
+        if plan == SettlingPlan::CleanupTarget {
+            if active.pointer.build_id != request.source_build_id {
+                return Err(ProvisionFailure::Rollback);
+            }
             for path in [
                 install_root
                     .join("versions")
@@ -655,13 +693,12 @@ impl UpdateActivation {
                     std::fs::remove_dir_all(path).map_err(|_| ProvisionFailure::Rollback)?;
                 }
             }
-            if state != "target_verifying" {
-                return Err(ProvisionFailure::Rollback);
-            }
             std::fs::remove_file(UPDATE_SETTLING_PATH).map_err(|_| ProvisionFailure::Rollback)?;
             return Ok(SettlingResume::None);
         }
-        if active.pointer.build_id != request.target_build_id || state != "target_verifying" {
+        if plan != SettlingPlan::ResumeTarget
+            || active.pointer.build_id != request.target_build_id
+        {
             return Err(ProvisionFailure::Rollback);
         }
         verify_authenticode_publisher(
@@ -3062,6 +3099,75 @@ mod tests {
             "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FW;;;BU)",
             high_no_write_up
         ));
+    }
+
+    #[test]
+    fn settling_journal_recovers_each_helper_crash_boundary() {
+        for (state, failure, current, expected) in [
+            (
+                "target_verifying",
+                None,
+                "source",
+                SettlingPlan::CleanupTarget,
+            ),
+            (
+                "target_verifying",
+                None,
+                "target",
+                SettlingPlan::ResumeTarget,
+            ),
+            (
+                "rollback_verifying",
+                Some("health_failed"),
+                "target",
+                SettlingPlan::FinishRollback("health_failed"),
+            ),
+            (
+                "rollback_verifying",
+                Some("health_failed"),
+                "source",
+                SettlingPlan::FinishRollback("health_failed"),
+            ),
+        ] {
+            assert_eq!(
+                settling_plan(state, failure, current, "source", "target"),
+                Ok(expected)
+            );
+        }
+        assert!(settling_plan(
+            "rollback_verifying",
+            Some("unknown"),
+            "target",
+            "source",
+            "target"
+        )
+        .is_err());
+        assert!(
+            settling_plan("target_verifying", None, "other", "source", "target").is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn switch_and_rollback_pointer_failures_are_fail_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-pointer-fault-{}",
+            std::process::id()
+        ));
+        let pointer = root.join("current.json");
+        std::fs::create_dir_all(&pointer).unwrap();
+
+        assert!(matches!(
+            replace_pointer(&pointer, b"target"),
+            Err(ProvisionFailure::InstallRoots)
+        ));
+        assert!(matches!(
+            restore_pointer(&pointer, Some(b"source")),
+            Err(ProvisionFailure::Rollback)
+        ));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

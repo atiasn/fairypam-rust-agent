@@ -1032,15 +1032,20 @@ fn shutdown_from_local_request(
     }
     tracing::info!(?reason, "local control requested safe Agent shutdown");
     let _ = supervisor.handle_control_failure()?;
-    if let Some(request) = driver
-        .pending_update_activation
-        .lock()
-        .map_err(lock_error)?
-        .take()
-    {
-        crate::update::authorize_activation(&request)?;
+    authorize_pending_update(&driver.pending_update_activation, |request| {
+        crate::update::authorize_activation(request)
+    })
+}
+
+#[cfg(windows)]
+fn authorize_pending_update(
+    pending: &Mutex<Option<fairypam_agent_suite::UpdateRequest>>,
+    authorize: impl FnOnce(&fairypam_agent_suite::UpdateRequest) -> Result<(), AgentError>,
+) -> Result<(), AgentError> {
+    match pending.lock().map_err(lock_error)?.take() {
+        Some(request) => authorize(&request),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -2085,6 +2090,33 @@ mod tests {
             };
             assert_eq!(command_reference(&command), Some(reference.clone()));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn authorized_update_handoff_survives_ack_loss() {
+        let request = fairypam_agent_suite::UpdateRequest {
+            schema_version: 1,
+            update_id: "update-1".to_owned(),
+            source_build_id: "source-1".to_owned(),
+            target_build_id: "target-1".to_owned(),
+            suite_version: "1.0.1".to_owned(),
+            artifact_sha256: "a".repeat(64),
+            artifact_size: 1,
+            manifest_sha256: "b".repeat(64),
+        };
+        let pending = Mutex::new(Some(request.clone()));
+        let mut authorized = false;
+
+        authorize_pending_update(&pending, |actual| {
+            assert_eq!(actual, &request);
+            authorized = true;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(authorized);
+        assert!(pending.lock().unwrap().is_none());
     }
 
     #[test]

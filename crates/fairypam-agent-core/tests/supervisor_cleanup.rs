@@ -19,7 +19,7 @@ impl SupervisorHooks for RecordingHooks {
     fn guardian_release_all(&mut self) -> Result<(), String> {
         self.effects.push("guardian_release_all");
         if self.fail_guardian {
-            Err("guardian unavailable".into())
+            Err("release timeout".into())
         } else {
             Ok(())
         }
@@ -89,7 +89,7 @@ fn frame_failure_does_not_release_control_session() {
 }
 
 #[test]
-fn cleanup_continues_after_guardian_release_error() {
+fn release_timeout_fails_closed_after_completing_cleanup() {
     let hooks = RecordingHooks {
         fail_guardian: true,
         ..RecordingHooks::default()
