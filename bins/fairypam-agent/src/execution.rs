@@ -2208,7 +2208,8 @@ mod tests {
                 sink.clone(),
             ),
             CommandOutcome::TaskAck { ref receipt, .. }
-                if receipt.side_effect_state == TaskSideEffectState::None as i32
+                if receipt.side_effect_state == TaskSideEffectState::Applied as i32
+                    && receipt.last_side_effect_command_id == "target-1"
         ));
 
         let pulse = HubControlCommand {
