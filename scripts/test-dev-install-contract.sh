@@ -15,6 +15,12 @@ for required in 'atiasn/fairypam-rust-agent' '312470124' 'fairypam-agent-dev-$Ru
     exit 1
   }
 done
+if grep -Fq -- '[IO.File]::Replace($temporary, $canonicalTestbed, $null)' "$script" ||
+  ! grep -Fq -- '[IO.File]::Replace($temporary, $canonicalTestbed, $backup)' "$script" ||
+  ! grep -Fq -- 'Remove-Item -LiteralPath $temporary, $backup' "$script"; then
+  printf '[ERROR] Dev Testbed replacement must use and clean a real backup path for Windows PowerShell 5.1\n' >&2
+  exit 1
+fi
 for required in 'Assert-VerifiedDevSlot' 'Get-InteractiveProvisionIdentity' 'Get-InteractiveShellLogonSid' 'Get-Process -Name explorer' 'LogonSidForProcess' 'TokenStatistics' 'AuthenticationId' 'dev.task.artifact_proof_missing' 'dev.task.artifact_proof_invalid' 'dev.task.logon_session_query_failed' 'dev.task.interactive_session_required' 'dev.task.fixed_action_required' 'Stop-RunningDevAgent' "Get-Process -Name 'fairypam-agent'" 'Stop-Process -Id $process.Id' 'Wait-Process -Id $process.Id' 'Unregister-ScheduledTask -TaskName $taskName' '.dev-provision-result.json' 'Write-ProvisionResult'; do
   grep -Fq -- "$required" "$provision" || {
     printf '[ERROR] Dev provision contract missing: %s\n' "$required" >&2

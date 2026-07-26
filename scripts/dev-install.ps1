@@ -72,13 +72,14 @@ function Sync-CanonicalTestbed([string]$Source, [object]$Member) {
     Assert-NotReparsePoint $canonicalTestbed
 
     $temporary = Join-Path $canonicalTestbedDirectory ('.fairypam-test-window-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $backup = "$temporary.bak"
     try {
         [IO.File]::Copy($Source, $temporary, $true)
         if ((Get-Item -LiteralPath $temporary).Length -ne [uint64]$Member.size -or (Get-Sha256 $temporary) -cne [string]$Member.sha256) {
             Fail 'dev.testbed.deploy_invalid' 'canonical Testbed temporary file does not match the verified Dev artifact'
         }
         if (Test-Path -LiteralPath $canonicalTestbed -PathType Leaf) {
-            [IO.File]::Replace($temporary, $canonicalTestbed, $null)
+            [IO.File]::Replace($temporary, $canonicalTestbed, $backup)
         }
         else {
             [IO.File]::Move($temporary, $canonicalTestbed)
@@ -88,9 +89,7 @@ function Sync-CanonicalTestbed([string]$Source, [object]$Member) {
         }
     }
     finally {
-        if (Test-Path -LiteralPath $temporary) {
-            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
-        }
+        Remove-Item -LiteralPath $temporary, $backup -Force -ErrorAction SilentlyContinue
     }
 }
 
