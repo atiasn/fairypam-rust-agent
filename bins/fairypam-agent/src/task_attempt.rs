@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use fairypam_agent_core::AgentError;
 use fairypam_agent_protocol::v1::{
-    AgentAttemptContractV1, AttemptRef, TaskAttemptReceiptV1, TaskAttemptState,
-    TaskCaptureState, TaskCommandRef, TaskInputState, TaskOwnedTargetState, TaskSideEffectState,
+    AgentAttemptContractV1, AttemptRef, TaskAttemptReceiptV1, TaskAttemptState, TaskCaptureState,
+    TaskCommandRef, TaskInputState, TaskOwnedTargetState, TaskSideEffectState,
 };
 use fairypam_agent_protocol::verify_agent_attempt_contract;
 use serde::{Deserialize, Serialize};
@@ -58,7 +58,8 @@ impl TaskAttemptRuntime {
 
         if let Some(active) = self.active.as_ref() {
             active.require_reference(reference)?;
-            active.require_same_command(command.command_id.as_str(), task.payload_digest.as_str())?;
+            active
+                .require_same_command(command.command_id.as_str(), task.payload_digest.as_str())?;
             return Ok(active.receipt());
         }
 
@@ -134,7 +135,10 @@ impl TaskAttemptRuntime {
         fs::create_dir_all(root).map_err(|error| io_error("task.ledger_unavailable", error))?;
         let path = root.join(format!("{}.jsonl", state.reference.attempt_id));
         let mut bytes = serde_json::to_vec(state).map_err(|error| {
-            AgentError::new("task.ledger_invalid", format!("cannot encode attempt ledger: {error}"))
+            AgentError::new(
+                "task.ledger_invalid",
+                format!("cannot encode attempt ledger: {error}"),
+            )
         })?;
         bytes.push(b'\n');
         let mut file = OpenOptions::new()
@@ -283,7 +287,11 @@ impl AttemptState {
         Ok(())
     }
 
-    fn require_same_command(&self, command_id: &str, payload_digest: &str) -> Result<(), AgentError> {
+    fn require_same_command(
+        &self,
+        command_id: &str,
+        payload_digest: &str,
+    ) -> Result<(), AgentError> {
         if self.last_command_id != command_id {
             return Err(AgentError::new(
                 "attempt_already_claimed",
@@ -434,7 +442,9 @@ fn is_digest(value: &str) -> bool {
 
 fn production_root() -> Option<PathBuf> {
     #[cfg(windows)]
-    return Some(PathBuf::from(r"C:\ProgramData\FairyPam.Agent\Agent\attempts"));
+    return Some(PathBuf::from(
+        r"C:\ProgramData\FairyPam.Agent\Agent\attempts",
+    ));
     #[cfg(not(windows))]
     None
 }
@@ -521,10 +531,14 @@ mod tests {
         let root = temporary_root();
         let contract = contract();
         let begin = task(&contract, "begin-1", 'c');
-        let receipt = TaskAttemptRuntime::at(root.clone()).begin(&begin, &contract).unwrap();
+        let receipt = TaskAttemptRuntime::at(root.clone())
+            .begin(&begin, &contract)
+            .unwrap();
         assert_eq!(receipt.attempt_state, TaskAttemptState::Claimed as i32);
 
-        let replay = TaskAttemptRuntime::at(root.clone()).begin(&begin, &contract).unwrap();
+        let replay = TaskAttemptRuntime::at(root.clone())
+            .begin(&begin, &contract)
+            .unwrap();
         assert_eq!(replay.last_command_id, "begin-1");
 
         let changed = task(&contract, "begin-1", 'd');

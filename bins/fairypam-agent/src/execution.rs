@@ -125,7 +125,10 @@ pub enum CommandOutcome {
         outcome: Option<TaskCommandOutcomeV1>,
         receipt: Box<TaskAttemptReceiptV1>,
     },
-    Nack { code: String, message: String },
+    Nack {
+        code: String,
+        message: String,
+    },
 }
 
 impl CommandOutcome {
