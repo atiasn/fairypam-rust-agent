@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use fairypam_agent_core::AgentError;
+use fairypam_agent_core::{profile::VerifiedProfile, AgentError};
 use fairypam_agent_local_protocol::LogLevel;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -224,6 +224,74 @@ pub fn log_tail_json(records: &[AgentLogRecord], lines: u16, level: &LogLevel) -
 pub fn scan_installed_games(profiles: &ProfileStore) -> Result<Value, AgentError> {
     let entries = registry_entries()?;
     Ok(json!({"games": scan_entries(&entries, profiles)}))
+}
+
+pub fn resolve_profile_executable(profile: &VerifiedProfile) -> Result<PathBuf, AgentError> {
+    let mut paths = HashSet::new();
+    for entry in registry_entries()? {
+        if entry.source != RegistrySource::Machine {
+            continue;
+        }
+        let Some(game_id) = entry
+            .uninstall_string
+            .as_deref()
+            .and_then(extract_game_id)
+        else {
+            continue;
+        };
+        let Some(game) = KNOWN_GAMES.iter().find(|game| game.game_id == game_id) else {
+            continue;
+        };
+        if !profile
+            .profile()
+            .target
+            .process_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(game.process_name))
+        {
+            continue;
+        }
+        let executable = Path::new(entry.install_location.as_deref().unwrap_or_default())
+            .join("games")
+            .join(game.game_dir)
+            .join(game.process_name);
+        if trusted_executable(&executable) && profile_allows_path(profile, &executable) {
+            paths.insert(executable);
+        }
+    }
+    let mut paths = paths.into_iter();
+    let executable = paths.next().ok_or_else(|| {
+        AgentError::new(
+            "target_invalid",
+            "no installed executable matches the signed Profile",
+        )
+    })?;
+    if paths.next().is_some() {
+        return Err(AgentError::new(
+            "target_invalid",
+            "multiple installed executables match the signed Profile",
+        ));
+    }
+    Ok(executable)
+}
+
+fn profile_allows_path(profile: &VerifiedProfile, executable: &Path) -> bool {
+    let Some(path) = executable.to_str() else {
+        return false;
+    };
+    let Some(digest) = fairypam_agent_windows::normalized_process_path_sha256(path) else {
+        return false;
+    };
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    profile
+        .profile()
+        .target
+        .process_path_sha256
+        .iter()
+        .any(|allowed| allowed == &digest)
 }
 
 #[derive(Default)]

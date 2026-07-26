@@ -1,9 +1,13 @@
-#[derive(Clone, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TargetSelector {
     pub candidate_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TargetCandidate {
     pub selector: TargetSelector,
     pub window_handle: u64,
@@ -14,7 +18,8 @@ pub struct TargetCandidate {
     pub window_class: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TargetBinding {
     pub profile_id: String,
     pub profile_version: String,
@@ -30,7 +35,8 @@ pub struct TargetBinding {
     pub integrity: IntegrityLevel,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TargetSnapshot {
     pub binding: TargetBinding,
     pub foreground: bool,
@@ -38,13 +44,15 @@ pub struct TargetSnapshot {
     pub capturable: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ClientRect {
     pub width: u32,
     pub height: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum IntegrityLevel {
     Unknown,
     Low,

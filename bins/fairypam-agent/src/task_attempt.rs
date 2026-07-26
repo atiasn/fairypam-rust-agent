@@ -2,10 +2,12 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use fairypam_agent_core::target::TargetBinding;
 use fairypam_agent_core::AgentError;
 use fairypam_agent_protocol::v1::{
     AgentAttemptContractV1, AttemptRef, TaskAttemptReceiptV1, TaskAttemptState, TaskCaptureState,
-    TaskCommandRef, TaskInputState, TaskOwnedTargetState, TaskSideEffectState,
+    TaskCommandOutcomeState, TaskCommandOutcomeV1, TaskCommandRef, TaskInputState,
+    TaskOwnedTargetState, TaskSideEffectState,
 };
 use fairypam_agent_protocol::verify_agent_attempt_contract;
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,11 @@ pub struct TaskAttemptRuntime {
     root: Option<PathBuf>,
     active: Option<AttemptState>,
     loaded: bool,
+}
+
+pub struct TaskCommandResult {
+    pub outcome: TaskCommandOutcomeV1,
+    pub receipt: TaskAttemptReceiptV1,
 }
 
 impl TaskAttemptRuntime {
@@ -56,6 +63,12 @@ impl TaskAttemptRuntime {
         validate_contract_reference(reference, contract)?;
         self.load_active()?;
 
+        if self.active.as_ref().is_some_and(|active| {
+            active.attempt_state == TaskAttemptState::Terminal as i32 && active.cleanup_complete
+        }) {
+            self.active = None;
+        }
+
         if let Some(active) = self.active.as_ref() {
             active.require_reference(reference)?;
             active
@@ -74,7 +87,13 @@ impl TaskAttemptRuntime {
         let (reference, command) = validate_task(task)?;
         self.load_active()?;
         let Some(mut active) = self.active.take() else {
-            return Ok(not_found_receipt());
+            let Some(mut terminal) = self.load_named(reference)? else {
+                return Ok(not_found_receipt());
+            };
+            terminal.require_reference(reference)?;
+            terminal.record_command(command, &task.payload_digest)?;
+            self.persist(&terminal)?;
+            return Ok(terminal.receipt());
         };
         if let Err(error) = active.require_reference(reference) {
             self.active = Some(active);
@@ -88,6 +107,389 @@ impl TaskAttemptRuntime {
         let receipt = active.receipt();
         self.active = Some(active);
         Ok(receipt)
+    }
+
+    fn load_named(&self, reference: &AttemptRef) -> Result<Option<AttemptState>, AgentError> {
+        let Some(root) = self.root.as_ref() else {
+            return Ok(None);
+        };
+        let path = root.join(format!("{}.jsonl", reference.attempt_id));
+        match load_last(&path) {
+            Ok(state) => Ok(Some(state)),
+            Err(error) if error.code() == "task.ledger_not_found" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn is_active(&mut self) -> Result<bool, AgentError> {
+        self.load_active()?;
+        Ok(self.active.as_ref().is_some_and(|active| {
+            active.attempt_state != TaskAttemptState::Terminal as i32 || !active.cleanup_complete
+        }))
+    }
+
+    pub fn profile_id(&mut self, task: &TaskCommandRef) -> Result<String, AgentError> {
+        let active = self.require_active(task)?;
+        Ok(active.contract.profile_id.clone())
+    }
+
+    pub fn attempt_ref(&mut self, task: &TaskCommandRef) -> Result<AttemptRef, AgentError> {
+        Ok(self.require_active(task)?.reference.message())
+    }
+
+    pub fn owned_target(
+        &mut self,
+        task: &TaskCommandRef,
+    ) -> Result<Option<TargetBinding>, AgentError> {
+        Ok(self.require_active(task)?.owned_target.clone())
+    }
+
+    pub fn prepare(
+        &mut self,
+        task: &TaskCommandRef,
+        side_effect: bool,
+    ) -> Result<Option<TaskCommandResult>, AgentError> {
+        self.prepare_inner(task, side_effect, false)
+    }
+
+    pub fn prepare_finish(
+        &mut self,
+        task: &TaskCommandRef,
+    ) -> Result<Option<TaskCommandResult>, AgentError> {
+        self.prepare_inner(task, false, true)
+    }
+
+    fn prepare_inner(
+        &mut self,
+        task: &TaskCommandRef,
+        side_effect: bool,
+        allow_uncertain: bool,
+    ) -> Result<Option<TaskCommandResult>, AgentError> {
+        let (reference, command) = validate_task(task)?;
+        self.load_active()?;
+        let Some(mut active) = self.active.take() else {
+            return Err(attempt_not_found());
+        };
+        if let Err(error) = active.require_reference(reference) {
+            self.active = Some(active);
+            return Err(error);
+        }
+        if active.last_command_id == command.command_id {
+            if let Err(error) =
+                active.require_same_command(&command.command_id, &task.payload_digest)
+            {
+                self.active = Some(active);
+                return Err(error);
+            }
+            if allow_uncertain
+                && active.last_command_outcome == TaskCommandOutcomeState::Unspecified as i32
+            {
+                self.active = Some(active);
+                return Ok(None);
+            }
+            if active.last_command_outcome == TaskCommandOutcomeState::Unspecified as i32 {
+                let (outcome, error_code) = if side_effect
+                    && active.side_effect_state == TaskSideEffectState::IntentRecorded as i32
+                {
+                    active.side_effect_state = TaskSideEffectState::Uncertain as i32;
+                    (
+                        TaskCommandOutcomeState::Uncertain,
+                        "side_effect_uncertain",
+                    )
+                } else {
+                    (
+                        TaskCommandOutcomeState::NotApplied,
+                        "command_interrupted",
+                    )
+                };
+                active.last_command_outcome = outcome as i32;
+                active.last_command_error_code = Some(error_code.into());
+                active.error_code = Some(error_code.into());
+                if let Err(error) = self.persist(&active) {
+                    self.active = Some(active);
+                    return Err(error);
+                }
+            }
+            let result = active.command_result()?;
+            self.active = Some(active);
+            return Ok(Some(result));
+        }
+        if active.attempt_state == TaskAttemptState::Terminal as i32 {
+            self.active = Some(active);
+            return Err(AgentError::new(
+                "attempt_terminal",
+                "task attempt is already terminal",
+            ));
+        }
+        if !allow_uncertain
+            && matches!(
+            TaskSideEffectState::try_from(active.side_effect_state),
+            Ok(TaskSideEffectState::IntentRecorded | TaskSideEffectState::Uncertain)
+        )
+        {
+            self.active = Some(active);
+            return Err(AgentError::new(
+                "side_effect_uncertain",
+                "task attempt has an unresolved side effect",
+            ));
+        }
+        if let Err(error) = active.record_command(command, &task.payload_digest) {
+            self.active = Some(active);
+            return Err(error);
+        }
+        active.last_command_outcome = TaskCommandOutcomeState::Unspecified as i32;
+        active.last_command_source_frame_sequence = None;
+        active.last_command_error_code = None;
+        active.error_code = None;
+        if side_effect {
+            active.side_effect_state = TaskSideEffectState::IntentRecorded as i32;
+            active
+                .last_side_effect_command_id
+                .clone_from(&command.command_id);
+        }
+        if let Err(error) = self.persist(&active) {
+            self.active = Some(active);
+            return Err(error);
+        }
+        self.active = Some(active);
+        Ok(None)
+    }
+
+    pub fn complete_target_start(
+        &mut self,
+        task: &TaskCommandRef,
+        binding: Option<TargetBinding>,
+        error_code: Option<&str>,
+    ) -> Result<TaskCommandResult, AgentError> {
+        let applied = binding.is_some();
+        self.complete(
+            task,
+            if applied {
+                TaskCommandOutcomeState::Applied
+            } else {
+                TaskCommandOutcomeState::NotApplied
+            },
+            None,
+            error_code,
+            true,
+            |state| {
+                state.owned_target = binding;
+                state.owned_target_state = if applied {
+                    TaskOwnedTargetState::Running as i32
+                } else {
+                    TaskOwnedTargetState::NotStarted as i32
+                };
+                if applied {
+                    state.attempt_state = TaskAttemptState::TargetReady as i32;
+                }
+            },
+        )
+    }
+
+    pub fn complete_capture(
+        &mut self,
+        task: &TaskCommandRef,
+        running: bool,
+        error_code: Option<&str>,
+    ) -> Result<TaskCommandResult, AgentError> {
+        self.complete(
+            task,
+            if error_code.is_none() {
+                TaskCommandOutcomeState::Applied
+            } else {
+                TaskCommandOutcomeState::NotApplied
+            },
+            None,
+            error_code,
+            false,
+            |state| {
+                if error_code.is_none() {
+                    state.capture_state = if running {
+                        TaskCaptureState::Running as i32
+                    } else {
+                        TaskCaptureState::Stopped as i32
+                    };
+                    if running {
+                        state.attempt_state = TaskAttemptState::Active as i32;
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn complete_input_lease(
+        &mut self,
+        task: &TaskCommandRef,
+        error_code: Option<&str>,
+    ) -> Result<TaskCommandResult, AgentError> {
+        self.complete(
+            task,
+            if error_code.is_none() {
+                TaskCommandOutcomeState::Applied
+            } else {
+                TaskCommandOutcomeState::NotApplied
+            },
+            None,
+            error_code,
+            false,
+            |state| {
+                state.input_state = if error_code.is_none() {
+                    TaskInputState::Active as i32
+                } else {
+                    TaskInputState::Released as i32
+                };
+            },
+        )
+    }
+
+    pub fn complete_pulse(
+        &mut self,
+        task: &TaskCommandRef,
+        source_frame_sequence: u64,
+        applied: bool,
+        error_code: Option<&str>,
+    ) -> Result<TaskCommandResult, AgentError> {
+        self.complete(
+            task,
+            if applied {
+                TaskCommandOutcomeState::Applied
+            } else {
+                TaskCommandOutcomeState::Uncertain
+            },
+            Some(source_frame_sequence),
+            error_code,
+            true,
+            |_| {},
+        )
+    }
+
+    pub fn complete_release(
+        &mut self,
+        task: &TaskCommandRef,
+        error_code: Option<&str>,
+    ) -> Result<TaskCommandResult, AgentError> {
+        self.complete(
+            task,
+            if error_code.is_none() {
+                TaskCommandOutcomeState::Applied
+            } else {
+                TaskCommandOutcomeState::NotApplied
+            },
+            None,
+            error_code,
+            false,
+            |state| {
+                state.input_state = if error_code.is_none() {
+                    TaskInputState::Released as i32
+                } else {
+                    TaskInputState::Unknown as i32
+                };
+            },
+        )
+    }
+
+    pub fn complete_finish(
+        &mut self,
+        task: &TaskCommandRef,
+        input_released: bool,
+        capture_stopped: bool,
+        target_closed: bool,
+        error_code: Option<&str>,
+    ) -> Result<TaskCommandResult, AgentError> {
+        let side_effect_resolved = !matches!(
+            TaskSideEffectState::try_from(self.require_active(task)?.side_effect_state),
+            Ok(TaskSideEffectState::IntentRecorded | TaskSideEffectState::Uncertain)
+        );
+        let cleanup_complete =
+            input_released && capture_stopped && target_closed && side_effect_resolved;
+        let derived_error = if !side_effect_resolved {
+            Some("side_effect_uncertain")
+        } else if !cleanup_complete {
+            Some("cleanup_incomplete")
+        } else {
+            None
+        };
+        self.complete(
+            task,
+            if cleanup_complete {
+                TaskCommandOutcomeState::Applied
+            } else {
+                TaskCommandOutcomeState::NotApplied
+            },
+            None,
+            error_code.or(derived_error),
+            false,
+            |state| {
+                state.attempt_state = TaskAttemptState::Terminal as i32;
+                state.input_state = if input_released {
+                    TaskInputState::Released as i32
+                } else {
+                    TaskInputState::Unknown as i32
+                };
+                state.capture_state = if capture_stopped {
+                    TaskCaptureState::Stopped as i32
+                } else {
+                    TaskCaptureState::Unknown as i32
+                };
+                state.owned_target_state = if target_closed {
+                    TaskOwnedTargetState::Closed as i32
+                } else {
+                    TaskOwnedTargetState::Unknown as i32
+                };
+                state.cleanup_complete = cleanup_complete;
+                if target_closed {
+                    state.owned_target = None;
+                }
+            },
+        )
+    }
+
+    fn require_active(&mut self, task: &TaskCommandRef) -> Result<&AttemptState, AgentError> {
+        let (reference, _) = validate_task(task)?;
+        self.load_active()?;
+        let active = self.active.as_ref().ok_or_else(attempt_not_found)?;
+        active.require_reference(reference)?;
+        Ok(active)
+    }
+
+    fn complete(
+        &mut self,
+        task: &TaskCommandRef,
+        outcome: TaskCommandOutcomeState,
+        source_frame_sequence: Option<u64>,
+        error_code: Option<&str>,
+        side_effect: bool,
+        update: impl FnOnce(&mut AttemptState),
+    ) -> Result<TaskCommandResult, AgentError> {
+        let (_, command) = validate_task(task)?;
+        let Some(mut active) = self.active.take() else {
+            return Err(attempt_not_found());
+        };
+        if let Err(error) = active.require_same_command(&command.command_id, &task.payload_digest) {
+            self.active = Some(active);
+            return Err(error);
+        }
+        active.last_command_outcome = outcome as i32;
+        active.last_command_source_frame_sequence = source_frame_sequence;
+        active.last_command_error_code = error_code.map(str::to_owned);
+        active.error_code = error_code.map(str::to_owned);
+        if side_effect {
+            active.side_effect_state = match outcome {
+                TaskCommandOutcomeState::Applied => TaskSideEffectState::Applied,
+                TaskCommandOutcomeState::NotApplied => TaskSideEffectState::NotApplied,
+                TaskCommandOutcomeState::Uncertain | TaskCommandOutcomeState::Unspecified => {
+                    TaskSideEffectState::Uncertain
+                }
+            } as i32;
+        }
+        update(&mut active);
+        if let Err(error) = self.persist(&active) {
+            self.active = Some(active);
+            return Err(error);
+        }
+        let result = active.command_result()?;
+        self.active = Some(active);
+        Ok(result)
     }
 
     fn load_active(&mut self) -> Result<(), AgentError> {
@@ -114,7 +516,7 @@ impl TaskAttemptRuntime {
                 continue;
             }
             let state = load_last(&path)?;
-            if state.attempt_state == TaskAttemptState::Terminal as i32 {
+            if state.attempt_state == TaskAttemptState::Terminal as i32 && state.cleanup_complete {
                 continue;
             }
             if self.active.replace(state).is_some() {
@@ -162,11 +564,19 @@ struct AttemptState {
     last_command_sequence: u64,
     last_command_generation: u64,
     last_command_payload_digest: String,
+    #[serde(default)]
+    last_command_outcome: i32,
+    #[serde(default)]
+    last_command_source_frame_sequence: Option<u64>,
+    #[serde(default)]
+    last_command_error_code: Option<String>,
     side_effect_state: i32,
     last_side_effect_command_id: String,
     input_state: i32,
     capture_state: i32,
     owned_target_state: i32,
+    #[serde(default)]
+    owned_target: Option<TargetBinding>,
     cleanup_complete: bool,
     error_code: Option<String>,
 }
@@ -263,11 +673,15 @@ impl AttemptState {
                 .as_ref()
                 .map_or(0, |session| session.generation),
             last_command_payload_digest: task.payload_digest.clone(),
+            last_command_outcome: TaskCommandOutcomeState::Unspecified as i32,
+            last_command_source_frame_sequence: None,
+            last_command_error_code: None,
             side_effect_state: TaskSideEffectState::None as i32,
             last_side_effect_command_id: String::new(),
             input_state: TaskInputState::Released as i32,
             capture_state: TaskCaptureState::NotStarted as i32,
             owned_target_state: TaskOwnedTargetState::NotStarted as i32,
+            owned_target: None,
             cleanup_complete: false,
             error_code: None,
         })
@@ -349,12 +763,49 @@ impl AttemptState {
         }
     }
 
+    fn command_result(&self) -> Result<TaskCommandResult, AgentError> {
+        let outcome = TaskCommandOutcomeState::try_from(self.last_command_outcome)
+            .ok()
+            .filter(|outcome| *outcome != TaskCommandOutcomeState::Unspecified)
+            .ok_or_else(ledger_invalid)?;
+        Ok(TaskCommandResult {
+            outcome: TaskCommandOutcomeV1 {
+                attempt: Some(self.reference.message()),
+                command_id: self.last_command_id.clone(),
+                payload_digest: self.last_command_payload_digest.clone(),
+                outcome: outcome as i32,
+                source_frame_sequence: self.last_command_source_frame_sequence,
+                error_code: self.last_command_error_code.clone(),
+            },
+            receipt: self.receipt(),
+        })
+    }
+
     fn validate(&self) -> Result<(), AgentError> {
         let contract = self.contract.message();
         verify_agent_attempt_contract(&contract)
             .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
         let reference = self.reference.message();
         validate_contract_reference(&reference, &contract)?;
+        let attempt_state = TaskAttemptState::try_from(self.attempt_state).ok();
+        let side_effect_state = TaskSideEffectState::try_from(self.side_effect_state).ok();
+        let input_state = TaskInputState::try_from(self.input_state).ok();
+        let capture_state = TaskCaptureState::try_from(self.capture_state).ok();
+        let owned_target_state = TaskOwnedTargetState::try_from(self.owned_target_state).ok();
+        let cleanup_complete = attempt_state == Some(TaskAttemptState::Terminal)
+            && input_state == Some(TaskInputState::Released)
+            && matches!(
+                capture_state,
+                Some(TaskCaptureState::NotStarted | TaskCaptureState::Stopped)
+            )
+            && matches!(
+                owned_target_state,
+                Some(TaskOwnedTargetState::NotStarted | TaskOwnedTargetState::Closed)
+            )
+            && !matches!(
+                side_effect_state,
+                Some(TaskSideEffectState::IntentRecorded | TaskSideEffectState::Uncertain)
+            );
         if !TaskAttemptState::try_from(self.attempt_state)
             .is_ok_and(|state| state != TaskAttemptState::Unspecified)
             || !TaskSideEffectState::try_from(self.side_effect_state)
@@ -367,6 +818,20 @@ impl AttemptState {
                 .is_ok_and(|state| state != TaskOwnedTargetState::Unspecified)
             || self.last_command_id.is_empty()
             || !is_digest(&self.last_command_payload_digest)
+            || (self.last_command_outcome != TaskCommandOutcomeState::Unspecified as i32
+                && TaskCommandOutcomeState::try_from(self.last_command_outcome).is_err())
+            || self
+                .owned_target
+                .as_ref()
+                .is_some_and(|binding| binding.profile_id != self.contract.profile_id)
+            || self.cleanup_complete != cleanup_complete
+            || (self.owned_target.is_some()
+                && !matches!(
+                    owned_target_state,
+                    Some(TaskOwnedTargetState::Running | TaskOwnedTargetState::Unknown)
+                ))
+            || (self.owned_target.is_none()
+                && owned_target_state == Some(TaskOwnedTargetState::Running))
         {
             return Err(ledger_invalid());
         }
@@ -382,6 +847,10 @@ fn validate_task(
     if command.session.is_none()
         || command.command_id.is_empty()
         || !is_digest(&task.payload_digest)
+        || !is_uuid(&reference.task_run_id)
+        || !is_uuid(&reference.attempt_id)
+        || reference.contract_version != 1
+        || !is_digest(&reference.contract_digest)
     {
         return Err(task_ref_invalid());
     }
@@ -419,7 +888,13 @@ fn not_found_receipt() -> TaskAttemptReceiptV1 {
 }
 
 fn load_last(path: &Path) -> Result<AttemptState, AgentError> {
-    let file = fs::File::open(path).map_err(|error| io_error("task.ledger_unavailable", error))?;
+    let file = fs::File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AgentError::new("task.ledger_not_found", "task attempt ledger does not exist")
+        } else {
+            io_error("task.ledger_unavailable", error)
+        }
+    })?;
     let mut last = None;
     for line in BufReader::new(file).lines() {
         let line = line.map_err(|error| io_error("task.ledger_unavailable", error))?;
@@ -440,6 +915,17 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+}
+
 fn production_root() -> Option<PathBuf> {
     #[cfg(windows)]
     return Some(PathBuf::from(
@@ -454,6 +940,10 @@ fn task_ref_invalid() -> AgentError {
         "task.reference_invalid",
         "task command reference is incomplete or invalid",
     )
+}
+
+fn attempt_not_found() -> AgentError {
+    AgentError::new("attempt_not_found", "task attempt is not claimed")
 }
 
 fn ledger_invalid() -> AgentError {
@@ -548,6 +1038,31 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "command_payload_mismatch"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unresolved_side_effect_becomes_uncertain_after_restart_without_replay() {
+        let root = temporary_root();
+        let contract = contract();
+        let begin = task(&contract, "begin-1", 'c');
+        let effect = task(&contract, "pulse-1", 'd');
+        let mut runtime = TaskAttemptRuntime::at(root.clone());
+        runtime.begin(&begin, &contract).unwrap();
+        assert!(runtime.prepare(&effect, true).unwrap().is_none());
+
+        let replay = TaskAttemptRuntime::at(root.clone())
+            .prepare(&effect, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replay.outcome.outcome,
+            TaskCommandOutcomeState::Uncertain as i32
+        );
+        assert_eq!(
+            replay.receipt.side_effect_state,
+            TaskSideEffectState::Uncertain as i32
         );
         fs::remove_dir_all(root).unwrap();
     }

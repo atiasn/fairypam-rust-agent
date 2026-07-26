@@ -910,11 +910,12 @@ impl SupervisorHooks for RuntimeSafetyHooks {
     }
 
     fn guardian_release_all(&mut self) -> Result<(), String> {
-        // The production binary never arms without a separate local authority.
-        // Thus no physical holds can exist in this DryRun runtime. The hook is
-        // still explicit so the full Windows input owner can replace it in the
-        // Task 9 harness without changing supervisor ordering.
-        tracing::info!(effect = "guardian_release_all", state = "dry_run_no_holds");
+        self.execution
+            .lock()
+            .map_err(|error| error.to_string())?
+            .emergency_release_input()
+            .map_err(|error| error.to_string())?;
+        tracing::info!(effect = "guardian_release_all", state = "released");
         Ok(())
     }
 
