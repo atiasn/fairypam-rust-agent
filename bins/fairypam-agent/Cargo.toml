@@ -20,6 +20,7 @@ fairypam-agent-suite = { path = "../../crates/fairypam-agent-suite" }
 fairypam-agent-transport = { path = "../../crates/fairypam-agent-transport" }
 fairypam-agent-windows = { path = "../../crates/fairypam-agent-windows" }
 http = "1"
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }

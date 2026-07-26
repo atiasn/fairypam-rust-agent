@@ -408,6 +408,7 @@ dependencies = [
  "fairypam-agent-transport",
  "fairypam-agent-windows",
  "http",
+ "serde",
  "serde_json",
  "sha2",
  "time",

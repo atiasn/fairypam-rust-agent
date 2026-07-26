@@ -10,6 +10,7 @@ pub mod local_control;
 mod observability;
 pub mod profile_store;
 pub mod runtime;
+mod task_attempt;
 #[cfg(feature = "e2e-live-input")]
 pub mod test_arm;
 #[cfg(windows)]

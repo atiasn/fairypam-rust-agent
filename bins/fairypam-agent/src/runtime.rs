@@ -827,6 +827,11 @@ impl SessionDriver for GrpcSessionDriver {
                         );
                     let event = match outcome {
                         CommandOutcome::Ack(result) => ack_event(identity, &result),
+                        CommandOutcome::TaskAck {
+                            result,
+                            outcome,
+                            receipt,
+                        } => task_ack_event(identity, &result, outcome, *receipt),
                         CommandOutcome::Nack { code, message } => {
                             nack_event(identity, &code, &message)
                         }
@@ -2006,6 +2011,23 @@ fn ack_event(identity: CommandIdentity, result_json: &str) -> AgentControlEvent 
     }
 }
 
+fn task_ack_event(
+    identity: CommandIdentity,
+    result_json: &str,
+    outcome: Option<fairypam_agent_protocol::v1::TaskCommandOutcomeV1>,
+    receipt: fairypam_agent_protocol::v1::TaskAttemptReceiptV1,
+) -> AgentControlEvent {
+    AgentControlEvent {
+        payload: Some(agent_control_event::Payload::Ack(CommandAck {
+            command: Some(identity.command),
+            result_json: result_json.to_owned(),
+            task: identity.task,
+            task_outcome: outcome,
+            task_attempt_receipt: Some(receipt),
+        })),
+    }
+}
+
 fn nack_event(identity: CommandIdentity, error_code: &str, message: &str) -> AgentControlEvent {
     AgentControlEvent {
         payload: Some(agent_control_event::Payload::Nack(CommandNack {
@@ -2143,6 +2165,37 @@ mod tests {
                 Some(CommandIdentity::legacy(reference.clone()))
             );
         }
+    }
+
+    #[test]
+    fn typed_task_receipt_reaches_command_ack() {
+        let reference = CommandRef {
+            command_id: "begin-task".into(),
+            ..CommandRef::default()
+        };
+        let task = TaskCommandRef {
+            command: Some(reference.clone()),
+            ..TaskCommandRef::default()
+        };
+        let receipt = fairypam_agent_protocol::v1::TaskAttemptReceiptV1 {
+            receipt_version: 1,
+            ..fairypam_agent_protocol::v1::TaskAttemptReceiptV1::default()
+        };
+        let event = task_ack_event(
+            CommandIdentity {
+                command: reference,
+                task: Some(task),
+            },
+            "{}",
+            None,
+            receipt,
+        );
+
+        let Some(agent_control_event::Payload::Ack(ack)) = event.payload else {
+            panic!("typed task ACK was not emitted");
+        };
+        assert_eq!(ack.task_attempt_receipt.unwrap().receipt_version, 1);
+        assert!(ack.task.is_some());
     }
 
     #[cfg(windows)]

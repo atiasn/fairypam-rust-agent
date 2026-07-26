@@ -10,12 +10,14 @@ use fairypam_agent_core::target::{TargetBinding, TargetCandidate, TargetSelector
 use fairypam_agent_core::AgentError;
 use fairypam_agent_local_protocol::LocalCommand;
 use fairypam_agent_protocol::v1::{
-    hub_control_command, FramePacket, HubControlCommand, SessionRef,
+    hub_control_command, FramePacket, HubControlCommand, SessionRef, TaskAttemptReceiptV1,
+    TaskCommandOutcomeV1,
 };
 use fairypam_agent_transport::{SessionFrameSlot, VerifiedSession};
 use serde_json::json;
 
 use crate::profile_store::ProfileStore;
+use crate::task_attempt::TaskAttemptRuntime;
 
 const MAX_CLOSE_TIMEOUT_MS: u32 = 5_000;
 #[cfg(all(windows, feature = "dev-automation"))]
@@ -115,9 +117,14 @@ pub trait RuntimePlatform: Send {
     ) -> Result<(), AgentError>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CommandOutcome {
     Ack(String),
+    TaskAck {
+        result: String,
+        outcome: Option<TaskCommandOutcomeV1>,
+        receipt: Box<TaskAttemptReceiptV1>,
+    },
     Nack { code: String, message: String },
 }
 
@@ -152,14 +159,27 @@ pub struct CommandExecutor {
     binding: Option<TargetBinding>,
     capture: Option<CaptureWorker>,
     frame_sequences: BTreeMap<String, Arc<AtomicU64>>,
+    task_attempt: TaskAttemptRuntime,
 }
 
 impl CommandExecutor {
     pub fn production(profiles: ProfileStore) -> Self {
-        Self::with_platform(profiles, production_platform())
+        Self::with_platform_and_attempts(
+            profiles,
+            production_platform(),
+            TaskAttemptRuntime::production(),
+        )
     }
 
     pub fn with_platform(profiles: ProfileStore, platform: Box<dyn RuntimePlatform>) -> Self {
+        Self::with_platform_and_attempts(profiles, platform, TaskAttemptRuntime::memory())
+    }
+
+    fn with_platform_and_attempts(
+        profiles: ProfileStore,
+        platform: Box<dyn RuntimePlatform>,
+        task_attempt: TaskAttemptRuntime,
+    ) -> Self {
         Self {
             profiles,
             platform,
@@ -167,6 +187,7 @@ impl CommandExecutor {
             binding: None,
             capture: None,
             frame_sequences: BTreeMap::new(),
+            task_attempt,
         }
     }
 
@@ -467,15 +488,43 @@ impl CommandExecutor {
                 "execution.update_wrong_layer",
                 "update directives are handled by the runtime lifecycle",
             )),
-            Some(
-                Payload::BeginTaskAttempt(_)
-                | Payload::StartTaskTarget(_)
-                | Payload::FinishTaskAttempt(_)
-                | Payload::InspectTaskAttempt(_),
-            ) => Ok(CommandOutcome::Nack {
-                code: "task.not_implemented".into(),
-                message: "M1 task attempt runtime is not implemented".into(),
-            }),
+            Some(Payload::BeginTaskAttempt(value)) => {
+                let task = value.task.as_ref().ok_or_else(task_reference_invalid)?;
+                let contract = value.contract.as_ref().ok_or_else(task_reference_invalid)?;
+                let profile = self.profiles.get(&contract.profile_id)?;
+                if profile.content_sha256() != contract.profile_digest {
+                    return Err(AgentError::new(
+                        "profile_mismatch",
+                        "Agent task contract does not match the installed signed Profile",
+                    ));
+                }
+                let build_id = option_env!("FAIRYPAM_BUILD_ID").unwrap_or("unknown");
+                if contract.agent_build_id != build_id {
+                    return Err(AgentError::new(
+                        "agent_build_mismatch",
+                        "Agent task contract does not match this Agent build",
+                    ));
+                }
+                Ok(CommandOutcome::TaskAck {
+                    result: "{}".into(),
+                    outcome: None,
+                    receipt: Box::new(self.task_attempt.begin(task, contract)?),
+                })
+            }
+            Some(Payload::InspectTaskAttempt(value)) => {
+                let task = value.task.as_ref().ok_or_else(task_reference_invalid)?;
+                Ok(CommandOutcome::TaskAck {
+                    result: "{}".into(),
+                    outcome: None,
+                    receipt: Box::new(self.task_attempt.inspect(task)?),
+                })
+            }
+            Some(Payload::StartTaskTarget(_) | Payload::FinishTaskAttempt(_)) => {
+                Ok(CommandOutcome::Nack {
+                    code: "task.not_implemented".into(),
+                    message: "M1 task target lifecycle is not implemented".into(),
+                })
+            }
             Some(Payload::Hello(_)) | None => Err(AgentError::new(
                 "protocol.command_invalid",
                 "HubHello is not an executable command",
@@ -525,6 +574,13 @@ impl CommandExecutor {
             "unattended Testbed input requires Windows",
         ))
     }
+}
+
+fn task_reference_invalid() -> AgentError {
+    AgentError::new(
+        "task.reference_invalid",
+        "task command reference or Agent contract is missing",
+    )
 }
 
 impl Drop for CommandExecutor {
@@ -923,9 +979,11 @@ mod tests {
     };
     use fairypam_agent_core::target::{ClientRect, IntegrityLevel, TargetSnapshot};
     use fairypam_agent_protocol::v1::{
-        CloseTarget, CommandRef, EnumerateTargets, FocusTarget, InputLease, LockTarget,
-        StartCapture, StopCapture,
+        AgentAttemptContractV1, AttemptRef, BeginTaskAttempt, CloseTarget, CommandRef,
+        EnumerateTargets, FocusTarget, InputLease, InspectTaskAttempt, LockTarget, SessionRef,
+        StartCapture, StopCapture, TaskAttemptState, TaskCommandRef,
     };
+    use sha2::{Digest, Sha256};
 
     use super::*;
 
@@ -1141,6 +1199,48 @@ mod tests {
         (executor, state)
     }
 
+    fn task_contract(profile: &VerifiedProfile) -> AgentAttemptContractV1 {
+        let mut contract = AgentAttemptContractV1 {
+            task_run_id: "11111111-1111-4111-8111-111111111111".into(),
+            attempt_id: "22222222-2222-4222-8222-222222222222".into(),
+            agent_build_id: option_env!("FAIRYPAM_BUILD_ID").unwrap_or("unknown").into(),
+            profile_id: profile.profile().id.clone(),
+            profile_digest: profile.content_sha256().into(),
+            cleanup_policy: "close_owned_target".into(),
+            contract_version: 1,
+            contract_digest: String::new(),
+        };
+        let canonical =
+            fairypam_agent_protocol::canonical_agent_attempt_contract(&contract).unwrap();
+        contract.contract_digest = Sha256::digest(canonical.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        contract
+    }
+
+    fn task_ref(contract: &AgentAttemptContractV1, command_id: &str) -> TaskCommandRef {
+        TaskCommandRef {
+            command: Some(CommandRef {
+                session: Some(SessionRef {
+                    agent_id: "agent".into(),
+                    session_id: "session".into(),
+                    generation: 1,
+                }),
+                command_id: command_id.into(),
+                sequence: 1,
+                expires_at_unix_ms: i64::MAX,
+            }),
+            attempt: Some(AttemptRef {
+                task_run_id: contract.task_run_id.clone(),
+                attempt_id: contract.attempt_id.clone(),
+                contract_version: contract.contract_version,
+                contract_digest: contract.contract_digest.clone(),
+            }),
+            payload_digest: "c".repeat(64),
+        }
+    }
+
     fn lock_command() -> HubControlCommand {
         HubControlCommand {
             payload: Some(hub_control_command::Payload::LockTarget(LockTarget {
@@ -1189,6 +1289,49 @@ mod tests {
         assert!(matches!(
             executor.execute(&lock, &ExecutionSession::test(), sink),
             CommandOutcome::Ack(_)
+        ));
+    }
+
+    #[test]
+    fn begin_and_inspect_return_typed_claim_receipts() {
+        let profile = verified_profile();
+        let contract = task_contract(&profile);
+        let mut executor = CommandExecutor::with_platform(
+            ProfileStore::from_verified_profiles([profile]).unwrap(),
+            Box::new(FakePlatform::default()),
+        );
+        let begin = HubControlCommand {
+            payload: Some(hub_control_command::Payload::BeginTaskAttempt(
+                BeginTaskAttempt {
+                    task: Some(task_ref(&contract, "begin-1")),
+                    contract: Some(contract.clone()),
+                },
+            )),
+        };
+        let CommandOutcome::TaskAck { receipt, .. } = executor.execute(
+            &begin,
+            &ExecutionSession::test(),
+            Arc::new(CollectFrames::default()),
+        ) else {
+            panic!("task attempt claim was rejected");
+        };
+        assert_eq!(receipt.attempt_state, TaskAttemptState::Claimed as i32);
+
+        let inspect = HubControlCommand {
+            payload: Some(hub_control_command::Payload::InspectTaskAttempt(
+                InspectTaskAttempt {
+                    task: Some(task_ref(&contract, "inspect-1")),
+                },
+            )),
+        };
+        assert!(matches!(
+            executor.execute(
+                &inspect,
+                &ExecutionSession::test(),
+                Arc::new(CollectFrames::default()),
+            ),
+            CommandOutcome::TaskAck { receipt, .. }
+                if receipt.attempt_state == TaskAttemptState::Claimed as i32
         ));
     }
 

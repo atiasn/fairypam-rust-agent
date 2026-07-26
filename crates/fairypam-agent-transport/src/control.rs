@@ -478,7 +478,7 @@ mod tests {
                     command_id: "different".into(),
                     ..reference.clone()
                 }),
-                action_id: "wood.collect".into(),
+                action_id: "interaction.confirm".into(),
                 source_frame_sequence: Some(1),
                 task: Some(task),
             })),
