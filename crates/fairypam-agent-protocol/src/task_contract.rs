@@ -33,9 +33,7 @@ pub fn canonical_agent_attempt_contract(
     if !is_digest(&contract.profile_digest) {
         return Err(ContractError("task.contract_digest_invalid"));
     }
-    if contract.contract_version != 1
-        || contract.cleanup_policy != "close_owned_target"
-    {
+    if contract.contract_version != 1 || contract.cleanup_policy != "close_owned_target" {
         return Err(ContractError("task.contract_value_invalid"));
     }
 
@@ -104,9 +102,8 @@ mod tests {
     const CANONICAL: &str = include_str!(
         "../../../proto/fairypam/agent/v1/testdata/agent-attempt-contract-v1.canonical.json"
     );
-    const DIGEST: &str = include_str!(
-        "../../../proto/fairypam/agent/v1/testdata/agent-attempt-contract-v1.sha256"
-    );
+    const DIGEST: &str =
+        include_str!("../../../proto/fairypam/agent/v1/testdata/agent-attempt-contract-v1.sha256");
 
     fn contract() -> AgentAttemptContractV1 {
         AgentAttemptContractV1 {
@@ -124,7 +121,10 @@ mod tests {
     #[test]
     fn shared_golden_vector_is_canonical_and_verified() {
         let contract = contract();
-        assert_eq!(canonical_agent_attempt_contract(&contract).unwrap(), CANONICAL.trim());
+        assert_eq!(
+            canonical_agent_attempt_contract(&contract).unwrap(),
+            CANONICAL.trim()
+        );
         verify_agent_attempt_contract(&contract).unwrap();
     }
 
@@ -140,7 +140,9 @@ mod tests {
         let mut mismatched = contract();
         mismatched.profile_id = "genshin-impact-beta".into();
         assert_eq!(
-            verify_agent_attempt_contract(&mismatched).unwrap_err().code(),
+            verify_agent_attempt_contract(&mismatched)
+                .unwrap_err()
+                .code(),
             "task.contract_mismatch"
         );
     }

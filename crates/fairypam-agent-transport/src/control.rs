@@ -1,7 +1,6 @@
 use fairypam_agent_protocol::v1::agent_control_service_client::AgentControlServiceClient;
 use fairypam_agent_protocol::v1::{
-    hub_control_command, AgentControlEvent, CommandRef, HubControlCommand, HubHello,
-    TaskCommandRef,
+    hub_control_command, AgentControlEvent, CommandRef, HubControlCommand, HubHello, TaskCommandRef,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -312,8 +311,8 @@ fn verify_command_freshness(
 #[cfg(test)]
 mod tests {
     use fairypam_agent_protocol::v1::{
-        AgentAttemptContractV1, AttemptRef, BeginTaskAttempt, CloseTarget, CommandRef,
-        FocusTarget, PulseAction, SessionRef, TaskCommandRef,
+        AgentAttemptContractV1, AttemptRef, BeginTaskAttempt, CloseTarget, CommandRef, FocusTarget,
+        PulseAction, SessionRef, TaskCommandRef,
     };
 
     use super::*;

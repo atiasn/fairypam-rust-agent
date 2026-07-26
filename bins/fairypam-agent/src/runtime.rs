@@ -2006,11 +2006,7 @@ fn ack_event(identity: CommandIdentity, result_json: &str) -> AgentControlEvent 
     }
 }
 
-fn nack_event(
-    identity: CommandIdentity,
-    error_code: &str,
-    message: &str,
-) -> AgentControlEvent {
+fn nack_event(identity: CommandIdentity, error_code: &str, message: &str) -> AgentControlEvent {
     AgentControlEvent {
         payload: Some(agent_control_event::Payload::Nack(CommandNack {
             command: Some(identity.command),
