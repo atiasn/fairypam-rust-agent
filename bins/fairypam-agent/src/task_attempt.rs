@@ -177,7 +177,7 @@ impl TaskAttemptRuntime {
         }
         active.require_same_command(&command.command_id, &task.payload_digest)?;
         if active.last_command_outcome == TaskCommandOutcomeState::Unspecified as i32 {
-            return Ok(None);
+            return self.prepare(task, true);
         }
         active.command_result().map(Some)
     }
@@ -1186,7 +1186,7 @@ mod tests {
         assert!(runtime.prepare(&effect, true).unwrap().is_none());
 
         let replay = TaskAttemptRuntime::at(root.clone())
-            .prepare(&effect, true)
+            .replay(&effect)
             .unwrap()
             .unwrap();
         assert_eq!(
