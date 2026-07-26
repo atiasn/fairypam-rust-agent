@@ -1,4 +1,5 @@
 pub mod v1 {
+    #![allow(clippy::large_enum_variant)]
     tonic::include_proto!("fairypam.agent.v1");
 }
 
