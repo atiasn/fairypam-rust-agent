@@ -23,6 +23,105 @@ message CommandRef {
   int64 expires_at_unix_ms = 4;
 }
 
+message AttemptRef {
+  string task_run_id = 1;
+  string attempt_id = 2;
+  uint32 contract_version = 3;
+  string contract_digest = 4;
+}
+
+message TaskCommandRef {
+  CommandRef command = 1;
+  AttemptRef attempt = 2;
+  string payload_digest = 3;
+}
+
+message AgentAttemptContractV1 {
+  string task_run_id = 1;
+  string attempt_id = 2;
+  string agent_build_id = 3;
+  string profile_id = 4;
+  string profile_digest = 5;
+  string cleanup_policy = 6;
+  uint32 contract_version = 7;
+  string contract_digest = 8;
+}
+
+enum TaskCommandOutcomeState {
+  TASK_COMMAND_OUTCOME_STATE_UNSPECIFIED = 0;
+  TASK_COMMAND_OUTCOME_STATE_APPLIED = 1;
+  TASK_COMMAND_OUTCOME_STATE_NOT_APPLIED = 2;
+  TASK_COMMAND_OUTCOME_STATE_UNCERTAIN = 3;
+}
+
+enum TaskAttemptState {
+  TASK_ATTEMPT_STATE_UNSPECIFIED = 0;
+  TASK_ATTEMPT_STATE_NOT_FOUND = 1;
+  TASK_ATTEMPT_STATE_CLAIMED = 2;
+  TASK_ATTEMPT_STATE_TARGET_READY = 3;
+  TASK_ATTEMPT_STATE_ACTIVE = 4;
+  TASK_ATTEMPT_STATE_STOPPING = 5;
+  TASK_ATTEMPT_STATE_TERMINAL = 6;
+}
+
+enum TaskSideEffectState {
+  TASK_SIDE_EFFECT_STATE_UNSPECIFIED = 0;
+  TASK_SIDE_EFFECT_STATE_NONE = 1;
+  TASK_SIDE_EFFECT_STATE_INTENT_RECORDED = 2;
+  TASK_SIDE_EFFECT_STATE_APPLIED = 3;
+  TASK_SIDE_EFFECT_STATE_NOT_APPLIED = 4;
+  TASK_SIDE_EFFECT_STATE_UNCERTAIN = 5;
+}
+
+enum TaskInputState {
+  TASK_INPUT_STATE_UNSPECIFIED = 0;
+  TASK_INPUT_STATE_RELEASED = 1;
+  TASK_INPUT_STATE_ACTIVE = 2;
+  TASK_INPUT_STATE_UNKNOWN = 3;
+}
+
+enum TaskCaptureState {
+  TASK_CAPTURE_STATE_UNSPECIFIED = 0;
+  TASK_CAPTURE_STATE_NOT_STARTED = 1;
+  TASK_CAPTURE_STATE_RUNNING = 2;
+  TASK_CAPTURE_STATE_STOPPED = 3;
+  TASK_CAPTURE_STATE_UNKNOWN = 4;
+}
+
+enum TaskOwnedTargetState {
+  TASK_OWNED_TARGET_STATE_UNSPECIFIED = 0;
+  TASK_OWNED_TARGET_STATE_NOT_STARTED = 1;
+  TASK_OWNED_TARGET_STATE_RUNNING = 2;
+  TASK_OWNED_TARGET_STATE_CLOSED = 3;
+  TASK_OWNED_TARGET_STATE_UNKNOWN = 4;
+}
+
+message TaskCommandOutcomeV1 {
+  AttemptRef attempt = 1;
+  string command_id = 2;
+  string payload_digest = 3;
+  TaskCommandOutcomeState outcome = 4;
+  optional uint64 source_frame_sequence = 5;
+  optional string error_code = 6;
+}
+
+message TaskAttemptReceiptV1 {
+  uint32 receipt_version = 1;
+  AttemptRef attempt = 2;
+  TaskAttemptState attempt_state = 3;
+  string last_command_id = 4;
+  uint64 last_command_sequence = 5;
+  uint64 last_command_generation = 6;
+  string last_command_payload_digest = 7;
+  TaskSideEffectState side_effect_state = 8;
+  string last_side_effect_command_id = 9;
+  TaskInputState input_state = 10;
+  TaskCaptureState capture_state = 11;
+  TaskOwnedTargetState owned_target_state = 12;
+  optional bool cleanup_complete = 13;
+  optional string error_code = 14;
+}
+
 message AgentHello {
   string agent_id = 1;
   string agent_version = 2;
@@ -76,6 +175,10 @@ message HubControlCommand {
     FocusTarget focus_target = 12;
     CloseTarget close_target = 13;
     UpdateDirective update_directive = 14;
+    BeginTaskAttempt begin_task_attempt = 15;
+    StartTaskTarget start_task_target = 16;
+    FinishTaskAttempt finish_task_attempt = 17;
+    InspectTaskAttempt inspect_task_attempt = 18;
   }
 }
 
@@ -93,12 +196,16 @@ message AgentStatus {
 message CommandAck {
   CommandRef command = 1;
   string result_json = 2;
+  TaskCommandRef task = 3;
+  TaskCommandOutcomeV1 task_outcome = 4;
+  TaskAttemptReceiptV1 task_attempt_receipt = 5;
 }
 
 message CommandNack {
   CommandRef command = 1;
   string error_code = 2;
   string message = 3;
+  TaskCommandRef task = 4;
 }
 
 message TargetCandidate {
@@ -118,6 +225,24 @@ message SafetyEvent {
   SessionRef session = 1;
   string reason = 2;
   string state = 3;
+  AttemptRef attempt = 4;
+}
+
+message BeginTaskAttempt {
+  TaskCommandRef task = 1;
+  AgentAttemptContractV1 contract = 2;
+}
+
+message StartTaskTarget {
+  TaskCommandRef task = 1;
+}
+
+message FinishTaskAttempt {
+  TaskCommandRef task = 1;
+}
+
+message InspectTaskAttempt {
+  TaskCommandRef task = 1;
 }
 
 message EnumerateTargets {
@@ -159,22 +284,27 @@ message StartCapture {
   uint32 fps = 3;
   string encoding = 4;
   uint32 quality = 5;
+  TaskCommandRef task = 6;
 }
 
 message StopCapture {
   CommandRef command = 1;
   string source_id = 2;
+  TaskCommandRef task = 3;
 }
 
 message InputLease {
   CommandRef command = 1;
   uint32 ttl_ms = 2;
   repeated string desired_hold_actions = 3;
+  TaskCommandRef task = 4;
 }
 
 message PulseAction {
   CommandRef command = 1;
   string action_id = 2;
+  optional uint64 source_frame_sequence = 3;
+  TaskCommandRef task = 4;
 }
 
 message MouseDeltaAction {
@@ -194,6 +324,7 @@ message WindowPointClickAction {
 message ReleaseAll {
   CommandRef command = 1;
   string reason = 2;
+  TaskCommandRef task = 3;
 }
 
 message StopSession {
@@ -210,6 +341,7 @@ message FramePacket {
   uint32 height = 6;
   string encoding = 7;
   bytes payload = 8;
+  AttemptRef attempt = 9;
 }
 
 message FrameDirective {

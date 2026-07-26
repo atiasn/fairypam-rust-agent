@@ -1,6 +1,7 @@
 use fairypam_agent_protocol::v1::agent_control_service_client::AgentControlServiceClient;
 use fairypam_agent_protocol::v1::{
     hub_control_command, AgentControlEvent, CommandRef, HubControlCommand, HubHello,
+    TaskCommandRef,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -242,18 +243,50 @@ fn command_ref(command: &HubControlCommand) -> Option<&CommandRef> {
         Payload::Hello(_) => None,
         Payload::EnumerateTargets(value) => value.command.as_ref(),
         Payload::LockTarget(value) => value.command.as_ref(),
-        Payload::StartCapture(value) => value.command.as_ref(),
-        Payload::StopCapture(value) => value.command.as_ref(),
-        Payload::InputLease(value) => value.command.as_ref(),
-        Payload::PulseAction(value) => value.command.as_ref(),
+        Payload::StartCapture(value) => {
+            task_or_legacy_ref(value.task.as_ref(), value.command.as_ref())
+        }
+        Payload::StopCapture(value) => {
+            task_or_legacy_ref(value.task.as_ref(), value.command.as_ref())
+        }
+        Payload::InputLease(value) => {
+            task_or_legacy_ref(value.task.as_ref(), value.command.as_ref())
+        }
+        Payload::PulseAction(value) => {
+            task_or_legacy_ref(value.task.as_ref(), value.command.as_ref())
+        }
         Payload::MouseDeltaAction(value) => value.command.as_ref(),
         Payload::WindowPointClickAction(value) => value.command.as_ref(),
-        Payload::ReleaseAll(value) => value.command.as_ref(),
+        Payload::ReleaseAll(value) => {
+            task_or_legacy_ref(value.task.as_ref(), value.command.as_ref())
+        }
         Payload::StopSession(value) => value.command.as_ref(),
         Payload::FocusTarget(value) => value.command.as_ref(),
         Payload::CloseTarget(value) => value.command.as_ref(),
         Payload::UpdateDirective(value) => value.command.as_ref(),
+        Payload::BeginTaskAttempt(value) => task_ref(value.task.as_ref()),
+        Payload::StartTaskTarget(value) => task_ref(value.task.as_ref()),
+        Payload::FinishTaskAttempt(value) => task_ref(value.task.as_ref()),
+        Payload::InspectTaskAttempt(value) => task_ref(value.task.as_ref()),
     }
+}
+
+fn task_ref(task: Option<&TaskCommandRef>) -> Option<&CommandRef> {
+    task?.command.as_ref()
+}
+
+fn task_or_legacy_ref<'a>(
+    task: Option<&'a TaskCommandRef>,
+    legacy: Option<&'a CommandRef>,
+) -> Option<&'a CommandRef> {
+    let Some(task) = task else {
+        return legacy;
+    };
+    let reference = task.command.as_ref()?;
+    if legacy.is_some_and(|legacy| legacy != reference) {
+        return None;
+    }
+    Some(reference)
 }
 
 fn verify_command_freshness(
@@ -279,7 +312,8 @@ fn verify_command_freshness(
 #[cfg(test)]
 mod tests {
     use fairypam_agent_protocol::v1::{
-        CloseTarget, CommandRef, FocusTarget, PulseAction, SessionRef,
+        AgentAttemptContractV1, AttemptRef, BeginTaskAttempt, CloseTarget, CommandRef,
+        FocusTarget, PulseAction, SessionRef, TaskCommandRef,
     };
 
     use super::*;
@@ -336,6 +370,7 @@ mod tests {
                     expires_at_unix_ms: i64::MAX,
                 }),
                 action_id: "jump".into(),
+                ..PulseAction::default()
             })),
         };
 
@@ -402,5 +437,58 @@ mod tests {
             let command = verified.into_inner();
             assert_eq!(command_ref(&command).unwrap(), &reference);
         }
+    }
+
+    #[test]
+    fn task_commands_use_the_nested_command_ref_and_reject_conflicting_legacy_refs() {
+        let reference = CommandRef {
+            session: Some(SessionRef {
+                agent_id: "agent-a".into(),
+                session_id: "session-1".into(),
+                generation: 2,
+            }),
+            command_id: "task-command".into(),
+            sequence: 1,
+            expires_at_unix_ms: i64::MAX,
+        };
+        let task = TaskCommandRef {
+            command: Some(reference.clone()),
+            attempt: Some(AttemptRef {
+                task_run_id: "11111111-1111-1111-1111-111111111111".into(),
+                attempt_id: "22222222-2222-2222-2222-222222222222".into(),
+                contract_version: 1,
+                contract_digest: "a".repeat(64),
+            }),
+            payload_digest: "b".repeat(64),
+        };
+        let begin = HubControlCommand {
+            payload: Some(hub_control_command::Payload::BeginTaskAttempt(
+                BeginTaskAttempt {
+                    task: Some(task.clone()),
+                    contract: Some(AgentAttemptContractV1::default()),
+                },
+            )),
+        };
+
+        let verified = verify_control_command(&session(2), begin).unwrap();
+        assert_eq!(command_ref(&verified.into_inner()).unwrap(), &reference);
+
+        let conflict = HubControlCommand {
+            payload: Some(hub_control_command::Payload::PulseAction(PulseAction {
+                command: Some(CommandRef {
+                    command_id: "different".into(),
+                    ..reference.clone()
+                }),
+                action_id: "wood.collect".into(),
+                source_frame_sequence: Some(1),
+                task: Some(task),
+            })),
+        };
+        assert_eq!(
+            verify_control_command(&session(2), conflict)
+                .unwrap_err()
+                .code(),
+            "transport.command_session_invalid"
+        );
     }
 }

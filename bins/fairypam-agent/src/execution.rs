@@ -467,6 +467,15 @@ impl CommandExecutor {
                 "execution.update_wrong_layer",
                 "update directives are handled by the runtime lifecycle",
             )),
+            Some(
+                Payload::BeginTaskAttempt(_)
+                | Payload::StartTaskTarget(_)
+                | Payload::FinishTaskAttempt(_)
+                | Payload::InspectTaskAttempt(_),
+            ) => Ok(CommandOutcome::Nack {
+                code: "task.not_implemented".into(),
+                message: "M1 task attempt runtime is not implemented".into(),
+            }),
             Some(Payload::Hello(_)) | None => Err(AgentError::new(
                 "protocol.command_invalid",
                 "HubHello is not an executable command",
@@ -599,6 +608,7 @@ fn spawn_capture_worker(
                                 RuntimeCaptureEncoding::Png => "png".into(),
                             },
                             payload: frame.bytes,
+                            attempt: None,
                         };
                         if let Err(error) = frames.publish(packet) {
                             tracing::error!(code = error.code(), %error, "frame publish failed");

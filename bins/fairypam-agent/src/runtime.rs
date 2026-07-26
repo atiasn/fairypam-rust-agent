@@ -13,7 +13,7 @@ use fairypam_agent_core::supervisor::{SessionDriver, SessionSupervisor, Supervis
 use fairypam_agent_core::AgentError;
 use fairypam_agent_protocol::v1::{
     agent_control_event, hub_control_command, AgentControlEvent, AgentHello, AgentStatus,
-    CommandAck, CommandNack, CommandRef, Heartbeat, SessionRef,
+    CommandAck, CommandNack, CommandRef, Heartbeat, SessionRef, TaskCommandRef,
 };
 #[cfg(windows)]
 use fairypam_agent_transport::validate_transport_config;
@@ -750,8 +750,11 @@ impl SessionDriver for GrpcSessionDriver {
                     let command = command.map_err(map_transport)?.ok_or_else(|| {
                         AgentError::new("runtime.control_closed", "Hub closed the Control stream")
                     })?.into_inner();
-                    let reference = command_reference(&command).ok_or_else(|| {
-                        AgentError::new("runtime.command_invalid", "verified command lost CommandRef")
+                    let identity = command_identity(&command).ok_or_else(|| {
+                        AgentError::new(
+                            "runtime.command_invalid",
+                            "verified command lost CommandRef",
+                        )
                     })?;
                     #[cfg(windows)]
                     if let Some(hub_control_command::Payload::UpdateDirective(directive)) =
@@ -792,7 +795,7 @@ impl SessionDriver for GrpcSessionDriver {
                                             r#"{{"state":"staged","update_id":"{}","target_build_id":"{}"}}"#,
                                             request.update_id, request.target_build_id
                                         );
-                                        ack_event(reference, &result)
+                                        ack_event(identity, &result)
                                     }
                                     Err(error) => {
                                         *self
@@ -800,11 +803,11 @@ impl SessionDriver for GrpcSessionDriver {
                                             .lock()
                                             .map_err(lock_error)? = None;
                                         crate::update::abort_staged(&request)?;
-                                        nack_event(reference, error.code(), &error.to_string())
+                                        nack_event(identity, error.code(), &error.to_string())
                                     }
                                 }
                             }
-                            Err(error) => nack_event(reference, error.code(), &error.to_string()),
+                            Err(error) => nack_event(identity, error.code(), &error.to_string()),
                         };
                         sender.send(event).await.map_err(map_transport)?;
                         continue;
@@ -823,9 +826,9 @@ impl SessionDriver for GrpcSessionDriver {
                             Arc::new(frames) as Arc<dyn FrameSink>,
                         );
                     let event = match outcome {
-                        CommandOutcome::Ack(result) => ack_event(reference, &result),
+                        CommandOutcome::Ack(result) => ack_event(identity, &result),
                         CommandOutcome::Nack { code, message } => {
-                            nack_event(reference, &code, &message)
+                            nack_event(identity, &code, &message)
                         }
                     };
                     sender.try_send(event).map_err(map_transport)?;
@@ -1977,45 +1980,92 @@ fn status_event(session: &VerifiedSession, state: &str) -> AgentControlEvent {
     }
 }
 
-fn ack_event(command: CommandRef, result_json: &str) -> AgentControlEvent {
+#[derive(Clone, Debug, PartialEq)]
+struct CommandIdentity {
+    command: CommandRef,
+    task: Option<TaskCommandRef>,
+}
+
+impl CommandIdentity {
+    fn legacy(command: CommandRef) -> Self {
+        Self {
+            command,
+            task: None,
+        }
+    }
+}
+
+fn ack_event(identity: CommandIdentity, result_json: &str) -> AgentControlEvent {
     AgentControlEvent {
         payload: Some(agent_control_event::Payload::Ack(CommandAck {
-            command: Some(command),
+            command: Some(identity.command),
             result_json: result_json.to_owned(),
+            task: identity.task,
+            ..CommandAck::default()
         })),
     }
 }
 
-fn nack_event(command: CommandRef, error_code: &str, message: &str) -> AgentControlEvent {
+fn nack_event(
+    identity: CommandIdentity,
+    error_code: &str,
+    message: &str,
+) -> AgentControlEvent {
     AgentControlEvent {
         payload: Some(agent_control_event::Payload::Nack(CommandNack {
-            command: Some(command),
+            command: Some(identity.command),
             error_code: error_code.to_owned(),
             message: message.to_owned(),
+            task: identity.task,
         })),
     }
 }
 
-fn command_reference(
+fn command_identity(
     command: &fairypam_agent_protocol::v1::HubControlCommand,
-) -> Option<CommandRef> {
+) -> Option<CommandIdentity> {
     use hub_control_command::Payload;
     match command.payload.as_ref()? {
         Payload::Hello(_) => None,
-        Payload::EnumerateTargets(value) => value.command.clone(),
-        Payload::LockTarget(value) => value.command.clone(),
-        Payload::StartCapture(value) => value.command.clone(),
-        Payload::StopCapture(value) => value.command.clone(),
-        Payload::InputLease(value) => value.command.clone(),
-        Payload::PulseAction(value) => value.command.clone(),
-        Payload::MouseDeltaAction(value) => value.command.clone(),
-        Payload::WindowPointClickAction(value) => value.command.clone(),
-        Payload::ReleaseAll(value) => value.command.clone(),
-        Payload::StopSession(value) => value.command.clone(),
-        Payload::FocusTarget(value) => value.command.clone(),
-        Payload::CloseTarget(value) => value.command.clone(),
-        Payload::UpdateDirective(value) => value.command.clone(),
+        Payload::EnumerateTargets(value) => legacy_identity(value.command.clone()),
+        Payload::LockTarget(value) => legacy_identity(value.command.clone()),
+        Payload::StartCapture(value) => task_identity(value.task.clone(), value.command.clone()),
+        Payload::StopCapture(value) => task_identity(value.task.clone(), value.command.clone()),
+        Payload::InputLease(value) => task_identity(value.task.clone(), value.command.clone()),
+        Payload::PulseAction(value) => task_identity(value.task.clone(), value.command.clone()),
+        Payload::MouseDeltaAction(value) => legacy_identity(value.command.clone()),
+        Payload::WindowPointClickAction(value) => legacy_identity(value.command.clone()),
+        Payload::ReleaseAll(value) => task_identity(value.task.clone(), value.command.clone()),
+        Payload::StopSession(value) => legacy_identity(value.command.clone()),
+        Payload::FocusTarget(value) => legacy_identity(value.command.clone()),
+        Payload::CloseTarget(value) => legacy_identity(value.command.clone()),
+        Payload::UpdateDirective(value) => legacy_identity(value.command.clone()),
+        Payload::BeginTaskAttempt(value) => task_identity(value.task.clone(), None),
+        Payload::StartTaskTarget(value) => task_identity(value.task.clone(), None),
+        Payload::FinishTaskAttempt(value) => task_identity(value.task.clone(), None),
+        Payload::InspectTaskAttempt(value) => task_identity(value.task.clone(), None),
     }
+}
+
+fn legacy_identity(command: Option<CommandRef>) -> Option<CommandIdentity> {
+    command.map(CommandIdentity::legacy)
+}
+
+fn task_identity(
+    task: Option<TaskCommandRef>,
+    legacy: Option<CommandRef>,
+) -> Option<CommandIdentity> {
+    let Some(task) = task else {
+        return legacy_identity(legacy);
+    };
+    let command = task.command.clone()?;
+    if legacy.is_some_and(|legacy| legacy != command) {
+        return None;
+    }
+    Some(CommandIdentity {
+        command,
+        task: Some(task),
+    })
 }
 
 fn now_unix_ms() -> i64 {
@@ -2062,7 +2112,11 @@ mod tests {
             command_id: "command-1".into(),
             ..CommandRef::default()
         };
-        let event = nack_event(command, "agent.dry_run_only", "denied");
+        let event = nack_event(
+            CommandIdentity::legacy(command),
+            "agent.dry_run_only",
+            "denied",
+        );
 
         let Some(agent_control_event::Payload::Nack(nack)) = event.payload else {
             panic!("remote action was not denied");
@@ -2088,7 +2142,10 @@ mod tests {
             let command = HubControlCommand {
                 payload: Some(payload),
             };
-            assert_eq!(command_reference(&command), Some(reference.clone()));
+            assert_eq!(
+                command_identity(&command),
+                Some(CommandIdentity::legacy(reference.clone()))
+            );
         }
     }
 
