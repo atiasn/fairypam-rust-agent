@@ -11,7 +11,7 @@ use fairypam_agent_core::AgentError;
 use fairypam_agent_local_protocol::LocalCommand;
 use fairypam_agent_protocol::v1::{
     hub_control_command, FramePacket, HubControlCommand, SessionRef, TaskAttemptReceiptV1,
-    TaskCommandOutcomeV1, TaskCommandRef,
+    TaskCommandOutcomeV1,
 };
 use fairypam_agent_transport::{SessionFrameSlot, VerifiedSession};
 use serde_json::json;
@@ -899,6 +899,7 @@ fn parse_encoding(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_capture_worker(
     mut capture: Box<dyn RuntimeCapture>,
     frame_sequence: Arc<AtomicU64>,
