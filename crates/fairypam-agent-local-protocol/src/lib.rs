@@ -53,6 +53,7 @@ pub enum LocalCommand {
     #[cfg(feature = "dev-automation")]
     TestbedPulse,
     ReleaseAll,
+    ResetEmergencyStop,
     UpdateStatus,
     StartupStatus,
     GetConnectionStatus,
@@ -444,6 +445,7 @@ fn is_supported_command(command: &str) -> bool {
         | "start_capture"
         | "stop_capture"
         | "release_all"
+        | "reset_emergency_stop"
         | "update_status"
         | "startup_status"
         | "get_connection_status"

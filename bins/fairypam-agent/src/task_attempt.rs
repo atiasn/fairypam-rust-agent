@@ -14,11 +14,13 @@ use serde::{Deserialize, Serialize};
 
 const RECEIPT_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
+const EMERGENCY_STOP_MARKER: &str = "emergency-stopped";
 
 pub struct TaskAttemptRuntime {
     root: Option<PathBuf>,
     active: Option<AttemptState>,
     loaded: bool,
+    emergency_stopped: bool,
 }
 
 pub struct TaskCommandResult {
@@ -32,6 +34,7 @@ impl TaskAttemptRuntime {
             root: production_root(),
             active: None,
             loaded: false,
+            emergency_stopped: false,
         }
     }
 
@@ -40,6 +43,7 @@ impl TaskAttemptRuntime {
             root: None,
             active: None,
             loaded: true,
+            emergency_stopped: false,
         }
     }
 
@@ -49,6 +53,7 @@ impl TaskAttemptRuntime {
             root: Some(root),
             active: None,
             loaded: false,
+            emergency_stopped: false,
         }
     }
 
@@ -62,6 +67,13 @@ impl TaskAttemptRuntime {
         let (reference, command) = validate_task(task)?;
         validate_contract_reference(reference, contract)?;
         self.load_active()?;
+
+        if self.emergency_stopped {
+            return Err(AgentError::new(
+                "emergency_stopped",
+                "local emergency stop must be reset before accepting a task attempt",
+            ));
+        }
 
         if self.active.as_ref().is_some_and(|active| {
             active.attempt_state == TaskAttemptState::Terminal as i32 && active.cleanup_complete
@@ -142,6 +154,32 @@ impl TaskAttemptRuntime {
         task: &TaskCommandRef,
     ) -> Result<Option<TargetBinding>, AgentError> {
         Ok(self.require_active(task)?.owned_target.clone())
+    }
+
+    pub fn active_owned_target(&mut self) -> Result<Option<TargetBinding>, AgentError> {
+        self.load_active()?;
+        Ok(self
+            .active
+            .as_ref()
+            .and_then(|active| active.owned_target.clone()))
+    }
+
+    pub fn replay(
+        &mut self,
+        task: &TaskCommandRef,
+    ) -> Result<Option<TaskCommandResult>, AgentError> {
+        let (reference, command) = validate_task(task)?;
+        self.load_active()?;
+        let active = self.active.as_ref().ok_or_else(attempt_not_found)?;
+        active.require_reference(reference)?;
+        if active.last_command_id != command.command_id {
+            return Ok(None);
+        }
+        active.require_same_command(&command.command_id, &task.payload_digest)?;
+        if active.last_command_outcome == TaskCommandOutcomeState::Unspecified as i32 {
+            return Ok(None);
+        }
+        active.command_result().map(Some)
     }
 
     pub fn prepare(
@@ -438,6 +476,103 @@ impl TaskAttemptRuntime {
         )
     }
 
+    pub fn emergency_finish(
+        &mut self,
+        input_released: bool,
+        capture_stopped: bool,
+        target_closed: bool,
+        error_code: Option<&str>,
+    ) -> Result<Option<TaskAttemptReceiptV1>, AgentError> {
+        self.load_active()?;
+        let Some(mut active) = self.active.take() else {
+            return Ok(None);
+        };
+        let side_effect_resolved = !matches!(
+            TaskSideEffectState::try_from(active.side_effect_state),
+            Ok(TaskSideEffectState::IntentRecorded | TaskSideEffectState::Uncertain)
+        );
+        let cleanup_complete =
+            input_released && capture_stopped && target_closed && side_effect_resolved;
+        active.attempt_state = TaskAttemptState::Terminal as i32;
+        active.input_state = if input_released {
+            TaskInputState::Released as i32
+        } else {
+            TaskInputState::Unknown as i32
+        };
+        active.capture_state = if capture_stopped {
+            TaskCaptureState::Stopped as i32
+        } else {
+            TaskCaptureState::Unknown as i32
+        };
+        active.owned_target_state = if target_closed {
+            TaskOwnedTargetState::Closed as i32
+        } else {
+            TaskOwnedTargetState::Unknown as i32
+        };
+        active.cleanup_complete = cleanup_complete;
+        active.error_code = error_code
+            .or((!side_effect_resolved).then_some("side_effect_uncertain"))
+            .or((!cleanup_complete).then_some("cleanup_incomplete"))
+            .map(str::to_owned);
+        if target_closed {
+            active.owned_target = None;
+        }
+        self.persist(&active)?;
+        let receipt = active.receipt();
+        self.active = Some(active);
+        Ok(Some(receipt))
+    }
+
+    pub fn emergency_stopped(&mut self) -> Result<bool, AgentError> {
+        self.load_active()?;
+        Ok(self.emergency_stopped)
+    }
+
+    pub fn set_emergency_stopped(&mut self, stopped: bool) -> Result<(), AgentError> {
+        self.load_active()?;
+        let previous = self.emergency_stopped;
+        self.emergency_stopped = stopped;
+        if let Some(root) = self.root.as_ref() {
+            if let Err(error) = fs::create_dir_all(root) {
+                if !stopped {
+                    self.emergency_stopped = previous;
+                }
+                return Err(io_error("task.ledger_unavailable", error));
+            }
+            let marker = root.join(EMERGENCY_STOP_MARKER);
+            if stopped {
+                let file = match OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(marker)
+                {
+                    Ok(file) => file,
+                    Err(error) => return Err(io_error("task.ledger_unavailable", error)),
+                };
+                if let Err(error) = file.sync_all() {
+                    return Err(io_error("task.ledger_unavailable", error));
+                }
+            } else if let Err(error) = fs::remove_file(marker) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.emergency_stopped = previous;
+                    return Err(io_error("task.ledger_unavailable", error));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reset_emergency(&mut self) -> Result<(), AgentError> {
+        if self.is_active()? {
+            return Err(AgentError::new(
+                "emergency_cleanup_incomplete",
+                "task cleanup must be complete before resetting emergency stop",
+            ));
+        }
+        self.set_emergency_stopped(false)
+    }
+
     fn require_active(&mut self, task: &TaskCommandRef) -> Result<&AttemptState, AgentError> {
         let (reference, _) = validate_task(task)?;
         self.load_active()?;
@@ -494,6 +629,7 @@ impl TaskAttemptRuntime {
             self.loaded = true;
             return Ok(());
         };
+        self.emergency_stopped = root.join(EMERGENCY_STOP_MARKER).is_file();
         let entries = match fs::read_dir(root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1074,5 +1210,33 @@ mod tests {
         assert_eq!(receipt.attempt_state, TaskAttemptState::NotFound as i32);
         assert!(receipt.attempt.is_none());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn emergency_stop_marker_survives_restart_until_local_reset() {
+        let root = temporary_root();
+        let contract = contract();
+        let begin = task(&contract, "begin-1", 'c');
+        let mut runtime = TaskAttemptRuntime::at(root.clone());
+        runtime.begin(&begin, &contract).unwrap();
+        runtime.set_emergency_stopped(true).unwrap();
+        assert!(runtime
+            .emergency_finish(true, true, true, None)
+            .unwrap()
+            .unwrap()
+            .cleanup_complete
+            .unwrap());
+
+        let mut restarted = TaskAttemptRuntime::at(root.clone());
+        assert!(restarted.emergency_stopped().unwrap());
+        assert_eq!(
+            restarted.begin(&begin, &contract).unwrap_err().code(),
+            "emergency_stopped"
+        );
+        restarted.reset_emergency().unwrap();
+        assert!(!TaskAttemptRuntime::at(root.clone())
+            .emergency_stopped()
+            .unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 }

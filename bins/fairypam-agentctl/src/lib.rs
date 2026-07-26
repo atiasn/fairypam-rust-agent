@@ -65,6 +65,7 @@ pub fn parse_command(arguments: &[String]) -> Result<LocalCommand, CliError> {
         #[cfg(feature = "dev-automation")]
         ["testbed", "pulse"] => Ok(LocalCommand::TestbedPulse),
         ["release-all"] => Ok(LocalCommand::ReleaseAll),
+        ["reset-emergency-stop"] => Ok(LocalCommand::ResetEmergencyStop),
         ["update", "status"] => Ok(LocalCommand::UpdateStatus),
         ["startup", "status"] => Ok(LocalCommand::StartupStatus),
         _ => Err(usage("unsupported local control command")),

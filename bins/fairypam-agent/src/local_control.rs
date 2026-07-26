@@ -230,6 +230,7 @@ fn is_mutation(command: &LocalCommand) -> bool {
         | LocalCommand::StartCapture { .. }
         | LocalCommand::StopCapture { .. }
         | LocalCommand::ReleaseAll
+        | LocalCommand::ResetEmergencyStop
         | LocalCommand::BindUiLifetime
         | LocalCommand::ShutdownAgent
         | LocalCommand::RegisterHub { .. } => true,
@@ -252,6 +253,7 @@ fn command_name(command: &LocalCommand) -> &'static str {
         #[cfg(feature = "dev-automation")]
         LocalCommand::TestbedPulse => "testbed_pulse",
         LocalCommand::ReleaseAll => "release_all",
+        LocalCommand::ResetEmergencyStop => "reset_emergency_stop",
         LocalCommand::UpdateStatus => "update_status",
         LocalCommand::StartupStatus => "startup_status",
         LocalCommand::GetConnectionStatus => "get_connection_status",

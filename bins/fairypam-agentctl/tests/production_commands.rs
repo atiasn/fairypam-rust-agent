@@ -17,6 +17,10 @@ fn cli_uses_shared_domain_commands_and_rejects_process_or_input_arguments() {
         LocalCommand::ReleaseAll
     );
     assert_eq!(
+        parse_command(&arguments(&["reset-emergency-stop"])).unwrap(),
+        LocalCommand::ResetEmergencyStop
+    );
+    assert_eq!(
         parse_command(&arguments(&["target", "lock", "--hwnd", "1"]))
             .unwrap_err()
             .exit_code(),

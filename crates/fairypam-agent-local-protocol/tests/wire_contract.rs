@@ -48,6 +48,7 @@ fn round_trips_all_supported_command_shapes() {
             source_id: "source".to_owned(),
         },
         LocalCommand::ReleaseAll,
+        LocalCommand::ResetEmergencyStop,
         LocalCommand::UpdateStatus,
         LocalCommand::StartupStatus,
         LocalCommand::GetConnectionStatus,

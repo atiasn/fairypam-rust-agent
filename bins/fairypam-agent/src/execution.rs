@@ -239,6 +239,20 @@ impl CommandExecutor {
         &mut self,
         command: &LocalCommand,
     ) -> Result<serde_json::Value, AgentError> {
+        let emergency_stopped = self.task_attempt.emergency_stopped()?;
+        if emergency_stopped
+            && !matches!(
+                command,
+                LocalCommand::Status
+                    | LocalCommand::ReleaseAll
+                    | LocalCommand::ResetEmergencyStop
+            )
+        {
+            return Err(AgentError::new(
+                "emergency_stopped",
+                "only local emergency cleanup or reset is allowed while stopped",
+            ));
+        }
         if self.task_attempt.is_active()?
             && !matches!(command, LocalCommand::Status | LocalCommand::ReleaseAll)
         {
@@ -249,11 +263,19 @@ impl CommandExecutor {
         }
         match command {
             LocalCommand::Status => Ok(json!({
-                "state": if self.binding.is_some() { "TargetLocked" } else { "ConnectedIdle" },
+                "state": if emergency_stopped {
+                    "EmergencyStopped"
+                } else if self.binding.is_some() {
+                    "TargetLocked"
+                } else {
+                    "ConnectedIdle"
+                },
                 "capture_active": self.capture.is_some(),
                 "build_id": option_env!("FAIRYPAM_BUILD_ID").unwrap_or("unknown"),
                 "suite_version": env!("CARGO_PKG_VERSION"),
-                "guardian_state": if self.binding.is_none() && self.capture.is_none() {
+                "guardian_state": if emergency_stopped {
+                    "emergency_stopped"
+                } else if self.binding.is_none() && self.capture.is_none() {
                     "idle_no_holds"
                 } else {
                     "active"
@@ -321,7 +343,10 @@ impl CommandExecutor {
             #[cfg(feature = "dev-automation")]
             LocalCommand::TestbedPulse => self.execute_dev_testbed_pulse(),
             LocalCommand::ReleaseAll => {
-                self.reset()?;
+                self.emergency_stop()
+            }
+            LocalCommand::ResetEmergencyStop => {
+                self.task_attempt.reset_emergency()?;
                 Ok(json!({"state": "ConnectedIdle", "holds": 0}))
             }
             LocalCommand::StartCapture { .. } => Err(AgentError::new(
@@ -352,6 +377,14 @@ impl CommandExecutor {
     ) -> Result<CommandOutcome, AgentError> {
         use hub_control_command::Payload;
         let payload = command.payload.as_ref();
+        if self.task_attempt.emergency_stopped()?
+            && !matches!(payload, Some(Payload::InspectTaskAttempt(_)))
+        {
+            return Err(AgentError::new(
+                "emergency_stopped",
+                "remote commands cannot reset a local emergency stop",
+            ));
+        }
         if self.task_attempt.is_active()? && !task_payload_allowed(payload) {
             return Err(AgentError::new(
                 "task_command_not_allowed",
@@ -644,6 +677,9 @@ impl CommandExecutor {
                         "M1 task allows only interaction.confirm",
                     ));
                 }
+                if let Some(result) = self.task_attempt.replay(task)? {
+                    return Ok(CommandOutcome::task(result));
+                }
                 let source_frame_sequence = value.source_frame_sequence.ok_or_else(|| {
                     AgentError::new(
                         "source_frame_stale",
@@ -807,12 +843,54 @@ impl CommandExecutor {
     }
 
     pub fn reset(&mut self) -> Result<(), AgentError> {
+        if self.task_attempt.is_active()? || self.task_attempt.emergency_stopped()? {
+            self.emergency_stop()?;
+            return Ok(());
+        }
         self.stop_capture(None)?;
         self.platform.release_task_input()?;
         self.active_profile = None;
         self.binding = None;
         self.frame_sequences.clear();
         Ok(())
+    }
+
+    fn emergency_stop(&mut self) -> Result<serde_json::Value, AgentError> {
+        self.task_attempt.set_emergency_stopped(true)?;
+        let capture_error = self.stop_capture(None).err();
+        let release_error = self.platform.release_task_input().err();
+        let owned_target = self.task_attempt.active_owned_target()?;
+        let close_error = owned_target.as_ref().and_then(|binding| {
+            self.platform
+                .close(
+                    binding,
+                    Duration::from_millis(u64::from(MAX_CLOSE_TIMEOUT_MS)),
+                )
+                .err()
+        });
+        let target_closed = close_error.is_none();
+        if target_closed {
+            self.active_profile = None;
+            self.binding = None;
+        }
+        self.frame_sequences.clear();
+        let error_code = capture_error
+            .as_ref()
+            .or(release_error.as_ref())
+            .or(close_error.as_ref())
+            .map(AgentError::code);
+        let receipt = self.task_attempt.emergency_finish(
+            release_error.is_none(),
+            capture_error.is_none(),
+            target_closed,
+            error_code,
+        )?;
+        Ok(json!({
+            "state": "EmergencyStopped",
+            "holds": 0,
+            "cleanup_complete": receipt.as_ref().and_then(|value| value.cleanup_complete),
+            "error_code": receipt.as_ref().and_then(|value| value.error_code.as_deref()),
+        }))
     }
 
     pub fn emergency_release_input(&mut self) -> Result<(), AgentError> {
@@ -1638,7 +1716,7 @@ mod tests {
         AgentAttemptContractV1, AttemptRef, BeginTaskAttempt, CloseTarget, CommandRef,
         EnumerateTargets, FinishTaskAttempt, FocusTarget, InputLease, InspectTaskAttempt,
         LockTarget, PulseAction, SessionRef, StartCapture, StartTaskTarget, StopCapture,
-        TaskAttemptState, TaskCommandOutcomeState, TaskCommandRef,
+        TaskAttemptState, TaskCommandOutcomeState, TaskCommandRef, TaskSideEffectState,
     };
     use sha2::{Digest, Sha256};
 
@@ -2108,6 +2186,35 @@ mod tests {
             executor.execute(&lease, &ExecutionSession::test(), sink.clone()),
             CommandOutcome::TaskAck { .. }
         ));
+        let stale_pulse = HubControlCommand {
+            payload: Some(hub_control_command::Payload::PulseAction(PulseAction {
+                action_id: M1_ACTION_ID.into(),
+                source_frame_sequence: Some(2),
+                task: Some(task_ref(&contract, "pulse-stale")),
+                ..PulseAction::default()
+            })),
+        };
+        assert!(matches!(
+            executor.execute(&stale_pulse, &ExecutionSession::test(), sink.clone()),
+            CommandOutcome::Nack { ref code, .. } if code == "source_frame_stale"
+        ));
+        let inspect_after_stale = HubControlCommand {
+            payload: Some(hub_control_command::Payload::InspectTaskAttempt(
+                InspectTaskAttempt {
+                    task: Some(task_ref(&contract, "inspect-after-stale")),
+                },
+            )),
+        };
+        assert!(matches!(
+            executor.execute(
+                &inspect_after_stale,
+                &ExecutionSession::test(),
+                sink.clone(),
+            ),
+            CommandOutcome::TaskAck { ref receipt, .. }
+                if receipt.side_effect_state == TaskSideEffectState::None as i32
+        ));
+
         let pulse = HubControlCommand {
             payload: Some(hub_control_command::Payload::PulseAction(PulseAction {
                 action_id: M1_ACTION_ID.into(),
@@ -2116,14 +2223,33 @@ mod tests {
                 ..PulseAction::default()
             })),
         };
-        for _ in 0..2 {
-            assert!(matches!(
-                executor.execute(&pulse, &ExecutionSession::test(), sink.clone()),
-                CommandOutcome::TaskAck { ref outcome, .. }
-                    if outcome.as_ref().unwrap().outcome
-                        == TaskCommandOutcomeState::Applied as i32
-            ));
+        assert!(matches!(
+            executor.execute(&pulse, &ExecutionSession::test(), sink.clone()),
+            CommandOutcome::TaskAck { ref outcome, .. }
+                if outcome.as_ref().unwrap().outcome
+                    == TaskCommandOutcomeState::Applied as i32
+        ));
+        executor
+            .frame_sequences
+            .get("client")
+            .unwrap()
+            .store(2, Ordering::Release);
+        assert!(matches!(
+            executor.execute(&pulse, &ExecutionSession::test(), sink.clone()),
+            CommandOutcome::TaskAck { ref outcome, .. }
+                if outcome.as_ref().unwrap().outcome
+                    == TaskCommandOutcomeState::Applied as i32
+        ));
+        let mut changed_payload = pulse.clone();
+        if let Some(hub_control_command::Payload::PulseAction(value)) =
+            changed_payload.payload.as_mut()
+        {
+            value.task.as_mut().unwrap().payload_digest = "d".repeat(64);
         }
+        assert!(matches!(
+            executor.execute(&changed_payload, &ExecutionSession::test(), sink.clone()),
+            CommandOutcome::Nack { ref code, .. } if code == "command_payload_mismatch"
+        ));
         assert_eq!(state.lock().unwrap().pulse_calls, vec![M1_ACTION_ID]);
 
         let finish = HubControlCommand {
@@ -2147,6 +2273,92 @@ mod tests {
         );
         assert_eq!(state.lock().unwrap().launch_calls, 1);
         assert_eq!(state.lock().unwrap().close_calls.len(), 1);
+    }
+
+    #[test]
+    fn local_emergency_stop_cleans_active_attempt_and_requires_local_reset() {
+        let profile = verified_profile();
+        let contract = task_contract(&profile);
+        let state = Arc::new(Mutex::new(FakePlatformState::default()));
+        let mut executor = CommandExecutor::with_platform(
+            ProfileStore::from_verified_profiles([profile]).unwrap(),
+            Box::new(FakePlatform {
+                state: Arc::clone(&state),
+            }),
+        );
+        let sink = Arc::new(CollectFrames::default());
+        for command in [
+            HubControlCommand {
+                payload: Some(hub_control_command::Payload::BeginTaskAttempt(
+                    BeginTaskAttempt {
+                        task: Some(task_ref(&contract, "begin-emergency")),
+                        contract: Some(contract.clone()),
+                    },
+                )),
+            },
+            HubControlCommand {
+                payload: Some(hub_control_command::Payload::StartTaskTarget(
+                    StartTaskTarget {
+                        task: Some(task_ref(&contract, "target-emergency")),
+                    },
+                )),
+            },
+            HubControlCommand {
+                payload: Some(hub_control_command::Payload::StartCapture(StartCapture {
+                    source_id: "client".into(),
+                    fps: 10,
+                    encoding: "jpeg".into(),
+                    quality: 80,
+                    task: Some(task_ref(&contract, "capture-emergency")),
+                    ..StartCapture::default()
+                })),
+            },
+            HubControlCommand {
+                payload: Some(hub_control_command::Payload::InputLease(InputLease {
+                    ttl_ms: 1_000,
+                    task: Some(task_ref(&contract, "lease-emergency")),
+                    ..InputLease::default()
+                })),
+            },
+        ] {
+            assert!(matches!(
+                executor.execute(&command, &ExecutionSession::test(), sink.clone()),
+                CommandOutcome::TaskAck { .. }
+            ));
+        }
+
+        let stopped = executor.execute_local(&LocalCommand::ReleaseAll).unwrap();
+        assert_eq!(stopped["state"], "EmergencyStopped");
+        assert_eq!(stopped["cleanup_complete"], true);
+        assert!(!state.lock().unwrap().input_active);
+        assert_eq!(state.lock().unwrap().close_calls.len(), 1);
+        assert_eq!(
+            executor.execute_local(&LocalCommand::Status).unwrap()["state"],
+            "EmergencyStopped"
+        );
+
+        let new_attempt = HubControlCommand {
+            payload: Some(hub_control_command::Payload::BeginTaskAttempt(
+                BeginTaskAttempt {
+                    task: Some(task_ref(&contract, "begin-after-emergency")),
+                    contract: Some(contract),
+                },
+            )),
+        };
+        assert!(matches!(
+            executor.execute(&new_attempt, &ExecutionSession::test(), sink),
+            CommandOutcome::Nack { ref code, .. } if code == "emergency_stopped"
+        ));
+        assert_eq!(
+            executor
+                .execute_local(&LocalCommand::ResetEmergencyStop)
+                .unwrap()["state"],
+            "ConnectedIdle"
+        );
+        assert_eq!(
+            executor.execute_local(&LocalCommand::Status).unwrap()["state"],
+            "ConnectedIdle"
+        );
     }
 
     #[test]
