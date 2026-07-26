@@ -232,11 +232,7 @@ pub fn resolve_profile_executable(profile: &VerifiedProfile) -> Result<PathBuf, 
         if entry.source != RegistrySource::Machine {
             continue;
         }
-        let Some(game_id) = entry
-            .uninstall_string
-            .as_deref()
-            .and_then(extract_game_id)
-        else {
+        let Some(game_id) = entry.uninstall_string.as_deref().and_then(extract_game_id) else {
             continue;
         };
         let Some(game) = KNOWN_GAMES.iter().find(|game| game.game_id == game_id) else {

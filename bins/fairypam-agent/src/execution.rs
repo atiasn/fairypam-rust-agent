@@ -92,10 +92,8 @@ impl ExecutionSession {
 }
 
 pub trait RuntimePlatform: Send {
-    fn start_task_target(
-        &mut self,
-        profile: &VerifiedProfile,
-    ) -> Result<TargetBinding, AgentError>;
+    fn start_task_target(&mut self, profile: &VerifiedProfile)
+        -> Result<TargetBinding, AgentError>;
 
     fn enumerate(&mut self, profile: &VerifiedProfile) -> Result<Vec<TargetCandidate>, AgentError>;
 
@@ -500,22 +498,25 @@ impl CommandExecutor {
                     }
                 }
                 self.stop_capture(None)?;
-                let capture = match self
-                    .platform
-                    .start_capture(&binding, source.region.clone(), encoding)
-                {
-                    Ok(capture) => capture,
-                    Err(error) => {
-                        if let Some(task) = task {
-                            return Ok(CommandOutcome::task(self.task_attempt.complete_capture(
-                                task,
-                                false,
-                                Some(error.code()),
-                            )?));
+                let capture =
+                    match self
+                        .platform
+                        .start_capture(&binding, source.region.clone(), encoding)
+                    {
+                        Ok(capture) => capture,
+                        Err(error) => {
+                            if let Some(task) = task {
+                                return Ok(CommandOutcome::task(
+                                    self.task_attempt.complete_capture(
+                                        task,
+                                        false,
+                                        Some(error.code()),
+                                    )?,
+                                ));
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
-                    }
-                };
+                    };
                 let frame_sequence = Arc::clone(
                     self.frame_sequences
                         .entry(value.source_id.clone())
@@ -584,10 +585,10 @@ impl CommandExecutor {
                         return Ok(CommandOutcome::task(result));
                     }
                     let error = self.platform.release_task_input().err();
-                    return Ok(CommandOutcome::task(self.task_attempt.complete_release(
-                        task,
-                        error.as_ref().map(AgentError::code),
-                    )?));
+                    return Ok(CommandOutcome::task(
+                        self.task_attempt
+                            .complete_release(task, error.as_ref().map(AgentError::code))?,
+                    ));
                 }
                 Ok(CommandOutcome::Ack(
                     json!({"state": "DryRun", "holds": 0}).to_string(),
@@ -616,9 +617,10 @@ impl CommandExecutor {
                 }
                 let profile_id = self.task_attempt.profile_id(task)?;
                 let profile = self.profiles.get(&profile_id)?.clone();
-                let binding = self.binding.clone().ok_or_else(|| {
-                    AgentError::new("target_invalid", "task target is not ready")
-                })?;
+                let binding = self
+                    .binding
+                    .clone()
+                    .ok_or_else(|| AgentError::new("target_invalid", "task target is not ready"))?;
                 let session = task
                     .command
                     .as_ref()
@@ -630,10 +632,8 @@ impl CommandExecutor {
                     .start_task_input(&profile, &binding, session, expires_at)
                     .err();
                 Ok(CommandOutcome::task(
-                    self.task_attempt.complete_input_lease(
-                        task,
-                        error.as_ref().map(AgentError::code),
-                    )?,
+                    self.task_attempt
+                        .complete_input_lease(task, error.as_ref().map(AgentError::code))?,
                 ))
             }
             Some(Payload::PulseAction(value)) if value.task.is_some() => {
@@ -664,9 +664,10 @@ impl CommandExecutor {
                 if let Some(result) = self.task_attempt.prepare(task, true)? {
                     return Ok(CommandOutcome::task(result));
                 }
-                let binding = self.binding.clone().ok_or_else(|| {
-                    AgentError::new("target_invalid", "task target is not ready")
-                })?;
+                let binding = self
+                    .binding
+                    .clone()
+                    .ok_or_else(|| AgentError::new("target_invalid", "task target is not ready"))?;
                 let session = task
                     .command
                     .as_ref()
@@ -674,12 +675,7 @@ impl CommandExecutor {
                     .ok_or_else(task_reference_invalid)?;
                 let error = self
                     .platform
-                    .pulse_task_action(
-                        &binding,
-                        session,
-                        &value.action_id,
-                        Instant::now(),
-                    )
+                    .pulse_task_action(&binding, session, &value.action_id, Instant::now())
                     .err();
                 Ok(CommandOutcome::task(self.task_attempt.complete_pulse(
                     task,
@@ -744,18 +740,14 @@ impl CommandExecutor {
                     Ok(binding) => {
                         self.active_profile = Some(profile);
                         self.binding = Some(binding.clone());
-                        Ok(CommandOutcome::task(self.task_attempt.complete_target_start(
-                            task,
-                            Some(binding),
-                            None,
-                        )?))
+                        Ok(CommandOutcome::task(
+                            self.task_attempt
+                                .complete_target_start(task, Some(binding), None)?,
+                        ))
                     }
                     Err(error) => Ok(CommandOutcome::task(
-                        self.task_attempt.complete_target_start(
-                            task,
-                            None,
-                            Some(error.code()),
-                        )?,
+                        self.task_attempt
+                            .complete_target_start(task, None, Some(error.code()))?,
                     )),
                 }
             }
@@ -769,7 +761,10 @@ impl CommandExecutor {
                 let owned_target = self.task_attempt.owned_target(task)?;
                 let close_error = owned_target.as_ref().and_then(|binding| {
                     self.platform
-                        .close(binding, Duration::from_millis(u64::from(MAX_CLOSE_TIMEOUT_MS)))
+                        .close(
+                            binding,
+                            Duration::from_millis(u64::from(MAX_CLOSE_TIMEOUT_MS)),
+                        )
                         .err()
                 });
                 let target_closed = close_error.is_none();
@@ -1242,8 +1237,8 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         &mut self,
         profile: &VerifiedProfile,
     ) -> Result<TargetBinding, AgentError> {
-        use std::os::windows::io::AsRawHandle;
         use fairypam_agent_core::platform::TargetPlatform;
+        use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 
@@ -1255,7 +1250,10 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         }
         let executable = crate::observability::resolve_profile_executable(profile)?;
         let working_directory = executable.parent().ok_or_else(|| {
-            AgentError::new("target_invalid", "trusted executable has no working directory")
+            AgentError::new(
+                "target_invalid",
+                "trusted executable has no working directory",
+            )
         })?;
         let job = kill_on_close_job()?;
         let mut child = std::process::Command::new(&executable)
@@ -1263,10 +1261,8 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             .spawn()
             .map_err(|error| AgentError::new("target.launch_failed", error.to_string()))?;
         // SAFETY: child owns a valid process handle and job owns a configured Job Object handle.
-        if unsafe {
-            AssignProcessToJobObject(HANDLE(job.0 as _), HANDLE(child.as_raw_handle()))
-        }
-        .is_err()
+        if unsafe { AssignProcessToJobObject(HANDLE(job.0 as _), HANDLE(child.as_raw_handle())) }
+            .is_err()
         {
             let _ = child.kill();
             return Err(AgentError::new(
@@ -1356,8 +1352,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             }
         }
         if let Err(error) = self.targets.close(binding, timeout) {
-            if self.owned.is_some()
-                || !matches!(error.code(), "target.stale" | "target.not_found")
+            if self.owned.is_some() || !matches!(error.code(), "target.stale" | "target.not_found")
             {
                 return Err(error);
             }
@@ -1407,9 +1402,8 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             .start_input(profile, binding.clone(), guardian)
             .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
         {
-            let permit = InputPermit::from_capability(
-                machine.issue_input_capability(now, &snapshot, true)?,
-            );
+            let permit =
+                InputPermit::from_capability(machine.issue_input_capability(now, &snapshot, true)?);
             input
                 .apply_lease(
                     InputLease {
@@ -1466,9 +1460,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             AgentError::new("input_lease_invalid", "task input lease is not active")
         })?;
         let permit = InputPermit::from_capability(
-            input
-                .machine
-                .issue_input_capability(now, &snapshot, true)?,
+            input.machine.issue_input_capability(now, &snapshot, true)?,
         );
         let action = ActionId::new(action_id.to_owned())
             .map_err(|error| AgentError::new("task_command_not_allowed", error.to_string()))?;
@@ -1643,9 +1635,9 @@ mod tests {
     use fairypam_agent_core::target::{ClientRect, IntegrityLevel, TargetSnapshot};
     use fairypam_agent_protocol::v1::{
         AgentAttemptContractV1, AttemptRef, BeginTaskAttempt, CloseTarget, CommandRef,
-        EnumerateTargets, FinishTaskAttempt, FocusTarget, InputLease, InspectTaskAttempt, LockTarget,
-        PulseAction, SessionRef, StartCapture, StartTaskTarget, StopCapture, TaskAttemptState,
-        TaskCommandOutcomeState, TaskCommandRef,
+        EnumerateTargets, FinishTaskAttempt, FocusTarget, InputLease, InspectTaskAttempt,
+        LockTarget, PulseAction, SessionRef, StartCapture, StartTaskTarget, StopCapture,
+        TaskAttemptState, TaskCommandOutcomeState, TaskCommandRef,
     };
     use sha2::{Digest, Sha256};
 
@@ -2099,11 +2091,7 @@ mod tests {
             })),
         };
         assert!(matches!(
-            executor.execute(
-                &start_capture,
-                &ExecutionSession::test(),
-                sink.clone(),
-            ),
+            executor.execute(&start_capture, &ExecutionSession::test(), sink.clone(),),
             CommandOutcome::TaskAck { .. }
         ));
         std::thread::sleep(Duration::from_millis(150));

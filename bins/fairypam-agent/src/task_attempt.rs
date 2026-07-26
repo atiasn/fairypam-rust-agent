@@ -192,15 +192,9 @@ impl TaskAttemptRuntime {
                     && active.side_effect_state == TaskSideEffectState::IntentRecorded as i32
                 {
                     active.side_effect_state = TaskSideEffectState::Uncertain as i32;
-                    (
-                        TaskCommandOutcomeState::Uncertain,
-                        "side_effect_uncertain",
-                    )
+                    (TaskCommandOutcomeState::Uncertain, "side_effect_uncertain")
                 } else {
-                    (
-                        TaskCommandOutcomeState::NotApplied,
-                        "command_interrupted",
-                    )
+                    (TaskCommandOutcomeState::NotApplied, "command_interrupted")
                 };
                 active.last_command_outcome = outcome as i32;
                 active.last_command_error_code = Some(error_code.into());
@@ -223,9 +217,9 @@ impl TaskAttemptRuntime {
         }
         if !allow_uncertain
             && matches!(
-            TaskSideEffectState::try_from(active.side_effect_state),
-            Ok(TaskSideEffectState::IntentRecorded | TaskSideEffectState::Uncertain)
-        )
+                TaskSideEffectState::try_from(active.side_effect_state),
+                Ok(TaskSideEffectState::IntentRecorded | TaskSideEffectState::Uncertain)
+            )
         {
             self.active = Some(active);
             return Err(AgentError::new(
@@ -890,7 +884,10 @@ fn not_found_receipt() -> TaskAttemptReceiptV1 {
 fn load_last(path: &Path) -> Result<AttemptState, AgentError> {
     let file = fs::File::open(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
-            AgentError::new("task.ledger_not_found", "task attempt ledger does not exist")
+            AgentError::new(
+                "task.ledger_not_found",
+                "task attempt ledger does not exist",
+            )
         } else {
             io_error("task.ledger_unavailable", error)
         }
