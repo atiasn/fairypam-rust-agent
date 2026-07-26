@@ -518,6 +518,7 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
+ "sha2",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
