@@ -243,9 +243,7 @@ impl CommandExecutor {
         if emergency_stopped
             && !matches!(
                 command,
-                LocalCommand::Status
-                    | LocalCommand::ReleaseAll
-                    | LocalCommand::ResetEmergencyStop
+                LocalCommand::Status | LocalCommand::ReleaseAll | LocalCommand::ResetEmergencyStop
             )
         {
             return Err(AgentError::new(
@@ -342,9 +340,7 @@ impl CommandExecutor {
             }
             #[cfg(feature = "dev-automation")]
             LocalCommand::TestbedPulse => self.execute_dev_testbed_pulse(),
-            LocalCommand::ReleaseAll => {
-                self.emergency_stop()
-            }
+            LocalCommand::ReleaseAll => self.emergency_stop(),
             LocalCommand::ResetEmergencyStop => {
                 self.task_attempt.reset_emergency()?;
                 Ok(json!({"state": "ConnectedIdle", "holds": 0}))
