@@ -340,53 +340,93 @@ jobs:
             }
           }
 
-      - name: Smoke fixed Agent task crash recovery
+      - name: Smoke maintenance Agent task remains on demand
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction Stop)
-          if ($agents.Count -ne 1) { throw "expected one installed Agent, found $($agents.Count)" }
-          $originalPid = $agents[0].Id
-          $agentProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $originalPid"
-          $launcherProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($agentProcess.ParentProcessId)"
-          if ($launcherProcess.ExecutablePath -cne 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe') {
-            throw "fixed Agent task did not use the protected launcher helper: $($launcherProcess.ExecutablePath)"
+          $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
+          if ($agents.Count -ne 0) {
+            throw "maintenance health check left Agent processes running: $($agents.Count)"
+          }
+          $task = Get-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent'
+          if ($task.State -ne 'Ready') {
+            throw "maintenance Agent task is not idle: $($task.State)"
+          }
+          $taskInfo = Get-ScheduledTaskInfo -TaskPath '\' -TaskName 'FairyPam Agent'
+          if ($taskInfo.LastTaskResult -ne 0) {
+            throw "maintenance Agent health task did not exit cleanly: $($taskInfo.LastTaskResult)"
+          }
+          if (@($task.Triggers).Count -ne 0) {
+            throw "maintenance Agent task must not have automatic triggers"
+          }
+          if (@($task.Actions).Count -ne 1 `
+              -or $task.Actions[0].Execute -cne 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe' `
+              -or $task.Actions[0].Arguments -cne '--launch-agent-task "C:\Program Files\FairyPam"') {
+            throw "maintenance Agent task action is not the fixed protected launcher"
           }
 
-          Stop-Process -Id $originalPid -Force
-          $deadline = [DateTime]::UtcNow.AddSeconds(90)
-          do {
-            Start-Sleep -Seconds 2
-            $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
-            $replacement = @($agents | Where-Object { $_.Id -ne $originalPid })
-          } while ($replacement.Count -ne 1 -and [DateTime]::UtcNow -lt $deadline)
-          if ($agents.Count -ne 1 -or $replacement.Count -ne 1) {
-            throw "fixed task helper did not recover exactly one Agent after forced termination"
-          }
-          $replacementProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($replacement[0].Id)"
-          if ($replacementProcess.ParentProcessId -ne $launcherProcess.ProcessId) {
-            throw "recovered Agent did not reuse the fixed task helper"
-          }
-          $task = Get-ScheduledTask -TaskName 'FairyPam Agent'
-          if ($task.State -ne 'Running') {
-            throw "recovered Agent task is not running: $($task.State)"
-          }
+          Start-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent'
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              Start-Sleep -Seconds 1
+              $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
+            } while ($agents.Count -ne 1 -and [DateTime]::UtcNow -lt $deadline)
+            if ($agents.Count -ne 1) {
+              throw "on-demand maintenance task did not start exactly one Agent"
+            }
+            $originalPid = $agents[0].Id
+            $agentProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $originalPid"
+            $launcherProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($agentProcess.ParentProcessId)"
+            if ($launcherProcess.ExecutablePath -cne 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe') {
+              throw "maintenance Agent did not use the protected launcher helper: $($launcherProcess.ExecutablePath)"
+            }
 
-          $recoveredPid = $replacement[0].Id
-          $restart = Start-Process `
-            -FilePath 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe' `
-            -ArgumentList '--restart-agent-task', '"C:\Program Files\FairyPam"' `
-            -Wait `
-            -PassThru
-          if ($restart.ExitCode -ne 0) { throw "controlled Agent task restart failed: $($restart.ExitCode)" }
-          $deadline = [DateTime]::UtcNow.AddSeconds(30)
-          do {
-            Start-Sleep -Seconds 1
-            $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
-            $restarted = @($agents | Where-Object { $_.Id -ne $recoveredPid })
-          } while (($agents.Count -ne 1 -or $restarted.Count -ne 1) -and [DateTime]::UtcNow -lt $deadline)
-          if ($agents.Count -ne 1 -or $restarted.Count -ne 1) {
-            throw "controlled restart did not produce exactly one replacement Agent"
+            Stop-Process -Id $originalPid -Force
+            $deadline = [DateTime]::UtcNow.AddSeconds(90)
+            do {
+              Start-Sleep -Seconds 2
+              $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
+              $replacement = @($agents | Where-Object { $_.Id -ne $originalPid })
+            } while ($replacement.Count -ne 1 -and [DateTime]::UtcNow -lt $deadline)
+            if ($agents.Count -ne 1 -or $replacement.Count -ne 1) {
+              throw "maintenance launcher did not recover exactly one Agent"
+            }
+            $replacementProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($replacement[0].Id)"
+            if ($replacementProcess.ParentProcessId -ne $launcherProcess.ProcessId) {
+              throw "recovered Agent did not reuse the fixed task helper"
+            }
+
+            $recoveredPid = $replacement[0].Id
+            $restart = Start-Process `
+              -FilePath 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe' `
+              -ArgumentList '--restart-agent-task', '"C:\Program Files\FairyPam"' `
+              -Wait `
+              -PassThru
+            if ($restart.ExitCode -ne 0) {
+              throw "controlled maintenance restart failed: $($restart.ExitCode)"
+            }
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              Start-Sleep -Seconds 1
+              $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
+              $restarted = @($agents | Where-Object { $_.Id -ne $recoveredPid })
+            } while (($agents.Count -ne 1 -or $restarted.Count -ne 1) -and [DateTime]::UtcNow -lt $deadline)
+            if ($agents.Count -ne 1 -or $restarted.Count -ne 1) {
+              throw "controlled restart did not produce exactly one replacement Agent"
+            }
+          }
+          finally {
+            Stop-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent' -ErrorAction SilentlyContinue
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              Start-Sleep -Seconds 1
+              $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
+              $task = Get-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent'
+            } while (($agents.Count -ne 0 -or $task.State -ne 'Ready') -and [DateTime]::UtcNow -lt $deadline)
+            if ($agents.Count -ne 0 -or $task.State -ne 'Ready') {
+              throw "maintenance task cleanup did not clear Agent processes"
+            }
           }
 
       - name: Smoke trusted NSIS product reinstall
