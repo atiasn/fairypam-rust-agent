@@ -678,7 +678,10 @@ mod native {
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
-    use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, SetActiveWindow, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        VK_MENU,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
         GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
@@ -810,6 +813,23 @@ mod native {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
+        }
+        if unsafe { GetForegroundWindow() } != hwnd {
+            let alt_up = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VK_MENU,
+                        wScan: 0,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+            let _ = unsafe { SendInput(&[alt_up], std::mem::size_of::<INPUT>() as i32) };
+            let _ = unsafe { SetForegroundWindow(hwnd) };
+            let _ = unsafe { SetActiveWindow(hwnd) };
         }
         if unsafe { GetForegroundWindow() } == hwnd {
             let _ = unsafe { BringWindowToTop(hwnd) };
