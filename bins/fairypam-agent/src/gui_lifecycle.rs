@@ -125,6 +125,7 @@ impl GuiLifetime {
     }
 
     #[cfg(windows)]
+    #[cfg_attr(test, allow(dead_code))]
     pub fn bind_verified(&self, owner: VerifiedGuiOwner) -> Result<(), AgentError> {
         let pid = owner.pid();
         self.state.lock().map_err(lock_error)?.bind(pid)?;
@@ -138,6 +139,7 @@ impl GuiLifetime {
         Ok(())
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub fn confirm_bound(&self, pid: u32) -> Result<(), AgentError> {
         self.state
             .lock()
@@ -171,6 +173,7 @@ impl GuiLifetime {
     }
 
     #[cfg(windows)]
+    #[cfg_attr(test, allow(dead_code))]
     fn watch_verified_process(&self, owner: VerifiedGuiOwner) -> Result<(), AgentError> {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::{

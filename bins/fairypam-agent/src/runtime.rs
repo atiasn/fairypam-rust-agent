@@ -584,7 +584,7 @@ impl GrpcSessionDriver {
     }
 
     #[cfg(any(windows, test))]
-    fn local_runtime(&self, maintenance: bool) -> SharedRuntime {
+    fn local_runtime(&self, owner: RuntimeOwner) -> SharedRuntime {
         SharedRuntime {
             execution: Arc::clone(&self.execution),
             state: Arc::clone(&self.state),
@@ -593,7 +593,7 @@ impl GrpcSessionDriver {
             reconnect_requested: Arc::clone(&self.reconnect_requested),
             registration_in_progress: Arc::clone(&self.registration_in_progress),
             gui_lifetime: self.gui_lifetime.clone(),
-            maintenance,
+            owner,
         }
     }
 
@@ -950,6 +950,8 @@ pub struct RuntimeSafetyHooks {
 pub enum RuntimeOwner {
     Gui(u32),
     Maintenance,
+    #[cfg(feature = "dev-automation")]
+    DevAutomation,
 }
 
 impl RuntimeSafetyHooks {
@@ -1130,6 +1132,8 @@ async fn run_windows(
                 .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
             None
         }
+        #[cfg(feature = "dev-automation")]
+        RuntimeOwner::DevAutomation => None,
     };
     let driver = GrpcSessionDriver::new(config);
     if let Some(verified_gui) = verified_gui {
@@ -1137,7 +1141,7 @@ async fn run_windows(
     }
     let maintenance = owner == RuntimeOwner::Maintenance;
     let mut local_control = tokio::spawn(run_local_control(
-        driver.local_runtime(maintenance),
+        driver.local_runtime(owner),
         local_control_config,
     ));
     if maintenance {
@@ -1261,7 +1265,7 @@ struct SharedRuntime {
     reconnect_requested: Arc<tokio::sync::Notify>,
     registration_in_progress: Arc<AtomicBool>,
     gui_lifetime: GuiLifetime,
-    maintenance: bool,
+    owner: RuntimeOwner,
 }
 
 #[cfg(any(windows, test))]
@@ -1271,7 +1275,7 @@ impl LocalControlRuntime for SharedRuntime {
         caller: &fairypam_agent_windows::VerifiedPipeCaller,
         command: &LocalCommand,
     ) -> Result<serde_json::Value, AgentError> {
-        if self.maintenance
+        if self.owner == RuntimeOwner::Maintenance
             && !matches!(
                 command,
                 LocalCommand::Status
@@ -1286,7 +1290,9 @@ impl LocalControlRuntime for SharedRuntime {
                 "maintenance mode does not accept device operations",
             ));
         }
-        if matches!(command, LocalCommand::RegisterHub { .. }) {
+        if matches!(self.owner, RuntimeOwner::Gui(_))
+            && matches!(command, LocalCommand::RegisterHub { .. })
+        {
             self.gui_lifetime.confirm_bound(caller.pid)?;
         }
         self.record_local_operation(command);
@@ -1298,7 +1304,7 @@ impl LocalControlRuntime for SharedRuntime {
             LocalCommand::ShutdownAgent => {
                 self.authorize_shutdown(caller)?;
                 self.execution.lock().map_err(lock_error)?.reset()?;
-                if self.maintenance {
+                if self.owner == RuntimeOwner::Maintenance {
                     self.gui_lifetime.request_maintenance_shutdown()?;
                 } else {
                     self.gui_lifetime.request_shutdown(caller.pid)?;
@@ -1334,13 +1340,19 @@ impl SharedRuntime {
         &self,
         caller: &fairypam_agent_windows::VerifiedPipeCaller,
     ) -> Result<(), AgentError> {
-        if self.maintenance {
-            #[cfg(windows)]
-            fairypam_agent_windows::verify_fixed_installer_caller(caller)
-                .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
-            Ok(())
-        } else {
-            self.gui_lifetime.confirm_bound(caller.pid)
+        match self.owner {
+            RuntimeOwner::Maintenance => {
+                #[cfg(windows)]
+                fairypam_agent_windows::verify_fixed_installer_caller(caller)
+                    .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+                Ok(())
+            }
+            RuntimeOwner::Gui(_) => self.gui_lifetime.confirm_bound(caller.pid),
+            #[cfg(feature = "dev-automation")]
+            RuntimeOwner::DevAutomation => Err(AgentError::new(
+                "local.dev_shutdown_unsupported",
+                "Dev Agent shutdown remains owned by the developer task",
+            )),
         }
     }
 
@@ -2054,7 +2066,7 @@ pub async fn run_dev() -> Result<(), AgentError> {
         .as_ref()
         .ok_or_else(|| AgentError::new("local.config_invalid", "Dev state directory is missing"))?;
     let config = RuntimeConfig::from_dev(state.join("enrollment"), profiles)?;
-    run_windows(config, local_control).await
+    run_windows(config, local_control, RuntimeOwner::DevAutomation).await
 }
 
 #[cfg(all(windows, feature = "dev-automation"))]
@@ -2468,7 +2480,7 @@ mod tests {
     #[tokio::test]
     async fn unregistered_runtime_keeps_local_control_then_notifies_supervisor() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
-        let mut local = driver.local_runtime(false);
+        let mut local = driver.local_runtime(RuntimeOwner::Gui(7));
 
         assert!(!driver.is_registered().unwrap());
         assert!(local
@@ -2555,7 +2567,7 @@ mod tests {
     #[test]
     fn maintenance_runtime_rejects_device_and_hub_operations() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
-        let mut local = driver.local_runtime(true);
+        let mut local = driver.local_runtime(RuntimeOwner::Maintenance);
 
         assert!(local
             .execute(&local_caller(), &LocalCommand::Status)
@@ -2577,7 +2589,7 @@ mod tests {
     fn direct_runtime_shutdown_requires_the_bound_gui_pid() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
         driver.gui_lifetime.bind(7).unwrap();
-        let mut local = driver.local_runtime(false);
+        let mut local = driver.local_runtime(RuntimeOwner::Gui(7));
         let mut wrong = local_caller();
         wrong.pid = 8;
 
@@ -2598,8 +2610,21 @@ mod tests {
     #[test]
     fn register_hub_requires_the_bound_gui_pid_before_platform_handling() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        let mut local = driver.local_runtime(RuntimeOwner::Gui(7));
+        assert_eq!(
+            local
+                .execute(
+                    &local_caller(),
+                    &LocalCommand::RegisterHub {
+                        hub_address: "https://hub.example".into(),
+                        registration_code: "secret".into(),
+                    },
+                )
+                .unwrap_err()
+                .code(),
+            "local.lifecycle.not_bound"
+        );
         driver.gui_lifetime.bind(7).unwrap();
-        let mut local = driver.local_runtime(false);
         let mut wrong = local_caller();
         wrong.pid = 8;
 
@@ -2615,6 +2640,35 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "local.lifecycle.pid_mismatch"
+        );
+    }
+
+    #[cfg(feature = "dev-automation")]
+    #[test]
+    fn dev_registration_does_not_require_a_product_gui_binding() {
+        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        let mut local = driver.local_runtime(RuntimeOwner::DevAutomation);
+        let result = local.execute(
+            &local_caller(),
+            &LocalCommand::RegisterHub {
+                hub_address: "https://hub.example".into(),
+                registration_code: "secret".into(),
+            },
+        );
+
+        #[cfg(windows)]
+        assert_eq!(result.unwrap(), registration_pending());
+        #[cfg(not(windows))]
+        assert_eq!(
+            result.unwrap_err().code(),
+            "enrollment.platform_unsupported"
+        );
+        assert_eq!(
+            local
+                .execute(&local_caller(), &LocalCommand::ShutdownAgent)
+                .unwrap_err()
+                .code(),
+            "local.dev_shutdown_unsupported"
         );
     }
 

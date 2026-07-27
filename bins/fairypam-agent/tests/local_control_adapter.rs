@@ -472,6 +472,7 @@ fn dev_runtime_initializes_the_registration_gate() {
         .expect("Dev runtime construction must remain explicit");
 
     assert!(dev_runtime.contains("RuntimeConfig::from_dev(state.join(\"enrollment\"), profiles)"));
-    assert!(dev_runtime.contains("run_windows(config, local_control).await"));
+    assert!(dev_runtime
+        .contains("run_windows(config, local_control, RuntimeOwner::DevAutomation).await"));
     assert!(runtime.contains("crate::enrollment::register_at(&root"));
 }
