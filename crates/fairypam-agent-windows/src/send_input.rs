@@ -63,6 +63,8 @@ impl SendInputPlatform {
     }
 
     fn send(&self, inputs: &[INPUT]) -> Result<(), SafetyError> {
+        crate::desktop::ensure_input_desktop()
+            .map_err(|error| SafetyError::new(error.code(), error.to_string()))?;
         let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
         if sent == inputs.len() as u32 {
             Ok(())

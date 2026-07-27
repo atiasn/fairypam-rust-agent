@@ -1,6 +1,8 @@
 //! Windows target discovery and target-window BitBlt capture boundary.
 
 mod capture;
+#[cfg(windows)]
+mod desktop;
 mod dpi;
 mod local_pipe;
 mod process;
