@@ -413,64 +413,60 @@ mod tests {
 }
 
 #[cfg(windows)]
+type WgcFrameSlot = std::sync::Arc<(
+    std::sync::Mutex<Option<Result<CapturedBgraFrame, WindowsError>>>,
+    std::sync::Condvar,
+)>;
+
+#[cfg(windows)]
 pub struct WgcCaptureBackend {
-    requests: std::sync::mpsc::SyncSender<WgcRequest>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    frames: WgcFrameSlot,
+    control: Option<windows_capture::capture::CaptureControl<WgcHandler, WindowsError>>,
 }
 
 #[cfg(windows)]
-enum WgcRequest {
-    Next {
-        deadline: Instant,
-        reply: std::sync::mpsc::SyncSender<Result<CapturedBgraFrame, WindowsError>>,
-    },
-    Stop,
+struct WgcFlags {
+    frames: WgcFrameSlot,
+    hwnd: isize,
+    client_rect: Rect,
+}
+
+#[cfg(windows)]
+struct WgcHandler {
+    flags: WgcFlags,
+    scratch: Vec<u8>,
 }
 
 #[cfg(windows)]
 impl WgcCaptureBackend {
     pub fn new(identity: &crate::TargetIdentity) -> Result<Self, WindowsError> {
-        let identity = identity.clone();
-        let (requests, receiver) = std::sync::mpsc::sync_channel(1);
-        let (initialized, initialized_receiver) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("fairypam-wgc-capture".into())
-            .spawn(move || {
-                match native_wgc::initialize_apartment().and_then(|apartment| {
-                    native_wgc::create(&identity).map(|state| (apartment, state))
-                }) {
-                    Ok((_apartment, mut state)) => {
-                        let _ = initialized.send(Ok(()));
-                        while let Ok(request) = receiver.recv() {
-                            match request {
-                                WgcRequest::Next { deadline, reply } => {
-                                    let _ = reply.send(native_wgc::next_bgra(&mut state, deadline));
-                                }
-                                WgcRequest::Stop => break,
-                            }
-                        }
-                        native_wgc::close(&state);
-                    }
-                    Err(error) => {
-                        let _ = initialized.send(Err(error));
-                    }
-                }
-            })
-            .map_err(|error| WindowsError::new("capture.worker_failed", error.to_string()))?;
-        match initialized_receiver.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                join_wgc_worker(worker);
-                return Err(error);
-            }
-            Err(error) => {
-                eprintln!("WGC initialization did not terminate; aborting Agent: {error}");
-                std::process::abort();
-            }
-        }
+        use windows_capture::capture::GraphicsCaptureApiHandler;
+        use windows_capture::settings::{
+            ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+            MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+        };
+        use windows_capture::window::Window;
+
+        let frames = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let settings = Settings::new(
+            Window::from_raw_hwnd(identity.hwnd as *mut std::ffi::c_void),
+            CursorCaptureSettings::WithoutCursor,
+            DrawBorderSettings::Default,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            WgcFlags {
+                frames: frames.clone(),
+                hwnd: identity.hwnd,
+                client_rect: identity.client_rect,
+            },
+        );
+        let control = WgcHandler::start_free_threaded(settings)
+            .map_err(|error| WindowsError::new("capture.session_failed", error.to_string()))?;
         Ok(Self {
-            requests,
-            worker: Some(worker),
+            frames,
+            control: Some(control),
         })
     }
 }
@@ -478,20 +474,32 @@ impl WgcCaptureBackend {
 #[cfg(windows)]
 impl CaptureBackend for WgcCaptureBackend {
     fn next_bgra(&mut self, deadline: Instant) -> Result<CapturedBgraFrame, WindowsError> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(WindowsError::new(
-                "capture.deadline",
-                "capture deadline expired before dispatch",
-            ));
+        let (slot, ready) = &*self.frames;
+        let mut frame = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(frame) = frame.take() {
+                return frame;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(WindowsError::new(
+                    "capture.deadline",
+                    "no WGC frame arrived before deadline",
+                ));
+            }
+            let waited = ready.wait_timeout(frame, remaining);
+            let (next, timeout) = match waited {
+                Ok(waited) => waited,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            frame = next;
+            if timeout.timed_out() && frame.is_none() {
+                return Err(WindowsError::new(
+                    "capture.deadline",
+                    "no WGC frame arrived before deadline",
+                ));
+            }
         }
-        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
-        self.requests
-            .try_send(WgcRequest::Next { deadline, reply })
-            .map_err(map_worker_send_error)?;
-        receiver
-            .recv_timeout(remaining.saturating_add(std::time::Duration::from_millis(250)))
-            .map_err(map_worker_wait_error)?
     }
 
     fn rebuild(&mut self, client_rect: Rect, dpi: u32) -> Result<(), WindowsError> {
@@ -507,396 +515,111 @@ impl CaptureBackend for WgcCaptureBackend {
 #[cfg(windows)]
 impl Drop for WgcCaptureBackend {
     fn drop(&mut self) {
-        let _ = self.requests.send(WgcRequest::Stop);
-        if let Some(worker) = self.worker.take() {
-            join_wgc_worker(worker);
+        if let Some(control) = self.control.take() {
+            if let Err(error) = control.stop() {
+                eprintln!("WGC capture did not stop cleanly: {error}");
+            }
         }
     }
 }
 
 #[cfg(windows)]
-fn join_wgc_worker(worker: std::thread::JoinHandle<()>) {
-    let deadline = Instant::now() + std::time::Duration::from_secs(5);
-    while !worker.is_finished() {
-        if Instant::now() >= deadline {
-            eprintln!("WGC worker did not stop; aborting Agent before unsafe detach");
-            std::process::abort();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let _ = worker.join();
-}
+impl windows_capture::capture::GraphicsCaptureApiHandler for WgcHandler {
+    type Flags = WgcFlags;
+    type Error = WindowsError;
 
-#[cfg(windows)]
-fn map_worker_send_error<T>(error: std::sync::mpsc::TrySendError<T>) -> WindowsError {
-    match error {
-        std::sync::mpsc::TrySendError::Full(_) => WindowsError::new(
-            "capture.worker_busy",
-            "capture worker is still handling a request",
-        ),
-        std::sync::mpsc::TrySendError::Disconnected(_) => {
-            WindowsError::new("capture.worker_failed", "capture worker disconnected")
-        }
-    }
-}
-
-#[cfg(windows)]
-fn map_worker_wait_error(error: std::sync::mpsc::RecvTimeoutError) -> WindowsError {
-    match error {
-        std::sync::mpsc::RecvTimeoutError::Timeout => {
-            WindowsError::new("capture.deadline", "capture worker exceeded its deadline")
-        }
-        std::sync::mpsc::RecvTimeoutError::Disconnected => {
-            WindowsError::new("capture.worker_failed", "capture worker disconnected")
-        }
-    }
-}
-
-#[cfg(windows)]
-mod native_wgc {
-    use std::ffi::c_void;
-    use std::time::Instant;
-
-    use windows::core::{factory, IInspectable, Interface};
-    use windows::Foundation::TypedEventHandler;
-    use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
-    use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
-    use windows::Graphics::DirectX::DirectXPixelFormat;
-    use windows::Win32::Foundation::{HMODULE, HWND, RECT};
-    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-    use windows::Win32::Graphics::Direct3D11::{
-        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
-        D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_SDK_VERSION,
-        D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    };
-    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-    use windows::Win32::Graphics::Dxgi::{IDXGIDevice, DXGI_ERROR_WAS_STILL_DRAWING};
-    use windows::Win32::System::WinRT::Direct3D11::{
-        CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
-    };
-    use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-    use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
-
-    use super::{client_crop_box, CapturedBgraFrame, Rect, WindowsError};
-
-    pub(super) struct WgcState {
-        hwnd: isize,
-        _item: GraphicsCaptureItem,
-        _device: IDirect3DDevice,
-        d3d_device: ID3D11Device,
-        d3d_context: ID3D11DeviceContext,
-        frame_pool: Direct3D11CaptureFramePool,
-        frame_arrived: std::sync::mpsc::Receiver<()>,
-        frame_arrived_token: i64,
-        session: windows::Graphics::Capture::GraphicsCaptureSession,
-        client_rect: Rect,
-    }
-
-    pub(super) struct WinRtApartment;
-
-    impl Drop for WinRtApartment {
-        fn drop(&mut self) {
-            unsafe { RoUninitialize() };
-        }
-    }
-
-    pub(super) fn initialize_apartment() -> Result<WinRtApartment, WindowsError> {
-        unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
-            .map_err(|error| win_error("capture.com_initialization_failed", error))?;
-        Ok(WinRtApartment)
-    }
-
-    pub(super) fn create(identity: &crate::TargetIdentity) -> Result<WgcState, WindowsError> {
-        let (d3d_device, d3d_context, device) = create_device()?;
-        let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
-            .map_err(|error| win_error("capture.wgc_unavailable", error))?;
-        let hwnd = HWND(identity.hwnd as *mut c_void);
-        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd) }
-            .map_err(|error| win_error("capture.target_unavailable", error))?;
-        let size = item
-            .Size()
-            .map_err(|error| win_error("capture.target_unavailable", error))?;
-        let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            &device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            1,
-            size,
-        )
-        .map_err(|error| win_error("capture.frame_pool_failed", error))?;
-        let (frame_arrived_sender, frame_arrived) = std::sync::mpsc::sync_channel(1);
-        let frame_arrived_token = frame_pool
-            .FrameArrived(
-                &TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |_, _| {
-                    let _ = frame_arrived_sender.try_send(());
-                    Ok(())
-                }),
-            )
-            .map_err(|error| win_error("capture.frame_pool_failed", error))?;
-        let session = frame_pool
-            .CreateCaptureSession(&item)
-            .map_err(|error| win_error("capture.session_failed", error))?;
-        let _ = session.SetIsCursorCaptureEnabled(false);
-        session
-            .StartCapture()
-            .map_err(|error| win_error("capture.session_failed", error))?;
-        Ok(WgcState {
-            hwnd: identity.hwnd,
-            _item: item,
-            _device: device,
-            d3d_device,
-            d3d_context,
-            frame_pool,
-            frame_arrived,
-            frame_arrived_token,
-            session,
-            client_rect: identity.client_rect,
+    fn new(ctx: windows_capture::capture::Context<Self::Flags>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            flags: ctx.flags,
+            scratch: Vec::new(),
         })
     }
 
-    pub(super) fn next_bgra(
-        backend: &mut WgcState,
-        deadline: Instant,
-    ) -> Result<CapturedBgraFrame, WindowsError> {
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(WindowsError::new(
-                    "capture.deadline",
-                    "no WGC frame arrived before deadline",
-                ));
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut windows_capture::frame::Frame,
+        control: windows_capture::graphics_capture_api::InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        match copy_client_frame(&self.flags, frame, &mut self.scratch) {
+            Ok(frame) => {
+                publish_wgc_frame(&self.flags.frames, Ok(frame));
+                Ok(())
             }
-            backend
-                .frame_arrived
-                .recv_timeout(remaining)
-                .map_err(|error| match error {
-                    std::sync::mpsc::RecvTimeoutError::Timeout => WindowsError::new(
-                        "capture.deadline",
-                        "no WGC frame arrived before deadline",
-                    ),
-                    std::sync::mpsc::RecvTimeoutError::Disconnected => WindowsError::new(
-                        "capture.worker_failed",
-                        "WGC frame arrival handler disconnected",
-                    ),
-                })?;
-            match backend.frame_pool.TryGetNextFrame() {
-                Ok(frame) => {
-                    let result = copy_client_frame(backend, &frame, deadline);
-                    let _ = frame.Close();
-                    return result;
-                }
-                Err(_) if Instant::now() < deadline => continue,
-                Err(error) => {
-                    return Err(WindowsError::new(
-                        "capture.deadline",
-                        format!("no WGC frame before deadline: {error}"),
-                    ));
-                }
-            }
-        }
-    }
-
-    fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice), WindowsError>
-    {
-        let mut d3d_device = None;
-        let mut d3d_context = None;
-        unsafe {
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut d3d_device),
-                None,
-                Some(&mut d3d_context),
-            )
-            .map_err(|error| win_error("capture.d3d_device_failed", error))?;
-        }
-        let d3d_device = d3d_device.ok_or_else(|| {
-            WindowsError::new("capture.d3d_device_failed", "D3D11 device is null")
-        })?;
-        let d3d_context = d3d_context.ok_or_else(|| {
-            WindowsError::new("capture.d3d_device_failed", "D3D11 context is null")
-        })?;
-        let dxgi: IDXGIDevice = d3d_device
-            .cast()
-            .map_err(|error| win_error("capture.d3d_device_failed", error))?;
-        let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
-            .map_err(|error| win_error("capture.d3d_device_failed", error))?;
-        let device = inspectable
-            .cast::<IDirect3DDevice>()
-            .map_err(|error| win_error("capture.d3d_device_failed", error))?;
-        Ok((d3d_device, d3d_context, device))
-    }
-
-    fn copy_client_frame(
-        backend: &WgcState,
-        frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
-        deadline: Instant,
-    ) -> Result<CapturedBgraFrame, WindowsError> {
-        let surface = frame
-            .Surface()
-            .map_err(|error| win_error("capture.frame_invalid", error))?;
-        let access = surface
-            .cast::<IDirect3DDxgiInterfaceAccess>()
-            .map_err(|error| win_error("capture.frame_invalid", error))?;
-        let source = unsafe { access.GetInterface::<ID3D11Texture2D>() }
-            .map_err(|error| win_error("capture.frame_invalid", error))?;
-        copy_texture_client(backend, &source, deadline)
-    }
-
-    fn copy_texture_client(
-        backend: &WgcState,
-        source: &ID3D11Texture2D,
-        deadline: Instant,
-    ) -> Result<CapturedBgraFrame, WindowsError> {
-        let hwnd = HWND(backend.hwnd as *mut c_void);
-        let capture_bounds = capture_bounds(hwnd)?;
-        let mut source_desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { source.GetDesc(&mut source_desc) };
-        let (x, y, width, height) = client_crop_box(
-            capture_bounds,
-            backend.client_rect,
-            source_desc.Width,
-            source_desc.Height,
-        )?;
-        let frame_len = super::checked_bgra_len(width, height)?;
-        let mut staging_desc = source_desc;
-        staging_desc.Width = width;
-        staging_desc.Height = height;
-        staging_desc.BindFlags = 0;
-        staging_desc.MiscFlags = 0;
-        staging_desc.Usage = D3D11_USAGE_STAGING;
-        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-        let mut staging = None;
-        unsafe {
-            backend
-                .d3d_device
-                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
-                .map_err(|error| win_error("capture.staging_failed", error))?;
-        }
-        let staging = staging.ok_or_else(|| {
-            WindowsError::new("capture.staging_failed", "staging texture is null")
-        })?;
-        let region = D3D11_BOX {
-            left: x,
-            top: y,
-            right: x + width,
-            bottom: y + height,
-            front: 0,
-            back: 1,
-        };
-        let source_resource: ID3D11Resource = source
-            .cast()
-            .map_err(|error| win_error("capture.frame_invalid", error))?;
-        let staging_resource: ID3D11Resource = staging
-            .cast()
-            .map_err(|error| win_error("capture.staging_failed", error))?;
-        unsafe {
-            backend.d3d_context.CopySubresourceRegion(
-                &staging_resource,
-                0,
-                0,
-                0,
-                0,
-                &source_resource,
-                0,
-                Some(&region),
-            );
-        }
-        let mapped = loop {
-            if Instant::now() >= deadline {
-                return Err(WindowsError::new(
-                    "capture.deadline",
-                    "GPU frame copy did not complete before the capture deadline",
-                ));
-            }
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            match unsafe {
-                backend.d3d_context.Map(
-                    &staging_resource,
-                    0,
-                    D3D11_MAP_READ,
-                    D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
-                    Some(&mut mapped),
-                )
-            } {
-                Ok(()) => break mapped,
+            Err(error) => {
+                publish_wgc_frame(&self.flags.frames, Err(error.clone()));
+                control.stop();
                 Err(error)
-                    if error.code() == DXGI_ERROR_WAS_STILL_DRAWING
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::yield_now();
-                }
-                Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING => {
-                    return Err(WindowsError::new(
-                        "capture.deadline",
-                        "GPU frame copy did not complete before the capture deadline",
-                    ));
-                }
-                Err(error) => return Err(win_error("capture.map_failed", error)),
             }
-        };
-        let row_bytes = width as usize * 4;
-        if mapped.pData.is_null() || (mapped.RowPitch as usize) < row_bytes {
-            unsafe { backend.d3d_context.Unmap(&staging_resource, 0) };
-            return Err(WindowsError::new(
-                "capture.map_failed",
-                "mapped texture has a null pointer or short row pitch",
-            ));
         }
-        let mut pixels = vec![0_u8; frame_len];
-        for row in 0..height as usize {
-            let source_row = unsafe {
-                std::slice::from_raw_parts(
-                    (mapped.pData as *const u8).add(row * mapped.RowPitch as usize),
-                    row_bytes,
-                )
-            };
-            pixels[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(source_row);
-        }
-        unsafe { backend.d3d_context.Unmap(&staging_resource, 0) };
-        Ok(CapturedBgraFrame {
-            pixels,
-            width,
-            height,
-            captured_at: Instant::now(),
-        })
     }
 
-    fn capture_bounds(hwnd: HWND) -> Result<Rect, WindowsError> {
-        let mut bounds = RECT::default();
-        unsafe {
-            DwmGetWindowAttribute(
-                hwnd,
-                DWMWA_EXTENDED_FRAME_BOUNDS,
-                (&mut bounds as *mut RECT).cast(),
-                std::mem::size_of::<RECT>() as u32,
-            )
-        }
-        .map_err(|error| win_error("capture.target_unavailable", error))?;
-        let width = u32::try_from(bounds.right - bounds.left).map_err(|_| {
-            WindowsError::new("capture.target_unavailable", "negative DWM frame width")
-        })?;
-        let height = u32::try_from(bounds.bottom - bounds.top).map_err(|_| {
-            WindowsError::new("capture.target_unavailable", "negative DWM frame height")
-        })?;
-        Rect::new(bounds.left, bounds.top, width, height)
-            .map_err(|error| WindowsError::new("capture.target_unavailable", error.to_string()))
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        publish_wgc_frame(
+            &self.flags.frames,
+            Err(WindowsError::new(
+                "capture.target_unavailable",
+                "WGC target window closed",
+            )),
+        );
+        Ok(())
     }
+}
 
-    fn win_error(code: &'static str, error: windows::core::Error) -> WindowsError {
-        WindowsError::new(code, error.to_string())
-    }
+#[cfg(windows)]
+fn publish_wgc_frame(frames: &WgcFrameSlot, frame: Result<CapturedBgraFrame, WindowsError>) {
+    let (slot, ready) = &**frames;
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(frame);
+    ready.notify_one();
+}
 
-    pub(super) fn close(state: &WgcState) {
-        let _ = state
-            .frame_pool
-            .RemoveFrameArrived(state.frame_arrived_token);
-        unsafe { state.d3d_context.Flush() };
-        let _ = state.session.Close();
-        let _ = state.frame_pool.Close();
+#[cfg(windows)]
+fn copy_client_frame(
+    flags: &WgcFlags,
+    frame: &mut windows_capture::frame::Frame,
+    scratch: &mut Vec<u8>,
+) -> Result<CapturedBgraFrame, WindowsError> {
+    let capture_bounds = capture_bounds(windows::Win32::Foundation::HWND(
+        flags.hwnd as *mut std::ffi::c_void,
+    ))?;
+    let (x, y, width, height) = client_crop_box(
+        capture_bounds,
+        flags.client_rect,
+        frame.width(),
+        frame.height(),
+    )?;
+    checked_bgra_len(width, height)?;
+    let buffer = frame
+        .buffer_crop(x, y, x + width, y + height)
+        .map_err(|error| WindowsError::new("capture.map_failed", error.to_string()))?;
+    let pixels = buffer.as_nopadding_buffer(scratch).to_vec();
+    Ok(CapturedBgraFrame {
+        pixels,
+        width,
+        height,
+        captured_at: Instant::now(),
+    })
+}
+
+#[cfg(windows)]
+fn capture_bounds(hwnd: windows::Win32::Foundation::HWND) -> Result<Rect, WindowsError> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+
+    let mut bounds = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&mut bounds as *mut RECT).cast(),
+            std::mem::size_of::<RECT>() as u32,
+        )
     }
+    .map_err(|error| WindowsError::new("capture.target_unavailable", error.to_string()))?;
+    let width = u32::try_from(bounds.right - bounds.left)
+        .map_err(|_| WindowsError::new("capture.target_unavailable", "negative DWM frame width"))?;
+    let height = u32::try_from(bounds.bottom - bounds.top).map_err(|_| {
+        WindowsError::new("capture.target_unavailable", "negative DWM frame height")
+    })?;
+    Rect::new(bounds.left, bounds.top, width, height)
+        .map_err(|error| WindowsError::new("capture.target_unavailable", error.to_string()))
 }
