@@ -682,10 +682,12 @@ mod native {
         PROCESS_SYNCHRONIZE,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
-        ShowWindow, SW_RESTORE, WM_CLOSE,
+        BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
+        SendMessageW, SetForegroundWindow, ShowWindow, SC_RESTORE, SW_RESTORE, WM_CLOSE,
+        WM_SYSCOMMAND,
     };
 
     use crate::{normalized_process_path_sha256, validate_dpi};
@@ -791,8 +793,11 @@ mod native {
         let current = candidate_from_raw_hwnd(identity.hwnd)?;
         require_same_identity(identity, &current.identity)?;
         let hwnd = HWND(identity.hwnd as *mut c_void);
+        unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, Some(WPARAM(SC_RESTORE as usize)), None) };
         let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
         let _ = unsafe { SetForegroundWindow(hwnd) };
+        let _ = unsafe { BringWindowToTop(hwnd) };
+        let _ = unsafe { SetActiveWindow(hwnd) };
         let deadline = Instant::now() + Duration::from_millis(500);
         while unsafe { GetForegroundWindow() } != hwnd {
             if Instant::now() >= deadline {
