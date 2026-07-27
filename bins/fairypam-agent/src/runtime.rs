@@ -2110,6 +2110,7 @@ fn command_identity(
         Payload::StartTaskTarget(value) => task_identity(value.task.clone(), None),
         Payload::FinishTaskAttempt(value) => task_identity(value.task.clone(), None),
         Payload::InspectTaskAttempt(value) => task_identity(value.task.clone(), None),
+        Payload::LaunchTarget(value) => legacy_identity(value.command.clone()),
     }
 }
 

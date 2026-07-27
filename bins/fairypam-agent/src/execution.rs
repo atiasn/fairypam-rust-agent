@@ -388,6 +388,27 @@ impl CommandExecutor {
             ));
         }
         match payload {
+            Some(Payload::LaunchTarget(value)) => {
+                if self.binding.is_some() {
+                    return Err(AgentError::new(
+                        "target.active",
+                        "launch requires no active target",
+                    ));
+                }
+                let profile = self.profiles.get(&value.profile_id)?.clone();
+                let binding = self.platform.start_task_target(&profile)?;
+                self.active_profile = Some(profile);
+                self.binding = Some(binding.clone());
+                Ok(CommandOutcome::Ack(
+                    json!({
+                        "profile_id": binding.profile_id,
+                        "pid": binding.process_id,
+                        "hwnd": binding.window_handle,
+                        "state": "DryRun",
+                    })
+                    .to_string(),
+                ))
+            }
             Some(Payload::EnumerateTargets(value)) => {
                 self.stop_capture(None)?;
                 let profile = self.profiles.get(&value.profile_id)?.clone();
@@ -1317,11 +1338,28 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 
-        if self.owned.is_some() {
-            return Err(AgentError::new(
-                "target_invalid",
-                "a task-owned target is already active",
-            ));
+        if let Some(owned) = self.owned.as_ref() {
+            if owned.binding.profile_id != profile.profile().id {
+                return Err(AgentError::new(
+                    "target_invalid",
+                    "an Agent-owned target for another Profile is already active",
+                ));
+            }
+            let process_id = owned.binding.process_id;
+            let candidate = self
+                .targets
+                .enumerate(profile)?
+                .into_iter()
+                .find(|candidate| candidate.process_id == process_id)
+                .ok_or_else(|| {
+                    AgentError::new(
+                        "target_invalid",
+                        "the Agent-owned target is no longer a signed Profile candidate",
+                    )
+                })?;
+            let binding = self.targets.lock(profile, candidate.selector)?;
+            self.owned.as_mut().expect("checked above").binding = binding.clone();
+            return Ok(binding);
         }
         let executable = crate::observability::resolve_profile_executable(profile)?;
         let working_directory = executable.parent().ok_or_else(|| {
@@ -1711,8 +1749,9 @@ mod tests {
     use fairypam_agent_protocol::v1::{
         AgentAttemptContractV1, AttemptRef, BeginTaskAttempt, CloseTarget, CommandRef,
         EnumerateTargets, FinishTaskAttempt, FocusTarget, InputLease, InspectTaskAttempt,
-        LockTarget, PulseAction, SessionRef, StartCapture, StartTaskTarget, StopCapture,
-        TaskAttemptState, TaskCommandOutcomeState, TaskCommandRef, TaskSideEffectState,
+        LaunchTarget, LockTarget, PulseAction, SessionRef, StartCapture, StartTaskTarget,
+        StopCapture, TaskAttemptState, TaskCommandOutcomeState, TaskCommandRef,
+        TaskSideEffectState,
     };
     use sha2::{Digest, Sha256};
 
@@ -1834,6 +1873,7 @@ mod tests {
     #[derive(Default)]
     struct FakePlatformState {
         launch_calls: usize,
+        target_owned: bool,
         focus_calls: Vec<TargetBinding>,
         close_calls: Vec<(TargetBinding, Duration)>,
         input_active: bool,
@@ -1851,7 +1891,11 @@ mod tests {
             &mut self,
             _profile: &VerifiedProfile,
         ) -> Result<TargetBinding, AgentError> {
-            self.state.lock().unwrap().launch_calls += 1;
+            let mut state = self.state.lock().unwrap();
+            if !state.target_owned {
+                state.launch_calls += 1;
+                state.target_owned = true;
+            }
             Ok(binding())
         }
 
@@ -1908,6 +1952,7 @@ mod tests {
                     "fake target did not exit",
                 ))
             } else {
+                state.target_owned = false;
                 Ok(())
             }
         }
@@ -2072,6 +2117,49 @@ mod tests {
             executor.execute(&lock, &ExecutionSession::test(), sink),
             CommandOutcome::Ack(_)
         ));
+    }
+
+    #[test]
+    fn generic_launch_is_profile_only_and_task_reuses_the_agent_owned_target() {
+        let profile = verified_profile();
+        let contract = task_contract(&profile);
+        let (mut executor, state) = executor_with_state();
+        let sink = Arc::new(CollectFrames::default());
+        let launch = HubControlCommand {
+            payload: Some(hub_control_command::Payload::LaunchTarget(LaunchTarget {
+                profile_id: "testbed".into(),
+                ..LaunchTarget::default()
+            })),
+        };
+        assert!(matches!(
+            executor.execute(&launch, &ExecutionSession::test(), sink.clone()),
+            CommandOutcome::Ack(ref result) if result.contains("\"pid\":42")
+        ));
+
+        let begin = HubControlCommand {
+            payload: Some(hub_control_command::Payload::BeginTaskAttempt(
+                BeginTaskAttempt {
+                    task: Some(task_ref(&contract, "begin-prelaunched")),
+                    contract: Some(contract.clone()),
+                },
+            )),
+        };
+        assert!(matches!(
+            executor.execute(&begin, &ExecutionSession::test(), sink.clone()),
+            CommandOutcome::TaskAck { .. }
+        ));
+        let start = HubControlCommand {
+            payload: Some(hub_control_command::Payload::StartTaskTarget(
+                StartTaskTarget {
+                    task: Some(task_ref(&contract, "target-prelaunched")),
+                },
+            )),
+        };
+        assert!(matches!(
+            executor.execute(&start, &ExecutionSession::test(), sink),
+            CommandOutcome::TaskAck { .. }
+        ));
+        assert_eq!(state.lock().unwrap().launch_calls, 1);
     }
 
     #[test]

@@ -267,6 +267,7 @@ fn command_ref(command: &HubControlCommand) -> Option<&CommandRef> {
         Payload::StartTaskTarget(value) => task_ref(value.task.as_ref()),
         Payload::FinishTaskAttempt(value) => task_ref(value.task.as_ref()),
         Payload::InspectTaskAttempt(value) => task_ref(value.task.as_ref()),
+        Payload::LaunchTarget(value) => value.command.as_ref(),
     }
 }
 

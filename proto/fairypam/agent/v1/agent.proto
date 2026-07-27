@@ -179,6 +179,7 @@ message HubControlCommand {
     StartTaskTarget start_task_target = 16;
     FinishTaskAttempt finish_task_attempt = 17;
     InspectTaskAttempt inspect_task_attempt = 18;
+    LaunchTarget launch_target = 19;
   }
 }
 
@@ -243,6 +244,11 @@ message FinishTaskAttempt {
 
 message InspectTaskAttempt {
   TaskCommandRef task = 1;
+}
+
+message LaunchTarget {
+  CommandRef command = 1;
+  string profile_id = 2;
 }
 
 message EnumerateTargets {
