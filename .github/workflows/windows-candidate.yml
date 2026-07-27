@@ -356,7 +356,9 @@ jobs:
           if ($taskInfo.LastTaskResult -ne 0) {
             throw "maintenance Agent health task did not exit cleanly: $($taskInfo.LastTaskResult)"
           }
-          if (@($task.Triggers).Count -ne 0) {
+          $taskXml = [xml](Export-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent')
+          if ($null -ne $taskXml.Task.Triggers `
+              -and @($taskXml.Task.Triggers.ChildNodes).Count -ne 0) {
             throw "maintenance Agent task must not have automatic triggers"
           }
           if (@($task.Actions).Count -ne 1 `
