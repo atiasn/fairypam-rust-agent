@@ -275,10 +275,15 @@ fn fixed_installer_image_matches(agent: &str, actual: &str) -> bool {
     if candidate.is_empty() || install_root.is_empty() {
         return false;
     }
-    crate::normalize_process_path(actual)
-        == Some(format!(
-            r"{install_root}\resources\runtime\fairypam-agent-installer.exe"
-        ))
+    let actual = crate::normalize_process_path(actual);
+    [
+        format!(r"{install_root}\resources\runtime\fairypam-agent-installer.exe"),
+        format!(
+            r"{install_root}\.fairypam-installer\payload\resources\runtime\fairypam-agent-installer.exe"
+        ),
+    ]
+    .into_iter()
+    .any(|expected| actual.as_ref() == Some(&expected))
 }
 
 /// RegisterHub is the only local command that carries a registration secret.
@@ -843,9 +848,17 @@ mod path_tests {
             agent,
             r"C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe"
         ));
+        assert!(fixed_installer_image_matches(
+            agent,
+            r"C:\Program Files\FairyPam\.fairypam-installer\payload\resources\runtime\fairypam-agent-installer.exe"
+        ));
         assert!(!fixed_installer_image_matches(
             agent,
             r"C:\Program Files\FairyPam\versions\candidate-1\resources\runtime\fairypam-agent-installer.exe"
+        ));
+        assert!(!fixed_installer_image_matches(
+            agent,
+            r"C:\Program Files\FairyPam\.fairypam-installer\fairypam-agent-installer.exe"
         ));
         assert!(!fixed_installer_image_matches(
             r"C:\Program Files\FairyPam\fairypam-agent.exe",
