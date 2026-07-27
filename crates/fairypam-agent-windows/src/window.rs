@@ -673,16 +673,15 @@ mod native {
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
     use windows::Win32::System::Threading::{
-        AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken,
-        QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+        WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
-    use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
-        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
-        SetForegroundWindow, ShowWindow, SW_RESTORE, WM_CLOSE,
+        EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowTextW,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
+        ShowWindow, SW_RESTORE, WM_CLOSE,
     };
 
     use crate::{normalized_process_path_sha256, validate_dpi};
@@ -789,60 +788,13 @@ mod native {
         require_same_identity(identity, &current.identity)?;
         let hwnd = HWND(identity.hwnd as *mut c_void);
         let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
-        let foreground = unsafe { GetForegroundWindow() };
-        let target_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
-        let foreground_thread = unsafe { GetWindowThreadProcessId(foreground, None) };
-        let current_thread = unsafe { GetCurrentThreadId() };
-        let attached_current = foreground_thread != 0
-            && foreground_thread != current_thread
-            && unsafe { AttachThreadInput(current_thread, foreground_thread, true) }.as_bool();
-        let attached_target = foreground_thread != 0
-            && target_thread != 0
-            && foreground_thread != target_thread
-            && unsafe { AttachThreadInput(foreground_thread, target_thread, true) }.as_bool();
-        if unsafe { IsIconic(hwnd).as_bool() } {
-            let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
-        }
-        let mut foreground_request_accepted = false;
-        for _ in 0..5 {
-            foreground_request_accepted |= unsafe { SetForegroundWindow(hwnd) }.as_bool();
-            let _ = unsafe { SetActiveWindow(hwnd) };
-            if unsafe { GetForegroundWindow() } == hwnd {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        if unsafe { GetForegroundWindow() } == hwnd {
-            let _ = unsafe { BringWindowToTop(hwnd) };
-        }
-        let detached_target = !attached_target
-            || unsafe { AttachThreadInput(foreground_thread, target_thread, false) }.as_bool();
-        let detached_current = !attached_current
-            || unsafe { AttachThreadInput(current_thread, foreground_thread, false) }.as_bool();
-        if !detached_target || !detached_current {
-            return Err(WindowsError::new(
-                "target.focus_failed",
-                "Windows input queues could not be detached after foreground activation",
-            ));
-        }
+        let _ = unsafe { SetForegroundWindow(hwnd) };
         let deadline = Instant::now() + Duration::from_millis(500);
         while unsafe { GetForegroundWindow() } != hwnd {
             if Instant::now() >= deadline {
-                let foreground = unsafe { GetForegroundWindow() };
-                let mut foreground_pid = 0;
-                unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_pid)) };
-                if foreground == HWND::default() {
-                    return Err(WindowsError::new(
-                        "target.interactive_desktop_unavailable",
-                        "the interactive Windows desktop is unavailable or locked",
-                    ));
-                }
                 return Err(WindowsError::new(
                     "target.focus_failed",
-                    format!(
-                        "target did not become the foreground window; request_accepted={foreground_request_accepted}, foreground_pid={foreground_pid}, target_pid={}",
-                        identity.pid
-                    ),
+                    "target did not become the foreground window",
                 ));
             }
             thread::sleep(Duration::from_millis(10));

@@ -1600,13 +1600,21 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                     "task target exited before its trusted window was ready",
                 ));
             }
-            if let Some(candidate) = self
+            if self
                 .targets
                 .enumerate(profile)?
                 .into_iter()
-                .find(|candidate| candidate.process_id == child.id())
+                .any(|candidate| candidate.process_id == child.id())
             {
-                break self.targets.lock(profile, candidate.selector)?;
+                std::thread::sleep(Duration::from_secs(5));
+                if let Some(stable_candidate) = self
+                    .targets
+                    .enumerate(profile)?
+                    .into_iter()
+                    .find(|candidate| candidate.process_id == child.id())
+                {
+                    break self.targets.lock(profile, stable_candidate.selector)?;
+                }
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
