@@ -3263,7 +3263,7 @@ mod tests {
             Err(ProvisionFailure::InstallRoots)
         ));
         assert!(!accepted.get());
-        activation.rollback().unwrap();
+        assert!(activation.rollback().is_ok());
         assert_eq!(
             std::fs::read(root.join(CURRENT_POINTER_FILE)).unwrap(),
             b"previous-pointer"
