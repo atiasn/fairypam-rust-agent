@@ -829,9 +829,8 @@ mod native {
                     },
                 },
             };
-            alt_up_sent = Some(unsafe {
-                SendInput(&[alt_up], std::mem::size_of::<INPUT>() as i32) == 1
-            });
+            alt_up_sent =
+                Some(unsafe { SendInput(&[alt_up], std::mem::size_of::<INPUT>() as i32) == 1 });
             foreground_request_accepted |= unsafe { SetForegroundWindow(hwnd) }.as_bool();
             let _ = unsafe { SetActiveWindow(hwnd) };
         }
