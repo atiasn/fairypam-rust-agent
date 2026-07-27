@@ -678,10 +678,11 @@ mod native {
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
         GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
-        SetActiveWindow, SetForegroundWindow, ShowWindow, SW_RESTORE, WM_CLOSE,
+        SetForegroundWindow, ShowWindow, SW_RESTORE, WM_CLOSE,
     };
 
     use crate::{normalized_process_path_sha256, validate_dpi};
