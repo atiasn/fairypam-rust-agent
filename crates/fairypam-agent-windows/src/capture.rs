@@ -415,7 +415,6 @@ mod tests {
 #[cfg(windows)]
 pub struct WgcCaptureBackend {
     requests: std::sync::mpsc::SyncSender<WgcRequest>,
-    worker_done: std::sync::mpsc::Receiver<()>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -438,7 +437,6 @@ impl WgcCaptureBackend {
         let identity = identity.clone();
         let (requests, receiver) = std::sync::mpsc::sync_channel(1);
         let (initialized, initialized_receiver) = std::sync::mpsc::sync_channel(1);
-        let (worker_done_sender, worker_done) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("fairypam-wgc-capture".into())
             .spawn(move || {
@@ -465,7 +463,6 @@ impl WgcCaptureBackend {
                         let _ = initialized.send(Err(error));
                     }
                 }
-                let _ = worker_done_sender.send(());
             })
             .map_err(|error| WindowsError::new("capture.worker_failed", error.to_string()))?;
         initialized_receiver
@@ -473,7 +470,6 @@ impl WgcCaptureBackend {
             .map_err(map_worker_wait_error)??;
         Ok(Self {
             requests,
-            worker_done,
             worker: Some(worker),
         })
     }
@@ -493,9 +489,9 @@ impl CaptureBackend for WgcCaptureBackend {
         self.requests
             .try_send(WgcRequest::Next { deadline, reply })
             .map_err(map_worker_send_error)?;
-        receiver
-            .recv_timeout(remaining)
-            .map_err(map_worker_wait_error)?
+        receiver.recv().map_err(|_| {
+            WindowsError::new("capture.worker_failed", "capture worker disconnected")
+        })?
     }
 
     fn rebuild(&mut self, client_rect: Rect, dpi: u32) -> Result<(), WindowsError> {
@@ -513,19 +509,9 @@ impl CaptureBackend for WgcCaptureBackend {
 #[cfg(windows)]
 impl Drop for WgcCaptureBackend {
     fn drop(&mut self) {
-        let _ = self.requests.try_send(WgcRequest::Stop);
+        let _ = self.requests.send(WgcRequest::Stop);
         if let Some(worker) = self.worker.take() {
-            match self
-                .worker_done
-                .recv_timeout(std::time::Duration::from_millis(250))
-            {
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = worker.join();
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    drop(worker);
-                }
-            }
+            let _ = worker.join();
         }
     }
 }
