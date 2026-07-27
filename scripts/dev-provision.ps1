@@ -37,10 +37,21 @@ function Assert-Elevated {
 
 function Protect-PrivateDirectory([string]$Path) {
     New-Item -ItemType Directory -Force -Path $Path | Out-Null
-    & icacls.exe $Path /setowner '*S-1-5-32-544' /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'dev.state.acl_failed: failed to set the private directory owner' }
-    & icacls.exe $Path /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'dev.state.acl_failed: failed to protect the private directory' }
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetOwner($administrators)
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @($system, $administrators)) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $sid,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            [Security.AccessControl.InheritanceFlags]::None,
+            [Security.AccessControl.PropagationFlags]::None,
+            [Security.AccessControl.AccessControlType]::Allow
+        ))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
 function Get-InteractiveShellLogonSid([int]$SessionId) {
