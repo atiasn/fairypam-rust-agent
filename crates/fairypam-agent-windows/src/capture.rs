@@ -134,7 +134,7 @@ impl<B: CaptureBackend> CaptureSession for CapturePipeline<B> {
 pub struct WindowsTargetCapture {
     targets: WindowsTargetPlatform<NativeWindows>,
     binding: TargetBinding,
-    capture: CapturePipeline<WgcCaptureBackend>,
+    capture: CapturePipeline<DxgiCaptureBackend>,
 }
 
 #[cfg(windows)]
@@ -145,7 +145,7 @@ impl WindowsTargetCapture {
         region: CaptureRegion,
         encoding: CaptureEncoding,
     ) -> Result<Self, WindowsError> {
-        let backend = WgcCaptureBackend::new(&identity)?;
+        let backend = DxgiCaptureBackend::new(&identity)?;
         let capture = CapturePipeline::new(
             backend,
             identity.client_rect,
@@ -325,13 +325,13 @@ fn client_crop_box(
     let x = u32::try_from(client_rect.left - capture_bounds.left).map_err(|_| {
         WindowsError::new(
             "capture.client_bounds_invalid",
-            "client left is outside WGC frame",
+            "client left is outside capture frame",
         )
     })?;
     let y = u32::try_from(client_rect.top - capture_bounds.top).map_err(|_| {
         WindowsError::new(
             "capture.client_bounds_invalid",
-            "client top is outside WGC frame",
+            "client top is outside capture frame",
         )
     })?;
     if x.checked_add(client_rect.width)
@@ -342,7 +342,7 @@ fn client_crop_box(
         return Err(WindowsError::new(
             "capture.client_bounds_invalid",
             format!(
-                "client rectangle ({x},{y} {}x{}) exceeds WGC frame {source_width}x{source_height}",
+                "client rectangle ({x},{y} {}x{}) exceeds capture frame {source_width}x{source_height}",
                 client_rect.width, client_rect.height
             ),
         ));
@@ -378,215 +378,154 @@ fn checked_frame_len(
 }
 
 #[cfg(windows)]
-type WgcFrameSlot = std::sync::Arc<(
-    std::sync::Mutex<Option<Result<CapturedBgraFrame, WindowsError>>>,
-    std::sync::Condvar,
-)>;
-
-#[cfg(windows)]
-pub struct WgcCaptureBackend {
-    frames: WgcFrameSlot,
-    control: Option<windows_capture::capture::CaptureControl<WgcHandler, WindowsError>>,
-}
-
-#[cfg(windows)]
-struct WgcFlags {
-    frames: WgcFrameSlot,
+pub struct DxgiCaptureBackend {
     hwnd: isize,
+    monitor_bounds: Rect,
     client_rect: Rect,
-}
-
-#[cfg(windows)]
-struct WgcHandler {
-    flags: WgcFlags,
+    capture: windows_capture::dxgi_duplication_api::DxgiDuplicationApi,
     scratch: Vec<u8>,
 }
 
 #[cfg(windows)]
-impl WgcCaptureBackend {
+impl DxgiCaptureBackend {
     pub fn new(identity: &crate::TargetIdentity) -> Result<Self, WindowsError> {
-        use windows_capture::capture::GraphicsCaptureApiHandler;
-        use windows_capture::settings::{
-            ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
-            MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+        use windows_capture::dxgi_duplication_api::{
+            DxgiDuplicationApi, DxgiDuplicationFormat,
         };
-        use windows_capture::window::Window;
+        use windows_capture::monitor::Monitor;
 
-        let frames = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
-        let settings = Settings::new(
-            Window::from_raw_hwnd(identity.hwnd as *mut std::ffi::c_void),
-            CursorCaptureSettings::WithoutCursor,
-            DrawBorderSettings::Default,
-            SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
-            DirtyRegionSettings::Default,
-            ColorFormat::Bgra8,
-            WgcFlags {
-                frames: frames.clone(),
-                hwnd: identity.hwnd,
-                client_rect: identity.client_rect,
-            },
-        );
-        let control = WgcHandler::start_free_threaded(settings)
+        let hwnd = windows::Win32::Foundation::HWND(identity.hwnd as *mut std::ffi::c_void);
+        let (monitor, monitor_bounds) = target_monitor(hwnd)?;
+        client_crop_box(
+            monitor_bounds,
+            identity.client_rect,
+            monitor_bounds.width,
+            monitor_bounds.height,
+        )?;
+        let capture = DxgiDuplicationApi::new_options(
+            Monitor::from_raw_hmonitor(monitor.0),
+            &[DxgiDuplicationFormat::Bgra8],
+        )
             .map_err(|error| WindowsError::new("capture.session_failed", error.to_string()))?;
         Ok(Self {
-            frames,
-            control: Some(control),
+            hwnd: identity.hwnd,
+            monitor_bounds,
+            client_rect: identity.client_rect,
+            capture,
+            scratch: Vec::new(),
         })
     }
 }
 
 #[cfg(windows)]
-impl CaptureBackend for WgcCaptureBackend {
+impl CaptureBackend for DxgiCaptureBackend {
     fn next_bgra(&mut self, deadline: Instant) -> Result<CapturedBgraFrame, WindowsError> {
-        let (slot, ready) = &*self.frames;
-        let mut frame = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        loop {
-            if let Some(frame) = frame.take() {
-                return frame;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(WindowsError::new(
-                    "capture.deadline",
-                    "no WGC frame arrived before deadline",
-                ));
-            }
-            let waited = ready.wait_timeout(frame, remaining);
-            let (next, timeout) = match waited {
-                Ok(waited) => waited,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            frame = next;
-            if timeout.timed_out() && frame.is_none() {
-                return Err(WindowsError::new(
-                    "capture.deadline",
-                    "no WGC frame arrived before deadline",
-                ));
-            }
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        use windows_capture::dxgi_duplication_api::{DxgiDuplicationFormat, Error};
+
+        let hwnd = HWND(self.hwnd as *mut std::ffi::c_void);
+        if unsafe { GetForegroundWindow() } != hwnd {
+            return Err(WindowsError::new(
+                "capture.target_not_foreground",
+                "desktop capture requires the signed target window to be foreground",
+            ));
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(WindowsError::new(
+                "capture.deadline",
+                "capture deadline expired before DXGI frame acquisition",
+            ));
+        }
+        let timeout_ms = u32::try_from(remaining.as_millis().max(1)).unwrap_or(u32::MAX);
+        let mut frame = self
+            .capture
+            .acquire_next_frame(timeout_ms)
+            .map_err(|error| match error {
+                Error::Timeout => WindowsError::new(
+                    "capture.deadline",
+                    "no DXGI frame arrived before deadline",
+                ),
+                Error::AccessLost => WindowsError::new(
+                    "capture.access_lost",
+                    "DXGI duplication access was lost",
+                ),
+                error => WindowsError::new("capture.map_failed", error.to_string()),
+            })?;
+        if frame.format() != DxgiDuplicationFormat::Bgra8 {
+            return Err(WindowsError::new(
+                "capture.format_unsupported",
+                "DXGI capture did not provide BGRA8 pixels",
+            ));
+        }
+        let (x, y, width, height) = client_crop_box(
+            self.monitor_bounds,
+            self.client_rect,
+            frame.width(),
+            frame.height(),
+        )?;
+        checked_bgra_len(width, height)?;
+        let buffer = frame
+            .buffer_crop(x, y, x + width, y + height)
+            .map_err(|error| WindowsError::new("capture.map_failed", error.to_string()))?;
+        let pixels = buffer.as_nopadding_buffer(&mut self.scratch).to_vec();
+        Ok(CapturedBgraFrame {
+            pixels,
+            width,
+            height,
+            captured_at: Instant::now(),
+        })
     }
 
     fn rebuild(&mut self, client_rect: Rect, dpi: u32) -> Result<(), WindowsError> {
         validate_dpi(dpi)?;
-        let _ = client_rect;
-        Err(WindowsError::new(
-            "capture.geometry_changed",
-            "WGC capture must be restarted after target geometry changes",
-        ))
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WgcCaptureBackend {
-    fn drop(&mut self) {
-        if let Some(control) = self.control.take() {
-            if let Err(error) = control.stop() {
-                eprintln!("WGC capture did not stop cleanly: {error}");
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-impl windows_capture::capture::GraphicsCaptureApiHandler for WgcHandler {
-    type Flags = WgcFlags;
-    type Error = WindowsError;
-
-    fn new(ctx: windows_capture::capture::Context<Self::Flags>) -> Result<Self, Self::Error> {
-        Ok(Self {
-            flags: ctx.flags,
-            scratch: Vec::new(),
-        })
-    }
-
-    fn on_frame_arrived(
-        &mut self,
-        frame: &mut windows_capture::frame::Frame,
-        control: windows_capture::graphics_capture_api::InternalCaptureControl,
-    ) -> Result<(), Self::Error> {
-        match copy_client_frame(&self.flags, frame, &mut self.scratch) {
-            Ok(frame) => {
-                publish_wgc_frame(&self.flags.frames, Ok(frame));
-                Ok(())
-            }
-            Err(error) => {
-                publish_wgc_frame(&self.flags.frames, Err(error.clone()));
-                control.stop();
-                Err(error)
-            }
-        }
-    }
-
-    fn on_closed(&mut self) -> Result<(), Self::Error> {
-        publish_wgc_frame(
-            &self.flags.frames,
-            Err(WindowsError::new(
-                "capture.target_unavailable",
-                "WGC target window closed",
-            )),
-        );
+        client_crop_box(
+            self.monitor_bounds,
+            client_rect,
+            self.monitor_bounds.width,
+            self.monitor_bounds.height,
+        )?;
+        self.client_rect = client_rect;
         Ok(())
     }
 }
 
 #[cfg(windows)]
-fn publish_wgc_frame(frames: &WgcFrameSlot, frame: Result<CapturedBgraFrame, WindowsError>) {
-    let (slot, ready) = &**frames;
-    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(frame);
-    ready.notify_one();
-}
-
-#[cfg(windows)]
-fn copy_client_frame(
-    flags: &WgcFlags,
-    frame: &mut windows_capture::frame::Frame,
-    scratch: &mut Vec<u8>,
-) -> Result<CapturedBgraFrame, WindowsError> {
-    let capture_bounds = capture_bounds(windows::Win32::Foundation::HWND(
-        flags.hwnd as *mut std::ffi::c_void,
-    ))?;
-    let (x, y, width, height) = client_crop_box(
-        capture_bounds,
-        flags.client_rect,
-        frame.width(),
-        frame.height(),
-    )?;
-    checked_bgra_len(width, height)?;
-    let buffer = frame
-        .buffer_crop(x, y, x + width, y + height)
-        .map_err(|error| WindowsError::new("capture.map_failed", error.to_string()))?;
-    let pixels = buffer.as_nopadding_buffer(scratch).to_vec();
-    Ok(CapturedBgraFrame {
-        pixels,
-        width,
-        height,
-        captured_at: Instant::now(),
-    })
-}
-
-#[cfg(windows)]
-fn capture_bounds(hwnd: windows::Win32::Foundation::HWND) -> Result<Rect, WindowsError> {
+fn target_monitor(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> Result<(windows::Win32::Graphics::Gdi::HMONITOR, Rect), WindowsError> {
     use windows::Win32::Foundation::RECT;
-    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL,
+    };
 
-    let mut bounds = RECT::default();
-    unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS,
-            (&mut bounds as *mut RECT).cast(),
-            std::mem::size_of::<RECT>() as u32,
-        )
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
+    if monitor.is_invalid() {
+        return Err(WindowsError::new(
+            "capture.target_unavailable",
+            "target window is not on an active monitor",
+        ));
     }
-    .map_err(|error| WindowsError::new("capture.target_unavailable", error.to_string()))?;
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err(WindowsError::new(
+            "capture.target_unavailable",
+            "failed to resolve target monitor bounds",
+        ));
+    }
+    let bounds: RECT = info.rcMonitor;
     let width = u32::try_from(bounds.right - bounds.left)
-        .map_err(|_| WindowsError::new("capture.target_unavailable", "negative DWM frame width"))?;
+        .map_err(|_| WindowsError::new("capture.target_unavailable", "negative monitor width"))?;
     let height = u32::try_from(bounds.bottom - bounds.top).map_err(|_| {
-        WindowsError::new("capture.target_unavailable", "negative DWM frame height")
+        WindowsError::new("capture.target_unavailable", "negative monitor height")
     })?;
-    Rect::new(bounds.left, bounds.top, width, height)
-        .map_err(|error| WindowsError::new("capture.target_unavailable", error.to_string()))
+    let bounds = Rect::new(bounds.left, bounds.top, width, height)
+        .map_err(|error| WindowsError::new("capture.target_unavailable", error.to_string()))?;
+    Ok((monitor, bounds))
 }
 
 #[cfg(test)]
@@ -606,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn client_crop_uses_visible_dwm_bounds_instead_of_invisible_resize_border() {
+    fn client_crop_rejects_source_bounds_that_exclude_the_client() {
         let client = Rect::new(108, 131, 784, 561).unwrap();
         let visible_dwm_bounds = Rect::new(108, 108, 784, 584).unwrap();
         assert_eq!(

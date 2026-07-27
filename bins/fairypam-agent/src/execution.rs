@@ -945,7 +945,10 @@ impl CommandExecutor {
         if plan.rediscovery_allowed
             && matches!(
                 failure.code(),
-                "capture.no_frame_timeout" | "target.stale" | "target.not_found"
+                "capture.no_frame_timeout"
+                    | "capture.access_lost"
+                    | "target.stale"
+                    | "target.not_found"
             )
         {
             match self.restart_capture_after_rediscovery(plan) {

@@ -1,4 +1,4 @@
-//! Windows target discovery and WGC/D3D11 capture boundary.
+//! Windows target discovery and DXGI capture boundary.
 
 mod capture;
 mod dpi;
@@ -38,7 +38,7 @@ pub use window::{
 pub use window::LockedInputTarget;
 
 #[cfg(windows)]
-pub use capture::WgcCaptureBackend;
+pub use capture::DxgiCaptureBackend;
 #[cfg(windows)]
 pub use send_input::WindowsInput;
 #[cfg(windows)]
