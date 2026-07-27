@@ -371,8 +371,8 @@ impl BitBltCaptureBackend {
     fn initialize_resources(&mut self) -> Result<(), WindowsError> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::Graphics::Gdi::{
-            CreateCompatibleDC, CreateDIBSection, DeleteDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-            DIB_RGB_COLORS, GetDC, HGDIOBJ, ReleaseDC, SelectObject,
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, GetDC, ReleaseDC, SelectObject,
+            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
         };
 
         if self.source_dc != 0 {
@@ -439,7 +439,10 @@ impl BitBltCaptureBackend {
                     DeleteDC(target_dc);
                     ReleaseDC(Some(hwnd), source_dc);
                 }
-                return Err(WindowsError::new("capture.session_failed", error.to_string()));
+                return Err(WindowsError::new(
+                    "capture.session_failed",
+                    error.to_string(),
+                ));
             }
         };
         let previous_bitmap = unsafe { SelectObject(target_dc, bitmap.into()) };
@@ -465,7 +468,7 @@ impl BitBltCaptureBackend {
     fn release_resources(&mut self) {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::Graphics::Gdi::{
-            DeleteDC, DeleteObject, HDC, HGDIOBJ, ReleaseDC, SelectObject,
+            DeleteDC, DeleteObject, ReleaseDC, SelectObject, HDC, HGDIOBJ,
         };
 
         unsafe {
@@ -586,5 +589,4 @@ mod tests {
         let error = checked_rgb_len(16_384, 16_384).unwrap_err();
         assert_eq!(error.code(), "capture.frame_too_large");
     }
-
 }
