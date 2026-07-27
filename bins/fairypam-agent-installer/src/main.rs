@@ -1268,12 +1268,15 @@ impl InstallActivation {
             .iter()
             .filter(|member| member.scope == MemberScope::Versioned)
         {
-            std::fs::remove_file(self.install_root.join(member.path.replace('/', "\\")))
+            let path = self.install_root.join(member.path.replace('/', "\\"));
+            retry_locked_remove(|| std::fs::remove_file(&path))
                 .map_err(|_| ProvisionFailure::InstallRoots)?;
         }
-        std::fs::remove_file(self.install_root.join(MANIFEST_FILE))
+        let manifest = self.install_root.join(MANIFEST_FILE);
+        retry_locked_remove(|| std::fs::remove_file(&manifest))
             .map_err(|_| ProvisionFailure::InstallRoots)?;
-        match std::fs::remove_dir_all(self.install_root.join("profiles")) {
+        let profiles = self.install_root.join("profiles");
+        match retry_locked_remove(|| std::fs::remove_dir_all(&profiles)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(ProvisionFailure::InstallRoots),
@@ -1287,10 +1290,30 @@ impl InstallActivation {
             .join(fairypam_agent_suite::CURRENT_POINTER_FILE);
         restore_pointer(&pointer, self.previous_pointer.as_deref())?;
         if self.created_version {
-            std::fs::remove_dir_all(self.version_root).map_err(|_| ProvisionFailure::Rollback)?;
+            retry_locked_remove(|| std::fs::remove_dir_all(&self.version_root))
+                .map_err(|_| ProvisionFailure::Rollback)?;
         }
         Ok(())
     }
+}
+
+#[cfg(any(windows, test))]
+fn retry_locked_remove(mut operation: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    const ATTEMPTS: usize = 50;
+    for attempt in 0..ATTEMPTS {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt + 1 < ATTEMPTS
+                    && (error.kind() == std::io::ErrorKind::PermissionDenied
+                        || matches!(error.raw_os_error(), Some(32 | 33))) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded removal loop always returns")
 }
 
 #[cfg(windows)]
@@ -3419,7 +3442,6 @@ mod tests {
         ));
         let version_root = root.join("versions").join("target-build");
         std::fs::create_dir_all(&version_root).unwrap();
-        std::fs::create_dir(root.join("blocked.exe")).unwrap();
         std::fs::write(root.join(CURRENT_POINTER_FILE), b"target-pointer").unwrap();
         let activation = InstallActivation {
             install_root: root.clone(),
@@ -3461,6 +3483,31 @@ mod tests {
         assert!(!version_root.exists());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installer_cleanup_retries_only_transient_windows_locks() {
+        let attempts = std::cell::Cell::new(0);
+        retry_locked_remove(|| {
+            attempts.set(attempts.get() + 1);
+            (attempts.get() >= 3)
+                .then_some(())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap();
+        assert_eq!(attempts.get(), 3);
+
+        let attempts = std::cell::Cell::new(0);
+        assert_eq!(
+            retry_locked_remove(|| {
+                attempts.set(attempts.get() + 1);
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            })
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(attempts.get(), 1);
     }
 
     #[test]
