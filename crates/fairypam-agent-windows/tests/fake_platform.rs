@@ -1,9 +1,10 @@
 use fairypam_agent_core::profile::{
     profile_content_sha256, verify_profile, ProfileContent, ProfileEnvelope, SignatureVerifier,
 };
+use fairypam_agent_core::target::{ClientRect, IntegrityLevel, TargetBinding};
 use fairypam_agent_windows::{
     lock_unique, revalidate_identity, FakeWindows, Rect, TargetIdentity, WindowsError,
-    WindowsTargetCandidate,
+    WindowsTargetCandidate, WindowsTargetPlatform,
 };
 
 struct AcceptSignature;
@@ -70,6 +71,26 @@ fn candidate(hwnd: isize, started_at: u64) -> WindowsTargetCandidate {
     }
 }
 
+fn binding(hwnd: u64, started_at: u64) -> TargetBinding {
+    TargetBinding {
+        profile_id: "testbed".into(),
+        profile_version: "1.0.0".into(),
+        process_id: 42,
+        process_name: "testbed.exe".into(),
+        process_started_at_unix_ms: started_at,
+        process_path_sha256: "11".repeat(32),
+        window_handle: hwnd,
+        window_title: format!("FairyPam Testbed {hwnd}"),
+        window_class: "FairyPamTestbed".into(),
+        client_rect: ClientRect {
+            width: 1280,
+            height: 720,
+        },
+        dpi: 96,
+        integrity: IntegrityLevel::Medium,
+    }
+}
+
 #[test]
 fn ambiguous_candidates_are_not_auto_selected() {
     let mut platform = FakeWindows::with_candidates(vec![candidate(1, 100), candidate(2, 101)]);
@@ -83,6 +104,17 @@ fn stale_process_start_time_invalidates_identity() {
     let mut platform = FakeWindows::with_candidates(vec![candidate(1, 101)]);
     let error = revalidate_identity(&mut platform, &original.identity).unwrap_err();
     assert_eq!(error.code(), "target.stale");
+}
+
+#[test]
+fn rediscovery_accepts_only_one_replacement_window_from_the_same_process() {
+    let mut targets =
+        WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![candidate(2, 100)]));
+
+    let refreshed = targets.rediscover(&profile(), &binding(1, 100)).unwrap();
+
+    assert_eq!(refreshed.window_handle, 2);
+    assert_eq!(refreshed.process_id, 42);
 }
 
 #[test]

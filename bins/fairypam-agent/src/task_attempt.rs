@@ -164,6 +164,47 @@ impl TaskAttemptRuntime {
             .and_then(|active| active.owned_target.clone()))
     }
 
+    pub fn refresh_owned_target(
+        &mut self,
+        reference: &AttemptRef,
+        binding: TargetBinding,
+    ) -> Result<(), AgentError> {
+        self.load_active()?;
+        let Some(mut active) = self.active.take() else {
+            return Err(attempt_not_found());
+        };
+        if let Err(error) = active.require_reference(reference) {
+            self.active = Some(active);
+            return Err(error);
+        }
+        let Some(previous) = active.owned_target.as_ref() else {
+            self.active = Some(active);
+            return Err(AgentError::new(
+                "target_invalid",
+                "task attempt has no Agent-owned target to refresh",
+            ));
+        };
+        if previous.profile_id != binding.profile_id
+            || previous.profile_version != binding.profile_version
+            || previous.process_id != binding.process_id
+            || previous.process_started_at_unix_ms != binding.process_started_at_unix_ms
+            || previous.process_path_sha256 != binding.process_path_sha256
+        {
+            self.active = Some(active);
+            return Err(AgentError::new(
+                "target.stale",
+                "refreshed window does not belong to the claimed Agent-owned process",
+            ));
+        }
+        active.owned_target = Some(binding);
+        if let Err(error) = self.persist(&active) {
+            self.active = Some(active);
+            return Err(error);
+        }
+        self.active = Some(active);
+        Ok(())
+    }
+
     pub fn replay(
         &mut self,
         task: &TaskCommandRef,
@@ -1138,6 +1179,26 @@ mod tests {
         }
     }
 
+    fn target_binding(hwnd: u64, started_at: u64) -> TargetBinding {
+        TargetBinding {
+            profile_id: "genshin-impact".into(),
+            profile_version: "1.0.0".into(),
+            process_id: 42,
+            process_name: "YuanShen.exe".into(),
+            process_started_at_unix_ms: started_at,
+            process_path_sha256: "11".repeat(32),
+            window_handle: hwnd,
+            window_title: "原神".into(),
+            window_class: "UnityWndClass".into(),
+            client_rect: fairypam_agent_core::target::ClientRect {
+                width: 1920,
+                height: 1080,
+            },
+            dpi: 96,
+            integrity: fairypam_agent_core::target::IntegrityLevel::High,
+        }
+    }
+
     fn temporary_root() -> PathBuf {
         std::env::temp_dir().join(format!(
             "fairypam-task-attempt-{}-{}",
@@ -1210,6 +1271,35 @@ mod tests {
         assert_eq!(receipt.attempt_state, TaskAttemptState::NotFound as i32);
         assert!(receipt.attempt.is_none());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refreshed_window_must_stay_on_the_claimed_owned_process() {
+        let contract = contract();
+        let begin = task(&contract, "begin-1", 'a');
+        let start = task(&contract, "target-1", 'b');
+        let mut runtime = TaskAttemptRuntime::memory();
+        runtime.begin(&begin, &contract).unwrap();
+        assert!(runtime.prepare(&start, true).unwrap().is_none());
+        runtime
+            .complete_target_start(&start, Some(target_binding(1, 100)), None)
+            .unwrap();
+        let reference = start.attempt.as_ref().unwrap();
+
+        runtime
+            .refresh_owned_target(reference, target_binding(2, 100))
+            .unwrap();
+        assert_eq!(
+            runtime.owned_target(&start).unwrap().unwrap().window_handle,
+            2
+        );
+        assert_eq!(
+            runtime
+                .refresh_owned_target(reference, target_binding(3, 101))
+                .unwrap_err()
+                .code(),
+            "target.stale"
+        );
     }
 
     #[test]

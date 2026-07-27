@@ -106,6 +106,12 @@ pub trait RuntimePlatform: Send {
         selector: TargetSelector,
     ) -> Result<TargetBinding, AgentError>;
 
+    fn rediscover_target(
+        &mut self,
+        profile: &VerifiedProfile,
+        binding: &TargetBinding,
+    ) -> Result<TargetBinding, AgentError>;
+
     fn start_capture(
         &mut self,
         binding: &TargetBinding,
@@ -176,9 +182,23 @@ impl CommandOutcome {
 
 struct CaptureWorker {
     source_id: String,
+    plan: CapturePlan,
     stop: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<CaptureFailure>>>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct CapturePlan {
+    region: CaptureRegion,
+    source_id: String,
+    fps: u32,
+    encoding: RuntimeCaptureEncoding,
+    session: ExecutionSession,
+    frames: Arc<dyn FrameSink>,
+    attempt: Option<AttemptRef>,
+    no_frame_timeout: Duration,
+    rediscovery_allowed: bool,
 }
 
 impl CaptureWorker {
@@ -614,17 +634,18 @@ impl CommandExecutor {
                 let attempt = task
                     .map(|task| self.task_attempt.attempt_ref(task))
                     .transpose()?;
-                let worker = spawn_capture_worker(
-                    capture,
-                    frame_sequence,
-                    value.source_id.clone(),
-                    value.fps,
+                let plan = CapturePlan {
+                    region: source.region.clone(),
+                    source_id: value.source_id.clone(),
+                    fps: value.fps,
                     encoding,
-                    session,
+                    session: session.clone(),
                     frames,
                     attempt,
-                    CAPTURE_NO_FRAME_TIMEOUT,
-                );
+                    no_frame_timeout: CAPTURE_NO_FRAME_TIMEOUT,
+                    rediscovery_allowed: true,
+                };
+                let worker = spawn_capture_worker(capture, frame_sequence, plan);
                 let worker = match worker {
                     Ok(worker) => worker,
                     Err(error) => {
@@ -904,7 +925,7 @@ impl CommandExecutor {
         &mut self,
         session: &ExecutionSession,
     ) -> Result<Option<AgentControlEvent>, AgentError> {
-        let Some((failure, attempt)) = self
+        let Some((mut failure, attempt)) = self
             .capture
             .as_ref()
             .map(CaptureWorker::failure)
@@ -913,18 +934,34 @@ impl CommandExecutor {
         else {
             return Ok(None);
         };
-        let source_id = self
-            .capture
-            .as_ref()
-            .expect("checked above")
-            .source_id
-            .clone();
+        let worker = self.capture.take().expect("checked above");
+        let source_id = worker.source_id.clone();
+        let plan = worker.plan.clone();
         let release_error = self.platform.release_task_input().err();
-        let _ = self.capture.take().expect("checked above").stop();
-        self.frame_sequences.remove(&source_id);
+        let _ = worker.stop();
         if let Some(error) = release_error {
             return Err(error);
         }
+        if plan.rediscovery_allowed
+            && matches!(
+                failure.code(),
+                "capture.no_frame_timeout" | "target.stale" | "target.not_found"
+            )
+        {
+            match self.restart_capture_after_rediscovery(plan) {
+                Ok(worker) => {
+                    tracing::warn!(
+                        capture_source_id = source_id,
+                        reason = failure.code(),
+                        "capture rebuilt after one signed-Profile target rediscovery"
+                    );
+                    self.capture = Some(worker);
+                    return Ok(None);
+                }
+                Err(error) => failure = error,
+            }
+        }
+        self.frame_sequences.remove(&source_id);
         Ok(Some(AgentControlEvent {
             payload: Some(agent_control_event::Payload::SafetyEvent(SafetyEvent {
                 session: Some(session.reference.clone()),
@@ -933,6 +970,40 @@ impl CommandExecutor {
                 attempt,
             })),
         }))
+    }
+
+    fn restart_capture_after_rediscovery(
+        &mut self,
+        mut plan: CapturePlan,
+    ) -> Result<CaptureWorker, AgentError> {
+        let profile = self.active_profile.clone().ok_or_else(|| {
+            AgentError::new(
+                "target.not_found",
+                "capture recovery requires an active signed Profile",
+            )
+        })?;
+        let binding = self.binding.clone().ok_or_else(|| {
+            AgentError::new(
+                "target.not_found",
+                "capture recovery requires an active target binding",
+            )
+        })?;
+        let refreshed = self.platform.rediscover_target(&profile, &binding)?;
+        if let Some(attempt) = plan.attempt.as_ref() {
+            self.task_attempt
+                .refresh_owned_target(attempt, refreshed.clone())?;
+        }
+        self.binding = Some(refreshed.clone());
+        let capture =
+            self.platform
+                .start_capture(&refreshed, plan.region.clone(), plan.encoding)?;
+        let frame_sequence = Arc::clone(
+            self.frame_sequences
+                .entry(plan.source_id.clone())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+        );
+        plan.rediscovery_allowed = false;
+        spawn_capture_worker(capture, frame_sequence, plan)
     }
 
     pub fn reset(&mut self) -> Result<(), AgentError> {
@@ -1070,24 +1141,23 @@ fn parse_encoding(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_capture_worker(
     mut capture: Box<dyn RuntimeCapture>,
     frame_sequence: Arc<AtomicU64>,
-    source_id: String,
-    fps: u32,
-    encoding: RuntimeCaptureEncoding,
-    session: &ExecutionSession,
-    frames: Arc<dyn FrameSink>,
-    attempt: Option<AttemptRef>,
-    no_frame_timeout: Duration,
+    plan: CapturePlan,
 ) -> Result<CaptureWorker, AgentError> {
+    let source_id = plan.source_id.clone();
+    let fps = plan.fps;
+    let encoding = plan.encoding;
+    let session = plan.session.reference.clone();
+    let frames = Arc::clone(&plan.frames);
+    let attempt = plan.attempt.clone();
+    let no_frame_timeout = plan.no_frame_timeout;
     let stop = Arc::new(AtomicBool::new(false));
     let failure = Arc::new(Mutex::new(None));
     let worker_stop = Arc::clone(&stop);
     let worker_failure = Arc::clone(&failure);
     let worker_source = source_id.clone();
-    let session = session.reference.clone();
     let thread = std::thread::Builder::new()
         .name(format!("fairypam-capture-{source_id}"))
         .spawn(move || {
@@ -1185,6 +1255,7 @@ fn spawn_capture_worker(
         })?;
     Ok(CaptureWorker {
         source_id,
+        plan,
         stop,
         failure,
         thread: Some(thread),
@@ -1255,6 +1326,17 @@ impl RuntimePlatform for UnsupportedPlatform {
         ))
     }
 
+    fn rediscover_target(
+        &mut self,
+        _profile: &VerifiedProfile,
+        _binding: &TargetBinding,
+    ) -> Result<TargetBinding, AgentError> {
+        Err(AgentError::new(
+            "target.platform_unsupported",
+            "target operations require Windows",
+        ))
+    }
+
     fn start_capture(
         &mut self,
         _binding: &TargetBinding,
@@ -1317,6 +1399,7 @@ struct WindowsRuntimePlatform {
     targets: fairypam_agent_windows::WindowsTargetPlatform<fairypam_agent_windows::NativeWindows>,
     owned: Option<OwnedTaskProcess>,
     task_input: Option<WindowsTaskInput>,
+    rediscovery_used: bool,
 }
 
 #[cfg(windows)]
@@ -1392,6 +1475,7 @@ impl WindowsRuntimePlatform {
             ),
             owned: None,
             task_input: None,
+            rediscovery_used: false,
         }
     }
 
@@ -1479,6 +1563,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 })?;
             let binding = self.targets.lock(profile, candidate.selector)?;
             self.owned.as_mut().expect("checked above").binding = binding.clone();
+            self.rediscovery_used = false;
             return Ok(binding);
         }
         let executable = crate::observability::resolve_profile_executable(profile)?;
@@ -1537,6 +1622,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             job: job.into_raw(),
             binding: binding.clone(),
         });
+        self.rediscovery_used = false;
         Ok(binding)
     }
 
@@ -1551,7 +1637,37 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         selector: TargetSelector,
     ) -> Result<TargetBinding, AgentError> {
         use fairypam_agent_core::platform::TargetPlatform;
-        self.targets.lock(profile, selector)
+        let binding = self.targets.lock(profile, selector)?;
+        self.rediscovery_used = false;
+        Ok(binding)
+    }
+
+    fn rediscover_target(
+        &mut self,
+        profile: &VerifiedProfile,
+        binding: &TargetBinding,
+    ) -> Result<TargetBinding, AgentError> {
+        if self.rediscovery_used {
+            return Err(AgentError::new(
+                "target.not_found",
+                "the active target has already used its one rediscovery attempt",
+            ));
+        }
+        self.rediscovery_used = true;
+        let refreshed = self.targets.rediscover(profile, binding)?;
+        if let Some(owned) = self.owned.as_mut() {
+            if owned.binding.process_id != refreshed.process_id
+                || owned.binding.process_started_at_unix_ms != refreshed.process_started_at_unix_ms
+                || owned.binding.process_path_sha256 != refreshed.process_path_sha256
+            {
+                return Err(AgentError::new(
+                    "target.stale",
+                    "rediscovered window does not belong to the Agent-owned process",
+                ));
+            }
+            owned.binding = refreshed.clone();
+        }
+        Ok(refreshed)
     }
 
     fn start_capture(
@@ -2021,6 +2137,7 @@ mod tests {
     #[derive(Default)]
     struct FakePlatformState {
         launch_calls: usize,
+        rediscovery_calls: usize,
         target_owned: bool,
         focus_calls: Vec<TargetBinding>,
         close_calls: Vec<(TargetBinding, Duration)>,
@@ -2061,6 +2178,18 @@ mod tests {
         ) -> Result<TargetBinding, AgentError> {
             assert_eq!(selector.candidate_id, "candidate-1");
             Ok(binding())
+        }
+
+        fn rediscover_target(
+            &mut self,
+            _profile: &VerifiedProfile,
+            binding: &TargetBinding,
+        ) -> Result<TargetBinding, AgentError> {
+            let mut state = self.state.lock().unwrap();
+            state.rediscovery_calls += 1;
+            let mut refreshed = binding.clone();
+            refreshed.window_handle = 200;
+            Ok(refreshed)
         }
 
         fn start_capture(
@@ -2159,19 +2288,31 @@ mod tests {
         }
     }
 
+    fn capture_plan(
+        frames: Arc<dyn FrameSink>,
+        no_frame_timeout: Duration,
+        rediscovery_allowed: bool,
+    ) -> CapturePlan {
+        CapturePlan {
+            region: CaptureRegion::FullClient,
+            source_id: "client".into(),
+            fps: 100,
+            encoding: RuntimeCaptureEncoding::Jpeg { quality: 80 },
+            session: ExecutionSession::test(),
+            frames,
+            attempt: None,
+            no_frame_timeout,
+            rediscovery_allowed,
+        }
+    }
+
     #[test]
     fn transient_capture_deadline_does_not_stop_the_worker() {
         let sink = Arc::new(CollectFrames::default());
         let worker = spawn_capture_worker(
             Box::new(DeadlineThenFrameCapture { calls: 0 }),
             Arc::new(AtomicU64::new(0)),
-            "client".into(),
-            100,
-            RuntimeCaptureEncoding::Jpeg { quality: 80 },
-            &ExecutionSession::test(),
-            sink.clone(),
-            None,
-            Duration::from_secs(1),
+            capture_plan(sink.clone(), Duration::from_secs(1), false),
         )
         .unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -2185,13 +2326,11 @@ mod tests {
         let worker = spawn_capture_worker(
             Box::new(DeadlineCapture),
             Arc::new(AtomicU64::new(0)),
-            "client".into(),
-            100,
-            RuntimeCaptureEncoding::Jpeg { quality: 80 },
-            &ExecutionSession::test(),
-            Arc::new(CollectFrames::default()),
-            None,
-            Duration::from_millis(30),
+            capture_plan(
+                Arc::new(CollectFrames::default()),
+                Duration::from_millis(30),
+                false,
+            ),
         )
         .unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -2217,13 +2356,11 @@ mod tests {
             spawn_capture_worker(
                 Box::new(DeadlineCapture),
                 sequence,
-                "client".into(),
-                100,
-                RuntimeCaptureEncoding::Jpeg { quality: 80 },
-                &ExecutionSession::test(),
-                Arc::new(CollectFrames::default()),
-                None,
-                Duration::from_millis(30),
+                capture_plan(
+                    Arc::new(CollectFrames::default()),
+                    Duration::from_millis(30),
+                    false,
+                ),
             )
             .unwrap(),
         );
@@ -2238,6 +2375,52 @@ mod tests {
         assert!(!state.lock().unwrap().input_active);
         assert!(executor.capture.is_none());
         assert!(!executor.frame_sequences.contains_key("client"));
+        assert!(matches!(
+            event.payload,
+            Some(agent_control_event::Payload::SafetyEvent(SafetyEvent {
+                ref reason,
+                ref state,
+                ..
+            })) if reason == "capture.no_frame_timeout" && state == "capture_failed"
+        ));
+    }
+
+    #[test]
+    fn capture_failure_rediscovery_rebuilds_once_then_fails_closed() {
+        let (mut executor, state) = executor_with_state();
+        let sequence = Arc::new(AtomicU64::new(0));
+        executor.active_profile = Some(verified_profile());
+        executor.binding = Some(binding());
+        executor
+            .frame_sequences
+            .insert("client".into(), sequence.clone());
+        executor.capture = Some(
+            spawn_capture_worker(
+                Box::new(DeadlineCapture),
+                sequence,
+                capture_plan(
+                    Arc::new(CollectFrames::default()),
+                    Duration::from_millis(30),
+                    true,
+                ),
+            )
+            .unwrap(),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(executor
+            .capture_failure_event(&ExecutionSession::test())
+            .unwrap()
+            .is_none());
+        assert_eq!(executor.binding.as_ref().unwrap().window_handle, 200);
+        assert_eq!(state.lock().unwrap().rediscovery_calls, 1);
+
+        std::thread::sleep(Duration::from_millis(100));
+        let event = executor
+            .capture_failure_event(&ExecutionSession::test())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.lock().unwrap().rediscovery_calls, 1);
         assert!(matches!(
             event.payload,
             Some(agent_control_event::Payload::SafetyEvent(SafetyEvent {

@@ -410,6 +410,44 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
         Ok(current.identity)
     }
 
+    pub fn rediscover(
+        &mut self,
+        profile: &VerifiedProfile,
+        binding: &TargetBinding,
+    ) -> Result<TargetBinding, AgentError> {
+        if binding.profile_id != profile.profile().id
+            || binding.profile_version != profile.profile().version
+        {
+            return Err(WindowsError::new(
+                "target.stale",
+                "active binding does not belong to the requested signed Profile",
+            )
+            .into());
+        }
+        let expected = binding_identity(binding)?;
+        let mut matches = matching_candidates(&mut self.api, profile)?
+            .into_iter()
+            .filter(|candidate| {
+                candidate.identity.pid == expected.pid
+                    && candidate.identity.process_started_at == expected.process_started_at
+                    && candidate.identity.process_path_sha256 == expected.process_path_sha256
+            });
+        let candidate = matches.next().ok_or_else(|| {
+            WindowsError::new(
+                "target.not_found",
+                "the signed Profile found no replacement window for the active process",
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(WindowsError::new(
+                "target.ambiguous",
+                "the active process exposes multiple signed Profile windows",
+            )
+            .into());
+        }
+        Ok(candidate_to_binding(candidate, profile))
+    }
+
     pub fn focus(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError> {
         let current = revalidate_identity(&mut self.api, &binding_identity(binding)?)?;
         self.api.focus_target(&current.identity)?;
