@@ -678,10 +678,7 @@ mod native {
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, SetActiveWindow, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-        VK_MENU,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
         GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
@@ -807,7 +804,6 @@ mod native {
             let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
         }
         let mut foreground_request_accepted = false;
-        let mut alt_up_sent = None;
         for _ in 0..5 {
             foreground_request_accepted |= unsafe { SetForegroundWindow(hwnd) }.as_bool();
             let _ = unsafe { SetActiveWindow(hwnd) };
@@ -815,24 +811,6 @@ mod native {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
-        }
-        if unsafe { GetForegroundWindow() } != hwnd {
-            let alt_up = INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VK_MENU,
-                        wScan: 0,
-                        dwFlags: KEYEVENTF_KEYUP,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            };
-            alt_up_sent =
-                Some(unsafe { SendInput(&[alt_up], std::mem::size_of::<INPUT>() as i32) == 1 });
-            foreground_request_accepted |= unsafe { SetForegroundWindow(hwnd) }.as_bool();
-            let _ = unsafe { SetActiveWindow(hwnd) };
         }
         if unsafe { GetForegroundWindow() } == hwnd {
             let _ = unsafe { BringWindowToTop(hwnd) };
@@ -853,10 +831,16 @@ mod native {
                 let foreground = unsafe { GetForegroundWindow() };
                 let mut foreground_pid = 0;
                 unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_pid)) };
+                if foreground == HWND::default() {
+                    return Err(WindowsError::new(
+                        "target.interactive_desktop_unavailable",
+                        "the interactive Windows desktop is unavailable or locked",
+                    ));
+                }
                 return Err(WindowsError::new(
                     "target.focus_failed",
                     format!(
-                        "target did not become the foreground window; request_accepted={foreground_request_accepted}, alt_up_sent={alt_up_sent:?}, foreground_pid={foreground_pid}, target_pid={}",
+                        "target did not become the foreground window; request_accepted={foreground_request_accepted}, foreground_pid={foreground_pid}, target_pid={}",
                         identity.pid
                     ),
                 ));
