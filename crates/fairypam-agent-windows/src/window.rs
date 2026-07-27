@@ -673,7 +673,7 @@ mod native {
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
     use windows::Win32::System::Threading::{
-        AttachThreadInput, GetProcessTimes, OpenProcess, OpenProcessToken,
+        AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken,
         QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
@@ -792,19 +792,33 @@ mod native {
         let foreground = unsafe { GetForegroundWindow() };
         let target_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
         let foreground_thread = unsafe { GetWindowThreadProcessId(foreground, None) };
-        let attached = foreground_thread != 0
+        let current_thread = unsafe { GetCurrentThreadId() };
+        let attached_current = foreground_thread != 0
+            && foreground_thread != current_thread
+            && unsafe { AttachThreadInput(current_thread, foreground_thread, true) }.as_bool();
+        let attached_target = foreground_thread != 0
             && target_thread != 0
             && foreground_thread != target_thread
-            && unsafe { AttachThreadInput(target_thread, foreground_thread, true) }.as_bool();
-        let _ = unsafe { SetForegroundWindow(hwnd) };
+            && unsafe { AttachThreadInput(foreground_thread, target_thread, true) }.as_bool();
         if unsafe { IsIconic(hwnd).as_bool() } {
             let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
         }
-        let _ = unsafe { BringWindowToTop(hwnd) };
-        let _ = unsafe { SetActiveWindow(hwnd) };
-        if attached
-            && !unsafe { AttachThreadInput(target_thread, foreground_thread, false) }.as_bool()
-        {
+        for _ in 0..5 {
+            let _ = unsafe { SetForegroundWindow(hwnd) };
+            let _ = unsafe { SetActiveWindow(hwnd) };
+            if unsafe { GetForegroundWindow() } == hwnd {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if unsafe { GetForegroundWindow() } == hwnd {
+            let _ = unsafe { BringWindowToTop(hwnd) };
+        }
+        let detached_target = !attached_target
+            || unsafe { AttachThreadInput(foreground_thread, target_thread, false) }.as_bool();
+        let detached_current = !attached_current
+            || unsafe { AttachThreadInput(current_thread, foreground_thread, false) }.as_bool();
+        if !detached_target || !detached_current {
             return Err(WindowsError::new(
                 "target.focus_failed",
                 "Windows input queues could not be detached after foreground activation",
