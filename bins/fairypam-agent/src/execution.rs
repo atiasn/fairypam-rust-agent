@@ -1060,6 +1060,12 @@ fn spawn_capture_worker(
                             );
                         }
                     }
+                    Err(error) if error.code() == "capture.deadline" => {
+                        tracing::debug!(
+                            capture_source_id = %worker_source,
+                            "capture frame deadline missed"
+                        );
+                    }
                     Err(error) => {
                         tracing::error!(code = error.code(), %error, "capture failed");
                         break;
@@ -1870,6 +1876,26 @@ mod tests {
         }
     }
 
+    struct DeadlineThenFrameCapture {
+        calls: u8,
+    }
+
+    impl RuntimeCapture for DeadlineThenFrameCapture {
+        fn next_frame(&mut self, _deadline: Instant) -> Result<RuntimeCapturedFrame, AgentError> {
+            self.calls += 1;
+            match self.calls {
+                1 => Err(AgentError::new("capture.deadline", "transient frame gap")),
+                2 => Ok(RuntimeCapturedFrame {
+                    bytes: vec![1, 2, 3],
+                    width: 1280,
+                    height: 720,
+                    sequence: 1,
+                }),
+                _ => Err(AgentError::new("capture.complete", "test capture completed")),
+            }
+        }
+    }
+
     #[derive(Default)]
     struct FakePlatformState {
         launch_calls: usize,
@@ -2009,6 +2035,26 @@ mod tests {
             self.0.lock().unwrap().push(frame);
             Ok(())
         }
+    }
+
+    #[test]
+    fn transient_capture_deadline_does_not_stop_the_worker() {
+        let sink = Arc::new(CollectFrames::default());
+        let worker = spawn_capture_worker(
+            Box::new(DeadlineThenFrameCapture { calls: 0 }),
+            Arc::new(AtomicU64::new(0)),
+            "client".into(),
+            100,
+            RuntimeCaptureEncoding::Jpeg { quality: 80 },
+            &ExecutionSession::test(),
+            sink.clone(),
+            None,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        worker.stop();
+
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
     }
 
     fn executor() -> CommandExecutor {
