@@ -1404,16 +1404,13 @@ struct WindowsRuntimePlatform {
 
 #[cfg(windows)]
 struct OwnedTaskProcess {
-    _process: OwnedProcess,
+    _child: std::process::Child,
     job: usize,
     binding: TargetBinding,
 }
 
 #[cfg(windows)]
 struct OwnedJob(usize);
-
-#[cfg(windows)]
-struct OwnedProcess(usize);
 
 #[cfg(windows)]
 impl OwnedJob {
@@ -1431,106 +1428,6 @@ impl Drop for OwnedJob {
 
         // SAFETY: this value owns the Job Object handle until this drop.
         let _ = unsafe { CloseHandle(HANDLE(self.0 as _)) };
-    }
-}
-
-#[cfg(windows)]
-impl OwnedProcess {
-    fn launch(
-        executable: &std::path::Path,
-        working_directory: &std::path::Path,
-    ) -> Result<Self, AgentError> {
-        use std::os::windows::ffi::OsStrExt;
-
-        let executable = executable
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let working_directory = working_directory
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let handle = std::thread::spawn(move || {
-            use windows::core::PCWSTR;
-            use windows::Win32::System::Com::{
-                CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
-            };
-            use windows::Win32::UI::Shell::{
-                ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
-                SHELLEXECUTEINFOW,
-            };
-            use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }
-                .ok()
-                .map_err(|error| AgentError::new("target.launch_failed", error.to_string()))?;
-            let mut execution = SHELLEXECUTEINFOW {
-                cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-                fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
-                lpFile: PCWSTR(executable.as_ptr()),
-                lpDirectory: PCWSTR(working_directory.as_ptr()),
-                nShow: SW_SHOWNORMAL.0,
-                ..Default::default()
-            };
-            let result = unsafe { ShellExecuteExW(&mut execution) };
-            unsafe { CoUninitialize() };
-            result.map_err(|error| AgentError::new("target.launch_failed", error.to_string()))?;
-            if execution.hProcess.is_invalid() {
-                return Err(AgentError::new(
-                    "target.launch_failed",
-                    "Windows Shell did not return the launched process",
-                ));
-            }
-            Ok(execution.hProcess.0 as usize)
-        })
-        .join()
-        .map_err(|_| AgentError::new("target.launch_failed", "Windows Shell launch panicked"))??;
-        Ok(Self(handle))
-    }
-
-    fn handle(&self) -> windows::Win32::Foundation::HANDLE {
-        windows::Win32::Foundation::HANDLE(self.0 as _)
-    }
-
-    fn id(&self) -> Result<u32, AgentError> {
-        let id = unsafe { windows::Win32::System::Threading::GetProcessId(self.handle()) };
-        if id == 0 {
-            Err(AgentError::new(
-                "target.launch_failed",
-                "launched process identity is unavailable",
-            ))
-        } else {
-            Ok(id)
-        }
-    }
-
-    fn has_exited(&self) -> Result<bool, AgentError> {
-        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-        use windows::Win32::System::Threading::WaitForSingleObject;
-
-        match unsafe { WaitForSingleObject(self.handle(), 0) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            status => Err(AgentError::new(
-                "target.launch_failed",
-                format!("waiting for launched process failed with status {status:?}"),
-            )),
-        }
-    }
-
-    fn terminate(&self) {
-        let _ = unsafe { windows::Win32::System::Threading::TerminateProcess(self.handle(), 1) };
-    }
-}
-
-#[cfg(windows)]
-impl Drop for OwnedProcess {
-    fn drop(&mut self) {
-        let _ = unsafe {
-            windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(self.0 as _))
-        };
     }
 }
 
@@ -1641,6 +1538,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         profile: &VerifiedProfile,
     ) -> Result<TargetBinding, AgentError> {
         use fairypam_agent_core::platform::TargetPlatform;
+        use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 
@@ -1676,11 +1574,15 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             )
         })?;
         let job = kill_on_close_job()?;
-        let process = OwnedProcess::launch(&executable, working_directory)?;
-        let process_id = process.id()?;
-        // SAFETY: process and job each own a valid Windows handle.
-        if unsafe { AssignProcessToJobObject(HANDLE(job.0 as _), process.handle()) }.is_err() {
-            process.terminate();
+        let mut child = std::process::Command::new(&executable)
+            .current_dir(working_directory)
+            .spawn()
+            .map_err(|error| AgentError::new("target.launch_failed", error.to_string()))?;
+        // SAFETY: child owns a valid process handle and job owns a configured Job Object handle.
+        if unsafe { AssignProcessToJobObject(HANDLE(job.0 as _), HANDLE(child.as_raw_handle())) }
+            .is_err()
+        {
+            let _ = child.kill();
             return Err(AgentError::new(
                 "target.launch_failed",
                 "task target could not be assigned to its cleanup Job Object",
@@ -1688,7 +1590,11 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         }
         let deadline = Instant::now() + Duration::from_secs(60);
         let binding = loop {
-            if process.has_exited()? {
+            if child
+                .try_wait()
+                .map_err(|error| AgentError::new("target.launch_failed", error.to_string()))?
+                .is_some()
+            {
                 return Err(AgentError::new(
                     "target.launch_failed",
                     "task target exited before its trusted window was ready",
@@ -1698,20 +1604,20 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 .targets
                 .enumerate(profile)?
                 .into_iter()
-                .any(|candidate| candidate.process_id == process_id)
+                .any(|candidate| candidate.process_id == child.id())
             {
                 std::thread::sleep(Duration::from_secs(5));
                 if let Some(stable_candidate) = self
                     .targets
                     .enumerate(profile)?
                     .into_iter()
-                    .find(|candidate| candidate.process_id == process_id)
+                    .find(|candidate| candidate.process_id == child.id())
                 {
                     break self.targets.lock(profile, stable_candidate.selector)?;
                 }
             }
             if Instant::now() >= deadline {
-                process.terminate();
+                let _ = child.kill();
                 return Err(AgentError::new(
                     "target.launch_failed",
                     "task target window did not become ready within 60 seconds",
@@ -1720,7 +1626,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             std::thread::sleep(Duration::from_millis(250));
         };
         self.owned = Some(OwnedTaskProcess {
-            _process: process,
+            _child: child,
             job: job.into_raw(),
             binding: binding.clone(),
         });

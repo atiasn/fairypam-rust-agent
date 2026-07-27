@@ -672,10 +672,13 @@ mod native {
     use windows::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
+    use windows::Win32::System::StationsAndDesktops::{
+        GetThreadDesktop, GetUserObjectInformationW, UOI_IO,
+    };
     use windows::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-        WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SYNCHRONIZE,
+        GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken,
+        QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -788,18 +791,40 @@ mod native {
         require_same_identity(identity, &current.identity)?;
         let hwnd = HWND(identity.hwnd as *mut c_void);
         let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
-        let _ = unsafe { SetForegroundWindow(hwnd) };
+        let request_accepted = unsafe { SetForegroundWindow(hwnd) }.as_bool();
         let deadline = Instant::now() + Duration::from_millis(500);
         while unsafe { GetForegroundWindow() } != hwnd {
             if Instant::now() >= deadline {
+                let foreground = unsafe { GetForegroundWindow() };
+                let mut foreground_pid = 0;
+                unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_pid)) };
                 return Err(WindowsError::new(
                     "target.focus_failed",
-                    "target did not become the foreground window",
+                    format!(
+                        "[DEBUG-focus-desktop] target did not become the foreground window; request_accepted={request_accepted}, desktop_receives_input={:?}, foreground_hwnd={}, foreground_pid={foreground_pid}, target_pid={}",
+                        desktop_receives_input(), foreground.0 as usize, identity.pid
+                    ),
                 ));
             }
             thread::sleep(Duration::from_millis(10));
         }
         Ok(())
+    }
+
+    fn desktop_receives_input() -> Option<bool> {
+        let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok()?;
+        let mut receives_input = BOOL::default();
+        unsafe {
+            GetUserObjectInformationW(
+                HANDLE(desktop.0),
+                UOI_IO,
+                Some(std::ptr::from_mut(&mut receives_input).cast()),
+                std::mem::size_of::<BOOL>() as u32,
+                None,
+            )
+        }
+        .ok()?;
+        Some(receives_input.as_bool())
     }
 
     pub(super) fn close_target(
