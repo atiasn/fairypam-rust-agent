@@ -4,7 +4,9 @@
 use std::fs;
 use std::io::Write;
 use std::os::windows::io::FromRawHandle;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "dev-automation")]
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fairypam_agent_core::AgentError;
@@ -270,7 +272,7 @@ fn persist(root: &Path, payload: &Value) -> Result<(), AgentError> {
         }
 
         // ponytail: validate the complete candidate before changing the active pointer.
-        crate::runtime::validate_enrollment_candidate(&root, &generation).map_err(|_| failed())?;
+        crate::runtime::validate_enrollment_candidate(root, &generation).map_err(|_| failed())?;
         write_private(
             &temporary,
             &serde_json::to_vec(&json!({"generation": generation})).map_err(|_| failed())?,

@@ -187,10 +187,10 @@ impl RuntimeConfig {
 
     #[cfg(windows)]
     fn from_enrollment_state_at(root: &Path) -> Result<Self, AgentError> {
-        crate::enrollment::ensure_private_directory(&root)?;
+        crate::enrollment::ensure_private_directory(root)?;
         let pointer = load_private_json(&root.join("current.json"))?;
         let generation = enrollment_field(&pointer, "generation")?;
-        Self::from_enrollment_candidate(&root, generation)
+        Self::from_enrollment_candidate(root, generation)
     }
 
     #[cfg(windows)]
@@ -1028,7 +1028,7 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
     #[cfg(windows)]
     {
         let _instance = AgentInstance::acquire()?;
-        return run_windows(config, production_local_control_config()?).await;
+        run_windows(config, production_local_control_config()?).await
     }
     #[cfg(not(windows))]
     {

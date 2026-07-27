@@ -320,7 +320,7 @@ fn enrollment_source_keeps_claims_bounded_and_publishes_only_validated_candidate
     assert!(source.contains("CLAIM_OPERATION_TIMEOUT_MS"));
     assert!(source.contains("set_remaining_timeouts(request, deadline)"));
     assert!(source.contains("ensure_success_status(request)"));
-    assert!(source.contains("crate::runtime::validate_enrollment_candidate(&root, &generation)"));
+    assert!(source.contains("crate::runtime::validate_enrollment_candidate(root, &generation)"));
     assert!(
         source.find("validate_enrollment_candidate") < source.rfind("MoveFileExW("),
         "candidate validation must precede pointer publication"
