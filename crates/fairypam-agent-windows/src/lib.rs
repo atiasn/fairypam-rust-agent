@@ -52,6 +52,7 @@ impl WindowsTargetPlatform<NativeWindows> {
         region: fairypam_agent_core::profile::CaptureRegion,
         encoding: CaptureEncoding,
     ) -> Result<WindowsTargetCapture, fairypam_agent_core::AgentError> {
+        self.focus(binding)?;
         let identity = self.capture_identity(binding)?;
         WindowsTargetCapture::new(binding.clone(), identity, region, encoding)
             .map_err(fairypam_agent_core::AgentError::from)
@@ -63,6 +64,9 @@ impl WindowsTargetPlatform<NativeWindows> {
         binding: fairypam_agent_core::target::TargetBinding,
         guardian: G,
     ) -> Result<WindowsInput<G>, fairypam_agent_input::SafetyError> {
+        self.focus(&binding).map_err(|error| {
+            fairypam_agent_input::SafetyError::new(error.code(), error.to_string())
+        })?;
         let target = self.lock_input_target(&binding).map_err(|error| {
             fairypam_agent_input::SafetyError::new(error.code(), error.to_string())
         })?;

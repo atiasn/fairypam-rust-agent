@@ -400,10 +400,10 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
         binding: &TargetBinding,
     ) -> Result<TargetIdentity, AgentError> {
         let current = revalidate_identity(&mut self.api, &binding_identity(binding)?)?;
-        if current.minimized || !current.capturable {
+        if !current.foreground || current.minimized || !current.capturable {
             return Err(WindowsError::new(
                 "target.capture_not_permitted",
-                "capture target must be visible and capturable",
+                "capture target must be foreground, visible, and capturable",
             )
             .into());
         }
@@ -571,14 +571,26 @@ mod tests {
     }
 
     #[test]
-    fn locked_input_target_requires_live_foreground_revalidation() {
+    fn input_and_capture_require_live_foreground_revalidation() {
         let mut foreground = FakeWindows::with_candidates(vec![input_candidate(true)]);
         let locked = revalidate_input_target(&mut foreground, &input_binding()).unwrap();
         assert_eq!(locked.identity().client_rect.left, 10);
 
-        let mut background = FakeWindows::with_candidates(vec![input_candidate(false)]);
-        let error = revalidate_input_target(&mut background, &input_binding()).unwrap_err();
-        assert_eq!(error.code(), "target.input_not_permitted");
+        let binding = input_binding();
+        let mut targets =
+            WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![input_candidate(false)]));
+        assert_eq!(
+            targets.lock_input_target(&binding).unwrap_err().code(),
+            "target.input_not_permitted"
+        );
+        assert_eq!(
+            targets.capture_identity(&binding).unwrap_err().code(),
+            "target.capture_not_permitted"
+        );
+
+        assert!(targets.focus(&binding).unwrap().foreground);
+        targets.lock_input_target(&binding).unwrap();
+        targets.capture_identity(&binding).unwrap();
     }
 
     #[test]
@@ -669,7 +681,7 @@ mod native {
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowTextW,
         GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
-        WM_CLOSE,
+        ShowWindow, SW_RESTORE, WM_CLOSE,
     };
 
     use crate::{normalized_process_path_sha256, validate_dpi};
@@ -775,6 +787,7 @@ mod native {
         let current = candidate_from_raw_hwnd(identity.hwnd)?;
         require_same_identity(identity, &current.identity)?;
         let hwnd = HWND(identity.hwnd as *mut c_void);
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
         if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
             return Err(WindowsError::new(
                 "target.focus_failed",
