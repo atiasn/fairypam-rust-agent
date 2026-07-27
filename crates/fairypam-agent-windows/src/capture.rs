@@ -425,8 +425,8 @@ impl BitBltCaptureBackend {
             Ok(bitmap) if !bits.is_null() => bitmap,
             Ok(bitmap) => {
                 unsafe {
-                    windows::Win32::Graphics::Gdi::DeleteObject(bitmap.into());
-                    DeleteDC(target_dc);
+                    let _ = windows::Win32::Graphics::Gdi::DeleteObject(bitmap.into());
+                    let _ = DeleteDC(target_dc);
                     ReleaseDC(Some(hwnd), source_dc);
                 }
                 return Err(WindowsError::new(
@@ -436,7 +436,7 @@ impl BitBltCaptureBackend {
             }
             Err(error) => {
                 unsafe {
-                    DeleteDC(target_dc);
+                    let _ = DeleteDC(target_dc);
                     ReleaseDC(Some(hwnd), source_dc);
                 }
                 return Err(WindowsError::new(
@@ -448,8 +448,8 @@ impl BitBltCaptureBackend {
         let previous_bitmap = unsafe { SelectObject(target_dc, bitmap.into()) };
         if previous_bitmap.is_invalid() {
             unsafe {
-                windows::Win32::Graphics::Gdi::DeleteObject(HGDIOBJ(bitmap.0));
-                DeleteDC(target_dc);
+                let _ = windows::Win32::Graphics::Gdi::DeleteObject(HGDIOBJ(bitmap.0));
+                let _ = DeleteDC(target_dc);
                 ReleaseDC(Some(hwnd), source_dc);
             }
             return Err(WindowsError::new(
@@ -479,10 +479,10 @@ impl BitBltCaptureBackend {
                 );
             }
             if self.bitmap != 0 {
-                DeleteObject(HGDIOBJ(self.bitmap as *mut std::ffi::c_void));
+                let _ = DeleteObject(HGDIOBJ(self.bitmap as *mut std::ffi::c_void));
             }
             if self.target_dc != 0 {
-                DeleteDC(HDC(self.target_dc as *mut std::ffi::c_void));
+                let _ = DeleteDC(HDC(self.target_dc as *mut std::ffi::c_void));
             }
             if self.source_dc != 0 {
                 ReleaseDC(
