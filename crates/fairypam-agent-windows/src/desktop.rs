@@ -100,7 +100,7 @@ fn user_object_name(handle: HANDLE) -> Result<String, WindowsError> {
             "Windows returned no input desktop name",
         ));
     }
-    let mut buffer = vec![0_u16; (needed as usize + 1) / 2];
+    let mut buffer = vec![0_u16; (needed as usize).div_ceil(2)];
     unsafe {
         GetUserObjectInformationW(
             handle,
