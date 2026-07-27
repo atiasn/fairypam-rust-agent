@@ -8,7 +8,9 @@ use tokio::{
 use windows::{
     core::{GUID, HSTRING, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, LocalFree, ERROR_ACCESS_DENIED, HANDLE, HLOCAL},
+        Foundation::{
+            CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, HANDLE, HLOCAL,
+        },
         Security::{
             Authorization::ConvertSidToStringSidW, GetSidSubAuthority, GetSidSubAuthorityCount,
             GetTokenInformation, TokenElevation, TokenIntegrityLevel, TokenSessionId, TokenUser,
@@ -460,6 +462,9 @@ fn same_windows_path(expected: &str, actual: &str) -> bool {
 }
 
 fn pipe_error(error: io::Error) -> LocalClientError {
+    if error.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) {
+        return LocalClientError::transport("local.transport.pipe_busy", error.to_string());
+    }
     match error.kind() {
         io::ErrorKind::NotFound => LocalClientError::pipe_not_found(),
         io::ErrorKind::BrokenPipe
@@ -468,5 +473,17 @@ fn pipe_error(error: io::Error) -> LocalClientError {
         | io::ErrorKind::NotConnected
         | io::ErrorKind::UnexpectedEof => LocalClientError::disconnected(),
         _ => LocalClientError::transport("local.transport.pipe_io", error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipe_busy_is_retryable_transport_error() {
+        let error = pipe_error(io::Error::from_raw_os_error(ERROR_PIPE_BUSY.0 as i32));
+
+        assert_eq!(error.code(), "local.transport.pipe_busy");
     }
 }
