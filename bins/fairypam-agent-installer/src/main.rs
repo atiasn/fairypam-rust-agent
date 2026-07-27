@@ -1206,7 +1206,11 @@ impl InstallActivation {
         }
         std::fs::remove_file(self.install_root.join(MANIFEST_FILE))
             .map_err(|_| ProvisionFailure::InstallRoots)?;
-        let _ = std::fs::remove_dir(self.install_root.join("profiles"));
+        match std::fs::remove_dir_all(self.install_root.join("profiles")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(ProvisionFailure::InstallRoots),
+        }
         Ok(())
     }
 
