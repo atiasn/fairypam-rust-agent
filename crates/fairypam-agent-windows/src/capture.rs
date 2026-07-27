@@ -377,41 +377,6 @@ fn checked_frame_len(
     Ok(length)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn oversized_frame_is_rejected_before_allocation() {
-        let error = checked_bgra_len(u32::MAX, u32::MAX).unwrap_err();
-        assert_eq!(error.code(), "capture.frame_too_large");
-    }
-
-    #[test]
-    fn oversized_encoding_source_is_rejected_before_encoding() {
-        let error = checked_rgb_len(16_384, 16_384).unwrap_err();
-        assert_eq!(error.code(), "capture.frame_too_large");
-    }
-
-    #[test]
-    fn client_crop_uses_visible_dwm_bounds_instead_of_invisible_resize_border() {
-        let client = Rect::new(108, 131, 784, 561).unwrap();
-        let visible_dwm_bounds = Rect::new(108, 108, 784, 584).unwrap();
-        assert_eq!(
-            client_crop_box(visible_dwm_bounds, client, 784, 584).unwrap(),
-            (0, 23, 784, 561)
-        );
-
-        let get_window_rect_bounds = Rect::new(100, 100, 800, 600).unwrap();
-        assert_eq!(
-            client_crop_box(get_window_rect_bounds, client, 784, 584)
-                .unwrap_err()
-                .code(),
-            "capture.client_bounds_invalid"
-        );
-    }
-}
-
 #[cfg(windows)]
 type WgcFrameSlot = std::sync::Arc<(
     std::sync::Mutex<Option<Result<CapturedBgraFrame, WindowsError>>>,
@@ -623,3 +588,39 @@ fn capture_bounds(hwnd: windows::Win32::Foundation::HWND) -> Result<Rect, Window
     Rect::new(bounds.left, bounds.top, width, height)
         .map_err(|error| WindowsError::new("capture.target_unavailable", error.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_frame_is_rejected_before_allocation() {
+        let error = checked_bgra_len(u32::MAX, u32::MAX).unwrap_err();
+        assert_eq!(error.code(), "capture.frame_too_large");
+    }
+
+    #[test]
+    fn oversized_encoding_source_is_rejected_before_encoding() {
+        let error = checked_rgb_len(16_384, 16_384).unwrap_err();
+        assert_eq!(error.code(), "capture.frame_too_large");
+    }
+
+    #[test]
+    fn client_crop_uses_visible_dwm_bounds_instead_of_invisible_resize_border() {
+        let client = Rect::new(108, 131, 784, 561).unwrap();
+        let visible_dwm_bounds = Rect::new(108, 108, 784, 584).unwrap();
+        assert_eq!(
+            client_crop_box(visible_dwm_bounds, client, 784, 584).unwrap(),
+            (0, 23, 784, 561)
+        );
+
+        let get_window_rect_bounds = Rect::new(100, 100, 800, 600).unwrap();
+        assert_eq!(
+            client_crop_box(get_window_rect_bounds, client, 784, 584)
+                .unwrap_err()
+                .code(),
+            "capture.client_bounds_invalid"
+        );
+    }
+}
+
