@@ -464,7 +464,7 @@ impl WgcCaptureBackend {
                 return Err(error);
             }
             Err(error) => {
-                tracing::error!(%error, "WGC initialization did not terminate; aborting Agent");
+                eprintln!("WGC initialization did not terminate; aborting Agent: {error}");
                 std::process::abort();
             }
         }
@@ -519,7 +519,7 @@ fn join_wgc_worker(worker: std::thread::JoinHandle<()>) {
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     while !worker.is_finished() {
         if Instant::now() >= deadline {
-            tracing::error!("WGC worker did not stop; aborting Agent before unsafe detach");
+            eprintln!("WGC worker did not stop; aborting Agent before unsafe detach");
             std::process::abort();
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
