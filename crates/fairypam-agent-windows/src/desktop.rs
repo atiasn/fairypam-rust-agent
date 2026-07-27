@@ -5,9 +5,9 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, CloseWindowStation, GetThreadDesktop, GetUserObjectInformationW,
     OpenInputDesktop, OpenWindowStationW, SetProcessWindowStation, SetThreadDesktop,
-    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS, UOI_IO,
-    UOI_NAME,
+    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, UOI_IO, UOI_NAME,
 };
+use windows::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::WINSTA_ALL_ACCESS;
 
@@ -24,7 +24,7 @@ pub(crate) fn ensure_input_desktop() -> Result<(), WindowsError> {
         OpenInputDesktop(
             DESKTOP_CONTROL_FLAGS::default(),
             false,
-            DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_WRITEOBJECTS.0),
+            DESKTOP_ACCESS_FLAGS(MAXIMUM_ALLOWED),
         )
     }
     .map_err(|error| desktop_error("desktop.input_unavailable", error))?;
