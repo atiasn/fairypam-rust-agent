@@ -1891,7 +1891,10 @@ mod tests {
                     height: 720,
                     sequence: 1,
                 }),
-                _ => Err(AgentError::new("capture.complete", "test capture completed")),
+                _ => Err(AgentError::new(
+                    "capture.complete",
+                    "test capture completed",
+                )),
             }
         }
     }
