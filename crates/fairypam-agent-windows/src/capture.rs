@@ -389,9 +389,7 @@ pub struct DxgiCaptureBackend {
 #[cfg(windows)]
 impl DxgiCaptureBackend {
     pub fn new(identity: &crate::TargetIdentity) -> Result<Self, WindowsError> {
-        use windows_capture::dxgi_duplication_api::{
-            DxgiDuplicationApi, DxgiDuplicationFormat,
-        };
+        use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
         use windows_capture::monitor::Monitor;
 
         let hwnd = windows::Win32::Foundation::HWND(identity.hwnd as *mut std::ffi::c_void);
@@ -406,7 +404,7 @@ impl DxgiCaptureBackend {
             Monitor::from_raw_hmonitor(monitor.0),
             &[DxgiDuplicationFormat::Bgra8],
         )
-            .map_err(|error| WindowsError::new("capture.session_failed", error.to_string()))?;
+        .map_err(|error| WindowsError::new("capture.session_failed", error.to_string()))?;
         Ok(Self {
             hwnd: identity.hwnd,
             monitor_bounds,
@@ -439,20 +437,19 @@ impl CaptureBackend for DxgiCaptureBackend {
             ));
         }
         let timeout_ms = u32::try_from(remaining.as_millis().max(1)).unwrap_or(u32::MAX);
-        let mut frame = self
-            .capture
-            .acquire_next_frame(timeout_ms)
-            .map_err(|error| match error {
-                Error::Timeout => WindowsError::new(
-                    "capture.deadline",
-                    "no DXGI frame arrived before deadline",
-                ),
-                Error::AccessLost => WindowsError::new(
-                    "capture.access_lost",
-                    "DXGI duplication access was lost",
-                ),
-                error => WindowsError::new("capture.map_failed", error.to_string()),
-            })?;
+        let mut frame =
+            self.capture
+                .acquire_next_frame(timeout_ms)
+                .map_err(|error| match error {
+                    Error::Timeout => WindowsError::new(
+                        "capture.deadline",
+                        "no DXGI frame arrived before deadline",
+                    ),
+                    Error::AccessLost => {
+                        WindowsError::new("capture.access_lost", "DXGI duplication access was lost")
+                    }
+                    error => WindowsError::new("capture.map_failed", error.to_string()),
+                })?;
         if frame.format() != DxgiDuplicationFormat::Bgra8 {
             return Err(WindowsError::new(
                 "capture.format_unsupported",
@@ -520,9 +517,8 @@ fn target_monitor(
     let bounds: RECT = info.rcMonitor;
     let width = u32::try_from(bounds.right - bounds.left)
         .map_err(|_| WindowsError::new("capture.target_unavailable", "negative monitor width"))?;
-    let height = u32::try_from(bounds.bottom - bounds.top).map_err(|_| {
-        WindowsError::new("capture.target_unavailable", "negative monitor height")
-    })?;
+    let height = u32::try_from(bounds.bottom - bounds.top)
+        .map_err(|_| WindowsError::new("capture.target_unavailable", "negative monitor height"))?;
     let bounds = Rect::new(bounds.left, bounds.top, width, height)
         .map_err(|error| WindowsError::new("capture.target_unavailable", error.to_string()))?;
     Ok((monitor, bounds))
