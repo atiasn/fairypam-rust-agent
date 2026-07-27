@@ -186,7 +186,7 @@ fn expired_deadline_is_rejected_before_capture_work() {
 fn cleiagent_testbed_wgc_soak() {
     use std::thread;
 
-    use fairypam_agent_windows::{DxgiCaptureBackend, NativeWindows, WindowsApi};
+    use fairypam_agent_windows::{BitBltCaptureBackend, NativeWindows, WindowsApi};
 
     let expected_pid = std::env::var("FAIRYPAM_TESTBED_PID")
         .expect("FAIRYPAM_TESTBED_PID must identify the running testbed")
@@ -244,7 +244,7 @@ fn cleiagent_testbed_wgc_soak() {
                 && path_sha256 == expected_path_sha256
         })
         .expect("the exact started Testbed identity was not enumerated");
-    let backend = DxgiCaptureBackend::new(&candidate.identity).unwrap();
+    let backend = BitBltCaptureBackend::new(&candidate.identity).unwrap();
     let mut capture = CapturePipeline::new(
         backend,
         candidate.identity.client_rect,

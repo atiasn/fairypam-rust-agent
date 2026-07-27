@@ -1,4 +1,4 @@
-//! Windows target discovery and DXGI capture boundary.
+//! Windows target discovery and target-window BitBlt capture boundary.
 
 mod capture;
 mod dpi;
@@ -38,7 +38,7 @@ pub use window::{
 pub use window::LockedInputTarget;
 
 #[cfg(windows)]
-pub use capture::DxgiCaptureBackend;
+pub use capture::BitBltCaptureBackend;
 #[cfg(windows)]
 pub use send_input::WindowsInput;
 #[cfg(windows)]

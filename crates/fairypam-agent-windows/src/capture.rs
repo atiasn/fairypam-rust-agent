@@ -134,7 +134,7 @@ impl<B: CaptureBackend> CaptureSession for CapturePipeline<B> {
 pub struct WindowsTargetCapture {
     targets: WindowsTargetPlatform<NativeWindows>,
     binding: TargetBinding,
-    capture: CapturePipeline<DxgiCaptureBackend>,
+    capture: CapturePipeline<BitBltCaptureBackend>,
 }
 
 #[cfg(windows)]
@@ -145,7 +145,7 @@ impl WindowsTargetCapture {
         region: CaptureRegion,
         encoding: CaptureEncoding,
     ) -> Result<Self, WindowsError> {
-        let backend = DxgiCaptureBackend::new(&identity)?;
+        let backend = BitBltCaptureBackend::new(&identity)?;
         let capture = CapturePipeline::new(
             backend,
             identity.client_rect,
@@ -315,41 +315,6 @@ fn checked_rgb_len(width: u32, height: u32) -> Result<usize, WindowsError> {
     )
 }
 
-#[cfg(any(windows, test))]
-fn client_crop_box(
-    capture_bounds: Rect,
-    client_rect: Rect,
-    source_width: u32,
-    source_height: u32,
-) -> Result<(u32, u32, u32, u32), WindowsError> {
-    let x = u32::try_from(client_rect.left - capture_bounds.left).map_err(|_| {
-        WindowsError::new(
-            "capture.client_bounds_invalid",
-            "client left is outside capture frame",
-        )
-    })?;
-    let y = u32::try_from(client_rect.top - capture_bounds.top).map_err(|_| {
-        WindowsError::new(
-            "capture.client_bounds_invalid",
-            "client top is outside capture frame",
-        )
-    })?;
-    if x.checked_add(client_rect.width)
-        .is_none_or(|right| right > source_width)
-        || y.checked_add(client_rect.height)
-            .is_none_or(|bottom| bottom > source_height)
-    {
-        return Err(WindowsError::new(
-            "capture.client_bounds_invalid",
-            format!(
-                "client rectangle ({x},{y} {}x{}) exceeds capture frame {source_width}x{source_height}",
-                client_rect.width, client_rect.height
-            ),
-        ));
-    }
-    Ok((x, y, client_rect.width, client_rect.height))
-}
-
 fn checked_frame_len(
     width: u32,
     height: u32,
@@ -378,49 +343,165 @@ fn checked_frame_len(
 }
 
 #[cfg(windows)]
-pub struct DxgiCaptureBackend {
+pub struct BitBltCaptureBackend {
     hwnd: isize,
-    monitor_bounds: Rect,
     client_rect: Rect,
-    capture: windows_capture::dxgi_duplication_api::DxgiDuplicationApi,
-    scratch: Vec<u8>,
+    source_dc: isize,
+    target_dc: isize,
+    bitmap: isize,
+    previous_bitmap: isize,
+    bits: usize,
 }
 
 #[cfg(windows)]
-impl DxgiCaptureBackend {
+impl BitBltCaptureBackend {
     pub fn new(identity: &crate::TargetIdentity) -> Result<Self, WindowsError> {
-        use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
-        use windows_capture::monitor::Monitor;
-
-        let hwnd = windows::Win32::Foundation::HWND(identity.hwnd as *mut std::ffi::c_void);
-        let (monitor, monitor_bounds) = target_monitor(hwnd)?;
-        client_crop_box(
-            monitor_bounds,
-            identity.client_rect,
-            monitor_bounds.width,
-            monitor_bounds.height,
-        )?;
-        let capture = DxgiDuplicationApi::new_options(
-            Monitor::from_raw_hmonitor(monitor.0),
-            &[DxgiDuplicationFormat::Bgra8],
-        )
-        .map_err(|error| WindowsError::new("capture.session_failed", error.to_string()))?;
+        checked_bgra_len(identity.client_rect.width, identity.client_rect.height)?;
         Ok(Self {
             hwnd: identity.hwnd,
-            monitor_bounds,
             client_rect: identity.client_rect,
-            capture,
-            scratch: Vec::new(),
+            source_dc: 0,
+            target_dc: 0,
+            bitmap: 0,
+            previous_bitmap: 0,
+            bits: 0,
         })
+    }
+
+    fn initialize_resources(&mut self) -> Result<(), WindowsError> {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            DIB_RGB_COLORS, GetDC, HGDIOBJ, ReleaseDC, SelectObject,
+        };
+
+        if self.source_dc != 0 {
+            return Ok(());
+        }
+        let hwnd = HWND(self.hwnd as *mut std::ffi::c_void);
+        let source_dc = unsafe { GetDC(Some(hwnd)) };
+        if source_dc.is_invalid() {
+            return Err(WindowsError::new(
+                "capture.session_failed",
+                "GetDC failed for the signed target window",
+            ));
+        }
+        let target_dc = unsafe { CreateCompatibleDC(Some(source_dc)) };
+        if target_dc.is_invalid() {
+            unsafe { ReleaseDC(Some(hwnd), source_dc) };
+            return Err(WindowsError::new(
+                "capture.session_failed",
+                "CreateCompatibleDC failed for the signed target window",
+            ));
+        }
+        let width = i32::try_from(self.client_rect.width)
+            .map_err(|_| WindowsError::new("capture.frame_too_large", "client width overflow"))?;
+        let height = i32::try_from(self.client_rect.height)
+            .map_err(|_| WindowsError::new("capture.frame_too_large", "client height overflow"))?;
+        let bitmap_info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..BITMAPINFOHEADER::default()
+            },
+            ..BITMAPINFO::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap = unsafe {
+            CreateDIBSection(
+                Some(target_dc),
+                &bitmap_info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            )
+        };
+        let bitmap = match bitmap {
+            Ok(bitmap) if !bits.is_null() => bitmap,
+            Ok(bitmap) => {
+                unsafe {
+                    windows::Win32::Graphics::Gdi::DeleteObject(bitmap.into());
+                    DeleteDC(target_dc);
+                    ReleaseDC(Some(hwnd), source_dc);
+                }
+                return Err(WindowsError::new(
+                    "capture.session_failed",
+                    "CreateDIBSection returned no pixel buffer",
+                ));
+            }
+            Err(error) => {
+                unsafe {
+                    DeleteDC(target_dc);
+                    ReleaseDC(Some(hwnd), source_dc);
+                }
+                return Err(WindowsError::new("capture.session_failed", error.to_string()));
+            }
+        };
+        let previous_bitmap = unsafe { SelectObject(target_dc, bitmap.into()) };
+        if previous_bitmap.is_invalid() {
+            unsafe {
+                windows::Win32::Graphics::Gdi::DeleteObject(HGDIOBJ(bitmap.0));
+                DeleteDC(target_dc);
+                ReleaseDC(Some(hwnd), source_dc);
+            }
+            return Err(WindowsError::new(
+                "capture.session_failed",
+                "SelectObject failed for the capture bitmap",
+            ));
+        }
+        self.source_dc = source_dc.0 as isize;
+        self.target_dc = target_dc.0 as isize;
+        self.bitmap = bitmap.0 as isize;
+        self.previous_bitmap = previous_bitmap.0 as isize;
+        self.bits = bits as usize;
+        Ok(())
+    }
+
+    fn release_resources(&mut self) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Gdi::{
+            DeleteDC, DeleteObject, HDC, HGDIOBJ, ReleaseDC, SelectObject,
+        };
+
+        unsafe {
+            if self.target_dc != 0 && self.previous_bitmap != 0 {
+                SelectObject(
+                    HDC(self.target_dc as *mut std::ffi::c_void),
+                    HGDIOBJ(self.previous_bitmap as *mut std::ffi::c_void),
+                );
+            }
+            if self.bitmap != 0 {
+                DeleteObject(HGDIOBJ(self.bitmap as *mut std::ffi::c_void));
+            }
+            if self.target_dc != 0 {
+                DeleteDC(HDC(self.target_dc as *mut std::ffi::c_void));
+            }
+            if self.source_dc != 0 {
+                ReleaseDC(
+                    Some(HWND(self.hwnd as *mut std::ffi::c_void)),
+                    HDC(self.source_dc as *mut std::ffi::c_void),
+                );
+            }
+        }
+        self.source_dc = 0;
+        self.target_dc = 0;
+        self.bitmap = 0;
+        self.previous_bitmap = 0;
+        self.bits = 0;
     }
 }
 
 #[cfg(windows)]
-impl CaptureBackend for DxgiCaptureBackend {
+impl CaptureBackend for BitBltCaptureBackend {
     fn next_bgra(&mut self, deadline: Instant) -> Result<CapturedBgraFrame, WindowsError> {
         use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Gdi::{BitBlt, GdiFlush, HDC, SRCCOPY};
         use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-        use windows_capture::dxgi_duplication_api::{DxgiDuplicationFormat, Error};
 
         let hwnd = HWND(self.hwnd as *mut std::ffi::c_void);
         if unsafe { GetForegroundWindow() } != hwnd {
@@ -429,99 +510,65 @@ impl CaptureBackend for DxgiCaptureBackend {
                 "desktop capture requires the signed target window to be foreground",
             ));
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if Instant::now() >= deadline {
             return Err(WindowsError::new(
                 "capture.deadline",
-                "capture deadline expired before DXGI frame acquisition",
+                "capture deadline expired before BitBlt",
             ));
         }
-        let timeout_ms = u32::try_from(remaining.as_millis().max(1)).unwrap_or(u32::MAX);
-        let mut frame =
-            self.capture
-                .acquire_next_frame(timeout_ms)
-                .map_err(|error| match error {
-                    Error::Timeout => WindowsError::new(
-                        "capture.deadline",
-                        "no DXGI frame arrived before deadline",
-                    ),
-                    Error::AccessLost => {
-                        WindowsError::new("capture.access_lost", "DXGI duplication access was lost")
-                    }
-                    error => WindowsError::new("capture.map_failed", error.to_string()),
-                })?;
-        if frame.format() != DxgiDuplicationFormat::Bgra8 {
+        self.initialize_resources()?;
+        let width = i32::try_from(self.client_rect.width)
+            .map_err(|_| WindowsError::new("capture.frame_too_large", "client width overflow"))?;
+        let height = i32::try_from(self.client_rect.height)
+            .map_err(|_| WindowsError::new("capture.frame_too_large", "client height overflow"))?;
+        unsafe {
+            BitBlt(
+                HDC(self.target_dc as *mut std::ffi::c_void),
+                0,
+                0,
+                width,
+                height,
+                Some(HDC(self.source_dc as *mut std::ffi::c_void)),
+                0,
+                0,
+                SRCCOPY,
+            )
+        }
+        .map_err(|error| WindowsError::new("capture.map_failed", error.to_string()))?;
+        if !unsafe { GdiFlush() }.as_bool() {
             return Err(WindowsError::new(
-                "capture.format_unsupported",
-                "DXGI capture did not provide BGRA8 pixels",
+                "capture.map_failed",
+                "GdiFlush failed after BitBlt",
             ));
         }
-        let (x, y, width, height) = client_crop_box(
-            self.monitor_bounds,
-            self.client_rect,
-            frame.width(),
-            frame.height(),
-        )?;
-        checked_bgra_len(width, height)?;
-        let buffer = frame
-            .buffer_crop(x, y, x + width, y + height)
-            .map_err(|error| WindowsError::new("capture.map_failed", error.to_string()))?;
-        let pixels = buffer.as_nopadding_buffer(&mut self.scratch).to_vec();
+        let length = checked_bgra_len(self.client_rect.width, self.client_rect.height)?;
+        let pixels = unsafe { std::slice::from_raw_parts(self.bits as *const u8, length) }.to_vec();
         Ok(CapturedBgraFrame {
             pixels,
-            width,
-            height,
+            width: self.client_rect.width,
+            height: self.client_rect.height,
             captured_at: Instant::now(),
         })
     }
 
     fn rebuild(&mut self, client_rect: Rect, dpi: u32) -> Result<(), WindowsError> {
         validate_dpi(dpi)?;
-        client_crop_box(
-            self.monitor_bounds,
-            client_rect,
-            self.monitor_bounds.width,
-            self.monitor_bounds.height,
-        )?;
+        checked_bgra_len(client_rect.width, client_rect.height)?;
+        if self.client_rect.width != client_rect.width
+            || self.client_rect.height != client_rect.height
+        {
+            self.release_resources();
+        }
         self.client_rect = client_rect;
         Ok(())
     }
 }
 
 #[cfg(windows)]
-fn target_monitor(
-    hwnd: windows::Win32::Foundation::HWND,
-) -> Result<(windows::Win32::Graphics::Gdi::HMONITOR, Rect), WindowsError> {
-    use windows::Win32::Foundation::RECT;
-    use windows::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL,
-    };
-
-    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
-    if monitor.is_invalid() {
-        return Err(WindowsError::new(
-            "capture.target_unavailable",
-            "target window is not on an active monitor",
-        ));
+impl Drop for BitBltCaptureBackend {
+    fn drop(&mut self) {
+        self.release_resources();
     }
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..MONITORINFO::default()
-    };
-    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        return Err(WindowsError::new(
-            "capture.target_unavailable",
-            "failed to resolve target monitor bounds",
-        ));
-    }
-    let bounds: RECT = info.rcMonitor;
-    let width = u32::try_from(bounds.right - bounds.left)
-        .map_err(|_| WindowsError::new("capture.target_unavailable", "negative monitor width"))?;
-    let height = u32::try_from(bounds.bottom - bounds.top)
-        .map_err(|_| WindowsError::new("capture.target_unavailable", "negative monitor height"))?;
-    let bounds = Rect::new(bounds.left, bounds.top, width, height)
-        .map_err(|error| WindowsError::new("capture.target_unavailable", error.to_string()))?;
-    Ok((monitor, bounds))
 }
 
 #[cfg(test)]
@@ -540,21 +587,4 @@ mod tests {
         assert_eq!(error.code(), "capture.frame_too_large");
     }
 
-    #[test]
-    fn client_crop_rejects_source_bounds_that_exclude_the_client() {
-        let client = Rect::new(108, 131, 784, 561).unwrap();
-        let visible_dwm_bounds = Rect::new(108, 108, 784, 584).unwrap();
-        assert_eq!(
-            client_crop_box(visible_dwm_bounds, client, 784, 584).unwrap(),
-            (0, 23, 784, 561)
-        );
-
-        let get_window_rect_bounds = Rect::new(100, 100, 800, 600).unwrap();
-        assert_eq!(
-            client_crop_box(get_window_rect_bounds, client, 784, 584)
-                .unwrap_err()
-                .code(),
-            "capture.client_bounds_invalid"
-        );
-    }
 }
