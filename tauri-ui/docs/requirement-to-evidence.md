@@ -31,13 +31,13 @@ source/public/run 写入 smoke receipt 不会自动证明设备当前安装来�
 
 | Requirement | Status | Gate | Evidence | Remaining condition |
 | --- | --- | --- | --- | --- |
-| 普通 GUI 与高权限后台 Agent | pass | `WINDOWS-BUILD`, `TAURI-GUI-HUMAN` | 精确 candidate 已安装；产品固定 HIGHEST Agent Task 与 LUA UI Task 均运行，GUI 保持普通权限并由 human owner 直接确认“服务已连接”。 | 正式发布仍需 Authenticode/publisher。 |
+| 普通 GUI 与高权限 Agent Core | pending | `WINDOWS-BUILD`, `TAURI-GUI-HUMAN` | 静态与非正式 Windows 测试证明 GUI 直接 `runas` 启动固定同目录 Agent；Agent 在 Pipe/Hub 前验证 GUI PID、同用户/Session 并绑定，生命周期事务互斥且 Core 唯一。 | 安装精确新 candidate，确认 UAC、Pipe ready、唯一 Agent 与可见连接状态。 |
 | 最小 Capability 与 CSP | pass | local static gate | 已有本地 `npm run check:security`、`npm run check:command-surface` 与 Rust `safety_invariants` 静态证据。 | 这不证明安装器；候选仍须单独通过 `WINDOWS-BUILD`。 |
 | 五页用户流程 | pass | Vitest/RTL | 五项导航、移除页面、环境检查、脱敏日志和游戏发现测试通过。 | Windows 人工检查赛博朋克视觉与文本状态。 |
-| 无控制台后台启动、Hub 注册与有界观察 | partial | `WINDOWS-BUILD`, `TAURI-GUI-HUMAN`, `WINDOWS-LIVE-SMOKE` | 精确 candidate 的固定任务、后台 Agent、Pipe ready 与 GUI“服务已连接”已验证。 | 注册拒绝、超时后 Status/重试和脱敏审计负例仍需完整 live smoke。 |
+| 无控制台交互式启动、Hub 注册与有界观察 | pending | `WINDOWS-BUILD`, `TAURI-GUI-HUMAN`, `WINDOWS-LIVE-SMOKE` | 同一 Dev Core 由已验证前台进程直接启动后，Hub 已取得非黑原神加载帧；当前 Tauri direct-launch 实现的非正式 Windows tests 通过。 | 用精确产品 candidate 重跑 GUI direct launch、注册拒绝、超时后 Status/重试和脱敏审计负例。 |
 | Pipe 双向身份 | pending | `WINDOWS-LIVE-SMOKE` | 候选继续要求 GUI 写帧前验证高权限固定 Agent，Agent 对 `RegisterHub` 再验证固定 GUI caller；CI 成功后的 attestation 也不代替 Windows 负向 smoke。 | 关闭 `WINDOWS-BUILD` 后，用 fake server、非 GUI 同会话 client、错 session/image 做 Windows 负向测试。 |
 | 注册状态可恢复与持久化脱敏审计 | pending | `WINDOWS-LIVE-SMOKE` | 候选继续要求无效候选不发布 pointer、旧状态保留和生产审计不含秘密；CI 成功后的 attestation 也不代替 Windows 状态恢复 smoke。 | 关闭 `WINDOWS-BUILD` 后，验证无效 URI/key/cert 与半开 claim 后仍可 Status/重试，并检查真实 JSONL newline 与 ACL。 |
-| GUI 与 Agent 生命周期解耦 | pass | `TAURI-GUI-HUMAN`, `WINDOWS-LIVE-SMOKE` | cleiagent 停止 GUI 后 Agent 保持运行；连续两次启动 GUI 后仍为 GUI=1、Agent=1，human owner 确认服务连接。 | 无。 |
+| GUI 拥有 Agent 日常生命周期 | pending | `TAURI-GUI-HUMAN`, `WINDOWS-LIVE-SMOKE` | 新实现会安全替换残留 Agent、只读打开全局实例 mutex、以同一个已验证 process handle 绑定 GUI；GUI/Agent 还必须属于 protected current active suite，更新 activation 会令 stale GUI 安全退出后由 installer 重启 target GUI。退出界面先完成 Agent 清理，窗口关闭仍进托盘。维护 owner 验证固定 High helper 父进程、拒绝设备/Hub 操作且不启动 gRPC supervisor。 | 用精确 candidate 验证正常/异常退出后 Agent/Guardian/输入/采集清零、A→B 后 GUI/Agent image/build_id/suite_version 全为 B、旧目录直接启动被拒、手工 `--maintenance` 与维护 Pipe 设备命令被拒、并发生命周期请求不重复弹 UAC。 |
 | 可访问和可诊断的失败态 | pass | Vitest/RTL | 加载、失败、键盘导航与 axe gate 通过。 | Windows 人工检查作为 UI smoke 的一部分。 |
 | 受管产品安装器与状态根 | partial | static security re-review, `WINDOWS-BUILD`, `WINDOWS-LIVE-SMOKE` | 精确 candidate 已完成 fresh install、trusted reinstall、固定任务 SID/ACL/action 验证和当前用户不可写的固定产品根验证。 | 恶意 ACL、完整 SDDL 回滚、Repair/卸载及 rollback 故障注入仍待验证。 |
 | 生产安装布局不含开发者 CLI | pending | `WINDOWS-BUILD`, `WINDOWS-LIVE-SMOKE` | CI 成功后的 receipt 将声明 GUI、Agent、Guardian、安装辅助程序和 `profiles/`；开发者 CLI/Dev 脚本不是产品安装布局。 | 在真实安装后验证实际布局不含 `fairypam-agentctl.exe` 或 Dev 入口。 |
@@ -48,8 +48,9 @@ source/public/run 写入 smoke receipt 不会自动证明设备当前安装来�
 产品用户入口是受管 NSIS setup；不要手工解包或部署 runtime，也不要使用 `fairypam-agentctl.exe`。
 剩余门禁须在 **Windows 交互桌面**（不能只靠 SSH token）记录以下 smoke：同一固定根的成功升级；
 历史 `.previous`、`.installing` 或旧产品目录存在时新根安装成功且这些历史目录不被删除；根路径为
-reparse point 时拒绝且不变更；已运行或异常退出的 Agent 都由固定任务恢复且日常无 UAC；安装、
-Repair 或卸载只在事务开始请求一次 UAC，且不显示命令行窗口；Hub 注册值不出现在命令行、响应、
+reparse point 时拒绝且不变更；安装、Repair 和更新中的 maintenance Agent 只由无登录触发器的固定任务
+有界启动并在健康检查后关闭；日常 Agent 由新 GUI 会话直接请求 UAC 启动，异常退出后 GUI 显示失败并由
+用户显式重试；安装、Repair 或卸载只在事务开始请求一次 UAC，且不显示命令行窗口；Hub 注册值不出现在命令行、响应、
 日志或审计；fake Pipe server
 与非 GUI caller 被拒绝；Hub/Pipe 超时后下一条 Status 和重试仍可完成；无效候选不改变 `current`
 pointer；20 秒内本地管道/Hub 状态、五项导航与托盘左/右键行为。
@@ -59,5 +60,6 @@ pointer；20 秒内本地管道/Hub 状态、五项导航与托盘左/右键行�
 交付阶段与生产成员边界由 [ADR-0024](../../../docs/adr/0024-separate-installer-candidate-from-signed-update-suite.md) 固定。
 本 change 的 Phase A 实现 non-promotable、未签名的 Windows 产品安装器候选链路，不实现独立 Updater，
 也不构成正式签名发布；Phase B 自动更新将复用 Agent 与受保护 installer helper。产品固定任务属于安装生命周期；开发者 CLI 与 Dev task 仍不是生产入口，
-`%LOCALAPPDATA%\FairyPam\dev` 不能成为产品高权限来源。当前精确 candidate 的 `WINDOWS-BUILD` 与
-`TAURI-GUI-HUMAN` 已通过；完整 `WINDOWS-LIVE-SMOKE` 和 `SIGNED-RELEASE` 仍独立 pending。
+`%LOCALAPPDATA%\FairyPam\dev` 不能成为产品高权限来源。此前 candidate receipt 只覆盖其对应旧 source，
+不能关闭本次 owner/handoff source 的门禁；最新 source 仍需重新通过 `WINDOWS-BUILD`、
+`TAURI-GUI-HUMAN` 和 `WINDOWS-LIVE-SMOKE`，`SIGNED-RELEASE` 仍独立 pending。

@@ -2,7 +2,7 @@ use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::NewWindowResponse,
-    Manager, WindowEvent,
+    Emitter, Manager, WindowEvent,
 };
 
 use crate::{
@@ -14,6 +14,13 @@ use crate::{
 const BLOCK_PAGE_SURFACES: &str = "for (const event of ['contextmenu', 'dragenter', 'dragover', 'drop']) { window.addEventListener(event, (value) => value.preventDefault(), { capture: true }); }";
 
 pub fn run() -> tauri::Result<()> {
+    #[cfg(windows)]
+    commands::verify_active_gui().map_err(|error| {
+        tauri::Error::Io(std::io::Error::other(format!(
+            "{}: {}",
+            error.code, error.message
+        )))
+    })?;
     let instance = match GuiSingleInstance::acquire()? {
         GuiInstance::Primary(instance) => instance,
         GuiInstance::Existing => {
@@ -52,6 +59,22 @@ pub fn run() -> tauri::Result<()> {
                 .build()?;
             disable_default_context_menu(&main_window);
 
+            let activation_app = app.handle().clone();
+            app.state::<GuiSingleInstance>().watch_activation(move || {
+                let app = activation_app.clone();
+                tauri::async_runtime::spawn(async move {
+                    #[cfg(windows)]
+                    if commands::verify_active_gui().is_err() {
+                        let state = app.state::<ProductionGateway>();
+                        let _ = commands::shutdown_local_agent_for_exit(&state).await;
+                        app.exit(0);
+                        return;
+                    }
+                    show_main_window(&app);
+                    let _ = app.emit("local-agent-activation", ());
+                });
+            })?;
+
             let show_main = MenuItemBuilder::with_id("show-main", "显示主窗口").build(app)?;
             let exit_ui = MenuItemBuilder::with_id("exit-ui", "退出界面").build(app)?;
             let menu = MenuBuilder::new(app)
@@ -62,7 +85,20 @@ pub fn run() -> tauri::Result<()> {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show-main" => show_main_window(app),
-                    "exit-ui" => app.exit(0),
+                    "exit-ui" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = app.state::<ProductionGateway>();
+                            if commands::shutdown_local_agent_for_exit(&state)
+                                .await
+                                .is_ok()
+                            {
+                                app.exit(0);
+                            } else {
+                                show_main_window(&app);
+                            }
+                        });
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {

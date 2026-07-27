@@ -31,6 +31,7 @@ if (!csp.includes("script-src 'self'") || /script-src[^;]*https?:\/\//.test(csp)
 }
 
 const commandSource = read('src-tauri/src/commands.rs');
+const appSource = read('src-tauri/src/app.rs');
 const installGuardSource = installGuardPath
   ? readFileSync(resolve(installGuardPath), 'utf8')
   : read('../crates/fairypam-agent-local-client/src/windows_named_pipe.rs');
@@ -41,7 +42,17 @@ for (const forbidden of ['fn invoke', 'fn exec', 'fn spawn', 'fn read_file', 'se
 for (const required of [
   'for path in [&gui, &helper]',
   'verify_protected_program_files_path(path)',
-  'std::process::Command::new',
+  'ShellExecuteW',
+  'HSTRING::from("runas")',
+  '"--ui-owner-pid {}"',
+  'fixed_agent_path()',
+  'for path in [&gui, &pointer]',
+  'CURRENT_POINTER_FILE',
+  'resolve_active_suite(install_root)',
+  'startup.inactive_suite',
+  'std::fs::canonicalize',
+  'OpenMutexW',
+  'SYNCHRONIZATION_SYNCHRONIZE',
   'ShellExecuteExW',
   'SEE_MASK_NOCLOSEPROCESS',
   'verify_repair_helper_signature(&helper)?',
@@ -51,10 +62,13 @@ for (const required of [
   'FAIRYPAM_ALLOW_UNSIGNED_CANDIDATE_REPAIR',
   '"--repair-tasks"',
 ]) {
-  if (!commandSource.includes(required)) fail(`missing fixed task-helper guard ${required}`);
+  if (!commandSource.includes(required)) fail(`missing fixed Agent/helper guard ${required}`);
 }
-if (commandSource.includes('fairypam-agent.exe')) {
-  fail('GUI must not launch the Agent executable directly');
+for (const required of ['commands::verify_active_gui()', 'local-agent-activation']) {
+  if (!appSource.includes(required)) fail(`missing active GUI handoff guard ${required}`);
+}
+if (commandSource.includes('std::process::Command::new')) {
+  fail('GUI must use fixed ShellExecute paths instead of a generic process launcher');
 }
 for (const required of [
   'protected_install_chain',

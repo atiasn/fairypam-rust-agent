@@ -1,11 +1,17 @@
-use std::time::Duration;
+#[cfg(windows)]
+use std::sync::atomic::Ordering;
+use std::{sync::atomic::AtomicBool, time::Duration};
 
 use fairypam_agent_local_client::LocalClientError;
 #[cfg(any(windows, test))]
 use fairypam_agent_local_protocol::LocalResponse;
 use fairypam_agent_local_protocol::{LocalCommand, LogLevel};
+#[cfg(windows)]
+use serde::Deserialize;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
+#[cfg(windows)]
+use tokio::sync::MutexGuard;
 
 #[cfg(windows)]
 use crate::dto::StatusDto;
@@ -53,6 +59,8 @@ pub struct ProductionGateway {
     #[cfg(windows)]
     pipe_name: &'static str,
     request_gate: Mutex<()>,
+    lifecycle_gate: Mutex<()>,
+    interactive_owner_ready: AtomicBool,
 }
 
 impl ProductionGateway {
@@ -61,6 +69,8 @@ impl ProductionGateway {
         Self {
             pipe_name: DEFAULT_PIPE_NAME,
             request_gate: Mutex::new(()),
+            lifecycle_gate: Mutex::new(()),
+            interactive_owner_ready: AtomicBool::new(false),
         }
     }
 
@@ -68,6 +78,8 @@ impl ProductionGateway {
     pub fn new() -> Self {
         Self {
             request_gate: Mutex::new(()),
+            lifecycle_gate: Mutex::new(()),
+            interactive_owner_ready: AtomicBool::new(false),
         }
     }
 
@@ -190,6 +202,58 @@ impl ProductionGateway {
             self.request(command).await
         }
     }
+
+    #[cfg(windows)]
+    pub fn interactive_owner_ready(&self) -> bool {
+        self.interactive_owner_ready.load(Ordering::Acquire)
+    }
+
+    #[cfg(windows)]
+    pub fn acquire_lifecycle(&self) -> Result<MutexGuard<'_, ()>, UiCommandError> {
+        self.lifecycle_gate.try_lock().map_err(|_| {
+            UiCommandError::unavailable(
+                "startup.lifecycle_busy",
+                "Another FairyPam Agent lifecycle operation is already running",
+            )
+        })
+    }
+
+    #[cfg(windows)]
+    pub fn mark_interactive_owner_ready(&self) {
+        self.interactive_owner_ready.store(true, Ordering::Release);
+    }
+
+    #[cfg(windows)]
+    pub fn clear_interactive_owner(&self) {
+        self.interactive_owner_ready.store(false, Ordering::Release);
+    }
+
+    #[cfg(windows)]
+    pub async fn shutdown_agent(&self) -> Result<(), UiCommandError> {
+        let response: LifecycleStatusDto = self.request(LocalCommand::ShutdownAgent).await?;
+        require_lifecycle_state(response, "shutting_down")
+    }
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleStatusDto {
+    state: String,
+}
+
+#[cfg(windows)]
+fn require_lifecycle_state(
+    response: LifecycleStatusDto,
+    expected: &str,
+) -> Result<(), UiCommandError> {
+    if response.state == expected {
+        Ok(())
+    } else {
+        Err(UiCommandError::invalid_response(format!(
+            "expected lifecycle state {expected}"
+        )))
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -271,5 +335,21 @@ mod tests {
         assert!(gateway.request_gate.try_lock().is_err());
         drop(guard);
         assert!(gateway.request_gate.try_lock().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_a_second_lifecycle_operation() {
+        let gateway = ProductionGateway::new();
+        let guard = gateway
+            .acquire_lifecycle()
+            .expect("first operation owns the gate");
+
+        assert_eq!(
+            gateway.acquire_lifecycle().unwrap_err().code,
+            "startup.lifecycle_busy"
+        );
+        drop(guard);
+        assert!(gateway.acquire_lifecycle().is_ok());
     }
 }

@@ -99,7 +99,9 @@ impl<R: LocalControlRuntime, A: AuditSink> LocalControlAdapter<R, A> {
         }
         #[cfg(windows)]
         if matches!(&request.command, LocalCommand::ShutdownAgent) {
-            if let Err(error) = verify_fixed_installer_caller(caller.pid) {
+            if let Err(error) = verify_fixed_gui_caller(caller.pid)
+                .or_else(|_| verify_fixed_installer_caller(caller))
+            {
                 let _ = self.audit.record(AuditEvent {
                     request_id: request.request_id.clone(),
                     caller_sid_hash: sha256_hex(&caller.user_sid),

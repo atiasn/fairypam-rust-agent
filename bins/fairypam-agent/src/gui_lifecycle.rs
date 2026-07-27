@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use fairypam_agent_core::AgentError;
+#[cfg(windows)]
+use fairypam_agent_windows::VerifiedGuiOwner;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +111,7 @@ impl GuiLifetime {
         }
     }
 
+    #[cfg(test)]
     pub fn bind(&self, pid: u32) -> Result<(), AgentError> {
         self.state.lock().map_err(lock_error)?.bind(pid)?;
         if let Err(error) = self.watch_process(pid) {
@@ -119,6 +122,27 @@ impl GuiLifetime {
             return Err(error);
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    pub fn bind_verified(&self, owner: VerifiedGuiOwner) -> Result<(), AgentError> {
+        let pid = owner.pid();
+        self.state.lock().map_err(lock_error)?.bind(pid)?;
+        if let Err(error) = self.watch_verified_process(owner) {
+            self.shutdown.cancel();
+            if let Ok(mut lifecycle) = self.state.lock() {
+                lifecycle.watcher_failed(pid);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn confirm_bound(&self, pid: u32) -> Result<(), AgentError> {
+        self.state
+            .lock()
+            .map_err(lock_error)?
+            .require_bound_pid(pid)
     }
 
     pub fn request_shutdown(&self, pid: u32) -> Result<GuiExitReason, AgentError> {
@@ -146,29 +170,23 @@ impl GuiLifetime {
         Ok(self.state.lock().map_err(lock_error)?.exit_reason())
     }
 
-    #[cfg(all(windows, not(test)))]
-    fn watch_process(&self, pid: u32) -> Result<(), AgentError> {
+    #[cfg(windows)]
+    fn watch_verified_process(&self, owner: VerifiedGuiOwner) -> Result<(), AgentError> {
+        use std::os::windows::io::AsRawHandle;
         use windows::Win32::{
-            Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
-            System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE},
+            Foundation::{HANDLE, WAIT_OBJECT_0},
+            System::Threading::{WaitForSingleObject, INFINITE},
         };
 
-        // SAFETY: pid came from the authenticated Pipe caller; the returned
-        // process handle is owned by this watcher and closed on every exit path.
-        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.map_err(|error| {
-            AgentError::new("local.lifecycle.process_unavailable", error.to_string())
-        })?;
-        let raw_handle = handle.0 as usize;
+        let (pid, process) = owner.into_parts();
         let state = Arc::clone(&self.state);
         let shutdown = self.shutdown.clone();
-        let watcher = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("fairypam-gui-lifetime".to_owned())
             .spawn(move || {
-                let handle = HANDLE(raw_handle as _);
-                // SAFETY: handle is a valid process handle exclusively owned by this thread.
+                let handle = HANDLE(process.as_raw_handle());
+                // SAFETY: this is the same owned process handle used for GUI authentication.
                 let exited = unsafe { WaitForSingleObject(handle, INFINITE) } == WAIT_OBJECT_0;
-                // SAFETY: no later operation uses handle after this close.
-                let _ = unsafe { CloseHandle(handle) };
                 if let Ok(mut lifecycle) = state.lock() {
                     if exited {
                         lifecycle.process_exited(pid);
@@ -177,15 +195,8 @@ impl GuiLifetime {
                     }
                 }
                 shutdown.cancel();
-            });
-        if let Err(error) = watcher {
-            // SAFETY: the watcher was not started, so this call retains sole ownership.
-            let _ = unsafe { CloseHandle(handle) };
-            return Err(AgentError::new(
-                "local.lifecycle.watch_failed",
-                error.to_string(),
-            ));
-        }
+            })
+            .map_err(|error| AgentError::new("local.lifecycle.watch_failed", error.to_string()))?;
         Ok(())
     }
 

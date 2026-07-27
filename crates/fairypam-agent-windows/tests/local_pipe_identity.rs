@@ -121,7 +121,7 @@ fn register_hub_gui_proof_is_server_side_and_fails_closed_before_runtime_dispatc
         .find("if requires_fixed_gui(&request.command)")
         .expect("privileged local commands must verify the fixed product GUI");
     let installer_guard = adapter
-        .find("verify_fixed_installer_caller(caller.pid)")
+        .find("verify_fixed_installer_caller(caller)")
         .expect("maintenance shutdown must verify the fixed installer");
     let nonce_guard = adapter
         .find("self.nonces.accept(request.nonce)")

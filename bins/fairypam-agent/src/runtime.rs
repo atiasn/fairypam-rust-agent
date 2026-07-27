@@ -584,7 +584,7 @@ impl GrpcSessionDriver {
     }
 
     #[cfg(any(windows, test))]
-    fn local_runtime(&self) -> SharedRuntime {
+    fn local_runtime(&self, maintenance: bool) -> SharedRuntime {
         SharedRuntime {
             execution: Arc::clone(&self.execution),
             state: Arc::clone(&self.state),
@@ -593,6 +593,7 @@ impl GrpcSessionDriver {
             reconnect_requested: Arc::clone(&self.reconnect_requested),
             registration_in_progress: Arc::clone(&self.registration_in_progress),
             gui_lifetime: self.gui_lifetime.clone(),
+            maintenance,
         }
     }
 
@@ -945,6 +946,12 @@ pub struct RuntimeSafetyHooks {
     execution: Arc<Mutex<CommandExecutor>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeOwner {
+    Gui(u32),
+    Maintenance,
+}
+
 impl RuntimeSafetyHooks {
     pub fn for_driver(driver: &GrpcSessionDriver) -> Self {
         Self {
@@ -1038,14 +1045,16 @@ impl SupervisorHooks for RuntimeSafetyHooks {
     }
 }
 
-pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
+pub async fn run(config: RuntimeConfig, owner: RuntimeOwner) -> Result<(), AgentError> {
     #[cfg(windows)]
     {
+        verify_active_agent_suite()?;
         let _instance = AgentInstance::acquire()?;
-        run_windows(config, production_local_control_config()?).await
+        run_windows(config, production_local_control_config()?, owner).await
     }
     #[cfg(not(windows))]
     {
+        let _ = owner;
         let driver = GrpcSessionDriver::new(config);
         let hooks = RuntimeSafetyHooks::for_driver(&driver);
         let backoff = CappedBackoff::new(Duration::from_millis(250), Duration::from_secs(30))
@@ -1059,19 +1068,94 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
 }
 
 #[cfg(windows)]
+fn verify_active_agent_suite() -> Result<(), AgentError> {
+    let executable = std::env::current_exe().map_err(|_| {
+        AgentError::new("runtime.inactive_suite", "Agent executable is unavailable")
+    })?;
+    let version_root = executable.parent().ok_or_else(|| {
+        AgentError::new(
+            "runtime.inactive_suite",
+            "Agent version root is unavailable",
+        )
+    })?;
+    let versions = version_root.parent().ok_or_else(|| {
+        AgentError::new(
+            "runtime.inactive_suite",
+            "Agent versions root is unavailable",
+        )
+    })?;
+    if versions.file_name().and_then(|name| name.to_str()) != Some("versions") {
+        return Err(AgentError::new(
+            "runtime.inactive_suite",
+            "Agent is not running from a versioned product root",
+        ));
+    }
+    let install_root = versions.parent().ok_or_else(|| {
+        AgentError::new(
+            "runtime.inactive_suite",
+            "Agent install root is unavailable",
+        )
+    })?;
+    let active = fairypam_agent_suite::resolve_active_suite(install_root)
+        .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+    let actual = std::fs::canonicalize(version_root)
+        .map_err(|error| AgentError::new("runtime.inactive_suite", error.to_string()))?;
+    let expected = std::fs::canonicalize(active.version_root)
+        .map_err(|error| AgentError::new("runtime.inactive_suite", error.to_string()))?;
+    if !actual
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy())
+    {
+        return Err(AgentError::new(
+            "runtime.inactive_suite",
+            "Agent executable does not belong to the active suite",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 async fn run_windows(
     config: RuntimeConfig,
     local_control_config: LocalControlConfig,
+    owner: RuntimeOwner,
 ) -> Result<(), AgentError> {
+    let verified_gui = match owner {
+        RuntimeOwner::Gui(pid) => Some(
+            fairypam_agent_windows::verify_fixed_gui_owner(pid)
+                .map_err(|error| AgentError::new(error.code(), error.to_string()))?,
+        ),
+        RuntimeOwner::Maintenance => {
+            fairypam_agent_windows::verify_fixed_installer_parent()
+                .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+            None
+        }
+    };
     let driver = GrpcSessionDriver::new(config);
+    if let Some(verified_gui) = verified_gui {
+        driver.gui_lifetime.bind_verified(verified_gui)?;
+    }
+    let maintenance = owner == RuntimeOwner::Maintenance;
+    let mut local_control = tokio::spawn(run_local_control(
+        driver.local_runtime(maintenance),
+        local_control_config,
+    ));
+    if maintenance {
+        return tokio::select! {
+            _ = driver.gui_shutdown.cancelled() => {
+                local_control.abort();
+                Ok(())
+            }
+            result = &mut local_control => match result {
+                Ok(never) => match never {},
+                Err(error) => Err(AgentError::new("local.runtime_join_failed", error.to_string())),
+            },
+        };
+    }
     let hooks = RuntimeSafetyHooks::for_driver(&driver);
     let backoff = CappedBackoff::new(Duration::from_millis(250), Duration::from_secs(30))
         .map_err(map_transport)?;
     let mut supervisor = SessionSupervisor::new(hooks, backoff);
-    let mut local_control = tokio::spawn(run_local_control(
-        driver.local_runtime(),
-        local_control_config,
-    ));
     if !driver.is_registered()? {
         tokio::select! {
             result = driver.wait_until_registered() => result?,
@@ -1177,6 +1261,7 @@ struct SharedRuntime {
     reconnect_requested: Arc<tokio::sync::Notify>,
     registration_in_progress: Arc<AtomicBool>,
     gui_lifetime: GuiLifetime,
+    maintenance: bool,
 }
 
 #[cfg(any(windows, test))]
@@ -1186,15 +1271,38 @@ impl LocalControlRuntime for SharedRuntime {
         caller: &fairypam_agent_windows::VerifiedPipeCaller,
         command: &LocalCommand,
     ) -> Result<serde_json::Value, AgentError> {
+        if self.maintenance
+            && !matches!(
+                command,
+                LocalCommand::Status
+                    | LocalCommand::Doctor
+                    | LocalCommand::UpdateStatus
+                    | LocalCommand::StartupStatus
+                    | LocalCommand::ShutdownAgent
+            )
+        {
+            return Err(AgentError::new(
+                "local.maintenance_only",
+                "maintenance mode does not accept device operations",
+            ));
+        }
+        if matches!(command, LocalCommand::RegisterHub { .. }) {
+            self.gui_lifetime.confirm_bound(caller.pid)?;
+        }
         self.record_local_operation(command);
         match command {
             LocalCommand::BindUiLifetime => {
-                self.gui_lifetime.bind(caller.pid)?;
+                self.gui_lifetime.confirm_bound(caller.pid)?;
                 Ok(serde_json::json!({"state": "bound"}))
             }
             LocalCommand::ShutdownAgent => {
+                self.authorize_shutdown(caller)?;
                 self.execution.lock().map_err(lock_error)?.reset()?;
-                self.gui_lifetime.request_maintenance_shutdown()?;
+                if self.maintenance {
+                    self.gui_lifetime.request_maintenance_shutdown()?;
+                } else {
+                    self.gui_lifetime.request_shutdown(caller.pid)?;
+                }
                 Ok(serde_json::json!({"state": "shutting_down"}))
             }
             LocalCommand::GetConnectionStatus => self.connection_status(),
@@ -1222,6 +1330,20 @@ impl LocalControlRuntime for SharedRuntime {
 
 #[cfg(any(windows, test))]
 impl SharedRuntime {
+    fn authorize_shutdown(
+        &self,
+        caller: &fairypam_agent_windows::VerifiedPipeCaller,
+    ) -> Result<(), AgentError> {
+        if self.maintenance {
+            #[cfg(windows)]
+            fairypam_agent_windows::verify_fixed_installer_caller(caller)
+                .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+            Ok(())
+        } else {
+            self.gui_lifetime.confirm_bound(caller.pid)
+        }
+    }
+
     fn record_local_operation(&self, command: &LocalCommand) {
         let message = match command {
             LocalCommand::BindUiLifetime => Some(RuntimeLogMessage::LocalUiBound),
@@ -2346,7 +2468,7 @@ mod tests {
     #[tokio::test]
     async fn unregistered_runtime_keeps_local_control_then_notifies_supervisor() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
-        let mut local = driver.local_runtime();
+        let mut local = driver.local_runtime(false);
 
         assert!(!driver.is_registered().unwrap());
         assert!(local
@@ -2428,6 +2550,72 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(10), driver.wait_for_reconnect())
             .await
             .expect("re-registration must wake the active supervisor");
+    }
+
+    #[test]
+    fn maintenance_runtime_rejects_device_and_hub_operations() {
+        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        let mut local = driver.local_runtime(true);
+
+        assert!(local
+            .execute(&local_caller(), &LocalCommand::Status)
+            .is_ok());
+        for command in [
+            LocalCommand::GetConnectionStatus,
+            LocalCommand::RunEnvironmentCheck,
+            LocalCommand::FocusTarget,
+            LocalCommand::ScanInstalledGames,
+        ] {
+            assert_eq!(
+                local.execute(&local_caller(), &command).unwrap_err().code(),
+                "local.maintenance_only"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_runtime_shutdown_requires_the_bound_gui_pid() {
+        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        driver.gui_lifetime.bind(7).unwrap();
+        let mut local = driver.local_runtime(false);
+        let mut wrong = local_caller();
+        wrong.pid = 8;
+
+        assert_eq!(
+            local
+                .execute(&wrong, &LocalCommand::ShutdownAgent)
+                .unwrap_err()
+                .code(),
+            "local.lifecycle.pid_mismatch"
+        );
+        assert!(!driver.gui_shutdown.is_cancelled());
+        assert!(local
+            .execute(&local_caller(), &LocalCommand::ShutdownAgent)
+            .is_ok());
+        assert!(driver.gui_shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn register_hub_requires_the_bound_gui_pid_before_platform_handling() {
+        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        driver.gui_lifetime.bind(7).unwrap();
+        let mut local = driver.local_runtime(false);
+        let mut wrong = local_caller();
+        wrong.pid = 8;
+
+        assert_eq!(
+            local
+                .execute(
+                    &wrong,
+                    &LocalCommand::RegisterHub {
+                        hub_address: "https://hub.example".into(),
+                        registration_code: "secret".into(),
+                    },
+                )
+                .unwrap_err()
+                .code(),
+            "local.lifecycle.pid_mismatch"
+        );
     }
 
     #[test]

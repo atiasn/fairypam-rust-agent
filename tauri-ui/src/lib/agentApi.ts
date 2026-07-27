@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 import type {
   ConnectionStatus,
@@ -12,6 +13,8 @@ import type {
 
 export const agentApi = {
   ensureLocalAgent: () => invoke<SupportStatus>('ensure_local_agent'),
+  onLocalAgentActivation: (handler: () => void) =>
+    listen('local-agent-activation', handler),
   restartLocalAgent: () => invoke<SupportStatus>('restart_local_agent'),
   repairAgentTasks: () => invoke<SupportStatus>('repair_agent_tasks'),
   getOverview: () => invoke<Overview>('get_overview'),

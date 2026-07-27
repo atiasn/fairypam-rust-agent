@@ -55,16 +55,19 @@ fn command_surface_has_no_generic_bridge_or_removed_runtime_controls() {
 }
 
 #[test]
-fn product_gui_uses_fixed_tasks_and_elevates_only_the_repair_helper() {
+fn product_gui_directly_launches_the_fixed_agent_and_isolates_repair() {
     let source = include_str!("../src/commands.rs");
     for required in [
         "fairypam-agent-installer.exe",
-        "run_fixed_helper(\"--run-agent-task\")",
-        "run_fixed_helper(\"--restart-agent-task\")",
+        "launch_fixed_agent()",
+        "fixed_agent_path()",
         "\"--repair-tasks\"",
         "ShellExecuteExW",
         "SEE_MASK_NOCLOSEPROCESS",
         "HSTRING::from(\"runas\")",
+        "--ui-owner-pid {}",
+        "shutdown_local_agent_for_exit",
+        "state.shutdown_agent().await",
         "error.code == \"local.transport.pipe_not_found\"",
         "status: \"agent_ready\".into()",
         "status: \"hub_wait_timeout\".into()",
@@ -85,7 +88,6 @@ fn product_gui_uses_fixed_tasks_and_elevates_only_the_repair_helper() {
         "complete_enrollment",
         "schtasks",
         "SW_SHOWNORMAL",
-        "fairypam-agent.exe",
     ] {
         assert!(
             !source.contains(forbidden),
@@ -95,4 +97,7 @@ fn product_gui_uses_fixed_tasks_and_elevates_only_the_repair_helper() {
     assert!(!APP.contains("run_elevated_enrollment"));
     assert!(!CARGO.contains("fairypam-agentctl"));
     assert!(!source.contains("RegistrationResult"));
+    assert!(source.contains("fairypam-agent.exe"));
+    assert!(!source.contains("--run-agent-task"));
+    assert!(!source.contains("--restart-agent-task"));
 }

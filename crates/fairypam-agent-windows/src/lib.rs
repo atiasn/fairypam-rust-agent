@@ -30,6 +30,8 @@ pub use local_pipe::{
     IntegrityLevel, LocalIdentityError, PipeHandle, PipeIdentityProvider, PipeOwner,
     VerifiedPipeCaller,
 };
+#[cfg(windows)]
+pub use local_pipe::{verify_fixed_gui_owner, verify_fixed_installer_parent, VerifiedGuiOwner};
 pub use process::{normalize_process_path, normalized_process_path_sha256, process_path_is_within};
 pub use window::{
     lock_unique, revalidate_identity, FakeWindows, Rect, TargetIdentity, WindowsApi, WindowsError,

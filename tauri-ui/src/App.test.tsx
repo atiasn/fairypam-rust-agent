@@ -1,11 +1,19 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const activation = vi.hoisted(() => ({ handler: undefined as undefined | (() => void) }));
 
 vi.mock('./lib/agentApi', () => ({
   agentApi: {
     ensureLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
+    onLocalAgentActivation: vi.fn(async (handler: () => void) => {
+      activation.handler = handler;
+      return () => {
+        activation.handler = undefined;
+      };
+    }),
     restartLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
     repairAgentTasks: vi.fn().mockResolvedValue({ status: 'ready' }),
     getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' }, doctor: { profiles: ['signed-profile'], runtime: 'dry_run' } }),
@@ -31,6 +39,8 @@ function renderApp() {
 describe('App', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    activation.handler = undefined;
+    vi.mocked(agentApi.ensureLocalAgent).mockResolvedValue({ status: 'ready' });
     vi.mocked(agentApi.getLogTail).mockResolvedValue({ entries: [] });
   });
 
@@ -56,6 +66,52 @@ describe('App', () => {
     expect(await view.findByText('服务已就绪，正在重试连接')).toBeInTheDocument();
     expect(await view.findByText('正在持续尝试连接，您仍可继续使用本地功能。')).toBeInTheDocument();
     expect(view.queryByText('服务启动需要处理')).not.toBeInTheDocument();
+  });
+
+  it('重复打开触发恢复失败时立即清除旧的已连接状态', async () => {
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByText('服务已连接')).toBeInTheDocument();
+    await waitFor(() => expect(activation.handler).toBeTypeOf('function'));
+    vi.mocked(agentApi.ensureLocalAgent).mockRejectedValueOnce(new Error('UAC denied'));
+    await act(async () => activation.handler?.());
+
+    expect(await view.findByText('服务启动需要处理')).toBeInTheDocument();
+    expect(view.queryByText('服务已连接')).not.toBeInTheDocument();
+    expect(view.queryByRole('heading', { name: '后台服务已就绪' })).not.toBeInTheDocument();
+    expect(view.getByRole('button', { name: '重启后台服务' })).toBeEnabled();
+    expect(view.getByRole('button', { name: '修复后台服务' })).toBeEnabled();
+    await userEvent.click(view.getByRole('button', { name: '重试启动' }));
+    expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
+    expect(view.getByText('服务已连接')).toHaveClass('online');
+  });
+
+  it('重复打开恢复期间隐藏旧状态，完成后恢复在线操作', async () => {
+    let finishStartup: (value: { status: string }) => void;
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
+    await waitFor(() => expect(activation.handler).toBeTypeOf('function'));
+    vi.mocked(agentApi.ensureLocalAgent).mockImplementationOnce(() => new Promise((resolve) => {
+      finishStartup = resolve;
+    }));
+
+    act(() => activation.handler?.());
+
+    expect(await view.findByText('正在准备本机服务')).toBeInTheDocument();
+    expect(view.getByRole('heading', { name: '正在准备服务' })).toBeInTheDocument();
+    expect(view.queryByRole('heading', { name: '后台服务已就绪' })).not.toBeInTheDocument();
+    expect(view.queryByText(/运行状态：/)).not.toBeInTheDocument();
+
+    finishStartup!({ status: 'ready' });
+
+    const ready = await view.findByText('服务已连接');
+    expect(ready).toHaveClass('online');
+    expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
+    await userEvent.click(view.getByRole('button', { name: '连接与注册' }));
+    expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
   });
 
   it('启动后自动检查本机环境，并在未就绪时禁用注册', async () => {

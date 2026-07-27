@@ -66,18 +66,21 @@ fn gui_lifecycle_commands_remain_privileged_mutations() {
     assert!(source.contains("| LocalCommand::BindUiLifetime"));
     assert!(source.contains("| LocalCommand::RegisterHub { .. }"));
     assert!(source.contains("if requires_fixed_gui(&request.command)"));
-    assert!(source.contains("verify_fixed_installer_caller(caller.pid)"));
+    assert!(source.contains("verify_fixed_gui_caller(caller.pid)"));
+    assert!(source.contains(".or_else(|_| verify_fixed_installer_caller(caller))"));
+    assert!(source.contains("verify_fixed_installer_caller(caller)"));
 }
 
 #[test]
 fn windows_gui_lifecycle_uses_process_sync_and_keeps_local_control_abortable() {
     let lifecycle = include_str!("../src/gui_lifecycle.rs");
     let runtime = include_str!("../src/runtime.rs");
+    let identity = include_str!("../../../crates/fairypam-agent-windows/src/local_pipe.rs");
 
-    assert!(lifecycle.contains("PROCESS_SYNCHRONIZE"));
-    assert!(lifecycle.contains("OpenProcess(PROCESS_SYNCHRONIZE, false, pid)"));
-    assert!(lifecycle.contains("let raw_handle = handle.0 as usize;"));
-    assert!(lifecycle.contains("let handle = HANDLE(raw_handle as _);"));
+    assert!(identity.contains("PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE"));
+    assert!(identity.contains("Ok(VerifiedGuiOwner { pid, process })"));
+    assert!(lifecycle.contains("watch_verified_process"));
+    assert!(!lifecycle.contains("OpenProcess"));
     assert!(!runtime.contains("result = local_control =>"));
     assert!(runtime.matches("result = &mut local_control =>").count() >= 2);
 }

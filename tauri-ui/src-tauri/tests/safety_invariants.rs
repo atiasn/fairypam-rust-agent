@@ -9,6 +9,7 @@ const WINDOWS_PIPE_SERVER: &str =
     include_str!("../../../crates/fairypam-agent-windows/src/local_pipe.rs");
 const AGENT_ENROLLMENT: &str = include_str!("../../../bins/fairypam-agent/src/enrollment.rs");
 const AGENT_RUNTIME: &str = include_str!("../../../bins/fairypam-agent/src/runtime.rs");
+const AGENT_UPDATE: &str = include_str!("../../../bins/fairypam-agent/src/update.rs");
 const INSTALLER_PROVISIONER: &str =
     include_str!("../../../bins/fairypam-agent-installer/src/main.rs");
 const INSTALLER_LAYOUT_BUILD: &str =
@@ -109,6 +110,8 @@ fn product_uac_and_enrollment_publication_fail_closed() {
     let commands = include_str!("../src/commands.rs");
     for required in [
         "for path in [&gui, &helper]",
+        "for path in [&gui, &pointer]",
+        "CURRENT_POINTER_FILE",
         "verify_protected_program_files_path(path)",
         "startup.install_root_untrusted",
     ] {
@@ -581,7 +584,8 @@ fn local_identity_contract_verifies_peer_and_install_root_before_sensitive_actio
         "the GUI must verify the pipe server before any protocol bytes can be sent"
     );
     assert!(adapter.contains("if let Err(error) = verify_fixed_gui_caller(caller.pid)"));
-    assert!(adapter.contains("verify_fixed_installer_caller(caller.pid)"));
+    assert!(adapter.contains(".or_else(|_| verify_fixed_installer_caller(caller))"));
+    assert!(adapter.contains("verify_fixed_installer_caller(caller)"));
     assert!(adapter.contains("LocalCommand::RegisterHub { .. }"));
     assert!(GATEWAY.contains("REGISTRATION_TIMEOUT: Duration = Duration::from_secs(20)"));
     assert!(GATEWAY.contains("request_with_timeout(command, REGISTRATION_TIMEOUT)"));
@@ -602,12 +606,25 @@ fn local_identity_contract_verifies_peer_and_install_root_before_sensitive_actio
 }
 
 #[test]
+fn active_suite_pointer_is_verified_before_it_can_authorize_rollback() {
+    let commands = include_str!("../src/commands.rs");
+    let pointer_guard = commands
+        .find("for path in [&gui, &pointer]")
+        .expect("the active-suite pointer must use the protected path verifier");
+    let resolution = commands[pointer_guard..]
+        .find("resolve_active_suite(install_root)")
+        .expect("the protected pointer must be resolved after verification");
+    assert!(resolution > 0);
+}
+
+#[test]
 fn installer_owns_fixed_task_registration_and_bounded_recovery() {
     for required in [
         "(\"--launch-agent-task\", None) => launch_agent_task(install_root)",
         "(\"--prepare-install\", None) =>",
         "(\"--run-agent-task\", None) => with_install_transaction",
         "(\"--restart-agent-task\", None) =>",
+        "(\"--handoff-agent-task\", None) =>",
         "(\"--run-ui-task\", None) =>",
         "run_fixed_task(install_root, FixedTask::Ui, false)",
         "(\"--repair-tasks\", None) =>",
@@ -628,6 +645,10 @@ fn installer_owns_fixed_task_registration_and_bounded_recovery() {
         "fairypam-agent.exe",
         "resources\\runtime\\fairypam-agent-installer.exe",
         "fn launch_agent_task(",
+        ".arg(\"--maintenance\")",
+        "fn handoff_agent_task(",
+        "fn stop_maintenance_agent(",
+        ".try_wait()",
         "fn kill_on_close_job(",
         "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
         "AssignProcessToJobObject",
@@ -668,6 +689,8 @@ fn installer_owns_fixed_task_registration_and_bounded_recovery() {
     assert!(
         !NSIS_TEMPLATE.contains("nsis_tauri_utils::RunAsUser \"$INSTDIR\\${MAINBINARYNAME}.exe\"")
     );
+    assert!(AGENT_UPDATE.contains(".arg(\"--handoff-agent-task\")"));
+    assert!(AGENT_UPDATE.contains("update.handoff_failed"));
 }
 
 #[test]

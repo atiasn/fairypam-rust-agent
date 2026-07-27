@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 
 import { agentApi } from './lib/agentApi';
@@ -6,6 +6,7 @@ import { canMutate } from './lib/connectionReducer';
 import { queryKeys } from './lib/queryKeys';
 import { useAgentQueries } from './lib/useAgentQueries';
 import { useConnectionState } from './lib/useConnectionState';
+import { StatusPanel } from './components/StatusPanel';
 import { ConnectionPage } from './pages/ConnectionPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { DiagnosticsPage } from './pages/DiagnosticsPage';
@@ -40,6 +41,7 @@ function startupLabel(status: string | undefined, isPending: boolean, error: unk
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
   const [recoveryAction, setRecoveryAction] = useState<'restart' | 'repair'>();
+  const [activationState, setActivationState] = useState<'pending' | 'failed'>();
   const startup = useQuery({
     queryKey: queryKeys.startup,
     queryFn: agentApi.ensureLocalAgent,
@@ -47,6 +49,40 @@ export default function App() {
   });
   const queries = useAgentQueries(startup.isSuccess);
   const { connection, dispatch } = useConnectionState(queries.overview.isSuccess, queries.overview.error);
+  const refreshAgentState = useCallback(async () => {
+    const startupResult = await startup.refetch();
+    if (startupResult.isError) {
+      setActivationState('failed');
+      return;
+    }
+    const [overviewResult] = await Promise.all([
+      queries.overview.refetch(),
+      queries.environment.refetch(),
+    ]);
+    if (overviewResult.isError) {
+      setActivationState('failed');
+      return;
+    }
+    dispatch({ type: 'QuerySucceeded' });
+    setActivationState(undefined);
+  }, [dispatch, queries.environment.refetch, queries.overview.refetch, startup.refetch]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void agentApi.onLocalAgentActivation(() => {
+      setActivationState('pending');
+      dispatch({ type: 'ExplicitOffline', code: 'startup.activation_pending' });
+      void refreshAgentState();
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [dispatch, refreshAgentState]);
 
   useEffect(() => {
     if (queries.overview.data?.status.state.toLowerCase().includes('emergency')) {
@@ -62,10 +98,9 @@ export default function App() {
     setRecoveryAction(action);
     try {
       await operation();
-      await startup.refetch();
-      await Promise.all([queries.overview.refetch(), queries.environment.refetch()]);
+      await refreshAgentState();
     } catch {
-      // The existing startup error remains visible and keeps Repair available.
+      setActivationState('failed');
     } finally {
       setRecoveryAction(undefined);
     }
@@ -78,22 +113,19 @@ export default function App() {
     overview: queries.overview,
     startup,
     retryStartup: () => {
-      void startup.refetch().then((result) => {
-        if (!result.isError) {
-          void queries.overview.refetch();
-          void queries.environment.refetch();
-        }
-      });
+      void refreshAgentState();
     },
     restartAgent: () => {
+      setActivationState('pending');
       void recoverAgent('restart', agentApi.restartLocalAgent);
     },
     repairAgent: () => {
+      setActivationState('pending');
       void recoverAgent('repair', agentApi.repairAgentTasks);
     },
     recoveryAction,
   };
-  const agentReady = startup.isSuccess && queries.overview.isSuccess;
+  const agentReady = startup.isSuccess && !activationState && queries.overview.isSuccess;
 
   return (
     <div className="app-shell">
@@ -103,7 +135,11 @@ export default function App() {
           <h1>控制中心</h1>
         </div>
         <p aria-live="polite" className={`connection ${connection.availability}`}>
-          {startupLabel(startup.data?.status, startup.isPending, startup.error)}
+          {startupLabel(
+            startup.data?.status,
+            startup.isPending || activationState === 'pending',
+            activationState === 'failed' ? new Error('activation failed') : startup.error,
+          )}
         </p>
       </header>
       <div className="app-layout">
@@ -121,11 +157,33 @@ export default function App() {
           ))}
         </nav>
         <main>
-          {page === 'dashboard' && <DashboardPage {...common} />}
-          {page === 'connection' && <ConnectionPage {...common} />}
-          {page === 'environment' && <DiagnosticsPage environment={queries.environment} overview={queries.overview} />}
-          {page === 'logs' && <LogsPage enabled={agentReady} />}
-          {page === 'games' && <GamesPage enabled={agentReady} />}
+          {activationState === 'pending' && (
+            <StatusPanel availability="unknown" title="正在准备服务" detail="正在检查服务状态。" />
+          )}
+          {activationState === 'failed' && (
+            <>
+              <StatusPanel availability="offline" title="服务暂时无法使用" detail="请重试启动，或修复后台服务。" />
+              <div className="actions">
+                <button disabled={Boolean(recoveryAction)} onClick={common.restartAgent} type="button">重启后台服务</button>
+                <button disabled={Boolean(recoveryAction)} onClick={common.repairAgent} type="button">修复后台服务</button>
+                <button
+                  disabled={Boolean(recoveryAction)}
+                  onClick={() => {
+                    setActivationState('pending');
+                    void refreshAgentState();
+                  }}
+                  type="button"
+                >
+                  重试启动
+                </button>
+              </div>
+            </>
+          )}
+          {!activationState && page === 'dashboard' && <DashboardPage {...common} />}
+          {!activationState && page === 'connection' && <ConnectionPage {...common} />}
+          {!activationState && page === 'environment' && <DiagnosticsPage environment={queries.environment} overview={queries.overview} />}
+          {!activationState && page === 'logs' && <LogsPage enabled={agentReady} />}
+          {!activationState && page === 'games' && <GamesPage enabled={agentReady} />}
         </main>
       </div>
     </div>

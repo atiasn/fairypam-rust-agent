@@ -4,7 +4,7 @@ use thiserror::Error;
 use std::{
     ffi::c_void,
     mem::size_of,
-    os::windows::io::AsRawHandle,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -38,6 +38,10 @@ use windows::{
         },
         System::{
             Com::CoTaskMemFree,
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                TH32CS_SNAPPROCESS,
+            },
             Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient},
             SystemServices::{
                 SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID,
@@ -46,7 +50,7 @@ use windows::{
             Threading::{
                 GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
                 OpenThreadToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-                PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
             },
         },
         UI::Shell::{
@@ -87,6 +91,23 @@ pub struct VerifiedPipeCaller {
     pub logon_sid: String,
     pub session_id: u32,
     pub integrity: IntegrityLevel,
+}
+
+#[cfg(windows)]
+pub struct VerifiedGuiOwner {
+    pid: u32,
+    process: OwnedHandle,
+}
+
+#[cfg(windows)]
+impl VerifiedGuiOwner {
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn into_parts(self) -> (u32, OwnedHandle) {
+        (self.pid, self.process)
+    }
 }
 
 #[cfg(windows)]
@@ -275,28 +296,49 @@ pub fn verify_fixed_gui_caller(pid: u32) -> Result<(), LocalIdentityError> {
         .ok_or_else(LocalIdentityError::gui_image_mismatch)?;
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
         .map_err(windows_identity_error)?;
-    let result = (|| {
-        let image = process_image(process)?;
-        if !fixed_gui_image_matches(&expected.to_string_lossy(), &image) {
-            return Err(LocalIdentityError::gui_image_mismatch());
-        }
-        if !protected_program_files_path(&image, process)? {
-            return Err(LocalIdentityError::install_root_mismatch());
-        }
-        Ok(())
-    })();
+    let result = verify_fixed_gui_process(process, &expected);
     let _ = unsafe { CloseHandle(process) };
     result
 }
 
 #[cfg(windows)]
-pub fn verify_fixed_installer_caller(pid: u32) -> Result<(), LocalIdentityError> {
+pub fn verify_fixed_gui_owner(pid: u32) -> Result<VerifiedGuiOwner, LocalIdentityError> {
     if pid == 0 {
+        return Err(LocalIdentityError::invalid_handle());
+    }
+    let agent = std::env::current_exe().map_err(|_| LocalIdentityError::gui_image_mismatch())?;
+    let expected = agent
+        .parent()
+        .map(|directory| directory.join("fairypam-agent-tauri-ui.exe"))
+        .ok_or_else(LocalIdentityError::gui_image_mismatch)?;
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+    }
+    .map_err(windows_identity_error)?;
+    // SAFETY: OpenProcess returned an owned handle, transferred exactly once.
+    let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+    let handle = HANDLE(process.as_raw_handle());
+    let owner = current_process_pipe_owner(IntegrityLevel::Medium)?;
+    verify_pipe_caller(&owner, process_claims_from_handle(handle, pid)?)?;
+    verify_fixed_gui_process(handle, &expected)?;
+    Ok(VerifiedGuiOwner { pid, process })
+}
+
+#[cfg(windows)]
+pub fn verify_fixed_installer_caller(
+    caller: &VerifiedPipeCaller,
+) -> Result<(), LocalIdentityError> {
+    require_installer_integrity(caller)?;
+    if caller.pid == 0 {
         return Err(LocalIdentityError::invalid_handle());
     }
     let agent =
         std::env::current_exe().map_err(|_| LocalIdentityError::installer_image_mismatch())?;
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, caller.pid) }
         .map_err(windows_identity_error)?;
     let result = (|| {
         let image = process_image(process)?;
@@ -307,6 +349,76 @@ pub fn verify_fixed_installer_caller(pid: u32) -> Result<(), LocalIdentityError>
     })();
     let _ = unsafe { CloseHandle(process) };
     result
+}
+
+#[cfg(windows)]
+pub fn verify_fixed_installer_parent() -> Result<(), LocalIdentityError> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(windows_identity_error)?;
+    let result = (|| {
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        unsafe { Process32FirstW(snapshot, &mut entry) }.map_err(windows_identity_error)?;
+        loop {
+            if entry.th32ProcessID == std::process::id() {
+                let parent_pid = entry.th32ParentProcessID;
+                let owner = current_process_pipe_owner(IntegrityLevel::High)?;
+                let caller = verify_pipe_caller(&owner, process_claims(parent_pid)?)?;
+                return verify_fixed_installer_caller(&caller);
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                return Err(LocalIdentityError::installer_image_mismatch());
+            }
+        }
+    })();
+    let _ = unsafe { CloseHandle(snapshot) };
+    result
+}
+
+#[cfg(windows)]
+fn process_claims(pid: u32) -> Result<VerifiedPipeCaller, LocalIdentityError> {
+    if pid == 0 {
+        return Err(LocalIdentityError::invalid_handle());
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(windows_identity_error)?;
+    let result = process_claims_from_handle(process, pid);
+    let _ = unsafe { CloseHandle(process) };
+    result
+}
+
+#[cfg(windows)]
+fn process_claims_from_handle(
+    process: HANDLE,
+    pid: u32,
+) -> Result<VerifiedPipeCaller, LocalIdentityError> {
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }
+        .map_err(windows_identity_error)?;
+    let claims = token_claims(token, pid);
+    let _ = unsafe { CloseHandle(token) };
+    claims
+}
+
+#[cfg(windows)]
+fn verify_fixed_gui_process(process: HANDLE, expected: &Path) -> Result<(), LocalIdentityError> {
+    let image = process_image(process)?;
+    if !fixed_gui_image_matches(&expected.to_string_lossy(), &image) {
+        return Err(LocalIdentityError::gui_image_mismatch());
+    }
+    if !protected_program_files_path(&image, process)? {
+        return Err(LocalIdentityError::install_root_mismatch());
+    }
+    Ok(())
+}
+
+fn require_installer_integrity(caller: &VerifiedPipeCaller) -> Result<(), LocalIdentityError> {
+    if caller.integrity < IntegrityLevel::High {
+        return Err(LocalIdentityError::integrity_mismatch());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -719,7 +831,10 @@ fn utf16_identity_error(error: std::string::FromUtf16Error) -> LocalIdentityErro
 
 #[cfg(test)]
 mod path_tests {
-    use super::fixed_installer_image_matches;
+    use super::{
+        fixed_installer_image_matches, require_installer_integrity, IntegrityLevel,
+        VerifiedPipeCaller,
+    };
 
     #[test]
     fn maintenance_accepts_only_the_fixed_helper_for_a_versioned_agent() {
@@ -737,14 +852,38 @@ mod path_tests {
             r"C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe"
         ));
     }
+
+    #[test]
+    fn installer_shutdown_requires_high_integrity() {
+        let caller = |integrity| VerifiedPipeCaller {
+            pid: 1,
+            user_sid: "S-1-5-21-user".into(),
+            logon_sid: "S-1-5-5-logon".into(),
+            session_id: 1,
+            integrity,
+        };
+
+        assert_eq!(
+            require_installer_integrity(&caller(IntegrityLevel::Medium))
+                .unwrap_err()
+                .code(),
+            "local.identity.integrity_mismatch"
+        );
+        assert!(require_installer_integrity(&caller(IntegrityLevel::High)).is_ok());
+    }
 }
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::logon_sid_from_luid;
+    use super::{logon_sid_from_luid, verify_fixed_installer_parent};
 
     #[test]
     fn derives_logon_sid_from_unsigned_luid_parts() {
         assert_eq!(logon_sid_from_luid(-1, 42), "S-1-5-5-4294967295-42");
+    }
+
+    #[test]
+    fn ordinary_test_parent_cannot_authorize_maintenance_mode() {
+        assert!(verify_fixed_installer_parent().is_err());
     }
 }

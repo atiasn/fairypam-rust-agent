@@ -140,6 +140,11 @@ pub(crate) fn authorize_activation(request: &UpdateRequest) -> Result<(), AgentE
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
+    let install_root = install_root()?;
+    let helper = install_root
+        .join("resources")
+        .join("runtime")
+        .join("fairypam-agent-installer.exe");
     unsafe {
         MoveFileExW(
             PCWSTR(source.as_ptr()),
@@ -147,7 +152,28 @@ pub(crate) fn authorize_activation(request: &UpdateRequest) -> Result<(), AgentE
             MOVEFILE_WRITE_THROUGH,
         )
     }
-    .map_err(|_| failed())
+    .map_err(|_| failed())?;
+
+    if std::process::Command::new(helper)
+        .arg("--handoff-agent-task")
+        .arg(&install_root)
+        .current_dir(&install_root)
+        .spawn()
+        .is_err()
+    {
+        let _ = unsafe {
+            MoveFileExW(
+                PCWSTR(destination.as_ptr()),
+                PCWSTR(source.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        return Err(AgentError::new(
+            "update.handoff_failed",
+            "the installer helper could not resume the update",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn abort_staged(request: &UpdateRequest) -> Result<(), AgentError> {

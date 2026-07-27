@@ -17,9 +17,11 @@ use windows::{
             WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_CLOSE,
             WTD_STATEACTION_VERIFY, WTD_UI_NONE,
         },
-        System::Threading::{GetExitCodeProcess, WaitForSingleObject},
+        System::Threading::{
+            GetExitCodeProcess, OpenMutexW, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE,
+        },
         UI::{
-            Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
+            Shell::{ShellExecuteExW, ShellExecuteW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
             WindowsAndMessaging::SW_HIDE,
         },
     },
@@ -38,6 +40,8 @@ type CommandResult<T> = Result<T, UiCommandError>;
 #[cfg(windows)]
 const PIPE_STARTUP_LIMIT: Duration = Duration::from_secs(20);
 #[cfg(windows)]
+const PIPE_SHUTDOWN_LIMIT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
 const HUB_OBSERVATION_LIMIT: Duration = Duration::from_secs(20);
 #[cfg(windows)]
 const HUB_OBSERVATION_ATTEMPTS: u8 = 20;
@@ -47,6 +51,8 @@ const HUB_OBSERVATION_INTERVAL: Duration = Duration::from_secs(1);
 const PIPE_DELAYS_MS: [u64; 5] = [300, 600, 1_200, 2_400, 4_800];
 #[cfg(windows)]
 const REPAIR_TASK_ARGUMENT: &str = "--repair-tasks";
+#[cfg(windows)]
+const AGENT_INSTANCE_MUTEX: &str = r"Global\FairyPam.Agent.v1";
 
 #[tauri::command]
 pub async fn get_overview(state: State<'_, ProductionGateway>) -> CommandResult<OverviewDto> {
@@ -113,16 +119,25 @@ pub async fn register_hub(
 pub async fn ensure_local_agent(
     state: State<'_, ProductionGateway>,
 ) -> CommandResult<SupportStatusDto> {
+    ensure_local_agent_owned(&state).await
+}
+
+pub(crate) async fn ensure_local_agent_owned(
+    state: &ProductionGateway,
+) -> CommandResult<SupportStatusDto> {
     #[cfg(windows)]
     {
-        match state.status_with_timeout(Duration::from_secs(1)).await {
-            Ok(_) => return observe_hub(&state).await,
-            Err(error) if error.code == "local.transport.pipe_not_found" => {
-                run_fixed_helper("--run-agent-task")?;
+        let _lifecycle = state.acquire_lifecycle()?;
+        if state.interactive_owner_ready() {
+            match state.status_with_timeout(Duration::from_secs(1)).await {
+                Ok(_) => return observe_hub(state).await,
+                Err(error) if error.code == "local.transport.pipe_not_found" => {
+                    state.clear_interactive_owner();
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
-        wait_for_agent(&state).await
+        replace_with_interactive_agent(state).await
     }
     #[cfg(not(windows))]
     {
@@ -140,8 +155,8 @@ pub async fn restart_local_agent(
 ) -> CommandResult<SupportStatusDto> {
     #[cfg(windows)]
     {
-        run_fixed_helper("--restart-agent-task")?;
-        wait_for_agent(&state).await
+        let _lifecycle = state.acquire_lifecycle()?;
+        replace_with_interactive_agent(&state).await
     }
     #[cfg(not(windows))]
     {
@@ -156,9 +171,10 @@ pub async fn repair_agent_tasks(
 ) -> CommandResult<SupportStatusDto> {
     #[cfg(windows)]
     {
+        let _lifecycle = state.acquire_lifecycle()?;
+        stop_existing_agent(&state).await?;
         run_repair_helper()?;
-        run_fixed_helper("--run-agent-task")?;
-        wait_for_agent(&state).await
+        replace_with_interactive_agent(&state).await
     }
     #[cfg(not(windows))]
     {
@@ -173,6 +189,74 @@ fn platform_unsupported() -> UiCommandError {
         "local.transport.platform_unsupported",
         "FairyPam Agent startup requires Windows",
     )
+}
+
+#[cfg(windows)]
+async fn replace_with_interactive_agent(
+    state: &ProductionGateway,
+) -> CommandResult<SupportStatusDto> {
+    stop_existing_agent(state).await?;
+    launch_fixed_agent()?;
+    wait_for_agent(state).await
+}
+
+pub(crate) async fn shutdown_local_agent_for_exit(state: &ProductionGateway) -> CommandResult<()> {
+    #[cfg(windows)]
+    {
+        let _lifecycle = state.acquire_lifecycle()?;
+        stop_existing_agent(state).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+async fn stop_existing_agent(state: &ProductionGateway) -> CommandResult<()> {
+    state.clear_interactive_owner();
+    match state.shutdown_agent().await {
+        Ok(()) => {}
+        Err(error) if error.code == "local.transport.pipe_not_found" => {}
+        // The Agent cancels its Pipe server while completing safe shutdown.
+        Err(error) if error.code == "local.transport.disconnected" => {}
+        Err(error) => return Err(error),
+    }
+    let deadline = Instant::now() + PIPE_SHUTDOWN_LIMIT;
+    loop {
+        if !agent_instance_running()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(UiCommandError::unavailable(
+                "startup.agent_shutdown_timeout",
+                "The previous FairyPam Agent did not stop within 10 seconds",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(windows)]
+fn agent_instance_running() -> CommandResult<bool> {
+    match unsafe {
+        OpenMutexW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            &HSTRING::from(AGENT_INSTANCE_MUTEX),
+        )
+    } {
+        Ok(handle) => {
+            let _ = unsafe { CloseHandle(handle) };
+            Ok(true)
+        }
+        Err(error) if error.code().0 as u32 == 0x8007_0002 => Ok(false),
+        Err(_) => Err(UiCommandError::unavailable(
+            "startup.agent_instance_unavailable",
+            "FairyPam could not verify the previous Agent process",
+        )),
+    }
 }
 
 #[cfg(windows)]
@@ -192,7 +276,10 @@ async fn wait_for_agent(state: &ProductionGateway) -> CommandResult<SupportStatu
             .status_with_timeout(remaining.min(Duration::from_secs(1)))
             .await
         {
-            Ok(_) => return observe_hub(state).await,
+            Ok(_) => {
+                state.mark_interactive_owner_ready();
+                return observe_hub(state).await;
+            }
             Err(error) if error.code == "local.transport.pipe_not_found" => {}
             Err(error) => return Err(error),
         }
@@ -244,36 +331,25 @@ async fn observe_hub(state: &ProductionGateway) -> CommandResult<SupportStatusDt
 }
 
 #[cfg(windows)]
-fn run_fixed_helper(argument: &'static str) -> CommandResult<()> {
-    if !matches!(argument, "--run-agent-task" | "--restart-agent-task") {
+fn launch_fixed_agent() -> CommandResult<()> {
+    let (agent, directory) = fixed_agent_path()?;
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            &HSTRING::from("runas"),
+            &HSTRING::from(agent.to_string_lossy().as_ref()),
+            &HSTRING::from(format!("--ui-owner-pid {}", std::process::id())),
+            &HSTRING::from(directory.to_string_lossy().as_ref()),
+            SW_HIDE,
+        )
+    };
+    if result.0 as usize <= 32 {
         return Err(UiCommandError::unavailable(
-            "startup.agent_task_failed",
-            "FairyPam rejected an unsupported Agent task operation",
+            "startup.elevation_denied",
+            "Windows did not authorize starting the FairyPam Agent",
         ));
     }
-    let (helper, directory) = fixed_helper_path()?;
-    let status = std::process::Command::new(helper)
-        .arg(argument)
-        .arg(&directory)
-        .current_dir(&directory)
-        .status()
-        .map_err(|_| agent_task_failed())?;
-    match status.code() {
-        Some(0) => Ok(()),
-        Some(12) => Err(UiCommandError::unavailable(
-            "startup.agent_task_missing",
-            "The FairyPam Agent task is missing; repair the installation",
-        )),
-        Some(13) => Err(UiCommandError::unavailable(
-            "startup.agent_repair_required",
-            "The FairyPam Agent task is invalid; repair the installation",
-        )),
-        Some(22) => Err(UiCommandError::unavailable(
-            "startup.agent_repair_required",
-            "The FairyPam Agent exhausted bounded recovery; repair the installation",
-        )),
-        _ => Err(agent_task_failed()),
-    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -396,11 +472,54 @@ fn fixed_helper_path() -> CommandResult<(PathBuf, PathBuf)> {
 }
 
 #[cfg(windows)]
-fn agent_task_failed() -> UiCommandError {
-    UiCommandError::unavailable(
-        "startup.agent_task_failed",
-        "Windows could not run the FairyPam Agent task",
-    )
+fn fixed_agent_path() -> CommandResult<(PathBuf, PathBuf)> {
+    let (gui, directory) = active_gui_paths()?;
+    let agent = directory.join("fairypam-agent.exe");
+    for path in [&gui, &agent] {
+        fairypam_agent_local_client::verify_protected_program_files_path(path)
+            .map_err(|_| untrusted_install_root())?;
+    }
+    Ok((agent, directory))
+}
+
+#[cfg(windows)]
+pub(crate) fn verify_active_gui() -> CommandResult<()> {
+    active_gui_paths().map(|_| ())
+}
+
+#[cfg(windows)]
+fn active_gui_paths() -> CommandResult<(PathBuf, PathBuf)> {
+    let gui = std::env::current_exe().map_err(|_| {
+        UiCommandError::unavailable("startup.agent_unavailable", "FairyPam Agent is unavailable")
+    })?;
+    let version_root = gui.parent().map(|path| path.to_path_buf()).ok_or_else(|| {
+        UiCommandError::unavailable("startup.agent_unavailable", "FairyPam Agent is unavailable")
+    })?;
+    let versions = version_root.parent().ok_or_else(untrusted_install_root)?;
+    if versions.file_name().and_then(|name| name.to_str()) != Some("versions") {
+        return Err(untrusted_install_root());
+    }
+    let install_root = versions.parent().ok_or_else(untrusted_install_root)?;
+    let pointer = install_root.join(fairypam_agent_suite::CURRENT_POINTER_FILE);
+    for path in [&gui, &pointer] {
+        fairypam_agent_local_client::verify_protected_program_files_path(path)
+            .map_err(|_| untrusted_install_root())?;
+    }
+    let active = fairypam_agent_suite::resolve_active_suite(install_root)
+        .map_err(|_| untrusted_install_root())?;
+    let actual = std::fs::canonicalize(&version_root).map_err(|_| untrusted_install_root())?;
+    let expected =
+        std::fs::canonicalize(&active.version_root).map_err(|_| untrusted_install_root())?;
+    if !actual
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy())
+    {
+        return Err(UiCommandError::unavailable(
+            "startup.inactive_suite",
+            "FairyPam must be started from the active installed version",
+        ));
+    }
+    Ok((gui, version_root))
 }
 
 #[cfg(windows)]
@@ -418,8 +537,8 @@ mod tests {
 
     #[cfg(windows)]
     use super::{
-        HUB_OBSERVATION_ATTEMPTS, HUB_OBSERVATION_INTERVAL, HUB_OBSERVATION_LIMIT, PIPE_DELAYS_MS,
-        PIPE_STARTUP_LIMIT,
+        AGENT_INSTANCE_MUTEX, HUB_OBSERVATION_ATTEMPTS, HUB_OBSERVATION_INTERVAL,
+        HUB_OBSERVATION_LIMIT, PIPE_DELAYS_MS, PIPE_SHUTDOWN_LIMIT, PIPE_STARTUP_LIMIT,
     };
 
     #[cfg(windows)]
@@ -427,6 +546,8 @@ mod tests {
     fn startup_retry_budget_is_bounded() {
         assert_eq!(PIPE_DELAYS_MS.len(), 5);
         assert!(PIPE_DELAYS_MS.iter().sum::<u64>() < PIPE_STARTUP_LIMIT.as_millis() as u64);
+        assert_eq!(PIPE_SHUTDOWN_LIMIT, Duration::from_secs(10));
+        assert_eq!(AGENT_INSTANCE_MUTEX, r"Global\FairyPam.Agent.v1");
         assert_eq!(HUB_OBSERVATION_ATTEMPTS, 20);
         assert_eq!(HUB_OBSERVATION_INTERVAL, Duration::from_secs(1));
         assert_eq!(HUB_OBSERVATION_LIMIT, Duration::from_secs(20));

@@ -486,4 +486,17 @@ mod tests {
 
         assert_eq!(error.code(), "local.transport.pipe_busy");
     }
+
+    #[test]
+    fn writable_current_pointer_is_not_a_protected_install_path() {
+        let root =
+            std::env::temp_dir().join(format!("fairypam-writable-pointer-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let pointer = root.join("current.json");
+        fs::write(&pointer, "{}").unwrap();
+
+        assert!(!protected_install_path(&pointer, &root).unwrap());
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -1,7 +1,10 @@
 const APP: &str = include_str!("../src/app.rs");
+const AGENT_LIFECYCLE: &str = include_str!("../../../bins/fairypam-agent/src/gui_lifecycle.rs");
+const WINDOWS_IDENTITY: &str =
+    include_str!("../../../crates/fairypam-agent-windows/src/local_pipe.rs");
 
 #[test]
-fn tray_lifecycle_hides_on_close_and_leaves_the_resident_agent_running_on_exit() {
+fn window_close_keeps_the_process_alive_and_process_exit_stops_the_bound_agent() {
     let lifecycle = APP
         .split(".on_window_event")
         .nth(1)
@@ -11,9 +14,17 @@ fn tray_lifecycle_hides_on_close_and_leaves_the_resident_agent_running_on_exit()
     assert!(lifecycle.contains("api.prevent_close()"));
     assert!(lifecycle.contains("window.hide()"));
     assert!(!lifecycle.contains("release_all"));
-    assert!(APP.contains("\"exit-ui\" => app.exit(0)"));
-    assert!(!APP.contains("shutdown_bound_agent_then_exit"));
-    assert!(!APP.contains("gateway.shutdown_bound_agent().await"));
+    let shutdown = APP
+        .find("shutdown_local_agent_for_exit")
+        .expect("tray exit must request Agent cleanup");
+    let exit = APP
+        .find("app.exit(0)")
+        .expect("tray exit must close the GUI");
+    assert!(shutdown < exit);
+    assert!(WINDOWS_IDENTITY.contains("PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE"));
+    assert!(AGENT_LIFECYCLE.contains("watch_verified_process"));
+    assert!(AGENT_LIFECYCLE.contains("shutdown.cancel()"));
+    assert!(APP.contains("show_main_window(&app)"));
     assert!(APP.contains("\"show-main\" => show_main_window(app)"));
     assert!(!APP.contains("stop-agent"));
     assert!(APP.contains("show_menu_on_left_click(false)"));

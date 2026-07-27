@@ -1,12 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
+const { invoke, listen } = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
+vi.mock('@tauri-apps/api/event', () => ({ listen }));
 
 import { agentApi } from './agentApi';
 
 describe('agentApi', () => {
-  beforeEach(() => invoke.mockReset());
+  beforeEach(() => {
+    invoke.mockReset();
+    listen.mockReset();
+  });
 
   it('uses fixed local Gateway commands without command-line registration secrets', async () => {
     await agentApi.ensureLocalAgent();
@@ -23,5 +27,12 @@ describe('agentApi', () => {
       hubAddress: 'https://hub.test',
       registrationCode: '0123456789abcdef',
     });
+  });
+
+  it('subscribes to the fixed activation event', async () => {
+    const handler = vi.fn();
+    await agentApi.onLocalAgentActivation(handler);
+
+    expect(listen).toHaveBeenCalledWith('local-agent-activation', handler);
   });
 });

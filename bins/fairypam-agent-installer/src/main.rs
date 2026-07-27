@@ -31,6 +31,9 @@ fn main() {
                 ("--restart-agent-task", None) => with_install_transaction(|| {
                     run_fixed_task(install_root, FixedTask::Agent, true)
                 }),
+                ("--handoff-agent-task", None) => {
+                    with_install_transaction(|| handoff_agent_task(install_root))
+                }
                 ("--run-ui-task", None) => {
                     with_install_transaction(|| run_fixed_task(install_root, FixedTask::Ui, false))
                 }
@@ -157,6 +160,10 @@ impl FixedTask {
             Self::Ui => "LeastPrivilege",
         }
     }
+
+    fn has_logon_trigger(self) -> bool {
+        matches!(self, Self::Ui)
+    }
 }
 
 #[cfg(windows)]
@@ -276,6 +283,13 @@ fn fixed_task_xml(install_root: &std::path::Path, user_sid: &str, task: FixedTas
     let working_directory = xml_escape(&working_directory);
     let user_sid = xml_escape(user_sid);
     let security = xml_escape(&fixed_task_security(&user_sid));
+    let triggers = if task.has_logon_trigger() {
+        format!(
+            "  <Triggers>\n    <LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>{user_sid}</UserId>\n    </LogonTrigger>\n  </Triggers>\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -284,13 +298,7 @@ fn fixed_task_xml(install_root: &std::path::Path, user_sid: &str, task: FixedTas
     <SecurityDescriptor>{security}</SecurityDescriptor>
     <Source>FairyPam Installer</Source>
   </RegistrationInfo>
-  <Triggers>
-    <LogonTrigger>
-      <Enabled>true</Enabled>
-      <UserId>{user_sid}</UserId>
-    </LogonTrigger>
-  </Triggers>
-  <Principals>
+{triggers}  <Principals>
     <Principal id="Author">
       <UserId>{user_sid}</UserId>
       <LogonType>InteractiveToken</LogonType>
@@ -361,6 +369,7 @@ fn launch_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFail
             let active = active_suite(install_root)?;
             let mut child =
                 std::process::Command::new(active.version_root.join("fairypam-agent.exe"))
+                    .arg("--maintenance")
                     .current_dir(&active.version_root)
                     .spawn()
                     .map_err(|_| ProvisionFailure::TaskOperation)?;
@@ -373,7 +382,9 @@ fn launch_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFail
                     persist_update_result(&request, state, "succeeded")?;
                     std::fs::remove_file(UPDATE_SETTLING_PATH)
                         .map_err(|_| ProvisionFailure::Updates)?;
-                    let _ = run_fixed_task(install_root, FixedTask::Ui, false);
+                    stop_maintenance_agent(&mut child, install_root)?;
+                    run_fixed_task(install_root, FixedTask::Ui, false)?;
+                    return Ok(());
                 } else {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -384,7 +395,9 @@ fn launch_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFail
             if let Some(update) = update {
                 if wait_for_agent_health(install_root).is_ok() {
                     if update.commit().is_ok() {
-                        let _ = run_fixed_task(install_root, FixedTask::Ui, false);
+                        stop_maintenance_agent(&mut child, install_root)?;
+                        run_fixed_task(install_root, FixedTask::Ui, false)?;
+                        return Ok(());
                     } else {
                         let request = update.request.clone();
                         let _ = child.kill();
@@ -420,14 +433,56 @@ fn launch_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFail
 }
 
 #[cfg(windows)]
+fn stop_maintenance_agent(
+    child: &mut std::process::Child,
+    install_root: &std::path::Path,
+) -> Result<(), ProvisionFailure> {
+    request_agent_maintenance_shutdown(install_root).map_err(task_failure)?;
+    for _ in 0..100 {
+        match child
+            .try_wait()
+            .map_err(|_| ProvisionFailure::TaskOperation)?
+        {
+            Some(status) if status.success() => return Ok(()),
+            Some(_) => return Err(ProvisionFailure::TaskOperation),
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(ProvisionFailure::RepairRequired)
+}
+
+#[cfg(windows)]
 fn launch_ui_task(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
     let active = active_suite(install_root)?;
-    std::process::Command::new(active.version_root.join("fairypam-agent-tauri-ui.exe"))
-        .current_dir(active.version_root)
+    let gui = active.version_root.join("fairypam-agent-tauri-ui.exe");
+    let mut first = std::process::Command::new(&gui)
+        .current_dir(&active.version_root)
         .spawn()
-        .map(|_| ())
-        .map_err(|_| ProvisionFailure::TaskOperation)
+        .map_err(|_| ProvisionFailure::TaskOperation)?;
+    for _ in 0..20 {
+        match first
+            .try_wait()
+            .map_err(|_| ProvisionFailure::TaskOperation)?
+        {
+            Some(status) if status.success() => {
+                if wait_for_gui_handoff(install_root).map_err(task_failure)? {
+                    return Ok(());
+                }
+                std::process::Command::new(&gui)
+                    .current_dir(&active.version_root)
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|_| ProvisionFailure::TaskOperation)?;
+                return Ok(());
+            }
+            Some(_) => return Err(ProvisionFailure::TaskOperation),
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1463,6 +1518,7 @@ fn with_task_scheduler<T>(
 
 #[cfg(windows)]
 fn provision_fixed_tasks(install_root: &std::path::Path) -> Result<(), TaskError> {
+    use windows::Win32::System::TaskScheduler::{TASK_STATE_QUEUED, TASK_STATE_RUNNING};
     use windows::Win32::System::Variant::VARIANT;
 
     let user_sid = task_user_sid().map_err(|_| TaskError::Operation)?;
@@ -1477,9 +1533,24 @@ fn provision_fixed_tasks(install_root: &std::path::Path) -> Result<(), TaskError
                     agent = Some(registered);
                 }
             }
-            unsafe { agent.ok_or(TaskError::Operation)?.Run(&VARIANT::default()) }
-                .map_err(|_| TaskError::Operation)?;
+            let agent = agent.ok_or(TaskError::Operation)?;
+            unsafe { agent.Run(&VARIANT::default()) }.map_err(|_| TaskError::Operation)?;
             wait_for_agent_health(install_root)?;
+            request_agent_maintenance_shutdown(install_root)?;
+            for _ in 0..100 {
+                let state = unsafe { agent.State() }.map_err(|_| TaskError::Operation)?;
+                if !matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let state = unsafe { agent.State() }.map_err(|_| TaskError::Operation)?;
+            if matches!(state, TASK_STATE_RUNNING | TASK_STATE_QUEUED)
+                || unsafe { agent.LastTaskResult() }.map_err(|_| TaskError::Operation)? != 0
+            {
+                return Err(TaskError::Operation);
+            }
+            wait_for_agent_processes_to_exit(install_root)?;
             Ok(())
         })();
         if result.is_err() && restore_fixed_tasks(folder, &backups).is_err() {
@@ -1760,24 +1831,27 @@ fn validate_fixed_task(
     let triggers = unsafe { definition.Triggers() }.map_err(|_| TaskError::Operation)?;
     let mut trigger_count = 0;
     unsafe { triggers.Count(&mut trigger_count) }.map_err(|_| TaskError::Operation)?;
-    if trigger_count != 1 {
+    let expected_trigger_count = if task.has_logon_trigger() { 1 } else { 0 };
+    if trigger_count != expected_trigger_count {
         return Err(TaskError::InvalidTrigger);
     }
-    let trigger: ILogonTrigger = unsafe { triggers.get_Item(1) }
-        .and_then(|trigger| trigger.cast())
-        .map_err(|_| TaskError::InvalidTrigger)?;
-    let mut trigger_user = BSTR::default();
-    let mut trigger_delay = BSTR::default();
-    let mut trigger_enabled = VARIANT_BOOL::default();
-    unsafe { trigger.UserId(&mut trigger_user) }.map_err(|_| TaskError::Operation)?;
-    unsafe { trigger.Delay(&mut trigger_delay) }.map_err(|_| TaskError::Operation)?;
-    unsafe { trigger.Enabled(&mut trigger_enabled) }.map_err(|_| TaskError::Operation)?;
-    if !task_identity_matches_sid(&trigger_user.to_string(), user_sid)
-        .map_err(|_| TaskError::InvalidTrigger)?
-        || !trigger_delay.is_empty()
-        || !trigger_enabled.as_bool()
-    {
-        return Err(TaskError::InvalidTrigger);
+    if task.has_logon_trigger() {
+        let trigger: ILogonTrigger = unsafe { triggers.get_Item(1) }
+            .and_then(|trigger| trigger.cast())
+            .map_err(|_| TaskError::InvalidTrigger)?;
+        let mut trigger_user = BSTR::default();
+        let mut trigger_delay = BSTR::default();
+        let mut trigger_enabled = VARIANT_BOOL::default();
+        unsafe { trigger.UserId(&mut trigger_user) }.map_err(|_| TaskError::Operation)?;
+        unsafe { trigger.Delay(&mut trigger_delay) }.map_err(|_| TaskError::Operation)?;
+        unsafe { trigger.Enabled(&mut trigger_enabled) }.map_err(|_| TaskError::Operation)?;
+        if !task_identity_matches_sid(&trigger_user.to_string(), user_sid)
+            .map_err(|_| TaskError::InvalidTrigger)?
+            || !trigger_delay.is_empty()
+            || !trigger_enabled.as_bool()
+        {
+            return Err(TaskError::InvalidTrigger);
+        }
     }
 
     let actions = unsafe { definition.Actions() }.map_err(|_| TaskError::Operation)?;
@@ -1877,6 +1951,14 @@ fn run_fixed_task(
             .map_err(|_| TaskError::Operation)
     })
     .map_err(task_failure)
+}
+
+#[cfg(windows)]
+fn handoff_agent_task(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
+    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    wait_for_agent_processes_to_exit(install_root).map_err(task_failure)?;
+    run_fixed_task(install_root, FixedTask::Agent, false)
 }
 
 #[cfg(windows)]
@@ -2032,22 +2114,42 @@ fn request_agent_maintenance_shutdown(install_root: &std::path::Path) -> Result<
 
 #[cfg(windows)]
 fn wait_for_agent_processes_to_exit(install_root: &std::path::Path) -> Result<(), TaskError> {
-    wait_for_managed_processes_to_exit(install_root, false)
+    wait_for_managed_processes_to_exit(install_root, false, None)
 }
 
 #[cfg(windows)]
 fn wait_for_product_processes_to_exit(install_root: &std::path::Path) -> Result<(), TaskError> {
-    wait_for_managed_processes_to_exit(install_root, true)
+    wait_for_managed_processes_to_exit(install_root, true, Some(GuiProcessFilter::AnyVersion))
+}
+
+#[cfg(windows)]
+fn wait_for_gui_handoff(install_root: &std::path::Path) -> Result<bool, TaskError> {
+    for _ in 0..100 {
+        if !managed_process_is_running(install_root, false, Some(GuiProcessFilter::Stale))? {
+            return managed_process_is_running(install_root, false, Some(GuiProcessFilter::Active));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(TaskError::Rollback)
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuiProcessFilter {
+    AnyVersion,
+    Active,
+    Stale,
 }
 
 #[cfg(windows)]
 fn wait_for_managed_processes_to_exit(
     install_root: &std::path::Path,
     include_launcher: bool,
+    gui_filter: Option<GuiProcessFilter>,
 ) -> Result<(), TaskError> {
     for _ in 0..100 {
         if matches!(
-            managed_process_is_running(install_root, include_launcher),
+            managed_process_is_running(install_root, include_launcher, gui_filter),
             Ok(false)
         ) {
             return Ok(());
@@ -2059,13 +2161,14 @@ fn wait_for_managed_processes_to_exit(
 
 #[cfg(windows)]
 fn agent_process_is_running(install_root: &std::path::Path) -> Result<bool, TaskError> {
-    managed_process_is_running(install_root, false)
+    managed_process_is_running(install_root, false, None)
 }
 
 #[cfg(windows)]
 fn managed_process_is_running(
     install_root: &std::path::Path,
     include_launcher: bool,
+    gui_filter: Option<GuiProcessFilter>,
 ) -> Result<bool, TaskError> {
     use windows::core::PWSTR;
     use windows::Win32::{
@@ -2102,10 +2205,17 @@ fn managed_process_is_running(
                 .position(|character| *character == 0)
                 .unwrap_or(entry.szExeFile.len());
             let executable = String::from_utf16_lossy(&entry.szExeFile[..length]);
-            let expected = if executable.eq_ignore_ascii_case("fairypam-agent.exe") {
+            let include_core = matches!(gui_filter, None | Some(GuiProcessFilter::AnyVersion));
+            let expected = if include_core && executable.eq_ignore_ascii_case("fairypam-agent.exe")
+            {
                 Some(version_root.join("fairypam-agent.exe"))
-            } else if executable.eq_ignore_ascii_case("fairypam-agent-guardian.exe") {
+            } else if include_core && executable.eq_ignore_ascii_case("fairypam-agent-guardian.exe")
+            {
                 Some(version_root.join("fairypam-agent-guardian.exe"))
+            } else if gui_filter.is_some()
+                && executable.eq_ignore_ascii_case("fairypam-agent-tauri-ui.exe")
+            {
+                Some(version_root.join("fairypam-agent-tauri-ui.exe"))
             } else if include_launcher
                 && entry.th32ProcessID != std::process::id()
                 && executable.eq_ignore_ascii_case("fairypam-agent-installer.exe")
@@ -2140,7 +2250,18 @@ fn managed_process_is_running(
                     let _ = unsafe { CloseHandle(process) };
                     query.map_err(|_| TaskError::Rollback)?;
                     let image = String::from_utf16_lossy(&image[..image_length as usize]);
-                    if same_windows_path(std::path::Path::new(&image), &expected) {
+                    let image = std::path::Path::new(&image);
+                    let matches = if executable.eq_ignore_ascii_case("fairypam-agent-tauri-ui.exe")
+                    {
+                        gui_process_matches(
+                            image,
+                            &expected,
+                            gui_filter.expect("GUI process requires a GUI filter"),
+                        )
+                    } else {
+                        same_windows_path(image, &expected)
+                    };
+                    if matches {
                         return Ok(true);
                     }
                 }
@@ -2156,6 +2277,32 @@ fn managed_process_is_running(
     })();
     let _ = unsafe { CloseHandle(snapshot) };
     result
+}
+
+#[cfg(windows)]
+fn gui_process_matches(
+    image: &std::path::Path,
+    active_gui: &std::path::Path,
+    filter: GuiProcessFilter,
+) -> bool {
+    if filter == GuiProcessFilter::Active {
+        return same_windows_path(image, active_gui);
+    }
+    let is_versioned_gui = image
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("fairypam-agent-tauri-ui.exe"))
+        && image
+            .parent()
+            .and_then(std::path::Path::parent)
+            .is_some_and(|versions| {
+                active_gui
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .is_some_and(|active_versions| same_windows_path(versions, active_versions))
+            });
+    is_versioned_gui
+        && (filter == GuiProcessFilter::AnyVersion || !same_windows_path(image, active_gui))
 }
 
 #[cfg(windows)]
@@ -3010,7 +3157,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_tasks_are_single_instance_logon_tasks_with_bounded_agent_restart() {
+    fn ui_is_the_only_logon_task_and_agent_maintenance_is_on_demand() {
         let root = std::path::Path::new(r"C:\Program Files\FairyPam");
         let sid = "S-1-5-21-1-2-3-1001";
         let agent = fixed_task_xml(root, sid, FixedTask::Agent);
@@ -3019,9 +3166,10 @@ mod tests {
         for xml in [&agent, &ui] {
             assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
             assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
-            assert!(xml.contains("<LogonTrigger>"));
             assert!(xml.contains(&fixed_task_security(sid)));
         }
+        assert!(!agent.contains("<Triggers>"));
+        assert!(ui.contains("<LogonTrigger>"));
         assert!(agent.contains("<RunLevel>HighestAvailable</RunLevel>"));
         assert!(agent.contains("<URI>\\FairyPam Agent</URI>"));
         assert!(!agent.contains("<RestartOnFailure>"));
@@ -3040,6 +3188,48 @@ mod tests {
         ));
         assert!(ui
             .contains(r"C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gui_handoff_distinguishes_active_and_rollback_versions() {
+        let versions = std::path::Path::new(r"C:\Program Files\FairyPam\versions");
+        let active = versions.join("build-b").join("fairypam-agent-tauri-ui.exe");
+        let rollback = versions.join("build-a").join("fairypam-agent-tauri-ui.exe");
+
+        assert!(gui_process_matches(
+            &active,
+            &active,
+            GuiProcessFilter::Active
+        ));
+        assert!(!gui_process_matches(
+            &rollback,
+            &active,
+            GuiProcessFilter::Active,
+        ));
+        assert!(!gui_process_matches(
+            &active,
+            &active,
+            GuiProcessFilter::Stale
+        ));
+        assert!(gui_process_matches(
+            &rollback,
+            &active,
+            GuiProcessFilter::Stale,
+        ));
+        assert!(gui_process_matches(
+            &rollback,
+            &active,
+            GuiProcessFilter::AnyVersion,
+        ));
+        assert!(!gui_process_matches(
+            &versions
+                .join("build-a")
+                .join("nested")
+                .join("fairypam-agent-tauri-ui.exe"),
+            &active,
+            GuiProcessFilter::AnyVersion,
+        ));
     }
 
     #[test]
