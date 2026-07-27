@@ -673,7 +673,7 @@ mod native {
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
     use windows::Win32::System::Threading::{
-        AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken,
+        AttachThreadInput, GetProcessTimes, OpenProcess, OpenProcessToken,
         QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
@@ -681,7 +681,7 @@ mod native {
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
         GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
-        SetForegroundWindow, ShowWindow, SW_RESTORE, WM_CLOSE,
+        SetActiveWindow, SetForegroundWindow, ShowWindow, SW_RESTORE, WM_CLOSE,
     };
 
     use crate::{normalized_process_path_sha256, validate_dpi};
@@ -789,15 +789,20 @@ mod native {
         let hwnd = HWND(identity.hwnd as *mut c_void);
         let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
         let foreground = unsafe { GetForegroundWindow() };
-        let current_thread = unsafe { GetCurrentThreadId() };
+        let target_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
         let foreground_thread = unsafe { GetWindowThreadProcessId(foreground, None) };
         let attached = foreground_thread != 0
-            && foreground_thread != current_thread
-            && unsafe { AttachThreadInput(current_thread, foreground_thread, true) }.as_bool();
-        let _ = unsafe { BringWindowToTop(hwnd) };
+            && target_thread != 0
+            && foreground_thread != target_thread
+            && unsafe { AttachThreadInput(target_thread, foreground_thread, true) }.as_bool();
         let _ = unsafe { SetForegroundWindow(hwnd) };
+        if unsafe { IsIconic(hwnd).as_bool() } {
+            let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+        }
+        let _ = unsafe { BringWindowToTop(hwnd) };
+        let _ = unsafe { SetActiveWindow(hwnd) };
         if attached
-            && !unsafe { AttachThreadInput(current_thread, foreground_thread, false) }.as_bool()
+            && !unsafe { AttachThreadInput(target_thread, foreground_thread, false) }.as_bool()
         {
             return Err(WindowsError::new(
                 "target.focus_failed",
