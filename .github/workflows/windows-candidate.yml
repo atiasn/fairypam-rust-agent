@@ -357,9 +357,11 @@ jobs:
             throw "maintenance Agent health task did not exit cleanly: $($taskInfo.LastTaskResult)"
           }
           $taskXml = [xml](Export-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent')
-          if ($null -ne $taskXml.Task.Triggers `
-              -and @($taskXml.Task.Triggers.ChildNodes).Count -ne 0) {
-            throw "maintenance Agent task must not have automatic triggers"
+          $taskNamespace = [Xml.XmlNamespaceManager]::new($taskXml.NameTable)
+          $taskNamespace.AddNamespace('task', $taskXml.DocumentElement.NamespaceURI)
+          $triggers = @($taskXml.SelectNodes('/task:Task/task:Triggers/*', $taskNamespace))
+          if ($triggers.Count -ne 0) {
+            throw "maintenance Agent task must not have automatic triggers: $($triggers.LocalName -join ',')"
           }
           if (@($task.Actions).Count -ne 1 `
               -or $task.Actions[0].Execute -cne 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe' `
