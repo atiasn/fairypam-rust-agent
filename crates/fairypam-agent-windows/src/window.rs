@@ -673,15 +673,15 @@ mod native {
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
     use windows::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-        WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SYNCHRONIZE,
+        AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken,
+        QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
-        ShowWindow, SW_RESTORE, WM_CLOSE,
+        BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
+        SetForegroundWindow, ShowWindow, SW_RESTORE, WM_CLOSE,
     };
 
     use crate::{normalized_process_path_sha256, validate_dpi};
@@ -788,10 +788,20 @@ mod native {
         require_same_identity(identity, &current.identity)?;
         let hwnd = HWND(identity.hwnd as *mut c_void);
         let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
-        if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+        let foreground = unsafe { GetForegroundWindow() };
+        let current_thread = unsafe { GetCurrentThreadId() };
+        let foreground_thread = unsafe { GetWindowThreadProcessId(foreground, None) };
+        let attached = foreground_thread != 0
+            && foreground_thread != current_thread
+            && unsafe { AttachThreadInput(current_thread, foreground_thread, true) }.as_bool();
+        let _ = unsafe { BringWindowToTop(hwnd) };
+        let _ = unsafe { SetForegroundWindow(hwnd) };
+        if attached
+            && !unsafe { AttachThreadInput(current_thread, foreground_thread, false) }.as_bool()
+        {
             return Err(WindowsError::new(
                 "target.focus_failed",
-                "Windows rejected the foreground request",
+                "Windows input queues could not be detached after foreground activation",
             ));
         }
         let deadline = Instant::now() + Duration::from_millis(500);
