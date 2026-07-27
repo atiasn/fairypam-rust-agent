@@ -11,6 +11,7 @@ $devRoot = Join-Path $env:LOCALAPPDATA 'FairyPam\dev'
 $current = Join-Path $devRoot 'current'
 $agent = Join-Path $current 'fairypam-agent.exe'
 $state = Join-Path $devRoot 'state'
+$enrollment = Join-Path $state 'enrollment'
 $certificates = Join-Path $devRoot 'certificates'
 $receipt = Join-Path $devRoot 'provision.json'
 $verifiedArtifactReceipt = Join-Path $current '.verified-dev-artifact.json'
@@ -32,6 +33,14 @@ function Assert-Elevated {
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'dev.task.elevation_required: provision and unprovision require explicit UAC elevation'
     }
+}
+
+function Protect-PrivateDirectory([string]$Path) {
+    New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    & icacls.exe $Path /setowner '*S-1-5-32-544' /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'dev.state.acl_failed: failed to set the private directory owner' }
+    & icacls.exe $Path /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'dev.state.acl_failed: failed to protect the private directory' }
 }
 
 function Get-InteractiveShellLogonSid([int]$SessionId) {
@@ -187,14 +196,16 @@ switch ($Operation) {
             Assert-Elevated
             Assert-VerifiedDevSlot
             $boundIdentity = Get-InteractiveProvisionIdentity
-            New-Item -ItemType Directory -Force -Path $state, $certificates | Out-Null
+            New-Item -ItemType Directory -Force -Path $certificates | Out-Null
+            Protect-PrivateDirectory $state
+            Protect-PrivateDirectory $enrollment
             $identity = $boundIdentity.Identity
             $action = New-ScheduledTaskAction -Execute $agent -WorkingDirectory $current
             $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
             $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
             Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Description 'FairyPam Dev-only elevated Agent' -Force | Out-Null
             $registered = $true
-            $record = [ordered]@{ schema_version = 1; task_name = $taskName; owner_sid = $identity.User.Value; logon_sid = $boundIdentity.LogonSid; session_id = $boundIdentity.SessionId; task_action = $agent; working_directory = $current; state_dir = $state; certificate_dir = $certificates; pipe_name = '\\.\pipe\FairyPam.Agent.Dev.v1' }
+            $record = [ordered]@{ schema_version = 1; task_name = $taskName; owner_sid = $identity.User.Value; logon_sid = $boundIdentity.LogonSid; session_id = $boundIdentity.SessionId; task_action = $agent; working_directory = $current; state_dir = $state; enrollment_dir = $enrollment; certificate_dir = $certificates; pipe_name = '\\.\pipe\FairyPam.Agent.Dev.v1' }
             [IO.File]::WriteAllText($receipt, ($record | ConvertTo-Json -Depth 3), [Text.UTF8Encoding]::new($false))
             Assert-FixedTask
             Write-ProvisionResult 'completed' ''

@@ -416,7 +416,7 @@ fn registration_claims_directly_without_desktop_confirmation() {
         .map(|(source, _)| source)
         .expect("registration must remain an explicit bounded operation");
     let claim = registration
-        .find("register_before(hub_address, registration_code, deadline)")
+        .find("register_before(root, hub_address, registration_code, deadline)")
         .expect("the registration code must be consumed by the direct claim");
     let elevated = registration
         .find("ensure_elevated()?")
@@ -463,10 +463,12 @@ fn replacement_registration_installs_the_new_config_before_requesting_reconnect(
 fn dev_runtime_initializes_the_registration_gate() {
     let runtime = include_str!("../src/runtime.rs");
     let dev_runtime = runtime
-        .split_once("pub async fn run_dev_local()")
+        .split_once("pub async fn run_dev()")
         .and_then(|(_, source)| source.split_once("fn dev_local_control_config()"))
         .map(|(source, _)| source)
         .expect("Dev runtime construction must remain explicit");
 
-    assert!(dev_runtime.contains("registration_in_progress: Arc::new(AtomicBool::new(false))"));
+    assert!(dev_runtime.contains("RuntimeConfig::from_dev(state.join(\"enrollment\"), profiles)"));
+    assert!(dev_runtime.contains("run_windows(config, local_control).await"));
+    assert!(runtime.contains("crate::enrollment::register_at(&root"));
 }

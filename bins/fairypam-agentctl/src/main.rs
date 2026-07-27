@@ -7,7 +7,7 @@ async fn main() {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     #[cfg(all(windows, feature = "dev-automation"))]
     let result = if arguments.first().is_some_and(|value| value == "dev") {
-        dev_result(&arguments)
+        dev_result(&arguments).await
     } else {
         run_local(&arguments).await
     };
@@ -36,12 +36,17 @@ async fn run_local(arguments: &[String]) -> Result<serde_json::Value, fairypam_a
 }
 
 #[cfg(all(windows, feature = "dev-automation"))]
-fn dev_result(arguments: &[String]) -> Result<serde_json::Value, CliError> {
-    run_dev(arguments)
+async fn dev_result(arguments: &[String]) -> Result<serde_json::Value, CliError> {
+    run_dev(arguments).await
 }
 
 #[cfg(all(windows, feature = "dev-automation"))]
-fn run_dev(arguments: &[String]) -> Result<serde_json::Value, CliError> {
+async fn run_dev(arguments: &[String]) -> Result<serde_json::Value, CliError> {
+    if let [command, operation, flag, hub] = arguments {
+        if command == "dev" && operation == "register" && flag == "--hub" {
+            return register_dev(hub).await;
+        }
+    }
     let (operation, run_id) = match arguments {
         [command, operation, flag, run_id]
             if command == "dev"
@@ -130,6 +135,56 @@ fn run_dev(arguments: &[String]) -> Result<serde_json::Value, CliError> {
                 failure_message,
             ),
         ))
+    }
+}
+
+#[cfg(all(windows, feature = "dev-automation"))]
+async fn register_dev(hub_address: &str) -> Result<serde_json::Value, CliError> {
+    use std::io::{BufRead, Read};
+    use std::time::{Duration, Instant};
+
+    use fairypam_agent_local_protocol::LocalCommand;
+    use fairypam_agentctl::{dev_registration_code, execute_dev};
+
+    let mut line = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(258)
+        .read_until(b'\n', &mut line)
+        .map_err(|error| {
+            CliError::Client(fairypam_agent_local_client::LocalClientError::transport(
+                "dev.enrollment.stdin_failed",
+                error.to_string(),
+            ))
+        })?;
+    let registration_code = dev_registration_code(&line)?;
+    execute_dev(LocalCommand::RegisterHub {
+        hub_address: hub_address.to_owned(),
+        registration_code,
+    })
+    .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = execute_dev(LocalCommand::GetConnectionStatus).await?;
+        if status["control"] == "connected" && status["frame"] == "connected" {
+            return Ok(serde_json::json!({
+                "status": "connected",
+                "control": "connected",
+                "frame": "connected",
+            }));
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::Client(
+                fairypam_agent_local_client::LocalClientError::transport(
+                    "dev.enrollment.connection_timeout",
+                    status["recovery_code"]
+                        .as_str()
+                        .unwrap_or("runtime.connection_unavailable"),
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 

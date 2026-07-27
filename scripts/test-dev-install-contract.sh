@@ -21,7 +21,7 @@ if grep -Fq -- '[IO.File]::Replace($temporary, $canonicalTestbed, $null)' "$scri
   printf '[ERROR] Dev Testbed replacement must use and clean a real backup path for Windows PowerShell 5.1\n' >&2
   exit 1
 fi
-for required in 'Assert-VerifiedDevSlot' 'Get-InteractiveProvisionIdentity' 'Get-InteractiveShellLogonSid' 'Get-Process -Name explorer' 'LogonSidForProcess' 'TokenStatistics' 'AuthenticationId' 'dev.task.artifact_proof_missing' 'dev.task.artifact_proof_invalid' 'dev.task.logon_session_query_failed' 'dev.task.interactive_session_required' 'dev.task.fixed_action_required' 'Stop-RunningDevAgent' "Get-Process -Name 'fairypam-agent'" 'Stop-Process -Id $process.Id' 'Wait-Process -Id $process.Id' 'Unregister-ScheduledTask -TaskName $taskName' '.dev-provision-result.json' 'Write-ProvisionResult'; do
+for required in 'Assert-VerifiedDevSlot' 'Get-InteractiveProvisionIdentity' 'Get-InteractiveShellLogonSid' 'Get-Process -Name explorer' 'LogonSidForProcess' 'TokenStatistics' 'AuthenticationId' 'dev.task.artifact_proof_missing' 'dev.task.artifact_proof_invalid' 'dev.task.logon_session_query_failed' 'dev.task.interactive_session_required' 'dev.task.fixed_action_required' 'Stop-RunningDevAgent' "Get-Process -Name 'fairypam-agent'" 'Stop-Process -Id $process.Id' 'Wait-Process -Id $process.Id' 'Unregister-ScheduledTask -TaskName $taskName' '.dev-provision-result.json' 'Write-ProvisionResult' 'Protect-PrivateDirectory $state' 'Protect-PrivateDirectory $enrollment' 'enrollment_dir = $enrollment' 'S-1-5-18:(OI)(CI)F' 'S-1-5-32-544:(OI)(CI)F'; do
   grep -Fq -- "$required" "$provision" || {
     printf '[ERROR] Dev provision contract missing: %s\n' "$required" >&2
     exit 1
@@ -31,11 +31,15 @@ if grep -Fq -- 'CurrentLogonSid' "$provision"; then
   printf '[ERROR] Dev provision must bind the desktop shell Logon SID, not the UAC token\n' >&2
   exit 1
 fi
-for required in 'Start-Process -FilePath' '-PassThru' '-ErrorAction Stop' '$process.ExitCode' '.dev-provision-result.json'; do
+for required in 'Start-Process -FilePath' '-PassThru' '-ErrorAction Stop' '$process.ExitCode' '.dev-provision-result.json' 'operation == "register"' "read_until(b'\\n', &mut line)" 'execute_dev(LocalCommand::RegisterHub' 'LocalCommand::GetConnectionStatus'; do
   grep -Fq -- "$required" "$agentctl" || {
     printf '[ERROR] Dev launcher contract missing: %s\n' "$required" >&2
     exit 1
   }
 done
+if grep -Fq -- '--code' "$agentctl"; then
+  printf '[ERROR] Dev registration code must be read from stdin, never argv\n' >&2
+  exit 1
+fi
 
 printf '[PASS] Dev installer fixed-trust contract\n'

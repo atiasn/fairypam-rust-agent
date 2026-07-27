@@ -49,20 +49,29 @@ const CLAIM_OPERATION_TIMEOUT_MS: i32 = 5_000;
 /// The elevated Agent claims the one-time code after the protected Pipe has
 /// authenticated the GUI caller. No desktop confirmation is required.
 pub fn register(hub_address: &str, registration_code: &str) -> Result<(), AgentError> {
+    register_at(Path::new(STATE_ROOT), hub_address, registration_code)
+}
+
+pub(crate) fn register_at(
+    root: &Path,
+    hub_address: &str,
+    registration_code: &str,
+) -> Result<(), AgentError> {
     validate_registration_request(hub_address, registration_code).map_err(|_| invalid())?;
     ensure_elevated()?;
     let deadline = Instant::now() + CLAIM_DEADLINE;
-    register_before(hub_address, registration_code, deadline)
+    register_before(root, hub_address, registration_code, deadline)
 }
 
 fn register_before(
+    root: &Path,
     hub_address: &str,
     registration_code: &str,
     deadline: Instant,
 ) -> Result<(), AgentError> {
     let (host, port, path) = claim_target(hub_address)?;
     let payload = claim(&host, port, &path, registration_code, deadline)?;
-    persist(&payload)
+    persist(root, &payload)
 }
 
 fn claim_target(value: &str) -> Result<(String, u16, String), AgentError> {
@@ -209,7 +218,7 @@ fn read_response(request: *mut core::ffi::c_void, deadline: Instant) -> Result<V
     serde_json::from_slice(&bytes).map_err(|_| failed())
 }
 
-fn persist(payload: &Value) -> Result<(), AgentError> {
+fn persist(root: &Path, payload: &Value) -> Result<(), AgentError> {
     for name in [
         "agent_id",
         "control_endpoint",
@@ -224,8 +233,7 @@ fn persist(payload: &Value) -> Result<(), AgentError> {
         required(payload, name)?;
     }
 
-    let root = PathBuf::from(STATE_ROOT);
-    ensure_private_directory(&root)?;
+    ensure_private_directory(root)?;
 
     let generation = format!(
         "g-{}-{}",
@@ -320,6 +328,18 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), AgentError> {
     let logs = Path::new(LOG_ROOT);
     let updates = Path::new(UPDATE_ROOT);
     if path != enrollment && path != audit && path != logs && path != updates {
+        #[cfg(feature = "dev-automation")]
+        if path == dev_enrollment_root()?.as_path() {
+            let local_app_data =
+                PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or_else(failed)?);
+            let fairypam = local_app_data.join("FairyPam");
+            let dev = fairypam.join("dev");
+            verify_nonreparse_directory(&local_app_data)?;
+            verify_nonreparse_directory(&fairypam)?;
+            verify_nonreparse_directory(&dev)?;
+            verify_private_directory(&dev.join("state"))?;
+            return verify_private_directory(path);
+        }
         return Err(failed());
     }
 
@@ -327,6 +347,17 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), AgentError> {
     verify_private_directory(Path::new(PRODUCT_STATE_ROOT))?;
     verify_private_directory(Path::new(STATE_PARENT))?;
     verify_private_directory(path)
+}
+
+#[cfg(feature = "dev-automation")]
+fn dev_enrollment_root() -> Result<PathBuf, AgentError> {
+    Ok(
+        PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or_else(failed)?)
+            .join("FairyPam")
+            .join("dev")
+            .join("state")
+            .join("enrollment"),
+    )
 }
 
 fn verify_nonreparse_directory(path: &Path) -> Result<(), AgentError> {

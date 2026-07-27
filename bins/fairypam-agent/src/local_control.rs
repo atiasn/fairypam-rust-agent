@@ -43,11 +43,11 @@ pub struct AuditEvent {
 impl AuditEvent {
     pub fn to_json(&self) -> String {
         serde_json::json!({
-            "request_id": self.request_id,
+            "request_id_hash": sha256_hex(&self.request_id),
             "caller_sid_hash": self.caller_sid_hash,
             "command": self.command,
             "result_code": self.result_code,
-            "build_id": self.build_id,
+            "build_id_hash": sha256_hex(&self.build_id),
         })
         .to_string()
     }
@@ -268,10 +268,9 @@ fn command_name(command: &LocalCommand) -> &'static str {
 
 #[cfg(windows)]
 fn requires_fixed_gui(command: &LocalCommand) -> bool {
-    matches!(
-        command,
-        LocalCommand::RegisterHub { .. } | LocalCommand::BindUiLifetime
-    )
+    matches!(command, LocalCommand::BindUiLifetime)
+        || (!cfg!(feature = "dev-automation")
+            && matches!(command, LocalCommand::RegisterHub { .. }))
 }
 
 fn sha256_hex(value: &str) -> String {

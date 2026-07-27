@@ -69,6 +69,7 @@ pub struct RuntimeConfig {
     pub agent_version: String,
     pub build_commit: String,
     pub profiles: ProfileStore,
+    enrollment_root: Option<PathBuf>,
     enrollment_generation: Option<String>,
     awaiting_enrollment: bool,
 }
@@ -138,6 +139,10 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles: ProfileStore::default(),
+            #[cfg(windows)]
+            enrollment_root: Some(PathBuf::from(crate::enrollment::STATE_ROOT)),
+            #[cfg(not(windows))]
+            enrollment_root: None,
             enrollment_generation: None,
             awaiting_enrollment: true,
         }
@@ -168,6 +173,7 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles,
+            enrollment_root: None,
             enrollment_generation: None,
             awaiting_enrollment: false,
         })
@@ -176,6 +182,11 @@ impl RuntimeConfig {
     #[cfg(windows)]
     fn from_enrollment_state() -> Result<Self, AgentError> {
         let root = PathBuf::from(crate::enrollment::STATE_ROOT);
+        Self::from_enrollment_state_at(&root)
+    }
+
+    #[cfg(windows)]
+    fn from_enrollment_state_at(root: &Path) -> Result<Self, AgentError> {
         crate::enrollment::ensure_private_directory(&root)?;
         let pointer = load_private_json(&root.join("current.json"))?;
         let generation = enrollment_field(&pointer, "generation")?;
@@ -233,9 +244,27 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles,
+            enrollment_root: Some(root.to_path_buf()),
             enrollment_generation: Some(generation),
             awaiting_enrollment: false,
         })
+    }
+
+    #[cfg(all(windows, feature = "dev-automation"))]
+    fn from_dev(enrollment_root: PathBuf, profiles: ProfileStore) -> Result<Self, AgentError> {
+        if enrollment_state_exists_at(&enrollment_root) {
+            match Self::from_enrollment_state_at(&enrollment_root) {
+                Ok(config) => return Ok(config),
+                Err(error) => tracing::warn!(
+                    code = error.code(),
+                    "invalid Dev enrollment state ignored; local registration remains available"
+                ),
+            }
+        }
+        let mut config = Self::unregistered();
+        config.profiles = profiles;
+        config.enrollment_root = Some(enrollment_root);
+        Ok(config)
     }
 }
 
@@ -274,7 +303,11 @@ pub(crate) fn validate_enrollment_candidate(
 
 #[cfg(windows)]
 fn enrollment_state_exists() -> bool {
-    let root = Path::new(crate::enrollment::STATE_ROOT);
+    enrollment_state_exists_at(Path::new(crate::enrollment::STATE_ROOT))
+}
+
+#[cfg(windows)]
+fn enrollment_state_exists_at(root: &Path) -> bool {
     crate::enrollment::ensure_private_directory(root).is_ok()
         && crate::enrollment::verify_private_file(&root.join("current.json")).is_ok()
 }
@@ -597,17 +630,23 @@ impl GrpcSessionDriver {
     fn enrollment_changed(&self) -> Result<bool, AgentError> {
         #[cfg(windows)]
         {
-            let expected = self
-                .config
-                .lock()
-                .map_err(lock_error)?
-                .enrollment_generation
-                .clone();
+            let (expected, root) = {
+                let config = self.config.lock().map_err(lock_error)?;
+                (
+                    config.enrollment_generation.clone(),
+                    config.enrollment_root.clone(),
+                )
+            };
             let Some(expected) = expected else {
                 return Ok(false);
             };
-            let root = Path::new(crate::enrollment::STATE_ROOT);
-            crate::enrollment::ensure_private_directory(root)?;
+            let root = root.ok_or_else(|| {
+                AgentError::new(
+                    "runtime.enrollment_invalid",
+                    "enrollment state root is unavailable",
+                )
+            })?;
+            crate::enrollment::ensure_private_directory(&root)?;
             let pointer = load_private_json(&root.join("current.json"))?;
             Ok(enrollment_field(&pointer, "generation")? != expected)
         }
@@ -930,8 +969,14 @@ impl SupervisorHooks for RuntimeSafetyHooks {
 
     fn clear_target_session(&mut self) {
         #[cfg(windows)]
-        if enrollment_state_exists() {
-            match RuntimeConfig::from_enrollment_state() {
+        if let Some(root) = self
+            .config
+            .lock()
+            .ok()
+            .and_then(|config| config.enrollment_root.clone())
+            .filter(|root| enrollment_state_exists_at(root))
+        {
+            match RuntimeConfig::from_enrollment_state_at(&root) {
                 Ok(config) => {
                     if let Ok(mut execution) = self.execution.lock() {
                         *execution = CommandExecutor::production(config.profiles.clone());
@@ -981,18 +1026,38 @@ impl SupervisorHooks for RuntimeSafetyHooks {
 
 pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
     #[cfg(windows)]
-    let _instance = AgentInstance::acquire()?;
+    {
+        let _instance = AgentInstance::acquire()?;
+        return run_windows(config, production_local_control_config()?).await;
+    }
+    #[cfg(not(windows))]
+    {
+        let driver = GrpcSessionDriver::new(config);
+        let hooks = RuntimeSafetyHooks::for_driver(&driver);
+        let backoff = CappedBackoff::new(Duration::from_millis(250), Duration::from_secs(30))
+            .map_err(map_transport)?;
+        let mut supervisor = SessionSupervisor::new(hooks, backoff);
+        match supervisor.run(&driver).await {
+            Ok(never) => match never {},
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn run_windows(
+    config: RuntimeConfig,
+    local_control_config: LocalControlConfig,
+) -> Result<(), AgentError> {
     let driver = GrpcSessionDriver::new(config);
     let hooks = RuntimeSafetyHooks::for_driver(&driver);
     let backoff = CappedBackoff::new(Duration::from_millis(250), Duration::from_secs(30))
         .map_err(map_transport)?;
     let mut supervisor = SessionSupervisor::new(hooks, backoff);
-    #[cfg(windows)]
     let mut local_control = tokio::spawn(run_local_control(
         driver.local_runtime(),
-        production_local_control_config()?,
+        local_control_config,
     ));
-    #[cfg(windows)]
     if !driver.is_registered()? {
         tokio::select! {
             result = driver.wait_until_registered() => result?,
@@ -1006,27 +1071,21 @@ pub async fn run(config: RuntimeConfig) -> Result<(), AgentError> {
             },
         }
     }
-    #[cfg(windows)]
-    let result = {
-        let mut supervisor_run = Box::pin(supervisor.run(&driver));
-        tokio::select! {
-            result = &mut supervisor_run => result,
-            _ = driver.gui_shutdown.cancelled() => {
-                drop(supervisor_run);
-                local_control.abort();
-                return shutdown_from_local_request(&driver, &mut supervisor);
-            }
-            result = &mut local_control => match result {
-                Ok(never) => match never {},
-                Err(error) => Err(AgentError::new("local.runtime_join_failed", error.to_string())),
-            },
+    let mut supervisor_run = Box::pin(supervisor.run(&driver));
+    tokio::select! {
+        result = &mut supervisor_run => match result {
+            Ok(never) => match never {},
+            Err(error) => Err(error),
+        },
+        _ = driver.gui_shutdown.cancelled() => {
+            drop(supervisor_run);
+            local_control.abort();
+            shutdown_from_local_request(&driver, &mut supervisor)
         }
-    };
-    #[cfg(not(windows))]
-    let result = supervisor.run(&driver).await;
-    match result {
-        Ok(never) => match never {},
-        Err(error) => Err(error),
+        result = &mut local_control => match result {
+            Ok(never) => match never {},
+            Err(error) => Err(AgentError::new("local.runtime_join_failed", error.to_string())),
+        },
     }
 }
 
@@ -1215,8 +1274,22 @@ impl SharedRuntime {
             .lock()
             .map(|config| config.awaiting_enrollment)
             .unwrap_or(true);
-        let result = crate::enrollment::register(&hub_address, &registration_code)
-            .and_then(|_| RuntimeConfig::from_enrollment_state())
+        let root = self
+            .config
+            .lock()
+            .ok()
+            .and_then(|config| config.enrollment_root.clone());
+        let result = root
+            .ok_or_else(|| {
+                AgentError::new(
+                    "runtime.enrollment_invalid",
+                    "enrollment state root is unavailable",
+                )
+            })
+            .and_then(|root| {
+                crate::enrollment::register_at(&root, &hub_address, &registration_code)?;
+                RuntimeConfig::from_enrollment_state_at(&root)
+            })
             .and_then(|config| self.activate_enrollment(config))
             .map(|_| {
                 if !was_waiting {
@@ -1832,45 +1905,20 @@ fn apply_dev_effects(execution: &Arc<Mutex<CommandExecutor>>, effects: Vec<Effec
 }
 
 #[cfg(all(windows, feature = "dev-automation"))]
-pub async fn run_dev_local() -> Result<(), AgentError> {
+pub async fn run_dev() -> Result<(), AgentError> {
     let root = std::env::current_dir()
         .map_err(|error| AgentError::new("local.config_missing", error.to_string()))?;
     let key = std::fs::read_to_string(root.join("test-profile-root-public-key.hex"))
         .map_err(|error| AgentError::new("local.config_missing", error.to_string()))?;
     let verifier = Ed25519SignatureVerifier::from_public_key_hex(key.trim())?;
     let profiles = ProfileStore::load(&root.join("profiles"), &verifier)?;
-    let config = dev_local_control_config()?;
-    let execution = Arc::new(Mutex::new(CommandExecutor::production(profiles.clone())));
-    let never = run_local_control(
-        SharedRuntime {
-            execution,
-            state: Arc::new(Mutex::new(RuntimeState::default())),
-            config: Arc::new(Mutex::new(RuntimeConfig {
-                transport: TransportConfig {
-                    control_endpoint: "https://unavailable".parse().expect("fixed URI"),
-                    frame_endpoint: "https://unavailable".parse().expect("fixed URI"),
-                    server_name: "unavailable".to_owned(),
-                    agent_id: "unavailable".to_owned(),
-                    ca_pem: PathBuf::new(),
-                    identity_cert_pem: PathBuf::new(),
-                    identity_key_pem: PathBuf::new(),
-                    connect_timeout: Duration::from_secs(10),
-                },
-                agent_version: "dev".to_owned(),
-                build_commit: "unknown".to_owned(),
-                profiles,
-                enrollment_generation: None,
-                awaiting_enrollment: false,
-            })),
-            enrollment_ready: Arc::new(tokio::sync::Notify::new()),
-            reconnect_requested: Arc::new(tokio::sync::Notify::new()),
-            registration_in_progress: Arc::new(AtomicBool::new(false)),
-            gui_lifetime: GuiLifetime::new(CancellationToken::new()),
-        },
-        config,
-    )
-    .await;
-    match never {}
+    let local_control = dev_local_control_config()?;
+    let state = local_control
+        .audit_state_dir
+        .as_ref()
+        .ok_or_else(|| AgentError::new("local.config_invalid", "Dev state directory is missing"))?;
+    let config = RuntimeConfig::from_dev(state.join("enrollment"), profiles)?;
+    run_windows(config, local_control).await
 }
 
 #[cfg(all(windows, feature = "dev-automation"))]
@@ -1909,15 +1957,14 @@ fn dev_local_control_config() -> Result<LocalControlConfig, AgentError> {
         .as_str()
         .ok_or_else(|| AgentError::new("local.config_invalid", "provision pipe_name is missing"))?
         .to_owned();
-    let state_dir = receipt["state_dir"]
-        .as_str()
-        .ok_or_else(|| AgentError::new("local.config_invalid", "provision state_dir is missing"))?;
+    let state_dir = std::path::Path::new(&local_app_data).join("FairyPam/dev/state");
+    crate::enrollment::ensure_private_directory(&state_dir.join("enrollment"))?;
     Ok(LocalControlConfig {
         owner,
         pipe_name,
-        audit_state_dir: Some(PathBuf::from(state_dir)),
+        audit_state_dir: Some(state_dir.clone()),
         single_request_connections: false,
-        dev_session_state_dir: Some(PathBuf::from(state_dir)),
+        dev_session_state_dir: Some(state_dir),
     })
 }
 

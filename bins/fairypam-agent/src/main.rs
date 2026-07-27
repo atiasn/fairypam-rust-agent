@@ -14,7 +14,7 @@ async fn main() {
         .init();
 
     #[cfg(all(windows, feature = "dev-automation"))]
-    let result = runtime::run_dev_local().await;
+    let result = runtime::run_dev().await;
     #[cfg(not(all(windows, feature = "dev-automation")))]
     let result = match RuntimeConfig::from_production() {
         Ok(config) => runtime::run(config).await,

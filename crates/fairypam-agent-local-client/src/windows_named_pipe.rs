@@ -74,6 +74,23 @@ impl WindowsNamedPipeClientTransport {
         }
     }
 
+    pub fn new_verified_dev_sibling(
+        pipe_name: impl Into<String>,
+        expected_server_sibling: impl Into<String>,
+    ) -> Self {
+        let expected_server_path = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|directory| directory.to_path_buf()))
+            .map(|directory| Some(directory.join(expected_server_sibling.into())))
+            .ok_or(());
+        Self {
+            pipe_name: pipe_name.into(),
+            expected_server_path,
+            require_nonwritable_server: false,
+            pipe: None,
+        }
+    }
+
     /// Used only by the elevated fixed installer after it validates the full
     /// protected install tree; its admin token is expected to write Program Files.
     pub fn new_verified_maintenance_path(

@@ -4,6 +4,8 @@ use fairypam_agent_local_client::LocalClientError;
 use fairypam_agent_local_protocol::{CaptureEncoding, LocalCommand};
 
 pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\FairyPam.Agent.v1";
+#[cfg(feature = "dev-automation")]
+pub const DEV_PIPE_NAME: &str = r"\\.\pipe\FairyPam.Agent.Dev.v1";
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -76,6 +78,21 @@ pub fn usage(message: impl Into<String>) -> CliError {
     CliError::Usage(message.into())
 }
 
+#[cfg(feature = "dev-automation")]
+pub fn dev_registration_code(line: &[u8]) -> Result<String, CliError> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let code = std::str::from_utf8(line)
+        .map_err(|_| usage("registration code from stdin must be UTF-8"))?;
+    if code.is_empty() || code.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) || code.len() > 256
+    {
+        return Err(usage(
+            "stdin must contain one bounded registration code line",
+        ));
+    }
+    Ok(code.to_owned())
+}
+
 #[cfg(windows)]
 pub async fn execute(command: LocalCommand) -> Result<serde_json::Value, CliError> {
     use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
@@ -83,6 +100,21 @@ pub async fn execute(command: LocalCommand) -> Result<serde_json::Value, CliErro
     let pipe =
         std::env::var("FAIRYPAM_AGENT_PIPE").unwrap_or_else(|_| DEFAULT_PIPE_NAME.to_owned());
     let mut client = LocalClient::new(WindowsNamedPipeClientTransport::new(pipe));
+    client
+        .request(command, REQUEST_TIMEOUT)
+        .await
+        .map(|response| response.body)
+        .map_err(CliError::Client)
+}
+
+#[cfg(all(windows, feature = "dev-automation"))]
+pub async fn execute_dev(command: LocalCommand) -> Result<serde_json::Value, CliError> {
+    use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
+
+    let mut client = LocalClient::new(WindowsNamedPipeClientTransport::new_verified_dev_sibling(
+        DEV_PIPE_NAME,
+        "fairypam-agent.exe",
+    ));
     client
         .request(command, REQUEST_TIMEOUT)
         .await
