@@ -24,6 +24,7 @@ const MAX_INPUT_LEASE_MS: u32 = 5_000;
 const CAPTURE_NO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const M1_ACTION_ID: &str = "interaction.confirm";
+type CaptureFailure = (AgentError, Option<AttemptRef>);
 #[cfg(all(windows, feature = "dev-automation"))]
 const DEV_TESTBED_PROFILE_ID: &str = "fairypam-test-window";
 #[cfg(all(windows, feature = "dev-automation"))]
@@ -176,7 +177,7 @@ impl CommandOutcome {
 struct CaptureWorker {
     source_id: String,
     stop: Arc<AtomicBool>,
-    failure: Arc<Mutex<Option<(AgentError, Option<AttemptRef>)>>>,
+    failure: Arc<Mutex<Option<CaptureFailure>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -1191,7 +1192,7 @@ fn spawn_capture_worker(
 }
 
 fn record_capture_failure(
-    failure: &Mutex<Option<(AgentError, Option<AttemptRef>)>>,
+    failure: &Mutex<Option<CaptureFailure>>,
     error: AgentError,
     attempt: Option<AttemptRef>,
 ) {
