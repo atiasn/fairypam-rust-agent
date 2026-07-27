@@ -806,8 +806,10 @@ mod native {
         if unsafe { IsIconic(hwnd).as_bool() } {
             let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
         }
+        let mut foreground_request_accepted = false;
+        let mut alt_up_sent = None;
         for _ in 0..5 {
-            let _ = unsafe { SetForegroundWindow(hwnd) };
+            foreground_request_accepted |= unsafe { SetForegroundWindow(hwnd) }.as_bool();
             let _ = unsafe { SetActiveWindow(hwnd) };
             if unsafe { GetForegroundWindow() } == hwnd {
                 break;
@@ -827,8 +829,10 @@ mod native {
                     },
                 },
             };
-            let _ = unsafe { SendInput(&[alt_up], std::mem::size_of::<INPUT>() as i32) };
-            let _ = unsafe { SetForegroundWindow(hwnd) };
+            alt_up_sent = Some(unsafe {
+                SendInput(&[alt_up], std::mem::size_of::<INPUT>() as i32) == 1
+            });
+            foreground_request_accepted |= unsafe { SetForegroundWindow(hwnd) }.as_bool();
             let _ = unsafe { SetActiveWindow(hwnd) };
         }
         if unsafe { GetForegroundWindow() } == hwnd {
@@ -847,9 +851,15 @@ mod native {
         let deadline = Instant::now() + Duration::from_millis(500);
         while unsafe { GetForegroundWindow() } != hwnd {
             if Instant::now() >= deadline {
+                let foreground = unsafe { GetForegroundWindow() };
+                let mut foreground_pid = 0;
+                unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_pid)) };
                 return Err(WindowsError::new(
                     "target.focus_failed",
-                    "target did not become the foreground window",
+                    format!(
+                        "target did not become the foreground window; request_accepted={foreground_request_accepted}, alt_up_sent={alt_up_sent:?}, foreground_pid={foreground_pid}, target_pid={}",
+                        identity.pid
+                    ),
                 ));
             }
             thread::sleep(Duration::from_millis(10));
