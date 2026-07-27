@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,8 +10,8 @@ use fairypam_agent_core::target::{TargetBinding, TargetCandidate, TargetSelector
 use fairypam_agent_core::AgentError;
 use fairypam_agent_local_protocol::LocalCommand;
 use fairypam_agent_protocol::v1::{
-    hub_control_command, FramePacket, HubControlCommand, SessionRef, TaskAttemptReceiptV1,
-    TaskCommandOutcomeV1,
+    agent_control_event, hub_control_command, AgentControlEvent, AttemptRef, FramePacket,
+    HubControlCommand, SafetyEvent, SessionRef, TaskAttemptReceiptV1, TaskCommandOutcomeV1,
 };
 use fairypam_agent_transport::{SessionFrameSlot, VerifiedSession};
 use serde_json::json;
@@ -21,6 +21,8 @@ use crate::task_attempt::{TaskAttemptRuntime, TaskCommandResult};
 
 const MAX_CLOSE_TIMEOUT_MS: u32 = 5_000;
 const MAX_INPUT_LEASE_MS: u32 = 5_000;
+const CAPTURE_NO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const M1_ACTION_ID: &str = "interaction.confirm";
 #[cfg(all(windows, feature = "dev-automation"))]
 const DEV_TESTBED_PROFILE_ID: &str = "fairypam-test-window";
@@ -174,16 +176,50 @@ impl CommandOutcome {
 struct CaptureWorker {
     source_id: String,
     stop: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<(AgentError, Option<AttemptRef>)>>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl CaptureWorker {
-    fn stop(mut self) {
+    fn failure(&self) -> Result<Option<(AgentError, Option<AttemptRef>)>, AgentError> {
+        let failure = self
+            .failure
+            .lock()
+            .map_err(|error| AgentError::new("capture.worker_failed", error.to_string()))
+            .map(|failure| failure.clone())?;
+        if failure.is_none() && self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Ok(Some((
+                AgentError::new(
+                    "capture.worker_failed",
+                    "capture worker exited unexpectedly",
+                ),
+                None,
+            )));
+        }
+        Ok(failure)
+    }
+
+    fn stop(mut self) -> Result<(), AgentError> {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            join_capture_thread(thread)?;
         }
+        self.failure()?.map_or(Ok(()), |(error, _)| Err(error))
     }
+}
+
+fn join_capture_thread(thread: JoinHandle<()>) -> Result<(), AgentError> {
+    let deadline = Instant::now() + CAPTURE_JOIN_TIMEOUT;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            tracing::error!("capture thread did not stop; aborting Agent before unsafe detach");
+            std::process::abort();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    thread
+        .join()
+        .map_err(|_| AgentError::new("capture.worker_failed", "capture worker panicked"))
 }
 
 pub struct CommandExecutor {
@@ -494,7 +530,8 @@ impl CommandExecutor {
                 let binding = self.binding.clone().ok_or_else(|| {
                     AgentError::new("target.not_locked", "close requires a locked target")
                 })?;
-                self.stop_capture(None)?;
+                self.platform.release_task_input()?;
+                let capture_error = self.stop_capture(None).err();
                 self.platform
                     .close(&binding, Duration::from_millis(u64::from(value.timeout_ms)))?;
                 self.active_profile = None;
@@ -505,6 +542,7 @@ impl CommandExecutor {
                         "pid": binding.process_id,
                         "hwnd": binding.window_handle,
                         "closed": true,
+                        "capture_error": capture_error.as_ref().map(AgentError::code),
                         "state": "ConnectedIdle",
                     })
                     .to_string(),
@@ -584,6 +622,7 @@ impl CommandExecutor {
                     session,
                     frames,
                     attempt,
+                    CAPTURE_NO_FRAME_TIMEOUT,
                 );
                 let worker = match worker {
                     Ok(worker) => worker,
@@ -645,6 +684,7 @@ impl CommandExecutor {
                 ))
             }
             Some(Payload::StopSession(_)) => {
+                self.platform.release_task_input()?;
                 self.stop_capture(None)?;
                 self.active_profile = None;
                 self.binding = None;
@@ -809,8 +849,8 @@ impl CommandExecutor {
                 if let Some(result) = self.task_attempt.prepare_finish(task)? {
                     return Ok(CommandOutcome::task(result));
                 }
-                let capture_stopped = self.stop_capture(None).is_ok();
                 let release_error = self.platform.release_task_input().err();
+                let capture_stopped = self.stop_capture(None).is_ok();
                 let owned_target = self.task_attempt.owned_target(task)?;
                 let close_error = owned_target.as_ref().and_then(|binding| {
                     self.platform
@@ -854,9 +894,44 @@ impl CommandExecutor {
             }
         }
         if let Some(worker) = self.capture.take() {
-            worker.stop();
+            worker.stop()?;
         }
         Ok(())
+    }
+
+    pub fn capture_failure_event(
+        &mut self,
+        session: &ExecutionSession,
+    ) -> Result<Option<AgentControlEvent>, AgentError> {
+        let Some((failure, attempt)) = self
+            .capture
+            .as_ref()
+            .map(CaptureWorker::failure)
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let source_id = self
+            .capture
+            .as_ref()
+            .expect("checked above")
+            .source_id
+            .clone();
+        let release_error = self.platform.release_task_input().err();
+        let _ = self.capture.take().expect("checked above").stop();
+        self.frame_sequences.remove(&source_id);
+        if let Some(error) = release_error {
+            return Err(error);
+        }
+        Ok(Some(AgentControlEvent {
+            payload: Some(agent_control_event::Payload::SafetyEvent(SafetyEvent {
+                session: Some(session.reference.clone()),
+                reason: failure.code().to_owned(),
+                state: "capture_failed".to_owned(),
+                attempt,
+            })),
+        }))
     }
 
     pub fn reset(&mut self) -> Result<(), AgentError> {
@@ -864,8 +939,8 @@ impl CommandExecutor {
             self.emergency_stop()?;
             return Ok(());
         }
-        self.stop_capture(None)?;
         self.platform.release_task_input()?;
+        self.stop_capture(None)?;
         self.active_profile = None;
         self.binding = None;
         self.frame_sequences.clear();
@@ -874,8 +949,8 @@ impl CommandExecutor {
 
     fn emergency_stop(&mut self) -> Result<serde_json::Value, AgentError> {
         self.task_attempt.set_emergency_stopped(true)?;
-        let capture_error = self.stop_capture(None).err();
         let release_error = self.platform.release_task_input().err();
+        let capture_error = self.stop_capture(None).err();
         let owned_target = self.task_attempt.active_owned_target()?;
         let close_error = owned_target.as_ref().and_then(|binding| {
             self.platform
@@ -1003,10 +1078,13 @@ fn spawn_capture_worker(
     encoding: RuntimeCaptureEncoding,
     session: &ExecutionSession,
     frames: Arc<dyn FrameSink>,
-    attempt: Option<fairypam_agent_protocol::v1::AttemptRef>,
+    attempt: Option<AttemptRef>,
+    no_frame_timeout: Duration,
 ) -> Result<CaptureWorker, AgentError> {
     let stop = Arc::new(AtomicBool::new(false));
+    let failure = Arc::new(Mutex::new(None));
     let worker_stop = Arc::clone(&stop);
+    let worker_failure = Arc::clone(&failure);
     let worker_source = source_id.clone();
     let session = session.reference.clone();
     let thread = std::thread::Builder::new()
@@ -1014,6 +1092,7 @@ fn spawn_capture_worker(
         .spawn(move || {
             let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
             let mut reported_overwrites = 0;
+            let mut last_frame_at = Instant::now();
             while !worker_stop.load(Ordering::Acquire) {
                 let started = Instant::now();
                 match capture.next_frame(started + interval) {
@@ -1025,9 +1104,13 @@ fn spawn_capture_worker(
                         ) {
                             Ok(previous) => previous + 1,
                             Err(_) => {
-                                tracing::error!(
-                                    capture_source_id = %worker_source,
-                                    "capture frame sequence exhausted"
+                                record_capture_failure(
+                                    &worker_failure,
+                                    AgentError::new(
+                                        "capture.sequence_exhausted",
+                                        "capture frame sequence exhausted",
+                                    ),
+                                    attempt.clone(),
                                 );
                                 break;
                             }
@@ -1048,8 +1131,10 @@ fn spawn_capture_worker(
                         };
                         if let Err(error) = frames.publish(packet) {
                             tracing::error!(code = error.code(), %error, "frame publish failed");
+                            record_capture_failure(&worker_failure, error, attempt.clone());
                             break;
                         }
+                        last_frame_at = Instant::now();
                         let overwritten = frames.overwritten_frames();
                         if overwritten > reported_overwrites {
                             reported_overwrites = overwritten;
@@ -1061,6 +1146,20 @@ fn spawn_capture_worker(
                         }
                     }
                     Err(error) if error.code() == "capture.deadline" => {
+                        if worker_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if last_frame_at.elapsed() >= no_frame_timeout {
+                            record_capture_failure(
+                                &worker_failure,
+                                AgentError::new(
+                                    "capture.no_frame_timeout",
+                                    "capture produced no frame within the bounded deadline",
+                                ),
+                                attempt.clone(),
+                            );
+                            break;
+                        }
                         tracing::debug!(
                             capture_source_id = %worker_source,
                             "capture frame deadline missed"
@@ -1068,6 +1167,9 @@ fn spawn_capture_worker(
                     }
                     Err(error) => {
                         tracing::error!(code = error.code(), %error, "capture failed");
+                        if !worker_stop.load(Ordering::Acquire) {
+                            record_capture_failure(&worker_failure, error, attempt.clone());
+                        }
                         break;
                     }
                 }
@@ -1083,8 +1185,19 @@ fn spawn_capture_worker(
     Ok(CaptureWorker {
         source_id,
         stop,
+        failure,
         thread: Some(thread),
     })
+}
+
+fn record_capture_failure(
+    failure: &Mutex<Option<(AgentError, Option<AttemptRef>)>>,
+    error: AgentError,
+    attempt: Option<AttemptRef>,
+) {
+    if let Ok(mut failure) = failure.lock() {
+        failure.get_or_insert((error, attempt));
+    }
 }
 
 fn now_unix_us() -> i64 {
@@ -1872,7 +1985,7 @@ mod tests {
         fn next_frame(&mut self, _deadline: Instant) -> Result<RuntimeCapturedFrame, AgentError> {
             self.frames
                 .pop_front()
-                .ok_or_else(|| AgentError::new("capture.complete", "test capture completed"))
+                .ok_or_else(|| AgentError::new("capture.deadline", "test frame gap"))
         }
     }
 
@@ -1891,11 +2004,16 @@ mod tests {
                     height: 720,
                     sequence: 1,
                 }),
-                _ => Err(AgentError::new(
-                    "capture.complete",
-                    "test capture completed",
-                )),
+                _ => Err(AgentError::new("capture.deadline", "test frame gap")),
             }
+        }
+    }
+
+    struct DeadlineCapture;
+
+    impl RuntimeCapture for DeadlineCapture {
+        fn next_frame(&mut self, _deadline: Instant) -> Result<RuntimeCapturedFrame, AgentError> {
+            Err(AgentError::new("capture.deadline", "no frame"))
         }
     }
 
@@ -2052,12 +2170,81 @@ mod tests {
             &ExecutionSession::test(),
             sink.clone(),
             None,
+            Duration::from_secs(1),
         )
         .unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        worker.stop();
+        worker.stop().unwrap();
 
         assert_eq!(sink.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn persistent_capture_deadline_reports_a_bounded_failure() {
+        let worker = spawn_capture_worker(
+            Box::new(DeadlineCapture),
+            Arc::new(AtomicU64::new(0)),
+            "client".into(),
+            100,
+            RuntimeCaptureEncoding::Jpeg { quality: 80 },
+            &ExecutionSession::test(),
+            Arc::new(CollectFrames::default()),
+            None,
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(
+            worker.failure().unwrap().unwrap().0.code(),
+            "capture.no_frame_timeout"
+        );
+        assert_eq!(
+            worker.stop().unwrap_err().code(),
+            "capture.no_frame_timeout"
+        );
+    }
+
+    #[test]
+    fn capture_failure_releases_input_before_join_and_emits_safety_event() {
+        let (mut executor, state) = executor_with_state();
+        let sequence = Arc::new(AtomicU64::new(0));
+        executor
+            .frame_sequences
+            .insert("client".into(), sequence.clone());
+        executor.capture = Some(
+            spawn_capture_worker(
+                Box::new(DeadlineCapture),
+                sequence,
+                "client".into(),
+                100,
+                RuntimeCaptureEncoding::Jpeg { quality: 80 },
+                &ExecutionSession::test(),
+                Arc::new(CollectFrames::default()),
+                None,
+                Duration::from_millis(30),
+            )
+            .unwrap(),
+        );
+        state.lock().unwrap().input_active = true;
+        std::thread::sleep(Duration::from_millis(100));
+
+        let event = executor
+            .capture_failure_event(&ExecutionSession::test())
+            .unwrap()
+            .unwrap();
+
+        assert!(!state.lock().unwrap().input_active);
+        assert!(executor.capture.is_none());
+        assert!(!executor.frame_sequences.contains_key("client"));
+        assert!(matches!(
+            event.payload,
+            Some(agent_control_event::Payload::SafetyEvent(SafetyEvent {
+                ref reason,
+                ref state,
+                ..
+            })) if reason == "capture.no_frame_timeout" && state == "capture_failed"
+        ));
     }
 
     fn executor() -> CommandExecutor {

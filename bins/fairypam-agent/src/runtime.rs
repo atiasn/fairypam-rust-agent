@@ -764,6 +764,9 @@ impl SessionDriver for GrpcSessionDriver {
         let mut enrollment_watch = tokio::time::interval(Duration::from_secs(1));
         enrollment_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         enrollment_watch.tick().await;
+        let mut capture_health = tokio::time::interval(Duration::from_millis(250));
+        capture_health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        capture_health.tick().await;
         loop {
             tokio::select! {
                 biased;
@@ -784,6 +787,16 @@ impl SessionDriver for GrpcSessionDriver {
                 }
                 _ = heartbeat.tick() => {
                     sender.try_send(heartbeat_event(&session)).map_err(map_transport)?;
+                }
+                _ = capture_health.tick() => {
+                    let event = self
+                        .execution
+                        .lock()
+                        .map_err(lock_error)?
+                        .capture_failure_event(&ExecutionSession::from_verified(&session))?;
+                    if let Some(event) = event {
+                        sender.try_send(event).map_err(map_transport)?;
+                    }
                 }
                 command = control.message() => {
                     let command = command.map_err(map_transport)?.ok_or_else(|| {
@@ -1013,6 +1026,7 @@ impl SupervisorHooks for RuntimeSafetyHooks {
 
     fn cancel_frame_pipeline(&mut self) {
         if let Ok(mut execution) = self.execution.lock() {
+            let _ = execution.emergency_release_input();
             let _ = execution.stop_capture(None);
         }
         tracing::info!(effect = "cancel_frame_pipeline");

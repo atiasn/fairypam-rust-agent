@@ -506,7 +506,13 @@ fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
         Ok(())
     })();
     match result {
-        Ok(()) => activation.commit(),
+        Ok(()) => match activation.commit() {
+            Ok(()) => Ok(()),
+            Err(failure) => match activation.rollback() {
+                Ok(()) => Err(failure),
+                Err(_) => Err(ProvisionFailure::Rollback),
+            },
+        },
         Err(failure) => match activation.rollback() {
             Ok(()) => Err(failure),
             Err(_) => Err(ProvisionFailure::Rollback),
@@ -1192,9 +1198,15 @@ impl InstallActivation {
         })
     }
 
-    fn commit(self) -> Result<(), ProvisionFailure> {
+    fn commit(&self) -> Result<(), ProvisionFailure> {
+        self.commit_with(persist_last_accepted)
+    }
+
+    fn commit_with(
+        &self,
+        persist_accepted: impl FnOnce(&str, &str) -> Result<(), ProvisionFailure>,
+    ) -> Result<(), ProvisionFailure> {
         use fairypam_agent_suite::{MemberScope, MANIFEST_FILE};
-        persist_last_accepted(&self.manifest.build_id, &self.manifest.suite_version)?;
         for member in self
             .manifest
             .members
@@ -1211,7 +1223,7 @@ impl InstallActivation {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(ProvisionFailure::InstallRoots),
         }
-        Ok(())
+        persist_accepted(&self.manifest.build_id, &self.manifest.suite_version)
     }
 
     fn rollback(self) -> Result<(), ProvisionFailure> {
@@ -3196,6 +3208,67 @@ mod tests {
             Err(ProvisionFailure::Rollback)
         ));
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_commit_cleanup_failure_rolls_back_without_accepting_target() {
+        use fairypam_agent_suite::{
+            MemberScope, SuiteManifest, SuiteMember, CURRENT_POINTER_FILE, MANIFEST_KIND,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-install-commit-fault-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let version_root = root.join("versions").join("target-build");
+        std::fs::create_dir_all(&version_root).unwrap();
+        std::fs::create_dir(root.join("blocked.exe")).unwrap();
+        std::fs::write(root.join(CURRENT_POINTER_FILE), b"target-pointer").unwrap();
+        let activation = InstallActivation {
+            install_root: root.clone(),
+            version_root: version_root.clone(),
+            manifest: SuiteManifest {
+                schema_version: 1,
+                kind: MANIFEST_KIND.to_owned(),
+                build_id: "target-build".to_owned(),
+                source_commit: "source".to_owned(),
+                suite_version: "1.0.0".to_owned(),
+                built_at: "2026-07-27T00:00:00Z".to_owned(),
+                build_origin: "test".to_owned(),
+                installer_protocol: 1,
+                members: vec![SuiteMember {
+                    path: "blocked.exe".to_owned(),
+                    scope: MemberScope::Versioned,
+                    sha256: "0".repeat(64),
+                    size_bytes: 0,
+                }],
+            },
+            previous_pointer: Some(b"previous-pointer".to_vec()),
+            created_version: true,
+        };
+        let accepted = std::cell::Cell::new(false);
+
+        assert!(matches!(
+            activation.commit_with(|_, _| {
+                accepted.set(true);
+                Ok(())
+            }),
+            Err(ProvisionFailure::InstallRoots)
+        ));
+        assert!(!accepted.get());
+        activation.rollback().unwrap();
+        assert_eq!(
+            std::fs::read(root.join(CURRENT_POINTER_FILE)).unwrap(),
+            b"previous-pointer"
+        );
+        assert!(!version_root.exists());
 
         std::fs::remove_dir_all(root).unwrap();
     }

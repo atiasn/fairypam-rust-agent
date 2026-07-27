@@ -424,10 +424,6 @@ enum WgcRequest {
         deadline: Instant,
         reply: std::sync::mpsc::SyncSender<Result<CapturedBgraFrame, WindowsError>>,
     },
-    Rebuild {
-        client_rect: Rect,
-        reply: std::sync::mpsc::SyncSender<Result<(), WindowsError>>,
-    },
     Stop,
 }
 
@@ -450,10 +446,6 @@ impl WgcCaptureBackend {
                                 WgcRequest::Next { deadline, reply } => {
                                     let _ = reply.send(native_wgc::next_bgra(&mut state, deadline));
                                 }
-                                WgcRequest::Rebuild { client_rect, reply } => {
-                                    let _ =
-                                        reply.send(native_wgc::rebuild(&mut state, client_rect));
-                                }
                                 WgcRequest::Stop => break,
                             }
                         }
@@ -465,9 +457,17 @@ impl WgcCaptureBackend {
                 }
             })
             .map_err(|error| WindowsError::new("capture.worker_failed", error.to_string()))?;
-        initialized_receiver
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .map_err(map_worker_wait_error)??;
+        match initialized_receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                join_wgc_worker(worker);
+                return Err(error);
+            }
+            Err(error) => {
+                tracing::error!(%error, "WGC initialization did not terminate; aborting Agent");
+                std::process::abort();
+            }
+        }
         Ok(Self {
             requests,
             worker: Some(worker),
@@ -489,20 +489,18 @@ impl CaptureBackend for WgcCaptureBackend {
         self.requests
             .try_send(WgcRequest::Next { deadline, reply })
             .map_err(map_worker_send_error)?;
-        receiver.recv().map_err(|_| {
-            WindowsError::new("capture.worker_failed", "capture worker disconnected")
-        })?
+        receiver
+            .recv_timeout(remaining.saturating_add(std::time::Duration::from_millis(250)))
+            .map_err(map_worker_wait_error)?
     }
 
     fn rebuild(&mut self, client_rect: Rect, dpi: u32) -> Result<(), WindowsError> {
         validate_dpi(dpi)?;
-        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
-        self.requests
-            .try_send(WgcRequest::Rebuild { client_rect, reply })
-            .map_err(map_worker_send_error)?;
-        receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .map_err(map_worker_wait_error)?
+        let _ = client_rect;
+        Err(WindowsError::new(
+            "capture.geometry_changed",
+            "WGC capture must be restarted after target geometry changes",
+        ))
     }
 }
 
@@ -511,9 +509,22 @@ impl Drop for WgcCaptureBackend {
     fn drop(&mut self) {
         let _ = self.requests.send(WgcRequest::Stop);
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            join_wgc_worker(worker);
         }
     }
+}
+
+#[cfg(windows)]
+fn join_wgc_worker(worker: std::thread::JoinHandle<()>) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            tracing::error!("WGC worker did not stop; aborting Agent before unsafe detach");
+            std::process::abort();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = worker.join();
 }
 
 #[cfg(windows)]
@@ -556,11 +567,11 @@ mod native_wgc {
     use windows::Win32::Graphics::Direct3D11::{
         D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
         D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-        D3D11_USAGE_STAGING,
+        D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_SDK_VERSION,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     };
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+    use windows::Win32::Graphics::Dxgi::{IDXGIDevice, DXGI_ERROR_WAS_STILL_DRAWING};
     use windows::Win32::System::WinRT::Direct3D11::{
         CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
     };
@@ -571,8 +582,8 @@ mod native_wgc {
 
     pub(super) struct WgcState {
         hwnd: isize,
-        item: GraphicsCaptureItem,
-        device: IDirect3DDevice,
+        _item: GraphicsCaptureItem,
+        _device: IDirect3DDevice,
         d3d_device: ID3D11Device,
         d3d_context: ID3D11DeviceContext,
         frame_pool: Direct3D11CaptureFramePool,
@@ -631,8 +642,8 @@ mod native_wgc {
             .map_err(|error| win_error("capture.session_failed", error))?;
         Ok(WgcState {
             hwnd: identity.hwnd,
-            item,
-            device,
+            _item: item,
+            _device: device,
             d3d_device,
             d3d_context,
             frame_pool,
@@ -641,24 +652,6 @@ mod native_wgc {
             session,
             client_rect: identity.client_rect,
         })
-    }
-
-    pub(super) fn rebuild(backend: &mut WgcState, client_rect: Rect) -> Result<(), WindowsError> {
-        let size = backend
-            .item
-            .Size()
-            .map_err(|error| win_error("capture.target_unavailable", error))?;
-        backend
-            .frame_pool
-            .Recreate(
-                &backend.device,
-                DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                1,
-                size,
-            )
-            .map_err(|error| win_error("capture.frame_pool_failed", error))?;
-        backend.client_rect = client_rect;
-        Ok(())
     }
 
     pub(super) fn next_bgra(
@@ -688,7 +681,7 @@ mod native_wgc {
                 })?;
             match backend.frame_pool.TryGetNextFrame() {
                 Ok(frame) => {
-                    let result = copy_client_frame(backend, &frame);
+                    let result = copy_client_frame(backend, &frame, deadline);
                     let _ = frame.Close();
                     return result;
                 }
@@ -741,6 +734,7 @@ mod native_wgc {
     fn copy_client_frame(
         backend: &WgcState,
         frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
+        deadline: Instant,
     ) -> Result<CapturedBgraFrame, WindowsError> {
         let surface = frame
             .Surface()
@@ -750,12 +744,13 @@ mod native_wgc {
             .map_err(|error| win_error("capture.frame_invalid", error))?;
         let source = unsafe { access.GetInterface::<ID3D11Texture2D>() }
             .map_err(|error| win_error("capture.frame_invalid", error))?;
-        copy_texture_client(backend, &source)
+        copy_texture_client(backend, &source, deadline)
     }
 
     fn copy_texture_client(
         backend: &WgcState,
         source: &ID3D11Texture2D,
+        deadline: Instant,
     ) -> Result<CapturedBgraFrame, WindowsError> {
         let hwnd = HWND(backend.hwnd as *mut c_void);
         let capture_bounds = capture_bounds(hwnd)?;
@@ -811,13 +806,39 @@ mod native_wgc {
                 Some(&region),
             );
         }
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            backend
-                .d3d_context
-                .Map(&staging_resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .map_err(|error| win_error("capture.map_failed", error))?;
-        }
+        let mapped = loop {
+            if Instant::now() >= deadline {
+                return Err(WindowsError::new(
+                    "capture.deadline",
+                    "GPU frame copy did not complete before the capture deadline",
+                ));
+            }
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            match unsafe {
+                backend.d3d_context.Map(
+                    &staging_resource,
+                    0,
+                    D3D11_MAP_READ,
+                    D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                    Some(&mut mapped),
+                )
+            } {
+                Ok(()) => break mapped,
+                Err(error)
+                    if error.code() == DXGI_ERROR_WAS_STILL_DRAWING
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING => {
+                    return Err(WindowsError::new(
+                        "capture.deadline",
+                        "GPU frame copy did not complete before the capture deadline",
+                    ));
+                }
+                Err(error) => return Err(win_error("capture.map_failed", error)),
+            }
+        };
         let row_bytes = width as usize * 4;
         if mapped.pData.is_null() || (mapped.RowPitch as usize) < row_bytes {
             unsafe { backend.d3d_context.Unmap(&staging_resource, 0) };
@@ -874,6 +895,7 @@ mod native_wgc {
         let _ = state
             .frame_pool
             .RemoveFrameArrived(state.frame_arrived_token);
+        unsafe { state.d3d_context.Flush() };
         let _ = state.session.Close();
         let _ = state.frame_pool.Close();
     }
