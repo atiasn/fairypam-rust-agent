@@ -20,14 +20,8 @@ fn installed_testbed_and_genshin_profiles_verify_and_do_not_share_actions() {
     let genshin = store.get("genshin-impact").unwrap();
     assert!(testbed.profile().actions.contains_key("input.pulse"));
     assert!(!genshin.profile().actions.contains_key("input.pulse"));
-    assert!(genshin
-        .profile()
-        .actions
-        .contains_key("gadget.quick_use"));
-    assert!(!testbed
-        .profile()
-        .actions
-        .contains_key("gadget.quick_use"));
+    assert!(genshin.profile().actions.contains_key("gadget.quick_use"));
+    assert!(!testbed.profile().actions.contains_key("gadget.quick_use"));
 }
 
 #[cfg(not(feature = "e2e-live-input"))]
