@@ -948,7 +948,10 @@ pub struct RuntimeSafetyHooks {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeOwner {
-    Gui(u32),
+    Gui {
+        pid: u32,
+        foreground_broker_hwnd: isize,
+    },
     Maintenance,
     #[cfg(feature = "dev-automation")]
     DevAutomation,
@@ -1123,10 +1126,16 @@ async fn run_windows(
     owner: RuntimeOwner,
 ) -> Result<(), AgentError> {
     let verified_gui = match owner {
-        RuntimeOwner::Gui(pid) => Some(
-            fairypam_agent_windows::verify_fixed_gui_owner(pid)
-                .map_err(|error| AgentError::new(error.code(), error.to_string()))?,
-        ),
+        RuntimeOwner::Gui {
+            pid,
+            foreground_broker_hwnd,
+        } => {
+            let verified = fairypam_agent_windows::verify_fixed_gui_owner(pid)
+                .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+            fairypam_agent_windows::configure_foreground_broker(pid, foreground_broker_hwnd)
+                .map_err(AgentError::from)?;
+            Some(verified)
+        }
         RuntimeOwner::Maintenance => {
             fairypam_agent_windows::verify_fixed_installer_parent()
                 .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
@@ -1290,7 +1299,7 @@ impl LocalControlRuntime for SharedRuntime {
                 "maintenance mode does not accept device operations",
             ));
         }
-        if matches!(self.owner, RuntimeOwner::Gui(_))
+        if matches!(self.owner, RuntimeOwner::Gui { .. })
             && matches!(command, LocalCommand::RegisterHub { .. })
         {
             self.gui_lifetime.confirm_bound(caller.pid)?;
@@ -1347,7 +1356,7 @@ impl SharedRuntime {
                     .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
                 Ok(())
             }
-            RuntimeOwner::Gui(_) => self.gui_lifetime.confirm_bound(caller.pid),
+            RuntimeOwner::Gui { .. } => self.gui_lifetime.confirm_bound(caller.pid),
             #[cfg(feature = "dev-automation")]
             RuntimeOwner::DevAutomation => Err(AgentError::new(
                 "local.dev_shutdown_unsupported",
@@ -2480,7 +2489,10 @@ mod tests {
     #[tokio::test]
     async fn unregistered_runtime_keeps_local_control_then_notifies_supervisor() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
-        let mut local = driver.local_runtime(RuntimeOwner::Gui(7));
+        let mut local = driver.local_runtime(RuntimeOwner::Gui {
+            pid: 7,
+            foreground_broker_hwnd: 11,
+        });
 
         assert!(!driver.is_registered().unwrap());
         assert!(local
@@ -2589,7 +2601,10 @@ mod tests {
     fn direct_runtime_shutdown_requires_the_bound_gui_pid() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
         driver.gui_lifetime.bind(7).unwrap();
-        let mut local = driver.local_runtime(RuntimeOwner::Gui(7));
+        let mut local = driver.local_runtime(RuntimeOwner::Gui {
+            pid: 7,
+            foreground_broker_hwnd: 11,
+        });
         let mut wrong = local_caller();
         wrong.pid = 8;
 
@@ -2610,7 +2625,10 @@ mod tests {
     #[test]
     fn register_hub_requires_the_bound_gui_pid_before_platform_handling() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
-        let mut local = driver.local_runtime(RuntimeOwner::Gui(7));
+        let mut local = driver.local_runtime(RuntimeOwner::Gui {
+            pid: 7,
+            foreground_broker_hwnd: 11,
+        });
         assert_eq!(
             local
                 .execute(

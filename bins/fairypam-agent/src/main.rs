@@ -37,14 +37,35 @@ fn production_owner() -> Result<RuntimeOwner, AgentError> {
 fn parse_production_owner(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
 ) -> Result<RuntimeOwner, AgentError> {
-    match (arguments.next(), arguments.next(), arguments.next()) {
-        (Some(command), None, None) if command == "--maintenance" => Ok(RuntimeOwner::Maintenance),
-        (Some(command), Some(pid), None) if command == "--ui-owner-pid" => pid
-            .to_str()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|pid| *pid != 0)
-            .map(RuntimeOwner::Gui)
-            .ok_or_else(owner_invalid),
+    match (
+        arguments.next(),
+        arguments.next(),
+        arguments.next(),
+        arguments.next(),
+        arguments.next(),
+    ) {
+        (Some(command), None, None, None, None) if command == "--maintenance" => {
+            Ok(RuntimeOwner::Maintenance)
+        }
+        (Some(command), Some(pid), Some(broker_option), Some(broker_hwnd), None)
+            if command == "--ui-owner-pid" && broker_option == "--foreground-broker-hwnd" =>
+        {
+            let pid = pid
+                .to_str()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|pid| *pid != 0)
+                .ok_or_else(owner_invalid)?;
+            let foreground_broker_hwnd = broker_hwnd
+                .to_str()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|hwnd| *hwnd != 0)
+                .map(|hwnd| hwnd as isize)
+                .ok_or_else(owner_invalid)?;
+            Ok(RuntimeOwner::Gui {
+                pid,
+                foreground_broker_hwnd,
+            })
+        }
         _ => Err(owner_invalid()),
     }
 }
@@ -68,12 +89,31 @@ mod tests {
             RuntimeOwner::Maintenance
         );
         assert_eq!(
-            parse_production_owner(["--ui-owner-pid".into(), "42".into()].into_iter()).unwrap(),
-            RuntimeOwner::Gui(42)
+            parse_production_owner(
+                [
+                    "--ui-owner-pid".into(),
+                    "42".into(),
+                    "--foreground-broker-hwnd".into(),
+                    "4096".into(),
+                ]
+                .into_iter()
+            )
+            .unwrap(),
+            RuntimeOwner::Gui {
+                pid: 42,
+                foreground_broker_hwnd: 4096,
+            }
         );
         for arguments in [
             Vec::new(),
             vec!["--ui-owner-pid".into(), "0".into()],
+            vec!["--ui-owner-pid".into(), "42".into()],
+            vec![
+                "--ui-owner-pid".into(),
+                "42".into(),
+                "--foreground-broker-hwnd".into(),
+                "0".into(),
+            ],
             vec!["--maintenance".into(), "extra".into()],
         ] {
             assert_eq!(

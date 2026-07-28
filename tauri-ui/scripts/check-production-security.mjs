@@ -42,9 +42,9 @@ for (const forbidden of ['fn invoke', 'fn exec', 'fn spawn', 'fn read_file', 'se
 for (const required of [
   'for path in [&gui, &helper]',
   'verify_protected_program_files_path(path)',
-  'ShellExecuteW',
+  'ShellExecuteExW',
   'HSTRING::from("runas")',
-  '"--ui-owner-pid {}"',
+  '"--ui-owner-pid {} --foreground-broker-hwnd {}"',
   'fixed_agent_path()',
   'for path in [&gui, &pointer]',
   'CURRENT_POINTER_FILE',

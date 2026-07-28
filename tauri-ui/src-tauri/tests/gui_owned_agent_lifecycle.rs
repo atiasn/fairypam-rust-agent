@@ -1,15 +1,18 @@
 const APP: &str = include_str!("../src/app.rs");
 const COMMANDS: &str = include_str!("../src/commands.rs");
 const GATEWAY: &str = include_str!("../src/local_gateway.rs");
+const FOREGROUND_BROKER: &str = include_str!("../src/foreground_broker.rs");
 const SINGLE_INSTANCE: &str = include_str!("../src/gui_single_instance.rs");
 const AGENT_RUNTIME: &str = include_str!("../../../bins/fairypam-agent/src/runtime.rs");
 const AGENT_MAIN: &str = include_str!("../../../bins/fairypam-agent/src/main.rs");
 const GUI_LIFECYCLE: &str = include_str!("../../../bins/fairypam-agent/src/gui_lifecycle.rs");
 const WINDOWS_PIPE: &str = include_str!("../../../crates/fairypam-agent-windows/src/local_pipe.rs");
+const WINDOWS_FOREGROUND: &str =
+    include_str!("../../../crates/fairypam-agent-windows/src/foreground.rs");
 
 #[test]
 fn gui_binds_the_directly_launched_unique_agent() {
-    assert!(COMMANDS.contains("--ui-owner-pid {}"));
+    assert!(COMMANDS.contains("--ui-owner-pid {} --foreground-broker-hwnd {}"));
     assert!(AGENT_MAIN.contains("RuntimeOwner::Gui"));
     assert!(AGENT_RUNTIME.contains("verify_fixed_gui_owner(pid)"));
     assert!(AGENT_RUNTIME.contains("verify_fixed_installer_parent()"));
@@ -21,6 +24,16 @@ fn gui_binds_the_directly_launched_unique_agent() {
     assert!(!GUI_LIFECYCLE.contains("OpenProcess"));
     assert!(WINDOWS_PIPE.contains("PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE"));
     assert!(GATEWAY.contains("LocalCommand::ShutdownAgent"));
+    for required in [
+        "requested_pid == bound_pid",
+        "foreground_pid == gui_pid",
+        "process_running",
+        "AllowSetForegroundWindow(bound.pid)",
+    ] {
+        assert!(FOREGROUND_BROKER.contains(required));
+    }
+    assert!(WINDOWS_FOREGROUND.contains("actual_pid != gui_pid"));
+    assert!(WINDOWS_FOREGROUND.contains("WPARAM(std::process::id() as usize)"));
     let shutdown = APP
         .find("shutdown_local_agent_for_exit")
         .expect("tray exit must request Agent cleanup");
@@ -46,9 +59,9 @@ fn new_gui_session_replaces_residual_agent_then_launches_fixed_sibling() {
     assert!(COMMANDS.contains("startup.inactive_suite"));
     assert!(AGENT_RUNTIME.contains("verify_active_agent_suite()?"));
     assert!(AGENT_RUNTIME.contains("runtime.inactive_suite"));
-    assert!(COMMANDS.contains("ShellExecuteW"));
+    assert!(COMMANDS.contains("ShellExecuteExW"));
     assert!(COMMANDS.contains("HSTRING::from(\"runas\")"));
-    assert!(COMMANDS.contains("--ui-owner-pid {}"));
+    assert!(COMMANDS.contains("--ui-owner-pid {} --foreground-broker-hwnd {}"));
     assert!(COMMANDS.contains("agent_instance_running()?"));
     assert!(COMMANDS.contains("OpenMutexW"));
     assert!(!COMMANDS.contains("CreateMutexW"));

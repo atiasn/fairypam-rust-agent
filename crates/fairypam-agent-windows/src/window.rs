@@ -791,7 +791,16 @@ mod native {
         require_same_identity(identity, &current.identity)?;
         let hwnd = HWND(identity.hwnd as *mut c_void);
         let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
-        let foreground_request_accepted = unsafe { SetForegroundWindow(hwnd) }.as_bool();
+        let mut foreground_request_accepted = unsafe { SetForegroundWindow(hwnd) }.as_bool();
+        let broker_authorized = if foreground_request_accepted {
+            false
+        } else {
+            let authorized = crate::foreground::request_foreground_authorization()?;
+            if authorized {
+                foreground_request_accepted = unsafe { SetForegroundWindow(hwnd) }.as_bool();
+            }
+            authorized
+        };
         let deadline = Instant::now() + Duration::from_millis(500);
         while unsafe { GetForegroundWindow() } != hwnd {
             if Instant::now() >= deadline {
@@ -801,7 +810,7 @@ mod native {
                 return Err(WindowsError::new(
                     "target.focus_failed",
                     format!(
-                        "target did not become the foreground window; request_accepted={foreground_request_accepted}, desktop_receives_input={:?}, foreground_hwnd=0x{:x}, foreground_pid={foreground_pid}, target_hwnd=0x{:x}, target_pid={}",
+                        "target did not become the foreground window; request_accepted={foreground_request_accepted}, broker_authorized={broker_authorized}, desktop_receives_input={:?}, foreground_hwnd=0x{:x}, foreground_pid={foreground_pid}, target_hwnd=0x{:x}, target_pid={}",
                         desktop_receives_input(), foreground.0 as usize, identity.hwnd as usize, identity.pid
                     ),
                 ));

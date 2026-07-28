@@ -2,6 +2,8 @@
 
 mod capture;
 mod dpi;
+#[cfg(windows)]
+mod foreground;
 mod local_pipe;
 mod process;
 #[cfg(windows)]
@@ -15,6 +17,8 @@ pub use capture::{
     CapturedFrame, LatestFrameSlot,
 };
 pub use dpi::{physical_to_logical, validate_dpi};
+#[cfg(windows)]
+pub use foreground::configure_foreground_broker;
 #[cfg(windows)]
 pub use local_pipe::verify_fixed_gui_caller;
 #[cfg(windows)]

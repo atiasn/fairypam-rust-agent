@@ -65,7 +65,7 @@ fn product_gui_directly_launches_the_fixed_agent_and_isolates_repair() {
         "ShellExecuteExW",
         "SEE_MASK_NOCLOSEPROCESS",
         "HSTRING::from(\"runas\")",
-        "--ui-owner-pid {}",
+        "--ui-owner-pid {} --foreground-broker-hwnd {}",
         "shutdown_local_agent_for_exit",
         "state.shutdown_agent().await",
         "error.code == \"local.transport.pipe_not_found\"",

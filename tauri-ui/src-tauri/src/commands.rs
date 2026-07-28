@@ -21,12 +21,14 @@ use windows::{
             GetExitCodeProcess, OpenMutexW, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE,
         },
         UI::{
-            Shell::{ShellExecuteExW, ShellExecuteW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
+            Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
             WindowsAndMessaging::SW_HIDE,
         },
     },
 };
 
+#[cfg(windows)]
+use crate::foreground_broker::foreground_broker;
 use crate::{
     dto::{
         ConnectionStatusDto, EnvironmentCheckDto, InstalledGamesDto, LogTailDto, OverviewDto,
@@ -197,7 +199,13 @@ async fn replace_with_interactive_agent(
 ) -> CommandResult<SupportStatusDto> {
     stop_existing_agent(state).await?;
     launch_fixed_agent()?;
-    wait_for_agent(state).await
+    match wait_for_agent(state).await {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            foreground_broker()?.clear();
+            Err(error)
+        }
+    }
 }
 
 pub(crate) async fn shutdown_local_agent_for_exit(state: &ProductionGateway) -> CommandResult<()> {
@@ -215,6 +223,7 @@ pub(crate) async fn shutdown_local_agent_for_exit(state: &ProductionGateway) -> 
 
 #[cfg(windows)]
 async fn stop_existing_agent(state: &ProductionGateway) -> CommandResult<()> {
+    foreground_broker()?.clear();
     state.clear_interactive_owner();
     match state.shutdown_agent().await {
         Ok(()) => {}
@@ -333,22 +342,38 @@ async fn observe_hub(state: &ProductionGateway) -> CommandResult<SupportStatusDt
 #[cfg(windows)]
 fn launch_fixed_agent() -> CommandResult<()> {
     let (agent, directory) = fixed_agent_path()?;
-    let result = unsafe {
-        ShellExecuteW(
-            None,
-            &HSTRING::from("runas"),
-            &HSTRING::from(agent.to_string_lossy().as_ref()),
-            &HSTRING::from(format!("--ui-owner-pid {}", std::process::id())),
-            &HSTRING::from(directory.to_string_lossy().as_ref()),
-            SW_HIDE,
-        )
+    let broker = foreground_broker()?;
+    let verb = HSTRING::from("runas");
+    let file = HSTRING::from(agent.to_string_lossy().as_ref());
+    let parameters = HSTRING::from(format!(
+        "--ui-owner-pid {} --foreground-broker-hwnd {}",
+        std::process::id(),
+        broker.hwnd() as usize
+    ));
+    let working_directory = HSTRING::from(directory.to_string_lossy().as_ref());
+    let mut execution = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        lpDirectory: PCWSTR(working_directory.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
     };
-    if result.0 as usize <= 32 {
-        return Err(UiCommandError::unavailable(
+    unsafe { ShellExecuteExW(&mut execution) }.map_err(|_| {
+        UiCommandError::unavailable(
             "startup.elevation_denied",
             "Windows did not authorize starting the FairyPam Agent",
+        )
+    })?;
+    if execution.hProcess.is_invalid() {
+        return Err(UiCommandError::unavailable(
+            "startup.agent_start_failed",
+            "FairyPam could not bind the elevated Agent process",
         ));
     }
+    broker.bind_core(execution.hProcess)?;
     Ok(())
 }
 
