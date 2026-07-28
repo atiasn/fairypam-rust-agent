@@ -788,13 +788,19 @@ mod native {
         require_same_identity(identity, &current.identity)?;
         let hwnd = HWND(identity.hwnd as *mut c_void);
         let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
-        let _ = unsafe { SetForegroundWindow(hwnd) };
+        let foreground_request_accepted = unsafe { SetForegroundWindow(hwnd) }.as_bool();
         let deadline = Instant::now() + Duration::from_millis(500);
         while unsafe { GetForegroundWindow() } != hwnd {
             if Instant::now() >= deadline {
+                let foreground = unsafe { GetForegroundWindow() };
+                let mut foreground_pid = 0;
+                unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_pid)) };
                 return Err(WindowsError::new(
                     "target.focus_failed",
-                    "target did not become the foreground window",
+                    format!(
+                        "target did not become the foreground window; request_accepted={foreground_request_accepted}, foreground_hwnd=0x{:x}, foreground_pid={foreground_pid}, target_hwnd=0x{:x}, target_pid={}",
+                        foreground.0 as usize, identity.hwnd as usize, identity.pid
+                    ),
                 ));
             }
             thread::sleep(Duration::from_millis(10));
