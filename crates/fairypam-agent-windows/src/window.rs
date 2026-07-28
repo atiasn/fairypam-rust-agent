@@ -636,17 +636,14 @@ pub struct NativeWindows;
 #[cfg(windows)]
 impl WindowsApi for NativeWindows {
     fn enumerate_candidates(&mut self) -> Result<Vec<WindowsTargetCandidate>, WindowsError> {
-        crate::desktop::ensure_input_desktop()?;
         native::enumerate_candidates()
     }
 
     fn snapshot(&mut self, hwnd: isize) -> Result<WindowsTargetCandidate, WindowsError> {
-        crate::desktop::ensure_input_desktop()?;
         native::candidate_from_raw_hwnd(hwnd)
     }
 
     fn focus_target(&mut self, identity: &TargetIdentity) -> Result<(), WindowsError> {
-        crate::desktop::ensure_input_desktop()?;
         native::focus_target(identity)
     }
 
@@ -655,7 +652,6 @@ impl WindowsApi for NativeWindows {
         identity: &TargetIdentity,
         timeout: Duration,
     ) -> Result<(), WindowsError> {
-        crate::desktop::ensure_input_desktop()?;
         native::close_target(identity, timeout)
     }
 }
