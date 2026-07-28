@@ -9,13 +9,14 @@ const WINDOWS_PIPE_SERVER: &str =
     include_str!("../../../crates/fairypam-agent-windows/src/local_pipe.rs");
 const AGENT_ENROLLMENT: &str = include_str!("../../../bins/fairypam-agent/src/enrollment.rs");
 const AGENT_RUNTIME: &str = include_str!("../../../bins/fairypam-agent/src/runtime.rs");
-const AGENT_UPDATE: &str = include_str!("../../../bins/fairypam-agent/src/update.rs");
 const INSTALLER_PROVISIONER: &str =
     include_str!("../../../bins/fairypam-agent-installer/src/main.rs");
 const INSTALLER_LAYOUT_BUILD: &str =
     include_str!("../../../bins/fairypam-agent-installer/build.rs");
 const NSIS_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
 const NSIS_TEMPLATE: &str = include_str!("../windows/installer.nsi");
+const WINDOWS_CANDIDATE: &str =
+    include_str!("../../../../ops/rust-agent-public/.github/workflows/windows-candidate.yml");
 
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -80,7 +81,7 @@ fn production_ui_cannot_arm_inject_or_reset_emergency() {
 }
 
 #[test]
-fn registration_proves_the_elevated_pipe_server_before_dispatch() {
+fn retained_maintenance_pipe_proves_the_server_before_dispatch() {
     for required in [
         "GetNamedPipeServerProcessId",
         "server_sid_mismatch",
@@ -109,7 +110,6 @@ fn registration_proves_the_elevated_pipe_server_before_dispatch() {
 fn product_uac_and_enrollment_publication_fail_closed() {
     let commands = include_str!("../src/commands.rs");
     for required in [
-        "for path in [&gui, &helper]",
         "for path in [&gui, &pointer]",
         "CURRENT_POINTER_FILE",
         "verify_protected_program_files_path(path)",
@@ -510,55 +510,21 @@ fn product_installer_binds_each_command_to_one_helper_phase() {
 }
 
 #[test]
-fn fixed_repair_helper_requires_a_complete_nonwritable_program_files_chain() {
+fn embedded_product_removes_the_repair_helper_and_sibling_core() {
     let commands = include_str!("../src/commands.rs");
-    let guard =
-        include_str!("../../../crates/fairypam-agent-local-client/src/windows_named_pipe.rs");
-    for required in [
-        "for path in [&gui, &helper]",
-        "verify_protected_program_files_path(path)",
-        "verify_repair_helper_signature(&helper)?",
-        "WinVerifyTrust",
-        "WINTRUST_ACTION_GENERIC_VERIFY_V2",
-        "WTD_STATEACTION_CLOSE",
+    for forbidden in [
+        "run_repair_helper",
+        "fairypam-agent.exe",
+        "ShellExecuteExW",
+        "--repair-tasks",
+        "--ui-owner-pid",
     ] {
-        assert!(
-            commands.contains(required),
-            "missing fixed repair-helper guard: {required}"
-        );
+        assert!(!commands.contains(forbidden));
     }
-    for required in [
-        "protected_install_chain",
-        "for component in relative",
-        "path_is_writable(&current)?",
-        "has_reparse_component(path)",
-        "SHGetKnownFolderPath",
-        "FOLDERID_ProgramFiles",
-        "FOLDERID_ProgramFilesX86",
-    ] {
-        assert!(
-            guard.contains(required),
-            "missing complete Program Files chain guard: {required}"
-        );
-    }
-    let canonicalize_helper = guard
-        .find("fn protected_install_path")
-        .expect("canonicalization must be isolated behind a reparse guard");
-    let reparse_guard = guard[canonicalize_helper..]
-        .find("has_reparse_component(path)")
-        .expect("the canonicalization helper must reject reparse points first");
-    let canonicalize = guard[canonicalize_helper..]
-        .find("fs::canonicalize(path)")
-        .expect("the install chain must canonicalize only after rejecting reparse points");
-    assert!(reparse_guard < canonicalize);
-    assert!(
-        !commands.contains("std::env::var(\"ProgramFiles\")"),
-        "the trusted install root must come from Windows Known Folders, not user environment"
-    );
 }
 
 #[test]
-fn local_identity_contract_verifies_peer_and_install_root_before_sensitive_actions() {
+fn embedded_gateway_bypasses_pipe_while_retained_maintenance_pipe_stays_verified() {
     let client =
         include_str!("../../../crates/fairypam-agent-local-client/src/windows_named_pipe.rs");
     let commands = include_str!("../src/commands.rs");
@@ -589,18 +555,12 @@ fn local_identity_contract_verifies_peer_and_install_root_before_sensitive_actio
     assert!(adapter.contains("LocalCommand::RegisterHub { .. }"));
     assert!(GATEWAY.contains("REGISTRATION_TIMEOUT: Duration = Duration::from_secs(20)"));
     assert!(GATEWAY.contains("request_with_timeout(command, REGISTRATION_TIMEOUT)"));
-    assert!(GATEWAY.contains("one authenticated connection each"));
+    assert!(GATEWAY.contains("EmbeddedRuntimeHandle"));
+    assert!(GATEWAY.contains("runtime.execute(&command)"));
+    assert!(!GATEWAY.contains("WindowsNamedPipeClientTransport"));
     assert!(include_str!("../../../bins/fairypam-agent/src/runtime.rs")
         .contains("single_request_connections: true"));
-    for required in [
-        "for path in [&gui, &helper]",
-        "verify_protected_program_files_path(path)",
-    ] {
-        assert!(
-            commands.contains(required),
-            "missing fixed-install guard: {required}"
-        );
-    }
+    assert!(commands.contains("verify_protected_program_files_path(path)"));
     assert!(client.contains("FILE_DELETE_CHILD"));
     assert!(client.contains("ERROR_ACCESS_DENIED"));
 }
@@ -618,79 +578,37 @@ fn active_suite_pointer_is_verified_before_it_can_authorize_rollback() {
 }
 
 #[test]
-fn installer_owns_fixed_task_registration_and_bounded_recovery() {
-    for required in [
-        "(\"--launch-agent-task\", None) => launch_agent_task(install_root)",
-        "(\"--prepare-install\", None) =>",
-        "(\"--run-agent-task\", None) => with_install_transaction",
-        "(\"--restart-agent-task\", None) =>",
-        "(\"--handoff-agent-task\", None) =>",
-        "(\"--run-ui-task\", None) =>",
-        "run_fixed_task(install_root, FixedTask::Ui, false)",
-        "(\"--repair-tasks\", None) =>",
-        "repair_fixed_tasks(install_root)",
-        "(\"--remove-tasks\", None) =>",
-        "remove_fixed_tasks(install_root)",
-        "TASK_CREATE_OR_UPDATE",
-        "TASK_DONT_ADD_PRINCIPAL_ACE",
-        "TASK_LOGON_INTERACTIVE_TOKEN",
-        "TASK_RUNLEVEL_HIGHEST",
-        "TASK_RUNLEVEL_LUA",
-        "TASK_INSTANCES_IGNORE_NEW",
-        "AGENT_RESTART_COUNT",
-        "AGENT_RESTART_INTERVAL",
-        "AgentRestartExhausted",
-        "FairyPam Agent",
-        "FairyPam Agent UI",
-        "fairypam-agent.exe",
-        "resources\\runtime\\fairypam-agent-installer.exe",
-        "fn launch_agent_task(",
-        ".arg(\"--maintenance\")",
-        "fn handoff_agent_task(",
-        "fn stop_maintenance_agent(",
-        ".try_wait()",
-        "fn kill_on_close_job(",
-        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
-        "AssignProcessToJobObject",
-        "std::thread::sleep(AGENT_RESTART_INTERVAL)",
-        "fairypam-agent-tauri-ui.exe",
-        "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;",
-        "Global\\FairyPam.Agent.InstallTransaction.v1",
-        "SetEnabled(VARIANT_BOOL(0))",
-        "SetEnabled(VARIANT_BOOL(-1))",
-        "interactive_session_user_sid",
-        "validated_task_user_sid",
-        "WTSQuerySessionInformationW",
-        "request_agent_maintenance_shutdown",
-        "LocalCommand::ShutdownAgent",
-        "LastTaskResult",
-        "wait_for_agent_processes_to_exit",
-        "wait_for_product_processes_to_exit",
-        "stop_fixed_tasks_for_install",
-        "restore_fixed_tasks",
+fn installer_exposes_only_install_validation_and_stable_gui_launch() {
+    assert!(INSTALLER_PROVISIONER.contains("(\"--launch-ui\", None) => launch_ui(install_root)"));
+    for forbidden in [
+        "(\"--launch-agent-task\", None)",
+        "(\"--prepare-install\", None)",
+        "(\"--run-agent-task\", None)",
+        "(\"--restart-agent-task\", None)",
+        "(\"--handoff-agent-task\", None)",
+        "(\"--run-ui-task\", None)",
+        "(\"--repair-tasks\", None)",
+        "(\"--remove-tasks\", None)",
     ] {
-        assert!(
-            INSTALLER_PROVISIONER.contains(required),
-            "missing fixed task contract: {required}"
-        );
+        assert!(!INSTALLER_PROVISIONER.contains(forbidden));
     }
     assert!(NSIS_HOOKS.contains("--provision \"$FairyPamInstallDir\""));
-    assert!(NSIS_TEMPLATE.contains("--run-ui-task \"$INSTDIR\""));
-    assert!(NSIS_TEMPLATE.contains("--remove-tasks \"$INSTDIR\""));
-    let mut uninstall_parts = NSIS_TEMPLATE.split("Section Uninstall");
-    let before_uninstall = uninstall_parts
-        .next()
-        .expect("installer template must contain content before uninstall");
-    let uninstall_section = uninstall_parts
-        .next()
-        .expect("uninstall task removal must occur after confirmation");
-    assert!(!before_uninstall.contains("--remove-tasks \"$INSTDIR\""));
-    assert!(uninstall_section.contains("--remove-tasks \"$INSTDIR\""));
+    assert!(NSIS_TEMPLATE.contains("--launch-ui \"$INSTDIR\""));
+    assert!(!NSIS_TEMPLATE.contains("--run-ui-task \"$INSTDIR\""));
+    assert!(!NSIS_TEMPLATE.contains("--remove-tasks \"$INSTDIR\""));
+    assert!(!NSIS_HOOKS.contains("fairypam-agent.exe"));
+    for required in [
+        "$allowedProductExecutables -notcontains $executable.FullName",
+        "@('.exe', '.dll', '.msi', '.ps1', '.bat', '.cmd')",
+        "Get-ScheduledTask -TaskName $taskName",
+        "Name = 'fairypam-agent.exe'",
+    ] {
+        assert!(WINDOWS_CANDIDATE.contains(required));
+    }
+    assert!(!WINDOWS_CANDIDATE.contains("Smoke trusted NSIS product reinstall"));
     assert!(
         !NSIS_TEMPLATE.contains("nsis_tauri_utils::RunAsUser \"$INSTDIR\\${MAINBINARYNAME}.exe\"")
     );
-    assert!(AGENT_UPDATE.contains(".arg(\"--handoff-agent-task\")"));
-    assert!(AGENT_UPDATE.contains("update.handoff_failed"));
 }
 
 #[test]

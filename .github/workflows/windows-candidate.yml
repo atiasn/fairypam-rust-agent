@@ -224,8 +224,6 @@ jobs:
               --built-at $builtAt `
               --build-origin 'github-actions/windows-candidate.yml' `
               --output ..\target\suite\BUILD-MANIFEST.json `
-              --package ..\target\suite\fairypam-agent-update-windows.zip `
-              --agent ..\target\release\fairypam-agent.exe `
               --guardian ..\target\release\fairypam-agent-guardian.exe `
               --gui src-tauri\target\release\fairypam-agent-tauri-ui.exe `
               --helper ..\target\release\fairypam-agent-installer.exe `
@@ -326,221 +324,36 @@ jobs:
           foreach ($path in @(
             (Join-Path $versionRoot 'BUILD-MANIFEST.json'),
             (Join-Path $versionRoot 'fairypam-agent-tauri-ui.exe'),
-            (Join-Path $versionRoot 'fairypam-agent.exe'),
             (Join-Path $versionRoot 'fairypam-agent-guardian.exe'),
-            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe')
+            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'),
+            (Join-Path $installRoot 'uninstall.exe')
           )) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "missing installed product file: $path" }
           }
           $profiles = Join-Path $versionRoot 'profiles'
           if (-not (Test-Path -LiteralPath $profiles -PathType Container)) { throw "missing installed profiles directory: $profiles" }
-          foreach ($forbidden in @('fairypam-agentctl.exe', 'fairypam-agent-updater.exe')) {
-            if (Get-ChildItem -LiteralPath $installRoot -Recurse -File -Filter $forbidden) {
-              throw "forbidden product member found: $forbidden"
+          $allowedProductExecutables = @(
+            (Join-Path $versionRoot 'fairypam-agent-tauri-ui.exe'),
+            (Join-Path $versionRoot 'fairypam-agent-guardian.exe'),
+            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'),
+            (Join-Path $installRoot 'uninstall.exe')
+          ) | ForEach-Object { [IO.Path]::GetFullPath($_) }
+          foreach ($executable in Get-ChildItem -LiteralPath $installRoot -Recurse -File | Where-Object {
+            $_.Extension.ToLowerInvariant() -in @('.exe', '.dll', '.msi', '.ps1', '.bat', '.cmd')
+          }) {
+            if ($allowedProductExecutables -notcontains $executable.FullName) {
+              throw "executable is outside the exact product allowlist: $($executable.FullName)"
             }
           }
-
-      - name: Smoke maintenance Agent task remains on demand
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
-          if ($agents.Count -ne 0) {
-            throw "maintenance health check left Agent processes running: $($agents.Count)"
-          }
-          $task = Get-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent'
-          if ($task.State -ne 'Ready') {
-            throw "maintenance Agent task is not idle: $($task.State)"
-          }
-          $taskInfo = Get-ScheduledTaskInfo -TaskPath '\' -TaskName 'FairyPam Agent'
-          if ($taskInfo.LastTaskResult -ne 0) {
-            throw "maintenance Agent health task did not exit cleanly: $($taskInfo.LastTaskResult)"
-          }
-          $taskXml = [xml](Export-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent')
-          $taskNamespace = [Xml.XmlNamespaceManager]::new($taskXml.NameTable)
-          $taskNamespace.AddNamespace('task', $taskXml.DocumentElement.NamespaceURI)
-          $triggers = @($taskXml.SelectNodes('/task:Task/task:Triggers/*', $taskNamespace))
-          if ($triggers.Count -ne 0) {
-            throw "maintenance Agent task must not have automatic triggers: $($triggers.LocalName -join ',')"
-          }
-          if (@($task.Actions).Count -ne 1 `
-              -or $task.Actions[0].Execute -cne 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe' `
-              -or $task.Actions[0].Arguments -cne '--launch-agent-task "C:\Program Files\FairyPam"') {
-            throw "maintenance Agent task action is not the fixed protected launcher"
-          }
-
-          Start-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent'
-          try {
-            $deadline = [DateTime]::UtcNow.AddSeconds(30)
-            do {
-              Start-Sleep -Seconds 1
-              $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
-            } while ($agents.Count -ne 1 -and [DateTime]::UtcNow -lt $deadline)
-            if ($agents.Count -ne 1) {
-              throw "on-demand maintenance task did not start exactly one Agent"
-            }
-            $originalPid = $agents[0].Id
-            $agentProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $originalPid"
-            $launcherProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($agentProcess.ParentProcessId)"
-            if ($launcherProcess.ExecutablePath -cne 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe') {
-              throw "maintenance Agent did not use the protected launcher helper: $($launcherProcess.ExecutablePath)"
-            }
-
-            Stop-Process -Id $originalPid -Force
-            $deadline = [DateTime]::UtcNow.AddSeconds(90)
-            do {
-              Start-Sleep -Seconds 2
-              $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
-              $replacement = @($agents | Where-Object { $_.Id -ne $originalPid })
-            } while ($replacement.Count -ne 1 -and [DateTime]::UtcNow -lt $deadline)
-            if ($agents.Count -ne 1 -or $replacement.Count -ne 1) {
-              throw "maintenance launcher did not recover exactly one Agent"
-            }
-            $replacementProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($replacement[0].Id)"
-            if ($replacementProcess.ParentProcessId -ne $launcherProcess.ProcessId) {
-              throw "recovered Agent did not reuse the fixed task helper"
-            }
-
-            $recoveredPid = $replacement[0].Id
-            $restart = Start-Process `
-              -FilePath 'C:\Program Files\FairyPam\resources\runtime\fairypam-agent-installer.exe' `
-              -ArgumentList '--restart-agent-task', '"C:\Program Files\FairyPam"' `
-              -Wait `
-              -PassThru
-            if ($restart.ExitCode -ne 0) {
-              throw "controlled maintenance restart failed: $($restart.ExitCode)"
-            }
-            $deadline = [DateTime]::UtcNow.AddSeconds(30)
-            do {
-              Start-Sleep -Seconds 1
-              $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
-              $restarted = @($agents | Where-Object { $_.Id -ne $recoveredPid })
-            } while (($agents.Count -ne 1 -or $restarted.Count -ne 1) -and [DateTime]::UtcNow -lt $deadline)
-            if ($agents.Count -ne 1 -or $restarted.Count -ne 1) {
-              throw "controlled restart did not produce exactly one replacement Agent"
+          foreach ($taskName in @('FairyPam Agent', 'FairyPam Agent UI')) {
+            if (@(Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue).Count -ne 0) {
+              throw "forbidden scheduled task found: $taskName"
             }
           }
-          finally {
-            Stop-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent' -ErrorAction SilentlyContinue
-            $deadline = [DateTime]::UtcNow.AddSeconds(30)
-            do {
-              Start-Sleep -Seconds 1
-              $agents = @(Get-Process -Name 'fairypam-agent' -ErrorAction SilentlyContinue)
-              $task = Get-ScheduledTask -TaskPath '\' -TaskName 'FairyPam Agent'
-            } while (($agents.Count -ne 0 -or $task.State -ne 'Ready') -and [DateTime]::UtcNow -lt $deadline)
-            if ($agents.Count -ne 0 -or $task.State -ne 'Ready') {
-              throw "maintenance task cleanup did not clear Agent processes"
-            }
-          }
-
-      - name: Smoke trusted NSIS product reinstall
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $setup = @(Get-ChildItem tauri-ui/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
-          if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
-          $installRoot = 'C:\Program Files\FairyPam'
-          $stateRoot = 'C:\ProgramData\FairyPam.Agent'
-          $legacyPrincipal = [Security.Principal.WindowsIdentity]::GetCurrent().User
-          function Test-SddlHasSid {
-            param(
-              [string]$Sddl,
-              [Security.Principal.SecurityIdentifier]$Sid
-            )
-            $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
-            return @($descriptor.DiscretionaryAcl | Where-Object {
-              $_.SecurityIdentifier.Value -eq $Sid.Value
-            }).Count -gt 0
-          }
-          $legacySddl = "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;$($legacyPrincipal.Value))"
-          $unsupportedSddl = 'O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;OICI;FA;;;WD)'
-          $legacyTargets = @(
-            $stateRoot,
-            (Join-Path $stateRoot 'Agent'),
-            (Join-Path $stateRoot 'Agent\logs')
-          )
-          foreach ($target in $legacyTargets[0..1]) {
-            $legacyAcl = New-Object Security.AccessControl.DirectorySecurity
-            $legacyAcl.SetSecurityDescriptorSddlForm($legacySddl)
-            Set-Acl -LiteralPath $target -AclObject $legacyAcl -ErrorAction Stop
-          }
-          $unsupportedAcl = New-Object Security.AccessControl.DirectorySecurity
-          $unsupportedAcl.SetSecurityDescriptorSddlForm($unsupportedSddl)
-          Set-Acl -LiteralPath $legacyTargets[2] -AclObject $unsupportedAcl -ErrorAction Stop
-          foreach ($target in $legacyTargets[0..1]) {
-            $actual = (Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl
-            if (-not (Test-SddlHasSid -Sddl $actual -Sid $legacyPrincipal)) {
-              throw "legacy ACL fixture was not installed: $target ($actual)"
-            }
-          }
-          $actual = (Get-Acl -LiteralPath $legacyTargets[2] -ErrorAction Stop).Sddl
-          if (-not $actual.Contains('(A;OICI;FA;;;WD)')) {
-            throw "unsupported ACL fixture was not installed: $($legacyTargets[2]) ($actual)"
-          }
-          $beforeRejected = @{}
-          foreach ($target in $legacyTargets) {
-            $beforeRejected[$target] = (Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl
-          }
-          $rejected = Start-Process -FilePath $setup[0].FullName -ArgumentList '/S' -Wait -PassThru
-          if ($rejected.ExitCode -ne 524297) {
-            throw "unsupported state ACL returned $($rejected.ExitCode), expected 524297"
-          }
-          foreach ($target in $legacyTargets) {
-            $actual = (Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl
-            if ($actual -cne $beforeRejected[$target]) {
-              throw "failed reinstall did not restore exact ACL: $target (before=$($beforeRejected[$target]); after=$actual)"
-            }
-          }
-          foreach ($target in $legacyTargets) {
-            $legacyAcl = New-Object Security.AccessControl.DirectorySecurity
-            $legacyAcl.SetSecurityDescriptorSddlForm($legacySddl)
-            Set-Acl -LiteralPath $target -AclObject $legacyAcl -ErrorAction Stop
-            $actual = (Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl
-            if (-not (Test-SddlHasSid -Sddl $actual -Sid $legacyPrincipal)) {
-              throw "legacy ACL fixture was not installed: $target ($actual)"
-            }
-          }
-          $protectedDacls = @(
-            'D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)',
-            'D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
-          )
-          $protectedDirectories = @(
-            $installRoot,
-            (Join-Path $installRoot 'versions'),
-            (Join-Path $installRoot 'resources')
-          )
-          $installer = Start-Process -FilePath $setup[0].FullName -ArgumentList '/S' -Wait -PassThru
-          if ($installer.ExitCode -ne 0) {
-            throw "trusted reinstall failed with exit code $($installer.ExitCode)"
-          }
-          $current = Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
-          $protectedDirectories += @(
-            (Join-Path $installRoot "versions\$($current.build_id)"),
-            (Join-Path $installRoot "versions\$($current.build_id)\profiles")
-          )
-          foreach ($target in $protectedDirectories) {
-            $actual = (Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl
-            if (-not ($protectedDacls | Where-Object { $actual.Contains($_) }) -or $actual.Contains('ID;')) {
-              throw "trusted reinstall retained a non-protected ACL: $target ($actual)"
-            }
-          }
-          foreach ($target in @(
-            $stateRoot,
-            (Join-Path $stateRoot 'Agent'),
-            (Join-Path $stateRoot 'Agent\enrollment'),
-            (Join-Path $stateRoot 'Agent\audit'),
-            (Join-Path $stateRoot 'Agent\logs')
-          )) {
-            $actual = (Get-Acl -LiteralPath $target -ErrorAction Stop).Sddl
-            if (-not $actual.StartsWith('O:BA') -or
-                -not $actual.Contains('D:P') -or
-                -not $actual.Contains('(A;;FA;;;SY)') -or
-                -not $actual.Contains('(A;;FA;;;BA)') -or
-                (Test-SddlHasSid -Sddl $actual -Sid $legacyPrincipal)) {
-              throw "trusted reinstall did not normalize Agent state ACL: $target ($actual)"
-            }
-          }
+          $siblingCore = @(Get-CimInstance Win32_Process -Filter "Name = 'fairypam-agent.exe'" | Where-Object {
+            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installRoot, [StringComparison]::OrdinalIgnoreCase)
+          })
+          if ($siblingCore.Count -ne 0) { throw 'forbidden sibling Core process is running from the product install' }
 
       - name: Package product installer receipt
         shell: pwsh
@@ -569,7 +382,7 @@ jobs:
             suite_manifest_size = $manifest.Length
             install_mode = 'perMachine'
             state_root = 'C:\ProgramData\FairyPam.Agent\Agent'
-            layout = @('current.json', 'versions/<build-id>/BUILD-MANIFEST.json', 'versions/<build-id>/fairypam-agent-tauri-ui.exe', 'versions/<build-id>/fairypam-agent.exe', 'versions/<build-id>/fairypam-agent-guardian.exe', 'versions/<build-id>/profiles/', 'resources/runtime/fairypam-agent-installer.exe')
+            layout = @('current.json', 'versions/<build-id>/BUILD-MANIFEST.json', 'versions/<build-id>/fairypam-agent-tauri-ui.exe', 'versions/<build-id>/fairypam-agent-guardian.exe', 'versions/<build-id>/profiles/', 'resources/runtime/fairypam-agent-installer.exe')
           } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 dist/product-installer-receipt.json
 
       - name: Attest product setup provenance

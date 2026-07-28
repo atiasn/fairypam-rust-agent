@@ -40,8 +40,7 @@ function startupLabel(status: string | undefined, isPending: boolean, error: unk
 
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
-  const [recoveryAction, setRecoveryAction] = useState<'restart' | 'repair'>();
-  const [activationState, setActivationState] = useState<'pending' | 'failed'>();
+  const [activationState, setActivationState] = useState<'pending' | 'failed' | 'runtime-failed'>();
   const startup = useQuery({
     queryKey: queryKeys.startup,
     queryFn: agentApi.ensureLocalAgent,
@@ -85,26 +84,26 @@ export default function App() {
   }, [dispatch, refreshAgentState]);
 
   useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void agentApi.onEmbeddedRuntimeFailed(() => {
+      setActivationState('runtime-failed');
+      dispatch({ type: 'ExplicitOffline', code: 'runtime.embedded_failed' });
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [dispatch]);
+
+  useEffect(() => {
     if (queries.overview.data?.status.state.toLowerCase().includes('emergency')) {
       dispatch({ type: 'ExplicitEmergency', code: 'agent.guardian.emergency' });
     }
   }, [dispatch, queries.overview.data?.status.state]);
-
-  const recoverAgent = async (
-    action: 'restart' | 'repair',
-    operation: () => Promise<unknown>,
-  ) => {
-    if (recoveryAction) return;
-    setRecoveryAction(action);
-    try {
-      await operation();
-      await refreshAgentState();
-    } catch {
-      setActivationState('failed');
-    } finally {
-      setRecoveryAction(undefined);
-    }
-  };
 
   const common = {
     connection,
@@ -115,15 +114,6 @@ export default function App() {
     retryStartup: () => {
       void refreshAgentState();
     },
-    restartAgent: () => {
-      setActivationState('pending');
-      void recoverAgent('restart', agentApi.restartLocalAgent);
-    },
-    repairAgent: () => {
-      setActivationState('pending');
-      void recoverAgent('repair', agentApi.repairAgentTasks);
-    },
-    recoveryAction,
   };
   const agentReady = startup.isSuccess && !activationState && queries.overview.isSuccess;
 
@@ -135,11 +125,13 @@ export default function App() {
           <h1>控制中心</h1>
         </div>
         <p aria-live="polite" className={`connection ${connection.availability}`}>
-          {startupLabel(
-            startup.data?.status,
-            startup.isPending || activationState === 'pending',
-            activationState === 'failed' ? new Error('activation failed') : startup.error,
-          )}
+          {activationState === 'runtime-failed'
+            ? '本机服务已停止'
+            : startupLabel(
+              startup.data?.status,
+              startup.isPending || activationState === 'pending',
+              activationState === 'failed' ? new Error('activation failed') : startup.error,
+            )}
         </p>
       </header>
       <div className="app-layout">
@@ -160,14 +152,18 @@ export default function App() {
           {activationState === 'pending' && (
             <StatusPanel availability="unknown" title="正在准备服务" detail="正在检查服务状态。" />
           )}
+          {activationState === 'runtime-failed' && (
+            <StatusPanel
+              availability="offline"
+              title="本机服务已停止"
+              detail="为保护游戏操作，本次会话已锁定。请从系统托盘安全退出 FairyPam，然后重新启动。"
+            />
+          )}
           {activationState === 'failed' && (
             <>
-              <StatusPanel availability="offline" title="服务暂时无法使用" detail="请重试启动，或修复后台服务。" />
+              <StatusPanel availability="offline" title="服务暂时无法使用" detail="请重试检查本机服务。" />
               <div className="actions">
-                <button disabled={Boolean(recoveryAction)} onClick={common.restartAgent} type="button">重启后台服务</button>
-                <button disabled={Boolean(recoveryAction)} onClick={common.repairAgent} type="button">修复后台服务</button>
                 <button
-                  disabled={Boolean(recoveryAction)}
                   onClick={() => {
                     setActivationState('pending');
                     void refreshAgentState();

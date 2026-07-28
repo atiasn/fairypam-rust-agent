@@ -14,8 +14,6 @@
     "allow-get-log-tail",
     "allow-scan-installed-games",
     "allow-register-hub",
-    "allow-ensure-local-agent",
-    "allow-restart-local-agent",
-    "allow-repair-agent-tasks"
+    "allow-ensure-local-agent"
   ]
 }

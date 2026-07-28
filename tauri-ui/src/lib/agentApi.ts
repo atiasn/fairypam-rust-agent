@@ -15,8 +15,8 @@ export const agentApi = {
   ensureLocalAgent: () => invoke<SupportStatus>('ensure_local_agent'),
   onLocalAgentActivation: (handler: () => void) =>
     listen('local-agent-activation', handler),
-  restartLocalAgent: () => invoke<SupportStatus>('restart_local_agent'),
-  repairAgentTasks: () => invoke<SupportStatus>('repair_agent_tasks'),
+  onEmbeddedRuntimeFailed: (handler: () => void) =>
+    listen('embedded-runtime-failed', handler),
   getOverview: () => invoke<Overview>('get_overview'),
   getConnectionStatus: async (): Promise<ConnectionStatus> => {
     const { control, frame, capture_active } = await invoke<ConnectionStatus>('get_connection_status');

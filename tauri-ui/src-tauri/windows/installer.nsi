@@ -429,7 +429,7 @@ Var AppStartMenuFolder
 !insertmacro MUI_PAGE_FINISH
 
 Function RunMainBinary
-  ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --run-ui-task "$INSTDIR"' $0
+  ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --launch-ui "$INSTDIR"' $0
   ${If} $0 != 0
     MessageBox MB_OK|MB_ICONEXCLAMATION "FairyPam could not start the user interface (error $0). Use the installed shortcut to retry."
   ${EndIf}
@@ -542,7 +542,6 @@ Section Install
   StrCpy $INSTDIR "${FAIRYPAM_INSTALL_ROOT}"
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
-  !insertmacro CheckIfAppIsRunning "fairypam-agent.exe" "FairyPam Agent"
   !insertmacro CheckIfAppIsRunning "fairypam-agent-guardian.exe" "FairyPam Agent Guardian"
 
   !ifmacrodef NSIS_HOOK_PREINSTALL
@@ -683,7 +682,7 @@ Function .onInstSuccess
   ${OrIf} ${Silent}
     ${GetOptions} $CMDLINE "/R" $R0
     ${IfNot} ${Errors}
-      ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --run-ui-task "$INSTDIR"' $0
+      ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --launch-ui "$INSTDIR"' $0
       ${If} $0 != 0
         SetErrorLevel $0
       ${EndIf}
@@ -739,20 +738,7 @@ Section Uninstall
   ; Let the user cancel safely while the installation is still unchanged.
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
-  ; Mutate scheduled tasks only after the user has confirmed uninstall.
-  ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --remove-tasks "$INSTDIR"' $0
-  IfErrors fairypam_uninstall_task_cleanup_failed 0
-  ${If} $0 != 0
-    Goto fairypam_uninstall_task_cleanup_failed
-  ${EndIf}
-
-  !insertmacro CheckIfAppIsRunning "fairypam-agent.exe" "FairyPam Agent"
   !insertmacro CheckIfAppIsRunning "fairypam-agent-guardian.exe" "FairyPam Agent Guardian"
-  Goto fairypam_uninstall_tasks_removed
-
-fairypam_uninstall_task_cleanup_failed:
-  Abort "FairyPam could not stop and remove its scheduled tasks. Restart Windows or repair the installation, then retry."
-fairypam_uninstall_tasks_removed:
 
   ; Delete the app directory and its content from disk
   ; Copy main executable
@@ -899,10 +885,10 @@ Function CreateOrUpdateStartMenuShortcut
 
   !if "${STARTMENUFOLDER}" != ""
     CreateDirectory "$SMPROGRAMS\$AppStartMenuFolder"
-    CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\resources\runtime\fairypam-agent-installer.exe" '--run-ui-task "$INSTDIR"'
+    CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\resources\runtime\fairypam-agent-installer.exe" '--launch-ui "$INSTDIR"'
     !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
   !else
-    CreateShortcut "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\resources\runtime\fairypam-agent-installer.exe" '--run-ui-task "$INSTDIR"'
+    CreateShortcut "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\resources\runtime\fairypam-agent-installer.exe" '--launch-ui "$INSTDIR"'
     !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\${PRODUCTNAME}.lnk"
   !endif
 FunctionEnd
@@ -917,6 +903,6 @@ Function CreateOrUpdateDesktopShortcut
     ${EndIf}
   ${EndIf}
 
-  CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\resources\runtime\fairypam-agent-installer.exe" '--run-ui-task "$INSTDIR"'
+  CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\resources\runtime\fairypam-agent-installer.exe" '--launch-ui "$INSTDIR"'
   !insertmacro SetLnkAppUserModelId "$DESKTOP\${PRODUCTNAME}.lnk"
 FunctionEnd

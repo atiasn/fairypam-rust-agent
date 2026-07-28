@@ -1,10 +1,8 @@
-#[cfg(windows)]
-use std::sync::atomic::Ordering;
-use std::{sync::atomic::AtomicBool, time::Duration};
+use std::time::Duration;
 
-use fairypam_agent_local_client::LocalClientError;
-#[cfg(any(windows, test))]
-use fairypam_agent_local_protocol::LocalResponse;
+#[cfg(windows)]
+use fairypam_agent::runtime::EmbeddedRuntimeHandle;
+use fairypam_agent_core::AgentError;
 use fairypam_agent_local_protocol::{LocalCommand, LogLevel};
 #[cfg(windows)]
 use serde::Deserialize;
@@ -20,8 +18,6 @@ use crate::dto::{
     RegistrationStatusDto,
 };
 
-#[cfg(windows)]
-const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\FairyPam.Agent.v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -46,8 +42,8 @@ impl UiCommandError {
     }
 }
 
-impl From<LocalClientError> for UiCommandError {
-    fn from(error: LocalClientError) -> Self {
+impl From<AgentError> for UiCommandError {
+    fn from(error: AgentError) -> Self {
         Self {
             code: error.code().to_owned(),
             message: error.to_string(),
@@ -57,20 +53,18 @@ impl From<LocalClientError> for UiCommandError {
 
 pub struct ProductionGateway {
     #[cfg(windows)]
-    pipe_name: &'static str,
+    runtime: EmbeddedRuntimeHandle,
     request_gate: Mutex<()>,
     lifecycle_gate: Mutex<()>,
-    interactive_owner_ready: AtomicBool,
 }
 
 impl ProductionGateway {
     #[cfg(windows)]
-    pub fn new() -> Self {
+    pub fn new(runtime: EmbeddedRuntimeHandle) -> Self {
         Self {
-            pipe_name: DEFAULT_PIPE_NAME,
+            runtime,
             request_gate: Mutex::new(()),
             lifecycle_gate: Mutex::new(()),
-            interactive_owner_ready: AtomicBool::new(false),
         }
     }
 
@@ -79,7 +73,6 @@ impl ProductionGateway {
         Self {
             request_gate: Mutex::new(()),
             lifecycle_gate: Mutex::new(()),
-            interactive_owner_ready: AtomicBool::new(false),
         }
     }
 
@@ -89,21 +82,18 @@ impl ProductionGateway {
         command: LocalCommand,
         timeout: Duration,
     ) -> Result<T, UiCommandError> {
-        use fairypam_agent_local_client::{LocalClient, WindowsNamedPipeClientTransport};
-
-        // ponytail: the production Agent serves one Pipe request per instance;
-        // serialize GUI calls until the server gains safe multi-client support.
         let _request_gate = self.request_gate.lock().await;
-        // Product requests use one authenticated connection each. This keeps a
-        // verified but idle client from owning the Agent's only Pipe instance.
-        let mut client = LocalClient::new(WindowsNamedPipeClientTransport::new_verified_sibling(
-            self.pipe_name,
-            "fairypam-agent.exe",
-        ));
-        let response = client
-            .request(command, timeout)
-            .await
-            .map_err(UiCommandError::from)?;
+        let runtime = self.runtime.clone();
+        let response = tokio::time::timeout(timeout, async move {
+            tokio::task::spawn_blocking(move || runtime.execute(&command))
+                .await
+                .map_err(|error| {
+                    UiCommandError::unavailable("local.runtime_join_failed", error.to_string())
+                })?
+                .map_err(UiCommandError::from)
+        })
+        .await
+        .map_err(|_| UiCommandError::unavailable("local.runtime_timeout", "request timed out"))??;
         decode_response(response)
     }
 
@@ -204,11 +194,6 @@ impl ProductionGateway {
     }
 
     #[cfg(windows)]
-    pub fn interactive_owner_ready(&self) -> bool {
-        self.interactive_owner_ready.load(Ordering::Acquire)
-    }
-
-    #[cfg(windows)]
     pub fn acquire_lifecycle(&self) -> Result<MutexGuard<'_, ()>, UiCommandError> {
         self.lifecycle_gate.try_lock().map_err(|_| {
             UiCommandError::unavailable(
@@ -219,19 +204,13 @@ impl ProductionGateway {
     }
 
     #[cfg(windows)]
-    pub fn mark_interactive_owner_ready(&self) {
-        self.interactive_owner_ready.store(true, Ordering::Release);
-    }
-
-    #[cfg(windows)]
-    pub fn clear_interactive_owner(&self) {
-        self.interactive_owner_ready.store(false, Ordering::Release);
-    }
-
-    #[cfg(windows)]
     pub async fn shutdown_agent(&self) -> Result<(), UiCommandError> {
         let response: LifecycleStatusDto = self.request(LocalCommand::ShutdownAgent).await?;
-        require_lifecycle_state(response, "shutting_down")
+        require_lifecycle_state(response, "shutting_down")?;
+        self.runtime
+            .wait_for_shutdown(Duration::from_secs(25))
+            .await
+            .map_err(UiCommandError::from)
     }
 }
 
@@ -257,14 +236,14 @@ fn require_lifecycle_state(
 }
 
 #[cfg(any(windows, test))]
-fn decode_response<T: DeserializeOwned>(response: LocalResponse) -> Result<T, UiCommandError> {
-    serde_json::from_value(response.body)
+fn decode_response<T: DeserializeOwned>(response: serde_json::Value) -> Result<T, UiCommandError> {
+    serde_json::from_value(response)
         .map_err(|error| UiCommandError::invalid_response(error.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
-    use fairypam_agent_local_client::LocalClientError;
+    use fairypam_agent_core::AgentError;
     use serde_json::json;
 
     use super::{decode_response, ProductionGateway, UiCommandError};
@@ -272,9 +251,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_response_fields() {
-        let error = decode_response::<StatusDto>(fairypam_agent_local_protocol::LocalResponse {
-            body: json!({ "state": "ConnectedIdle", "capture_active": false, "unexpected": true }),
-        })
+        let error = decode_response::<StatusDto>(
+            json!({ "state": "ConnectedIdle", "capture_active": false, "unexpected": true }),
+        )
         .expect_err("DTO must deny unexpected protocol fields");
 
         assert_eq!(error.code, "local.protocol.invalid");
@@ -282,15 +261,13 @@ mod tests {
 
     #[test]
     fn decodes_runtime_status_contract() {
-        let status = decode_response::<StatusDto>(fairypam_agent_local_protocol::LocalResponse {
-            body: json!({
-                "state": "ConnectedIdle",
-                "capture_active": false,
-                "build_id": "product-installer-1-1",
-                "suite_version": "0.1.1",
-                "guardian_state": "idle_no_holds"
-            }),
-        })
+        let status = decode_response::<StatusDto>(json!({
+            "state": "ConnectedIdle",
+            "capture_active": false,
+            "build_id": "product-installer-1-1",
+            "suite_version": "0.1.1",
+            "guardian_state": "idle_no_holds"
+        }))
         .expect("GUI status DTO must match the Agent runtime status contract");
 
         assert_eq!(status.build_id, "product-installer-1-1");
@@ -300,56 +277,27 @@ mod tests {
 
     #[test]
     fn keeps_transport_error_codes_stable() {
-        let error = UiCommandError::from(LocalClientError::pipe_not_found());
+        let error = UiCommandError::from(AgentError::new("runtime.failed", "failed"));
 
-        assert_eq!(error.code, "local.transport.pipe_not_found");
+        assert_eq!(error.code, "runtime.failed");
     }
 
     #[test]
     fn decodes_registration_readiness_before_the_environment_checks() {
-        let response =
-            decode_response::<EnvironmentCheckDto>(fairypam_agent_local_protocol::LocalResponse {
-                body: json!({
-                    "registration_ready": true,
-                    "registration_pending": false,
-                    "checks": [{
-                        "id": "agent",
-                        "status": "available",
-                        "code": "agent.running",
-                        "recovery": "No action required"
-                    }]
-                }),
-            })
-            .expect("Agent environment checks include strict registration readiness");
+        let response = decode_response::<EnvironmentCheckDto>(json!({
+            "registration_ready": true,
+            "registration_pending": false,
+            "checks": [{
+                "id": "agent",
+                "status": "available",
+                "code": "agent.running",
+                "recovery": "No action required"
+            }]
+        }))
+        .expect("Agent environment checks include strict registration readiness");
 
         assert!(response.registration_ready);
         assert!(!response.registration_pending);
         assert_eq!(response.checks.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn keeps_one_local_pipe_request_in_flight() {
-        let gateway = ProductionGateway::new();
-        let guard = gateway.request_gate.lock().await;
-
-        assert!(gateway.request_gate.try_lock().is_err());
-        drop(guard);
-        assert!(gateway.request_gate.try_lock().is_ok());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn rejects_a_second_lifecycle_operation() {
-        let gateway = ProductionGateway::new();
-        let guard = gateway
-            .acquire_lifecycle()
-            .expect("first operation owns the gate");
-
-        assert_eq!(
-            gateway.acquire_lifecycle().unwrap_err().code,
-            "startup.lifecycle_busy"
-        );
-        drop(guard);
-        assert!(gateway.acquire_lifecycle().is_ok());
     }
 }

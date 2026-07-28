@@ -6,14 +6,15 @@ use std::path::{Path, PathBuf};
 #[cfg(any(windows, test))]
 use std::sync::atomic::Ordering;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fairypam_agent_core::profile::Ed25519SignatureVerifier;
 use fairypam_agent_core::supervisor::{SessionDriver, SessionSupervisor, SupervisorHooks};
 use fairypam_agent_core::AgentError;
 use fairypam_agent_protocol::v1::{
     agent_control_event, hub_control_command, AgentControlEvent, AgentHello, AgentStatus,
-    CommandAck, CommandNack, CommandRef, Heartbeat, SessionRef, TaskCommandRef,
+    CommandAck, CommandNack, CommandRef, Heartbeat, HubControlCommand, SessionRef, TaskCommandRef,
 };
 #[cfg(windows)]
 use fairypam_agent_transport::validate_transport_config;
@@ -38,6 +39,8 @@ use crate::profile_store::ProfileStore;
 const PRODUCTION_AUDIT_STATE_DIR: &str = crate::enrollment::AUDIT_ROOT;
 #[cfg(windows)]
 const LOCAL_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const TOPOLOGY_COMMAND_REJECTED: &str = "topology.zero_input_command_rejected";
+const REGISTRATION_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[cfg(any(windows, test))]
 use crate::local_control::LocalControlRuntime;
@@ -548,10 +551,9 @@ pub struct GrpcSessionDriver {
     enrollment_ready: Arc<tokio::sync::Notify>,
     reconnect_requested: Arc<tokio::sync::Notify>,
     registration_in_progress: Arc<AtomicBool>,
+    registration_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     gui_shutdown: CancellationToken,
     gui_lifetime: GuiLifetime,
-    #[cfg(windows)]
-    pending_update_activation: Arc<Mutex<Option<fairypam_agent_suite::UpdateRequest>>>,
 }
 
 impl GrpcSessionDriver {
@@ -576,10 +578,9 @@ impl GrpcSessionDriver {
             enrollment_ready: Arc::new(tokio::sync::Notify::new()),
             reconnect_requested: Arc::new(tokio::sync::Notify::new()),
             registration_in_progress: Arc::new(AtomicBool::new(false)),
+            registration_worker: Arc::new(Mutex::new(None)),
             gui_lifetime: GuiLifetime::new(gui_shutdown.clone()),
             gui_shutdown,
-            #[cfg(windows)]
-            pending_update_activation: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -592,6 +593,7 @@ impl GrpcSessionDriver {
             enrollment_ready: Arc::clone(&self.enrollment_ready),
             reconnect_requested: Arc::clone(&self.reconnect_requested),
             registration_in_progress: Arc::clone(&self.registration_in_progress),
+            registration_worker: Arc::clone(&self.registration_worker),
             gui_lifetime: self.gui_lifetime.clone(),
             owner,
         }
@@ -666,15 +668,6 @@ impl SessionDriver for GrpcSessionDriver {
                 "Agent is awaiting authenticated Hub registration",
             ));
         }
-        #[cfg(windows)]
-        tokio::select! {
-            _ = cancellation.cancelled() => return Err(cancelled()),
-            result = crate::update::wait_for_settlement() => result?,
-        }
-        #[cfg(windows)]
-        let (last_update_id, last_update_target_build_id, last_update_state, last_update_rollback) =
-            crate::update::last_result();
-        #[cfg(not(windows))]
         let (last_update_id, last_update_target_build_id, last_update_state, last_update_rollback):
             (String, String, String, String) = Default::default();
         if let Ok(mut state) = self.state.lock() {
@@ -700,14 +693,9 @@ impl SessionDriver for GrpcSessionDriver {
                     suite_build_id: option_env!("FAIRYPAM_BUILD_ID")
                         .unwrap_or("unknown")
                         .to_owned(),
-                    signed_update_capable: option_env!("FAIRYPAM_UPDATE_PUBLISHER").is_some()
-                        && option_env!("FAIRYPAM_UPDATE_CERT_THUMBPRINT").is_some(),
-                    update_publisher: option_env!("FAIRYPAM_UPDATE_PUBLISHER")
-                        .unwrap_or("")
-                        .to_owned(),
-                    update_cert_thumbprint: option_env!("FAIRYPAM_UPDATE_CERT_THUMBPRINT")
-                        .unwrap_or("")
-                        .to_ascii_lowercase(),
+                    signed_update_capable: false,
+                    update_publisher: String::new(),
+                    update_cert_thumbprint: String::new(),
                     last_update_id,
                     last_update_target_build_id,
                     last_update_state,
@@ -809,60 +797,12 @@ impl SessionDriver for GrpcSessionDriver {
                             "verified command lost CommandRef",
                         )
                     })?;
-                    #[cfg(windows)]
-                    if let Some(hub_control_command::Payload::UpdateDirective(directive)) =
-                        command.payload.as_ref()
-                    {
-                        let agent_id = self
-                            .config
-                            .lock()
-                            .map_err(lock_error)?
-                            .transport
-                            .agent_id
-                            .clone();
-                        let directive = directive.clone();
-                        let staged = tokio::task::spawn_blocking(move || {
-                            crate::update::stage(&agent_id, &directive)
-                        })
-                        .await
-                        .map_err(|error| {
-                            AgentError::new("update.stage_join_failed", error.to_string())
-                        })?;
-                        let event = match staged {
-                            Ok(request) => {
-                                let prepared = self
-                                    .execution
-                                    .lock()
-                                    .map_err(lock_error)?
-                                    .reset()
-                                    .and_then(|()| {
-                                        *self
-                                            .pending_update_activation
-                                            .lock()
-                                            .map_err(lock_error)? = Some(request.clone());
-                                        self.gui_lifetime.request_maintenance_shutdown()
-                                    });
-                                match prepared {
-                                    Ok(_) => {
-                                        let result = format!(
-                                            r#"{{"state":"staged","update_id":"{}","target_build_id":"{}"}}"#,
-                                            request.update_id, request.target_build_id
-                                        );
-                                        ack_event(identity, &result)
-                                    }
-                                    Err(error) => {
-                                        *self
-                                            .pending_update_activation
-                                            .lock()
-                                            .map_err(lock_error)? = None;
-                                        crate::update::abort_staged(&request)?;
-                                        nack_event(identity, error.code(), &error.to_string())
-                                    }
-                                }
-                            }
-                            Err(error) => nack_event(identity, error.code(), &error.to_string()),
-                        };
-                        sender.send(event).await.map_err(map_transport)?;
+                    if !topology_command_allowed(&command) {
+                        sender.try_send(nack_event(
+                            identity,
+                            TOPOLOGY_COMMAND_REJECTED,
+                            "this topology candidate does not allow the command kind",
+                        )).map_err(map_transport)?;
                         continue;
                     }
                     let frames = {
@@ -944,10 +884,12 @@ pub struct RuntimeSafetyHooks {
     config: Arc<Mutex<RuntimeConfig>>,
     state: Arc<Mutex<RuntimeState>>,
     execution: Arc<Mutex<CommandExecutor>>,
+    registration_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeOwner {
+    EmbeddedGui,
     Gui {
         pid: u32,
         foreground_broker_hwnd: isize,
@@ -963,8 +905,29 @@ impl RuntimeSafetyHooks {
             config: Arc::clone(&driver.config),
             state: Arc::clone(&driver.state),
             execution: Arc::clone(&driver.execution),
+            registration_worker: Arc::clone(&driver.registration_worker),
         }
     }
+}
+
+fn join_registration_worker(
+    worker: &Arc<Mutex<Option<JoinHandle<()>>>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let Some(worker_handle) = worker.lock().map_err(|error| error.to_string())?.take() else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + timeout;
+    while !worker_handle.is_finished() {
+        if Instant::now() >= deadline {
+            *worker.lock().map_err(|error| error.to_string())? = Some(worker_handle);
+            return Err("registration worker did not finish before the deadline".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    worker_handle
+        .join()
+        .map_err(|_| "registration worker panicked".to_owned())
 }
 
 impl SupervisorHooks for RuntimeSafetyHooks {
@@ -988,6 +951,7 @@ impl SupervisorHooks for RuntimeSafetyHooks {
     }
 
     fn join_all_tasks(&mut self) -> Result<(), String> {
+        join_registration_worker(&self.registration_worker, REGISTRATION_JOIN_TIMEOUT)?;
         tracing::info!(effect = "join_all_tasks", result = "joined");
         Ok(())
     }
@@ -1072,6 +1036,156 @@ pub async fn run(config: RuntimeConfig, owner: RuntimeOwner) -> Result<(), Agent
     }
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone)]
+pub struct EmbeddedRuntimeHandle {
+    runtime: SharedRuntime,
+    completion: Arc<EmbeddedRuntimeCompletion>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct EmbeddedRuntimeCompletion {
+    result: Mutex<Option<Result<(), String>>>,
+    completed: tokio::sync::Notify,
+}
+
+#[cfg(any(windows, test))]
+impl EmbeddedRuntimeCompletion {
+    fn finish(&self, result: &Result<(), AgentError>) {
+        let stored = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+        if let Ok(mut current) = self.result.lock() {
+            *current = Some(stored);
+        }
+        self.completed.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<(), AgentError> {
+        loop {
+            let notified = self.completed.notified();
+            if let Some(result) = self.result.lock().map_err(lock_error)?.clone() {
+                return result
+                    .map_err(|message| AgentError::new("runtime.embedded_failed", message));
+            }
+            notified.await;
+        }
+    }
+
+    fn ensure_running(&self) -> Result<(), AgentError> {
+        match self.result.lock().map_err(lock_error)?.as_ref() {
+            None => Ok(()),
+            Some(Ok(())) => Err(AgentError::new(
+                "runtime.embedded_stopped",
+                "embedded runtime has stopped",
+            )),
+            Some(Err(message)) => Err(AgentError::new("runtime.embedded_failed", message.clone())),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+impl EmbeddedRuntimeHandle {
+    pub fn execute(&self, command: &LocalCommand) -> Result<serde_json::Value, AgentError> {
+        self.completion.ensure_running()?;
+        self.runtime.record_local_operation(command);
+        match command {
+            LocalCommand::Status
+            | LocalCommand::Doctor
+            | LocalCommand::ListProfiles
+            | LocalCommand::GetConnectionStatus
+            | LocalCommand::RunEnvironmentCheck
+            | LocalCommand::GetLogTail { .. }
+            | LocalCommand::ScanInstalledGames
+            | LocalCommand::RegisterHub { .. } => self.runtime.execute_embedded(command),
+            LocalCommand::ShutdownAgent => {
+                self.runtime.execution.lock().map_err(lock_error)?.reset()?;
+                self.runtime.gui_lifetime.request_maintenance_shutdown()?;
+                Ok(serde_json::json!({"state": "shutting_down"}))
+            }
+            _ => Err(AgentError::new(
+                "local.embedded_command_not_allowed",
+                "the embedded GUI runtime does not expose device commands",
+            )),
+        }
+    }
+
+    pub async fn wait_for_shutdown(&self, timeout: Duration) -> Result<(), AgentError> {
+        tokio::time::timeout(timeout, self.completion.wait())
+            .await
+            .map_err(|_| {
+                AgentError::new(
+                    "runtime.shutdown_timeout",
+                    "embedded runtime did not finish cleanup before the deadline",
+                )
+            })?
+    }
+}
+
+#[cfg(windows)]
+pub fn start_embedded(
+    config: RuntimeConfig,
+) -> Result<
+    (
+        EmbeddedRuntimeHandle,
+        impl std::future::Future<Output = Result<(), AgentError>>,
+    ),
+    AgentError,
+> {
+    verify_active_agent_suite()?;
+    let instance = AgentInstance::acquire()?;
+    let driver = GrpcSessionDriver::new(config);
+    let completion = Arc::new(EmbeddedRuntimeCompletion::default());
+    let handle = EmbeddedRuntimeHandle {
+        runtime: driver.local_runtime(RuntimeOwner::EmbeddedGui),
+        completion: Arc::clone(&completion),
+    };
+    Ok((handle, async move {
+        let _instance = instance;
+        let result = run_embedded_driver(driver).await;
+        completion.finish(&result);
+        result
+    }))
+}
+
+#[cfg(windows)]
+async fn run_embedded_driver(driver: GrpcSessionDriver) -> Result<(), AgentError> {
+    let hooks = RuntimeSafetyHooks::for_driver(&driver);
+    let backoff = CappedBackoff::new(Duration::from_millis(250), Duration::from_secs(30))
+        .map_err(map_transport)?;
+    let mut supervisor = SessionSupervisor::new(hooks, backoff);
+    if !driver.is_registered()? {
+        tokio::select! {
+            result = driver.wait_until_registered() => result?,
+            _ = driver.gui_shutdown.cancelled() => {
+                return shutdown_embedded(&driver, &mut supervisor);
+            }
+        }
+    }
+    let mut supervisor_run = Box::pin(supervisor.run(&driver));
+    tokio::select! {
+        result = &mut supervisor_run => match result {
+            Ok(never) => match never {},
+            Err(error) => Err(error),
+        },
+        _ = driver.gui_shutdown.cancelled() => {
+            drop(supervisor_run);
+            shutdown_embedded(&driver, &mut supervisor)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn shutdown_embedded(
+    driver: &GrpcSessionDriver,
+    supervisor: &mut SessionSupervisor<RuntimeSafetyHooks>,
+) -> Result<(), AgentError> {
+    if let Ok(mut state) = driver.state.lock() {
+        state.record(LogLevel::Info, RuntimeLogMessage::LocalShutdownRequested);
+    }
+    let _ = supervisor.handle_control_failure()?;
+    Ok(())
+}
+
 #[cfg(windows)]
 fn verify_active_agent_suite() -> Result<(), AgentError> {
     let executable = std::env::current_exe().map_err(|_| {
@@ -1126,6 +1240,12 @@ async fn run_windows(
     owner: RuntimeOwner,
 ) -> Result<(), AgentError> {
     let verified_gui = match owner {
+        RuntimeOwner::EmbeddedGui => {
+            return Err(AgentError::new(
+                "runtime.owner_invalid",
+                "embedded GUI ownership requires start_embedded",
+            ));
+        }
         RuntimeOwner::Gui {
             pid,
             foreground_broker_hwnd,
@@ -1211,20 +1331,7 @@ fn shutdown_from_local_request(
     }
     tracing::info!(?reason, "local control requested safe Agent shutdown");
     let _ = supervisor.handle_control_failure()?;
-    authorize_pending_update(&driver.pending_update_activation, |request| {
-        crate::update::authorize_activation(request)
-    })
-}
-
-#[cfg(windows)]
-fn authorize_pending_update(
-    pending: &Mutex<Option<fairypam_agent_suite::UpdateRequest>>,
-    authorize: impl FnOnce(&fairypam_agent_suite::UpdateRequest) -> Result<(), AgentError>,
-) -> Result<(), AgentError> {
-    match pending.lock().map_err(lock_error)?.take() {
-        Some(request) => authorize(&request),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1273,6 +1380,7 @@ struct SharedRuntime {
     enrollment_ready: Arc<tokio::sync::Notify>,
     reconnect_requested: Arc<tokio::sync::Notify>,
     registration_in_progress: Arc<AtomicBool>,
+    registration_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     gui_lifetime: GuiLifetime,
     owner: RuntimeOwner,
 }
@@ -1345,11 +1453,39 @@ impl LocalControlRuntime for SharedRuntime {
 
 #[cfg(any(windows, test))]
 impl SharedRuntime {
+    fn execute_embedded(&self, command: &LocalCommand) -> Result<serde_json::Value, AgentError> {
+        match command {
+            LocalCommand::GetConnectionStatus => self.connection_status(),
+            LocalCommand::RunEnvironmentCheck => self.environment_check(),
+            LocalCommand::GetLogTail { lines, level } => self.log_tail(*lines, level),
+            LocalCommand::ScanInstalledGames => self.scan_installed_games(),
+            #[cfg(windows)]
+            LocalCommand::RegisterHub {
+                hub_address,
+                registration_code,
+            } => self.register_hub(hub_address, registration_code),
+            #[cfg(all(test, not(windows)))]
+            LocalCommand::RegisterHub { .. } => Err(AgentError::new(
+                "enrollment.platform_unsupported",
+                "Hub registration requires Windows",
+            )),
+            _ => self
+                .execution
+                .lock()
+                .map_err(lock_error)?
+                .execute_local(command),
+        }
+    }
+
     fn authorize_shutdown(
         &self,
         caller: &fairypam_agent_windows::VerifiedPipeCaller,
     ) -> Result<(), AgentError> {
         match self.owner {
+            RuntimeOwner::EmbeddedGui => Err(AgentError::new(
+                "local.embedded_pipe_forbidden",
+                "embedded GUI ownership does not accept Pipe callers",
+            )),
             RuntimeOwner::Maintenance => {
                 #[cfg(windows)]
                 fairypam_agent_windows::verify_fixed_installer_caller(caller)
@@ -1400,26 +1536,46 @@ impl SharedRuntime {
                 "a Hub registration is already pending",
             ));
         }
+        if let Err(error) =
+            join_registration_worker(&self.registration_worker, REGISTRATION_JOIN_TIMEOUT)
+        {
+            self.registration_in_progress
+                .store(false, Ordering::Release);
+            return Err(AgentError::new("enrollment.worker_join_failed", error));
+        }
         self.mark_registration_started();
         let runtime = self.clone();
         let hub_address = hub_address.to_owned();
         let registration_code = registration_code.to_owned();
-        if std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("fairypam-enrollment".to_owned())
             .spawn(move || runtime.finish_registration(hub_address, registration_code))
-            .is_err()
-        {
-            self.registration_in_progress
-                .store(false, Ordering::Release);
-            let error = AgentError::new(
-                "enrollment.unavailable",
-                "Hub registration could not be started",
-            );
-            if let Ok(mut state) = self.state.lock() {
-                state.last_error_code = error.code().to_owned();
-                state.record_registration_failure(error.code());
+            .map_err(|_| {
+                AgentError::new(
+                    "enrollment.unavailable",
+                    "Hub registration could not be started",
+                )
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.registration_in_progress
+                    .store(false, Ordering::Release);
+                if let Ok(mut state) = self.state.lock() {
+                    state.last_error_code = error.code().to_owned();
+                    state.record_registration_failure(error.code());
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        if let Ok(mut current) = self.registration_worker.lock() {
+            *current = Some(worker);
+        } else {
+            let _ = worker.join();
+            return Err(AgentError::new(
+                "enrollment.worker_state_unavailable",
+                "registration worker state is unavailable",
+            ));
         }
         Ok(registration_pending())
     }
@@ -2271,6 +2427,33 @@ fn command_identity(
     }
 }
 
+fn topology_command_allowed(command: &HubControlCommand) -> bool {
+    use hub_control_command::Payload;
+    match command.payload.as_ref() {
+        Some(Payload::BeginTaskAttempt(value)) => value.task.is_some(),
+        Some(Payload::StartTaskTarget(value)) => value.task.is_some(),
+        Some(Payload::StartCapture(value)) => value.task.is_some(),
+        Some(Payload::StopCapture(value)) => value.task.is_some(),
+        Some(Payload::FinishTaskAttempt(value)) => value.task.is_some(),
+        Some(Payload::InspectTaskAttempt(value)) => value.task.is_some(),
+        Some(Payload::ReleaseAll(_) | Payload::StopSession(_)) => true,
+        Some(
+            Payload::Hello(_)
+            | Payload::EnumerateTargets(_)
+            | Payload::LockTarget(_)
+            | Payload::InputLease(_)
+            | Payload::PulseAction(_)
+            | Payload::MouseDeltaAction(_)
+            | Payload::WindowPointClickAction(_)
+            | Payload::FocusTarget(_)
+            | Payload::CloseTarget(_)
+            | Payload::UpdateDirective(_)
+            | Payload::LaunchTarget(_),
+        )
+        | None => false,
+    }
+}
+
 fn legacy_identity(command: Option<CommandRef>) -> Option<CommandIdentity> {
     command.map(CommandIdentity::legacy)
 }
@@ -2303,6 +2486,7 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use fairypam_agent_local_protocol::{LocalCommand, LogLevel};
+    use fairypam_agent_protocol::v1 as protocol;
     use fairypam_agent_protocol::v1::{CloseTarget, FocusTarget, HubControlCommand};
     use fairypam_agent_windows::{IntegrityLevel, VerifiedPipeCaller};
 
@@ -2318,6 +2502,18 @@ mod tests {
             registration_failure_code("registration-code=not-for-log"),
             "enrollment.failed"
         );
+    }
+
+    #[test]
+    fn registration_worker_is_rejoined_after_a_bounded_timeout() {
+        let worker = Arc::new(Mutex::new(Some(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+        }))));
+
+        assert!(join_registration_worker(&worker, Duration::ZERO).is_err());
+        assert!(worker.lock().unwrap().is_some());
+        join_registration_worker(&worker, Duration::from_secs(1)).unwrap();
+        assert!(worker.lock().unwrap().is_none());
     }
 
     fn local_caller() -> VerifiedPipeCaller {
@@ -2346,6 +2542,87 @@ mod tests {
             panic!("remote action was not denied");
         };
         assert_eq!(nack.error_code, "agent.dry_run_only");
+    }
+
+    #[test]
+    fn topology_candidate_exhaustively_allows_only_zero_input_commands() {
+        let task = Some(TaskCommandRef::default());
+        let allowed = [
+            hub_control_command::Payload::BeginTaskAttempt(protocol::BeginTaskAttempt {
+                task: task.clone(),
+                ..Default::default()
+            }),
+            hub_control_command::Payload::StartTaskTarget(protocol::StartTaskTarget {
+                task: task.clone(),
+            }),
+            hub_control_command::Payload::StartCapture(protocol::StartCapture {
+                task: task.clone(),
+                ..Default::default()
+            }),
+            hub_control_command::Payload::StopCapture(protocol::StopCapture {
+                task: task.clone(),
+                ..Default::default()
+            }),
+            hub_control_command::Payload::FinishTaskAttempt(protocol::FinishTaskAttempt {
+                task: task.clone(),
+                ..Default::default()
+            }),
+            hub_control_command::Payload::InspectTaskAttempt(protocol::InspectTaskAttempt { task }),
+            hub_control_command::Payload::ReleaseAll(protocol::ReleaseAll::default()),
+            hub_control_command::Payload::StopSession(protocol::StopSession::default()),
+        ];
+        for payload in allowed {
+            assert!(topology_command_allowed(&HubControlCommand {
+                payload: Some(payload),
+            }));
+        }
+
+        let rejected = [
+            hub_control_command::Payload::Hello(protocol::HubHello::default()),
+            hub_control_command::Payload::EnumerateTargets(protocol::EnumerateTargets::default()),
+            hub_control_command::Payload::LockTarget(protocol::LockTarget::default()),
+            hub_control_command::Payload::InputLease(protocol::InputLease::default()),
+            hub_control_command::Payload::PulseAction(protocol::PulseAction::default()),
+            hub_control_command::Payload::MouseDeltaAction(protocol::MouseDeltaAction::default()),
+            hub_control_command::Payload::WindowPointClickAction(
+                protocol::WindowPointClickAction::default(),
+            ),
+            hub_control_command::Payload::FocusTarget(protocol::FocusTarget::default()),
+            hub_control_command::Payload::CloseTarget(protocol::CloseTarget::default()),
+            hub_control_command::Payload::UpdateDirective(protocol::UpdateDirective::default()),
+            hub_control_command::Payload::LaunchTarget(protocol::LaunchTarget::default()),
+        ];
+        for payload in rejected {
+            assert!(!topology_command_allowed(&HubControlCommand {
+                payload: Some(payload),
+            }));
+        }
+
+        assert!(!topology_command_allowed(&HubControlCommand::default()));
+    }
+
+    #[test]
+    fn embedded_runtime_exposes_observability_but_not_device_commands() {
+        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        let completion = Arc::new(EmbeddedRuntimeCompletion::default());
+        let handle = EmbeddedRuntimeHandle {
+            runtime: driver.local_runtime(RuntimeOwner::EmbeddedGui),
+            completion: Arc::clone(&completion),
+        };
+
+        assert!(handle.execute(&LocalCommand::Status).is_ok());
+        assert_eq!(
+            handle
+                .execute(&LocalCommand::ReleaseAll)
+                .unwrap_err()
+                .code(),
+            "local.embedded_command_not_allowed"
+        );
+        completion.finish(&Err(AgentError::new("runtime.test_failure", "stopped")));
+        assert_eq!(
+            handle.execute(&LocalCommand::Status).unwrap_err().code(),
+            "runtime.embedded_failed"
+        );
     }
 
     #[test]
@@ -2402,33 +2679,6 @@ mod tests {
         };
         assert_eq!(ack.task_attempt_receipt.unwrap().receipt_version, 1);
         assert!(ack.task.is_some());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn authorized_update_handoff_survives_ack_loss() {
-        let request = fairypam_agent_suite::UpdateRequest {
-            schema_version: 1,
-            update_id: "update-1".to_owned(),
-            source_build_id: "source-1".to_owned(),
-            target_build_id: "target-1".to_owned(),
-            suite_version: "1.0.1".to_owned(),
-            artifact_sha256: "a".repeat(64),
-            artifact_size: 1,
-            manifest_sha256: "b".repeat(64),
-        };
-        let pending = Mutex::new(Some(request.clone()));
-        let mut authorized = false;
-
-        authorize_pending_update(&pending, |actual| {
-            assert_eq!(actual, &request);
-            authorized = true;
-            Ok(())
-        })
-        .unwrap();
-
-        assert!(authorized);
-        assert!(pending.lock().unwrap().is_none());
     }
 
     #[test]

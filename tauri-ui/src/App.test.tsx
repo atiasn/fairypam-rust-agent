@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const activation = vi.hoisted(() => ({ handler: undefined as undefined | (() => void) }));
+const runtimeFailure = vi.hoisted(() => ({ handler: undefined as undefined | (() => void) }));
 
 vi.mock('./lib/agentApi', () => ({
   agentApi: {
@@ -14,8 +15,12 @@ vi.mock('./lib/agentApi', () => ({
         activation.handler = undefined;
       };
     }),
-    restartLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
-    repairAgentTasks: vi.fn().mockResolvedValue({ status: 'ready' }),
+    onEmbeddedRuntimeFailed: vi.fn(async (handler: () => void) => {
+      runtimeFailure.handler = handler;
+      return () => {
+        runtimeFailure.handler = undefined;
+      };
+    }),
     getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' }, doctor: { profiles: ['signed-profile'], runtime: 'dry_run' } }),
     getConnectionStatus: vi.fn().mockResolvedValue({ control: 'connected', frame: 'connected', capture_active: false }),
     runEnvironmentCheck: vi.fn().mockResolvedValue({ registration_ready: true, registration_pending: false, checks: [] }),
@@ -40,6 +45,7 @@ describe('App', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     activation.handler = undefined;
+    runtimeFailure.handler = undefined;
     vi.mocked(agentApi.ensureLocalAgent).mockResolvedValue({ status: 'ready' });
     vi.mocked(agentApi.getLogTail).mockResolvedValue({ entries: [] });
   });
@@ -80,8 +86,8 @@ describe('App', () => {
     expect(await view.findByText('服务启动需要处理')).toBeInTheDocument();
     expect(view.queryByText('服务已连接')).not.toBeInTheDocument();
     expect(view.queryByRole('heading', { name: '后台服务已就绪' })).not.toBeInTheDocument();
-    expect(view.getByRole('button', { name: '重启后台服务' })).toBeEnabled();
-    expect(view.getByRole('button', { name: '修复后台服务' })).toBeEnabled();
+    expect(view.queryByRole('button', { name: '重启后台服务' })).not.toBeInTheDocument();
+    expect(view.queryByRole('button', { name: '修复后台服务' })).not.toBeInTheDocument();
     await userEvent.click(view.getByRole('button', { name: '重试启动' }));
     expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
     expect(view.getByText('服务已连接')).toHaveClass('online');
@@ -112,6 +118,19 @@ describe('App', () => {
     expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
     await userEvent.click(view.getByRole('button', { name: '连接与注册' }));
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
+  });
+
+  it('Core 异常结束后立即锁定界面并清除在线状态', async () => {
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByText('服务已连接')).toBeInTheDocument();
+    await waitFor(() => expect(runtimeFailure.handler).toBeTypeOf('function'));
+    act(() => runtimeFailure.handler?.());
+
+    expect(await view.findByRole('heading', { name: '本机服务已停止' })).toBeInTheDocument();
+    expect(view.queryByText('服务已连接')).not.toBeInTheDocument();
+    expect(view.queryByRole('heading', { name: '后台服务已就绪' })).not.toBeInTheDocument();
   });
 
   it('启动后自动检查本机环境，并在未就绪时禁用注册', async () => {
@@ -277,8 +296,7 @@ describe('App', () => {
     expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
   });
 
-  it('后台服务异常时仅在用户选择修复后请求系统确认', async () => {
-    const user = userEvent.setup();
+  it('后台服务异常时只提供原进程内重试', async () => {
     vi.mocked(agentApi.ensureLocalAgent).mockRejectedValueOnce({
       code: 'startup.agent_repair_required',
       message: '需要修复',
@@ -286,14 +304,10 @@ describe('App', () => {
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByRole('button', { name: '修复后台服务' })).toBeInTheDocument();
+    expect(await view.findByRole('button', { name: '重试启动' })).toBeInTheDocument();
     expect(view.getByText('后台服务需要修复')).toBeInTheDocument();
-    expect(view.getByRole('button', { name: '重启后台服务' })).toBeInTheDocument();
-    expect(agentApi.repairAgentTasks).not.toHaveBeenCalled();
-
-    await user.click(view.getByRole('button', { name: '修复后台服务' }));
-    expect(agentApi.repairAgentTasks).toHaveBeenCalledOnce();
-    expect(agentApi.restartLocalAgent).not.toHaveBeenCalled();
+    expect(view.queryByRole('button', { name: '重启后台服务' })).not.toBeInTheDocument();
+    expect(view.queryByRole('button', { name: '修复后台服务' })).not.toBeInTheDocument();
   });
 
   it('日志和游戏在后台服务就绪前不请求本地通道', async () => {

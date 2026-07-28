@@ -2,7 +2,7 @@ use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::NewWindowResponse,
-    Emitter, Manager, WindowEvent,
+    AppHandle, Emitter, Manager, WindowEvent,
 };
 
 use crate::{
@@ -12,6 +12,7 @@ use crate::{
 };
 
 const BLOCK_PAGE_SURFACES: &str = "for (const event of ['contextmenu', 'dragenter', 'dragover', 'drop']) { window.addEventListener(event, (value) => value.preventDefault(), { capture: true }); }";
+const WEBVIEW_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-breakpad --disable-crash-reporter";
 
 pub fn run() -> tauri::Result<()> {
     #[cfg(windows)]
@@ -28,6 +29,13 @@ pub fn run() -> tauri::Result<()> {
             return Ok(());
         }
     };
+    #[cfg(windows)]
+    let webview_data_root = verified_webview_data_root()?;
+    #[cfg(windows)]
+    let (runtime, runtime_task) = fairypam_agent::runtime::start_embedded(
+        fairypam_agent::runtime::RuntimeConfig::from_production().map_err(runtime_error)?,
+    )
+    .map_err(runtime_error)?;
     let mut context = tauri::generate_context!();
     for window in &mut context.config_mut().app.windows {
         if window.label == "main" {
@@ -38,7 +46,16 @@ pub fn run() -> tauri::Result<()> {
 
     tauri::Builder::default()
         .manage(instance)
-        .manage(ProductionGateway::new())
+        .manage({
+            #[cfg(windows)]
+            {
+                ProductionGateway::new(runtime)
+            }
+            #[cfg(not(windows))]
+            {
+                ProductionGateway::new()
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_overview,
             commands::get_connection_status,
@@ -47,17 +64,32 @@ pub fn run() -> tauri::Result<()> {
             commands::scan_installed_games,
             commands::register_hub,
             commands::ensure_local_agent,
-            commands::restart_local_agent,
-            commands::repair_agent_tasks,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let main_config = &app.config().app.windows[0];
-            let main_window = tauri::WebviewWindowBuilder::from_config(app.handle(), main_config)?
+            let main_window = tauri::WebviewWindowBuilder::from_config(app.handle(), main_config)?;
+            #[cfg(windows)]
+            let main_window = main_window
+                .data_directory(webview_data_root.clone())
+                .incognito(true)
+                .devtools(cfg!(debug_assertions))
+                .additional_browser_args(WEBVIEW_BROWSER_ARGS);
+            let main_window = main_window
                 .on_navigation(allows_application_navigation)
                 .on_new_window(|_, _| NewWindowResponse::Deny)
                 .initialization_script(BLOCK_PAGE_SURFACES)
                 .build()?;
             disable_default_context_menu(&main_window);
+            #[cfg(windows)]
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if runtime_task.await.is_err() {
+                        show_main_window(&app_handle);
+                        let _ = app_handle.emit("embedded-runtime-failed", ());
+                    }
+                });
+            }
 
             let activation_app = app.handle().clone();
             app.state::<GuiSingleInstance>().watch_activation(move || {
@@ -65,9 +97,7 @@ pub fn run() -> tauri::Result<()> {
                 tauri::async_runtime::spawn(async move {
                     #[cfg(windows)]
                     if commands::verify_active_gui().is_err() {
-                        let state = app.state::<ProductionGateway>();
-                        let _ = commands::shutdown_local_agent_for_exit(&state).await;
-                        app.exit(0);
+                        exit_after_safe_shutdown(&app).await;
                         return;
                     }
                     show_main_window(&app);
@@ -88,15 +118,7 @@ pub fn run() -> tauri::Result<()> {
                     "exit-ui" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
-                            let state = app.state::<ProductionGateway>();
-                            if commands::shutdown_local_agent_for_exit(&state)
-                                .await
-                                .is_ok()
-                            {
-                                app.exit(0);
-                            } else {
-                                show_main_window(&app);
-                            }
+                            exit_after_safe_shutdown(&app).await;
                         });
                     }
                     _ => {}
@@ -123,6 +145,51 @@ pub fn run() -> tauri::Result<()> {
             }
         })
         .run(context)
+}
+
+async fn exit_after_safe_shutdown(app: &AppHandle) {
+    let state = app.state::<ProductionGateway>();
+    if commands::shutdown_local_agent_for_exit(&state).await.is_err() {
+        show_main_window(app);
+        let _ = app.emit("embedded-runtime-failed", ());
+        return;
+    }
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if window.clear_all_browsing_data().is_err() || window.destroy().is_err() {
+        show_main_window(app);
+        let _ = app.emit("embedded-runtime-failed", ());
+        return;
+    }
+    app.exit(0);
+}
+
+#[cfg(windows)]
+fn runtime_error(error: fairypam_agent_core::AgentError) -> tauri::Error {
+    tauri::Error::Io(std::io::Error::other(format!(
+        "{}: {}",
+        error.code(),
+        error
+    )))
+}
+
+#[cfg(windows)]
+fn verified_webview_data_root() -> tauri::Result<std::path::PathBuf> {
+    for variable in [
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+        "WEBVIEW2_RELEASE_CHANNEL_PREFERENCE",
+        "WEBVIEW2_USER_DATA_FOLDER",
+    ] {
+        if std::env::var_os(variable).is_some() {
+            return Err(tauri::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "WebView2 environment overrides are not allowed",
+            )));
+        }
+    }
+    fairypam_agent::enrollment::verified_webview_root().map_err(runtime_error)
 }
 
 fn allows_application_navigation(url: &tauri::Url) -> bool {

@@ -7,13 +7,14 @@ edition = "2021"
 name = "fairypam_agent_tauri_ui"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-# Keep the GUI build independent from the privileged Agent workspace.
 [workspace]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+fairypam-agent = { path = "../../bins/fairypam-agent" }
+fairypam-agent-core = { path = "../../crates/fairypam-agent-core" }
 fairypam-agent-local-client = { path = "../../crates/fairypam-agent-local-client" }
 fairypam-agent-local-protocol = { path = "../../crates/fairypam-agent-local-protocol" }
 fairypam-agent-suite = { path = "../../crates/fairypam-agent-suite" }

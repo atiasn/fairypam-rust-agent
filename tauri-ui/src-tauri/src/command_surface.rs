@@ -6,6 +6,4 @@ pub const COMMAND_NAMES: &[&str] = &[
     "scan_installed_games",
     "register_hub",
     "ensure_local_agent",
-    "restart_local_agent",
-    "repair_agent_tasks",
 ];

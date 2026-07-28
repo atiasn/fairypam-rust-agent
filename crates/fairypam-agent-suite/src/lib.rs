@@ -19,11 +19,8 @@ pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_MEMBER_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 
-const REQUIRED_VERSIONED_EXECUTABLES: [&str; 3] = [
-    "fairypam-agent.exe",
-    "fairypam-agent-guardian.exe",
-    "fairypam-agent-tauri-ui.exe",
-];
+const REQUIRED_VERSIONED_EXECUTABLES: [&str; 2] =
+    ["fairypam-agent-guardian.exe", "fairypam-agent-tauri-ui.exe"];
 const REQUIRED_STABLE_EXECUTABLE: &str = "resources/runtime/fairypam-agent-installer.exe";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -169,11 +166,6 @@ pub fn validate_manifest(manifest: &SuiteManifest) -> Result<(), SuiteError> {
         if !valid_sha256(&member.sha256) {
             return Err(invalid_manifest("member SHA256 is invalid"));
         }
-        if forbidden_production_member(&folded) {
-            return Err(invalid_manifest(
-                "developer CLI or independent updater is forbidden in the product suite",
-            ));
-        }
         if REQUIRED_VERSIONED_EXECUTABLES.contains(&folded.as_str()) {
             if member.scope != MemberScope::Versioned {
                 return Err(invalid_manifest(
@@ -187,6 +179,16 @@ pub fn validate_manifest(manifest: &SuiteManifest) -> Result<(), SuiteError> {
                 return Err(invalid_manifest("installer helper must be stable"));
             }
             stable_helper = true;
+        } else if is_executable_member(&folded) {
+            if !allowed_product_executable(&folded) {
+                return Err(invalid_manifest(
+                    "executable member is outside the exact product allowlist",
+                ));
+            }
+        } else if !valid_profile_member_path(&folded) {
+            return Err(invalid_manifest(
+                "data member is outside the exact profile layout",
+            ));
         }
     }
     if required_versioned.len() != REQUIRED_VERSIONED_EXECUTABLES.len() || !stable_helper {
@@ -720,10 +722,10 @@ fn reject_forbidden_executables(root: &Path, directory: &Path) -> Result<(), Sui
                 .to_string_lossy()
                 .replace('\\', "/")
                 .to_ascii_lowercase();
-            if forbidden_production_member(&relative) {
+            if is_executable_member(&relative) && !allowed_product_executable(&relative) {
                 return Err(SuiteError::new(
                     "suite.layout_invalid",
-                    "developer CLI or independent updater is forbidden in the product layout",
+                    "executable member is outside the exact product allowlist",
                 ));
             }
         }
@@ -783,11 +785,20 @@ fn is_executable_member(value: &str) -> bool {
         .any(|suffix| value.ends_with(suffix))
 }
 
-fn forbidden_production_member(value: &str) -> bool {
-    value
-        .rsplit('/')
-        .next()
-        .is_some_and(|name| name == "fairypam-agentctl.exe" || name.contains("updater"))
+fn allowed_product_executable(value: &str) -> bool {
+    let folded = value.to_ascii_lowercase();
+    REQUIRED_VERSIONED_EXECUTABLES.contains(&folded.as_str())
+        || folded == REQUIRED_STABLE_EXECUTABLE
+}
+
+fn valid_profile_member_path(value: &str) -> bool {
+    let mut parts = value.split('/');
+    matches!(parts.next(), Some("profiles"))
+        && parts
+            .next()
+            .is_some_and(|game_id| safe_identifier(game_id, 128))
+        && matches!(parts.next(), Some("profile.json"))
+        && parts.next().is_none()
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -833,7 +844,6 @@ mod tests {
                     MemberScope::Stable,
                     b"helper",
                 ),
-                member("fairypam-agent.exe", MemberScope::Versioned, b"agent"),
                 member(
                     "fairypam-agent-guardian.exe",
                     MemberScope::Versioned,
@@ -844,7 +854,11 @@ mod tests {
                     MemberScope::Versioned,
                     b"gui",
                 ),
-                member("profiles/default.json", MemberScope::Versioned, b"profile"),
+                member(
+                    "profiles/default/profile.json",
+                    MemberScope::Versioned,
+                    b"profile",
+                ),
             ],
         }
     }
@@ -855,10 +869,9 @@ mod tests {
         let options = zip::write::SimpleFileOptions::default();
         for (path, contents) in [
             (MANIFEST_FILE, manifest_bytes.as_slice()),
-            ("fairypam-agent.exe", b"agent".as_slice()),
             ("fairypam-agent-guardian.exe", guardian),
             ("fairypam-agent-tauri-ui.exe", b"gui".as_slice()),
-            ("profiles/default.json", b"profile".as_slice()),
+            ("profiles/default/profile.json", b"profile".as_slice()),
         ] {
             writer.start_file(path, options).unwrap();
             writer.write_all(contents).unwrap();
@@ -868,16 +881,24 @@ mod tests {
 
     #[test]
     fn manifest_rejects_developer_cli_and_missing_product_member() {
-        let mut value = manifest();
-        value.members.push(member(
+        for forbidden in [
+            "fairypam-agent.exe",
             "fairypam-agentctl.exe",
-            MemberScope::Versioned,
-            b"cli",
-        ));
-        assert_eq!(
-            validate_manifest(&value).unwrap_err().code(),
-            "suite.manifest_invalid"
-        );
+            "renamed-core.exe",
+            "profiles/game/renamed-core.exe",
+            "profiles/game/native.dll",
+            "profiles/game/setup.ps1",
+            "profiles/game/extra.json",
+        ] {
+            let mut value = manifest();
+            value
+                .members
+                .push(member(forbidden, MemberScope::Versioned, b"forbidden"));
+            assert_eq!(
+                validate_manifest(&value).unwrap_err().code(),
+                "suite.manifest_invalid"
+            );
+        }
 
         let mut value = manifest();
         value
@@ -1008,7 +1029,7 @@ mod tests {
                 .as_nanos()
         ));
         let version_root = directory.join("versions").join(&manifest.build_id);
-        fs::create_dir_all(version_root.join("profiles")).unwrap();
+        fs::create_dir_all(version_root.join("profiles").join("default")).unwrap();
         fs::create_dir_all(directory.join("resources").join("runtime")).unwrap();
         for (path, contents) in [
             (
@@ -1018,7 +1039,6 @@ mod tests {
                     .join("fairypam-agent-installer.exe"),
                 b"helper".as_slice(),
             ),
-            (version_root.join("fairypam-agent.exe"), b"agent".as_slice()),
             (
                 version_root.join("fairypam-agent-guardian.exe"),
                 b"guardian".as_slice(),
@@ -1028,7 +1048,10 @@ mod tests {
                 b"gui".as_slice(),
             ),
             (
-                version_root.join("profiles").join("default.json"),
+                version_root
+                    .join("profiles")
+                    .join("default")
+                    .join("profile.json"),
                 b"profile".as_slice(),
             ),
         ] {

@@ -4,19 +4,18 @@ import { fileURLToPath } from 'node:url';
 
 const root = process.env.FAIRYPAM_TAURI_UI_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (relativePath) => readFileSync(resolve(root, relativePath), 'utf8');
-const installGuardPath = process.env.FAIRYPAM_INSTALL_GUARD_SOURCE;
 const fail = (message) => {
   throw new Error(`production security check failed: ${message}`);
 };
 
 const manifest = read('src-tauri/windows-app-manifest.xml');
-if (!manifest.includes('level="asInvoker"') || !manifest.includes('uiAccess="false"')) {
-  fail('Windows manifest must use asInvoker with uiAccess=false');
+if (!manifest.includes('level="requireAdministrator"') || !manifest.includes('uiAccess="false"')) {
+  fail('Windows manifest must requireAdministrator with uiAccess=false');
 }
 
 const cargoToml = read('src-tauri/Cargo.toml');
-if (!cargoToml.includes('fairypam-agent-local-client') || /^fairypam-agent\s*=/m.test(cargoToml)) {
-  fail('UI must use the shared local client without depending on fairypam-agent');
+if (!/^fairypam-agent\s*=/m.test(cargoToml)) {
+  fail('Tauri host must link the unique in-process Agent core');
 }
 
 const capability = read('src-tauri/capabilities/default.json');
@@ -29,67 +28,53 @@ const csp = config?.app?.security?.csp ?? '';
 if (!csp.includes("script-src 'self'") || /script-src[^;]*https?:\/\//.test(csp)) {
   fail('CSP must keep scripts self-contained');
 }
+if (JSON.stringify(config).includes('fairypam-agent.exe')) {
+  fail('Tauri bundle must not contain a sibling Agent executable');
+}
 
-const commandSource = read('src-tauri/src/commands.rs');
-const appSource = read('src-tauri/src/app.rs');
-const installGuardSource = installGuardPath
-  ? readFileSync(resolve(installGuardPath), 'utf8')
-  : read('../crates/fairypam-agent-local-client/src/windows_named_pipe.rs');
-for (const forbidden of ['fn invoke', 'fn exec', 'fn spawn', 'fn read_file', 'serde_json::Value']) {
-  if (commandSource.includes(forbidden)) fail(`forbidden generic command surface ${forbidden}`);
+const commands = read('src-tauri/src/commands.rs');
+const gateway = read('src-tauri/src/local_gateway.rs');
+const app = read('src-tauri/src/app.rs');
+for (const forbidden of [
+  'fn invoke',
+  'fn exec',
+  'fn spawn',
+  'fn read_file',
+  'ShellExecuteExW',
+  'restart_local_agent',
+  'repair_agent_tasks',
+  'WindowsNamedPipeClientTransport',
+]) {
+  if (commands.includes(forbidden) || gateway.includes(forbidden)) {
+    fail(`forbidden renderer bridge ${forbidden}`);
+  }
 }
 
 for (const required of [
-  'for path in [&gui, &helper]',
-  'verify_protected_program_files_path(path)',
-  'ShellExecuteExW',
-  'HSTRING::from("runas")',
-  '"--ui-owner-pid {} --foreground-broker-hwnd {}"',
-  'fixed_agent_path()',
+  'runtime::start_embedded',
+  'ProductionGateway::new(runtime)',
+  '.data_directory(webview_data_root.clone())',
+  '.incognito(true)',
+  '.devtools(cfg!(debug_assertions))',
+  '.additional_browser_args(WEBVIEW_BROWSER_ARGS)',
+  '.on_navigation(allows_application_navigation)',
+  'NewWindowResponse::Deny',
+  'embedded-runtime-failed',
+  'shutdown_local_agent_for_exit',
+  'clear_all_browsing_data()',
+  'window.destroy()',
+]) {
+  if (!app.includes(required)) fail(`missing single-process safety boundary ${required}`);
+}
+for (const required of [
   'for path in [&gui, &pointer]',
-  'CURRENT_POINTER_FILE',
+  'verify_protected_program_files_path(path)',
   'resolve_active_suite(install_root)',
-  'startup.inactive_suite',
-  'std::fs::canonicalize',
-  'OpenMutexW',
-  'SYNCHRONIZATION_SYNCHRONIZE',
-  'ShellExecuteExW',
-  'SEE_MASK_NOCLOSEPROCESS',
-  'verify_repair_helper_signature(&helper)?',
-  'WinVerifyTrust',
-  'WINTRUST_ACTION_GENERIC_VERIFY_V2',
-  'WTD_STATEACTION_CLOSE',
-  'FAIRYPAM_ALLOW_UNSIGNED_CANDIDATE_REPAIR',
-  '"--repair-tasks"',
 ]) {
-  if (!commandSource.includes(required)) fail(`missing fixed Agent/helper guard ${required}`);
+  if (!commands.includes(required)) fail(`missing active-suite guard ${required}`);
 }
-for (const required of ['commands::verify_active_gui()', 'local-agent-activation']) {
-  if (!appSource.includes(required)) fail(`missing active GUI handoff guard ${required}`);
-}
-if (commandSource.includes('std::process::Command::new')) {
-  fail('GUI must use fixed ShellExecute paths instead of a generic process launcher');
-}
-for (const required of [
-  'protected_install_chain',
-  'for component in relative',
-  'path_is_writable(&current)?',
-  'has_reparse_component(path)',
-  'fs::canonicalize(path)',
-  'SHGetKnownFolderPath',
-  'FOLDERID_ProgramFiles',
-  'FOLDERID_ProgramFilesX86',
-]) {
-  if (!installGuardSource.includes(required)) fail(`missing shared UAC install-chain guard ${required}`);
-}
-if (commandSource.includes('std::env::var("ProgramFiles")')) {
-  fail('UAC trust root must not come from a user-controlled ProgramFiles environment variable');
-}
-const canonicalHelper = installGuardSource.indexOf('fn protected_install_path');
-const reparseGuard = installGuardSource.indexOf('has_reparse_component(path)', canonicalHelper);
-const canonicalize = installGuardSource.indexOf('fs::canonicalize(path)', canonicalHelper);
-if (canonicalHelper < 0 || reparseGuard < canonicalHelper || canonicalize < reparseGuard) {
-  fail('UAC trust chain must reject reparse points before canonicalizing a path');
+if (!gateway.includes('EmbeddedRuntimeHandle') || !gateway.includes('runtime.execute(&command)')) {
+  fail('Tauri Gateway must call the embedded runtime directly');
 }
 
 console.log('production security check passed');

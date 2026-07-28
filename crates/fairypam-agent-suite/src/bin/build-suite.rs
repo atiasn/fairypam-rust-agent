@@ -37,11 +37,6 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut members = vec![
         identity(
-            required_path(&options, "--agent")?,
-            "fairypam-agent.exe",
-            MemberScope::Versioned,
-        )?,
-        identity(
             required_path(&options, "--guardian")?,
             "fairypam-agent-guardian.exe",
             MemberScope::Versioned,
@@ -237,7 +232,6 @@ fn source_for_member(
     options: &BTreeMap<String, String>,
 ) -> Result<PathBuf, String> {
     let source = match member.path.as_str() {
-        "fairypam-agent.exe" => required_path(options, "--agent")?.to_owned(),
         "fairypam-agent-guardian.exe" => required_path(options, "--guardian")?.to_owned(),
         "fairypam-agent-tauri-ui.exe" => required_path(options, "--gui")?.to_owned(),
         path if path.starts_with("profiles/") => {

@@ -28,7 +28,6 @@
     "targets": "all",
     "icon": [],
     "resources": {
-      "../../target/release/fairypam-agent.exe": "fairypam-agent.exe",
       "../../target/release/fairypam-agent-guardian.exe": "fairypam-agent-guardian.exe",
       "../../target/release/fairypam-agent-installer.exe": "resources/runtime/fairypam-agent-installer.exe",
       "../../target/suite/BUILD-MANIFEST.json": "BUILD-MANIFEST.json",

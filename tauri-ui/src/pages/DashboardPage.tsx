@@ -9,9 +9,6 @@ type Props = {
   overview: UseQueryResult<Overview>;
   startup: UseQueryResult<SupportStatus>;
   retryStartup: () => void;
-  restartAgent: () => void;
-  repairAgent: () => void;
-  recoveryAction?: 'restart' | 'repair';
 };
 
 function connectionSummary(status: string | undefined) {
@@ -35,9 +32,6 @@ export function DashboardPage({
   overview,
   startup,
   retryStartup,
-  restartAgent,
-  repairAgent,
-  recoveryAction,
 }: Props) {
   if (startup.isPending || overview.isLoading) {
     return <StatusPanel availability="unknown" title="正在准备服务" detail="正在检查服务状态。" />;
@@ -47,9 +41,7 @@ export function DashboardPage({
       <>
         <StatusPanel availability="offline" title="服务暂时无法使用" detail="请检查安装或完成注册，然后重试。" />
         <div className="actions">
-          <button disabled={Boolean(recoveryAction)} onClick={restartAgent} type="button">重启后台服务</button>
-          <button disabled={Boolean(recoveryAction)} onClick={repairAgent} type="button">修复后台服务</button>
-          <button disabled={Boolean(recoveryAction)} onClick={retryStartup} type="button">重试启动</button>
+          <button onClick={retryStartup} type="button">重试启动</button>
         </div>
       </>
     );
@@ -59,9 +51,7 @@ export function DashboardPage({
       <>
         <StatusPanel availability={connection.availability} title="服务暂时无法使用" detail="服务连接已中断，请手动重试。" />
         <div className="actions">
-          <button disabled={Boolean(recoveryAction)} onClick={restartAgent} type="button">重启后台服务</button>
-          <button disabled={Boolean(recoveryAction)} onClick={repairAgent} type="button">修复后台服务</button>
-          <button disabled={Boolean(recoveryAction)} onClick={retryStartup} type="button">重试启动</button>
+          <button onClick={retryStartup} type="button">重试启动</button>
         </div>
       </>
     );
