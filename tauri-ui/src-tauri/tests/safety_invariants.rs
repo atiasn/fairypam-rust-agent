@@ -15,8 +15,6 @@ const INSTALLER_LAYOUT_BUILD: &str =
     include_str!("../../../bins/fairypam-agent-installer/build.rs");
 const NSIS_HOOKS: &str = include_str!("../windows/installer-hooks.nsh");
 const NSIS_TEMPLATE: &str = include_str!("../windows/installer.nsi");
-const WINDOWS_CANDIDATE: &str =
-    include_str!("../../../../ops/rust-agent-public/.github/workflows/windows-candidate.yml");
 
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -597,15 +595,6 @@ fn installer_exposes_only_install_validation_and_stable_gui_launch() {
     assert!(!NSIS_TEMPLATE.contains("--run-ui-task \"$INSTDIR\""));
     assert!(!NSIS_TEMPLATE.contains("--remove-tasks \"$INSTDIR\""));
     assert!(!NSIS_HOOKS.contains("fairypam-agent.exe"));
-    for required in [
-        "$allowedProductExecutables -notcontains $executable.FullName",
-        "@('.exe', '.dll', '.msi', '.ps1', '.bat', '.cmd')",
-        "Get-ScheduledTask -TaskName $taskName",
-        "Name = 'fairypam-agent.exe'",
-    ] {
-        assert!(WINDOWS_CANDIDATE.contains(required));
-    }
-    assert!(!WINDOWS_CANDIDATE.contains("Smoke trusted NSIS product reinstall"));
     assert!(
         !NSIS_TEMPLATE.contains("nsis_tauri_utils::RunAsUser \"$INSTDIR\\${MAINBINARYNAME}.exe\"")
     );

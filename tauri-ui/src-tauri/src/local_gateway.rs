@@ -133,15 +133,6 @@ impl ProductionGateway {
         })
     }
 
-    #[cfg(windows)]
-    pub async fn status_with_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<StatusDto, UiCommandError> {
-        self.request_with_timeout(LocalCommand::Status, timeout)
-            .await
-    }
-
     pub async fn connection_status(&self) -> Result<ConnectionStatusDto, UiCommandError> {
         self.request(LocalCommand::GetConnectionStatus).await
     }
