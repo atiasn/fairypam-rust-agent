@@ -4,9 +4,7 @@
 use std::fs;
 use std::io::Write;
 use std::os::windows::io::FromRawHandle;
-use std::path::Path;
-#[cfg(feature = "dev-automation")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fairypam_agent_core::AgentError;
