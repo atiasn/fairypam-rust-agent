@@ -1,12 +1,8 @@
-name: Windows core build
-run-name: "Windows core build ${{ github.sha }} #${{ github.run_number }}"
+name: Windows candidate
+run-name: "Windows candidate ${{ github.sha }} #${{ github.run_number }}"
 
 on:
   workflow_dispatch:
-
-concurrency:
-  group: windows-candidate-${{ github.sha }}
-  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -15,158 +11,18 @@ permissions:
 
 jobs:
   build:
-    name: Build non-promotable Windows core artifact
+    name: Build unsigned Windows candidate
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout mirror snapshot
         uses: actions/checkout@v6
 
-      - name: Install pinned Rust toolchain
-        shell: pwsh
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $toolchain = (Get-Content rust-toolchain.toml | Select-String 'channel = "([^"]+)"').Matches.Groups[1].Value
-          rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy
-          rustup override set $toolchain
-          rustc --version
-          cargo --version
-
-      - name: Test workspace and build release binaries
-        shell: pwsh
-        env:
-          FAIRYPAM_BUILD_ID: public-core-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $env:FAIRYPAM_BUILD_COMMIT = (Get-Content SOURCE_COMMIT -Raw).Trim()
-          cargo fmt --all -- --check
-          cargo check --workspace --all-targets --locked
-          cargo test --workspace --locked
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo build --workspace --release --locked
-
-      - name: Verify production Dev isolation
-        shell: bash
-        run: scripts/test-production-dev-isolation.sh target/release/fairypam-agent.exe target/release/fairypam-agentctl.exe target/release/fairypam-agent-guardian.exe
-
-      - name: Package non-promotable core build
-        shell: pwsh
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          New-Item -ItemType Directory -Force -Path dist/core | Out-Null
-          Copy-Item target/release/fairypam-agent.exe dist/core/
-          Copy-Item target/release/fairypam-agent-guardian.exe dist/core/
-          Copy-Item -Recurse profiles dist/core/profiles
-          Copy-Item test-profile-root-public-key.hex dist/core/
-          Compress-Archive -Path dist/core/* -DestinationPath dist/fairypam-agent-core-windows.zip
-          $sourceCommit = (Get-Content SOURCE_COMMIT -Raw).Trim()
-          $agent = Get-Item dist/core/fairypam-agent.exe
-          $guardian = Get-Item dist/core/fairypam-agent-guardian.exe
-          $zip = Get-Item dist/fairypam-agent-core-windows.zip
-          $receipt = [ordered]@{
-            schema_version = 1
-            artifact_class = 'core-build-only'
-            promotable = $false
-            source_commit = $sourceCommit
-            public_commit = '${{ github.sha }}'
-            build_id = 'public-core-${{ github.run_id }}-${{ github.run_attempt }}'
-            run_id = '${{ github.run_id }}'
-            run_attempt = '${{ github.run_attempt }}'
-            agent_sha256 = (Get-FileHash $agent -Algorithm SHA256).Hash.ToLowerInvariant()
-            agent_size = $agent.Length
-            guardian_sha256 = (Get-FileHash $guardian -Algorithm SHA256).Hash.ToLowerInvariant()
-            guardian_size = $guardian.Length
-            zip_sha256 = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-            zip_size = $zip.Length
-          }
-          $receipt | ConvertTo-Json | Set-Content -Encoding utf8 dist/core-build-receipt.json
-
-      - name: Attest core ZIP provenance
-        uses: actions/attest@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
         with:
-          subject-path: dist/fairypam-agent-core-windows.zip
-
-      - name: Attest core receipt provenance
-        uses: actions/attest@v4
-        with:
-          subject-path: dist/core-build-receipt.json
-
-      - name: Upload non-promotable core artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: fairypam-agent-core-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            dist/fairypam-agent-core-windows.zip
-            dist/core-build-receipt.json
-          if-no-files-found: error
-          retention-days: 14
-
-  dev-automation:
-    name: Build non-promotable Dev automation artifact
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-      - shell: pwsh
-        name: Install pinned Rust toolchain
-        run: |
-          $toolchain = (Get-Content rust-toolchain.toml | Select-String 'channel = "([^"]+)"').Matches.Groups[1].Value
-          rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy
-          rustup override set $toolchain
-      - shell: pwsh
-        name: Build isolated Dev binaries
-        env:
-          FAIRYPAM_BUILD_ID: dev-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $features = 'fairypam-agent/dev-automation,fairypam-agentctl/dev-automation,fairypam-agent-windows/testbed'
-          cargo fmt --all -- --check
-          cargo test --workspace --locked
-          cargo test -p fairypam-agent --features dev-automation --locked
-          cargo test -p fairypam-agentctl --features dev-automation --locked
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo build --release --locked --no-default-features -p fairypam-agent -p fairypam-agent-guardian -p fairypam-agentctl -p fairypam-agent-windows --features $features
-      - shell: bash
-        name: Verify Dev installer contract
-        run: scripts/test-dev-install-contract.sh
-      - shell: pwsh
-        name: Package Dev receipt
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          New-Item -ItemType Directory -Force dist/dev/profiles | Out-Null
-          Copy-Item target/release/fairypam-agent.exe,target/release/fairypam-agent-guardian.exe,target/release/fairypam-agentctl.exe,target/release/fairypam-agent-testbed.exe,scripts/dev-install.ps1,scripts/dev-provision.ps1 dist/dev/
-          Copy-Item -Recurse profiles/* dist/dev/profiles/
-          Copy-Item test-profile-root-public-key.hex dist/dev/
-          $root = (Resolve-Path dist/dev).Path
-          $files = Get-ChildItem dist/dev -File -Recurse | ForEach-Object { [ordered]@{ path = $_.FullName.Substring($root.Length + 1).Replace('\','/'); sha256 = (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant(); size = $_.Length } }
-          Compress-Archive -Path dist/dev/* -DestinationPath dist/fairypam-agent-dev-windows.zip
-          $zip = Get-Item dist/fairypam-agent-dev-windows.zip
-          [ordered]@{ schema_version = 1; artifact_class = 'dev-automation'; promotable = $false; source_commit = (Get-Content SOURCE_COMMIT -Raw).Trim(); public_commit = '${{ github.sha }}'; run_id = '${{ github.run_id }}'; run_attempt = '${{ github.run_attempt }}'; build_id = 'dev-${{ github.run_id }}-${{ github.run_attempt }}'; features = @('dev-automation','testbed'); files = @($files); zip_sha256 = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant(); zip_size = $zip.Length } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 dist/dev-build-receipt.json
-      - uses: actions/attest@v4
-        with: { subject-path: dist/fairypam-agent-dev-windows.zip }
-      - uses: actions/attest@v4
-        with: { subject-path: dist/dev-build-receipt.json }
-      - uses: actions/upload-artifact@v7
-        with:
-          name: fairypam-agent-dev-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            dist/fairypam-agent-dev-windows.zip
-            dist/dev-build-receipt.json
-          if-no-files-found: error
-          retention-days: 14
-
-  tauri-ui:
-    name: Build non-promotable Windows product installer
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Node for the Tauri UI
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+          node-version: 22
           cache: npm
           cache-dependency-path: tauri-ui/package-lock.json
 
@@ -180,271 +36,63 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Test and build the product installer
-        shell: pwsh
-        env:
-          FAIRYPAM_ALLOW_UNSIGNED_CANDIDATE_REPAIR: '1'
-          FAIRYPAM_BUILD_ID: product-installer-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $env:FAIRYPAM_BUILD_COMMIT = (Get-Content SOURCE_COMMIT -Raw).Trim()
-          cargo build --release --locked -p fairypam-agent -p fairypam-agent-guardian -p fairypam-agent-installer -p fairypam-agent-suite
-          New-Item -ItemType Directory -Force target\suite | Out-Null
-          '{"schema_version":0,"promotable":false}' |
-            Set-Content -NoNewline -Encoding utf8 target\suite\BUILD-MANIFEST.json
-          Push-Location tauri-ui
-          try {
-            npm ci
-            npm run check:security
-            npm test -- --run
-            npm run test:accessibility
-
-            Push-Location src-tauri
-            try {
-              cargo generate-lockfile
-              git diff --exit-code -- Cargo.lock
-              cargo fmt --all -- --check
-              cargo check --all-targets --locked
-              cargo test --all-targets --locked
-              cargo clippy --all-targets --locked -- -D warnings
-            }
-            finally {
-              Pop-Location
-            }
-
-            npm run tauri build -- --no-bundle
-            ..\target\release\fairypam-build-suite.exe `
-              --patch-tauri-nsis src-tauri\target\release\fairypam-agent-tauri-ui.exe
-            $suiteVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-            $builtAt = [DateTime]::UtcNow.ToString('o')
-            ..\target\release\fairypam-build-suite.exe `
-              --build-id $env:FAIRYPAM_BUILD_ID `
-              --source-commit $env:FAIRYPAM_BUILD_COMMIT `
-              --suite-version $suiteVersion `
-              --built-at $builtAt `
-              --build-origin 'github-actions/windows-candidate.yml' `
-              --output ..\target\suite\BUILD-MANIFEST.json `
-              --guardian ..\target\release\fairypam-agent-guardian.exe `
-              --gui src-tauri\target\release\fairypam-agent-tauri-ui.exe `
-              --helper ..\target\release\fairypam-agent-installer.exe `
-              --profiles ..\profiles
-            npm run tauri bundle -- --bundles nsis
-            npm run check:command-surface
-            git diff --exit-code -- src-tauri/Cargo.lock
-          }
-          finally {
-            Pop-Location
-          }
-
-      - name: Smoke fresh NSIS product install
+      - name: Test and build Rust core
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $setup = @(Get-ChildItem tauri-ui/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
-          if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
-          & whoami.exe /groups /fo csv /nh
-          $installRoot = 'C:\Program Files\FairyPam'
-          $installer = Start-Process -FilePath $setup[0].FullName -ArgumentList '/S' -Wait -PassThru
-          if ($installer.ExitCode -ne 0) {
-            $bootstrapHelper = Join-Path $installRoot '.fairypam-installer\payload\resources\runtime\fairypam-agent-installer.exe'
-            $requiredPaths = [ordered]@{
-              current = Join-Path $installRoot 'current.json'
-              versions = Join-Path $installRoot 'versions'
-              runtime_helper = Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'
-              bootstrap_helper = $bootstrapHelper
-            }
-            foreach ($entry in $requiredPaths.GetEnumerator()) {
-              $exists = Test-Path -LiteralPath $entry.Value
-              Write-Host "FairyPam diagnostic path: name=$($entry.Key) exists=$exists path=$($entry.Value)"
-            }
-            if (Test-Path -LiteralPath $installRoot -PathType Container) {
-              try {
-                Write-Host "FairyPam installation root SDDL: $((Get-Acl -LiteralPath $installRoot).Sddl)"
-              }
-              catch {
-                Write-Host 'FairyPam installation root exists but its SDDL could not be read.'
-              }
-              Get-ChildItem -LiteralPath $installRoot -Force -Recurse | ForEach-Object {
-                $kind = if ($_.PSIsContainer) { 'directory' } else { 'file' }
-                $length = if ($_.PSIsContainer) { 0 } else { $_.Length }
-                $relative = [System.IO.Path]::GetRelativePath($installRoot, $_.FullName)
-                try {
-                  $sddl = (Get-Acl -LiteralPath $_.FullName).Sddl
-                }
-                catch {
-                  $sddl = 'unavailable'
-                }
-                Write-Host "FairyPam diagnostic tree: kind=$kind relative=$relative length=$length sddl=$sddl"
-              }
-            }
-            else {
-              Write-Host 'FairyPam installation root does not exist after failed setup.'
-            }
-            if (Test-Path -LiteralPath $bootstrapHelper -PathType Leaf) {
-              try {
-                $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-                $startInfo.FileName = $bootstrapHelper
-                $startInfo.UseShellExecute = $false
-                $startInfo.ArgumentList.Add('--preflight')
-                $startInfo.ArgumentList.Add($installRoot)
-                $preflight = [System.Diagnostics.Process]::Start($startInfo)
-                $preflight.WaitForExit()
-                Write-Host "FairyPam diagnostic preflight: status=completed exit_code=$($preflight.ExitCode)"
-                $preflight.Dispose()
-              }
-              catch {
-                Write-Host "FairyPam diagnostic preflight: status=launch_failed hresult=$($_.Exception.HResult) type=$($_.Exception.GetType().FullName)"
-              }
-            }
-            else {
-              Write-Host 'FairyPam diagnostic preflight: status=helper_missing'
-            }
-            $stageNames = @{
-              1 = 'sddl'
-              2 = 'security-attributes'
-              3 = 'create-directory'
-              4 = 'pin'
-              5 = 'verify'
-              6 = 'not-directory'
-              7 = 'reparse'
-              8 = 'validation'
-              9 = 'release'
-            }
-            $exitCode = [int64]$installer.ExitCode
-            $stageId = [math]::Floor($exitCode / 65536)
-            $detail = $exitCode % 65536
-            $stageName = $stageNames[[int]$stageId]
-            if ($null -ne $stageName) {
-              throw "NSIS setup failed with exit code $exitCode (stage=$stageName, detail=$detail)"
-            }
-            throw "NSIS setup failed with exit code $exitCode"
-          }
-          $current = Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
-          $versionRoot = Join-Path $installRoot "versions\$($current.build_id)"
-          foreach ($path in @(
-            (Join-Path $versionRoot 'BUILD-MANIFEST.json'),
-            (Join-Path $versionRoot 'fairypam-agent-tauri-ui.exe'),
-            (Join-Path $versionRoot 'fairypam-agent-guardian.exe'),
-            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'),
-            (Join-Path $installRoot 'uninstall.exe')
-          )) {
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "missing installed product file: $path" }
-          }
-          $profiles = Join-Path $versionRoot 'profiles'
-          if (-not (Test-Path -LiteralPath $profiles -PathType Container)) { throw "missing installed profiles directory: $profiles" }
-          $allowedProductExecutables = @(
-            (Join-Path $versionRoot 'fairypam-agent-tauri-ui.exe'),
-            (Join-Path $versionRoot 'fairypam-agent-guardian.exe'),
-            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'),
-            (Join-Path $installRoot 'uninstall.exe')
-          ) | ForEach-Object { [IO.Path]::GetFullPath($_) }
-          foreach ($executable in Get-ChildItem -LiteralPath $installRoot -Recurse -File | Where-Object {
-            $_.Extension.ToLowerInvariant() -in @('.exe', '.dll', '.msi', '.ps1', '.bat', '.cmd')
-          }) {
-            if ($allowedProductExecutables -notcontains $executable.FullName) {
-              throw "executable is outside the exact product allowlist: $($executable.FullName)"
-            }
-          }
-          foreach ($taskName in @('FairyPam Agent', 'FairyPam Agent UI')) {
-            if (@(Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue).Count -ne 0) {
-              throw "forbidden scheduled task found: $taskName"
-            }
-          }
-          $siblingCore = @(Get-CimInstance Win32_Process -Filter "Name = 'fairypam-agent.exe'" | Where-Object {
-            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installRoot, [StringComparison]::OrdinalIgnoreCase)
-          })
-          if ($siblingCore.Count -ne 0) { throw 'forbidden sibling Core process is running from the product install' }
+          cargo fmt --all -- --check
+          bash scripts/tests/test-safe-smoke-mode.sh
+          bash scripts/tests/test-package-smoke.sh
+          cargo test --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo build --locked --release
 
-      - name: Package product installer receipt
+      - name: Test and build Tauri UI
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $setup = @(Get-ChildItem tauri-ui/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
-          if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item $setup[0] dist/fairypam-agent-setup-windows.exe
-          $artifact = Get-Item dist/fairypam-agent-setup-windows.exe
-          $manifest = Get-Item target/suite/BUILD-MANIFEST.json
-          $manifestBody = Get-Content $manifest.FullName -Raw | ConvertFrom-Json
-          [ordered]@{
-            schema_version = 1
-            artifact_class = 'product-installer'
-            promotable = $false
-            source_commit = (Get-Content SOURCE_COMMIT -Raw).Trim()
-            public_commit = '${{ github.sha }}'
-            build_id = 'product-installer-${{ github.run_id }}-${{ github.run_attempt }}'
-            run_id = '${{ github.run_id }}'
-            run_attempt = '${{ github.run_attempt }}'
-            setup_sha256 = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
-            setup_size = $artifact.Length
-            suite_version = $manifestBody.suite_version
-            suite_manifest_sha256 = (Get-FileHash $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
-            suite_manifest_size = $manifest.Length
-            install_mode = 'perMachine'
-            state_root = 'C:\ProgramData\FairyPam.Agent\Agent'
-            layout = @('current.json', 'versions/<build-id>/BUILD-MANIFEST.json', 'versions/<build-id>/fairypam-agent-tauri-ui.exe', 'versions/<build-id>/fairypam-agent-guardian.exe', 'versions/<build-id>/profiles/', 'resources/runtime/fairypam-agent-installer.exe')
-          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 dist/product-installer-receipt.json
+          Set-Location tauri-ui
+          npm ci
+          Set-Location src-tauri
+          cargo fmt --all -- --check
+          cargo test --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          Set-Location ..
+          npm run tauri build -- --no-bundle --ci
 
-      - name: Attest product setup provenance
+      - name: Package unsigned candidate
+        id: package
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $sourceCommit = (Get-Content SOURCE_COMMIT -Raw).Trim()
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+            Where-Object name -eq 'fairypam-agent' |
+            Select-Object -ExpandProperty version
+          $sourceShort = $sourceCommit.Substring(0, 8)
+          $buildId = "$version-dev.$sourceShort.run${{ github.run_id }}"
+          ./scripts/package-windows-candidate.ps1 `
+            -BuildId $buildId `
+            -SourceCommit $sourceCommit `
+            -PublicCommit '${{ github.sha }}' `
+            -RunId '${{ github.run_id }}' `
+            -RunAttempt '${{ github.run_attempt }}' `
+            -OutputDirectory dist
+          "artifact_name=fairypam-agent-candidate-${{ github.run_id }}-${{ github.run_attempt }}" >> $env:GITHUB_OUTPUT
+          "package=$(Get-ChildItem dist/*-portable.zip | Select-Object -ExpandProperty FullName)" >> $env:GITHUB_OUTPUT
+          "manifest=$(Resolve-Path dist/candidate-manifest.json)" >> $env:GITHUB_OUTPUT
+
+      - name: Attest candidate provenance
         uses: actions/attest@v4
         with:
-          subject-path: dist/fairypam-agent-setup-windows.exe
+          subject-path: |
+            ${{ steps.package.outputs.package }}
+            ${{ steps.package.outputs.manifest }}
 
-      - name: Attest product installer receipt provenance
-        uses: actions/attest@v4
-        with:
-          subject-path: dist/product-installer-receipt.json
-
-      - name: Upload non-promotable product installer
+      - name: Upload candidate artifact
         uses: actions/upload-artifact@v7
         with:
-          name: fairypam-agent-setup-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            dist/fairypam-agent-setup-windows.exe
-            dist/product-installer-receipt.json
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: dist/*
           if-no-files-found: error
           retention-days: 14
-
-  verify-dev-attestation:
-    name: Verify Dev artifact attestation as a consumer
-    needs: dev-automation
-    runs-on: windows-latest
-    timeout-minutes: 15
-    steps:
-      - name: Download Dev artifact
-        uses: actions/download-artifact@v5
-        with:
-          name: fairypam-agent-dev-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist/verified-dev
-
-      - name: Verify Dev ZIP and receipt provenance
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $signer = "$env:GITHUB_REPOSITORY/.github/workflows/windows-candidate.yml"
-          gh attestation verify dist/verified-dev/fairypam-agent-dev-windows.zip --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
-          gh attestation verify dist/verified-dev/dev-build-receipt.json --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
-
-  verify-product-installer-attestation:
-    name: Verify product installer attestation as a consumer
-    needs: tauri-ui
-    runs-on: windows-latest
-    timeout-minutes: 15
-    steps:
-      - name: Download product installer
-        uses: actions/download-artifact@v5
-        with:
-          name: fairypam-agent-setup-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist/verified-product-installer
-
-      - name: Verify product installer provenance as a consumer
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $signer = "$env:GITHUB_REPOSITORY/.github/workflows/windows-candidate.yml"
-          gh attestation verify dist/verified-product-installer/fairypam-agent-setup-windows.exe --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners
-          gh attestation verify dist/verified-product-installer/product-installer-receipt.json --repo $env:GITHUB_REPOSITORY --signer-workflow $signer --deny-self-hosted-runners

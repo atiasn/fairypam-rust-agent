@@ -1,19 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Least-privilege capability for FairyPam Agent UI",
+  "description": "Default capability for FairyPam Agent main window",
   "windows": ["main"],
-  "permissions": [
-    "core:app:default",
-    "core:window:default",
-    "core:menu:default",
-    "core:tray:default",
-    "allow-get-overview",
-    "allow-get-connection-status",
-    "allow-run-environment-check",
-    "allow-get-log-tail",
-    "allow-scan-installed-games",
-    "allow-register-hub",
-    "allow-ensure-local-agent"
-  ]
+  "permissions": ["core:default"]
 }

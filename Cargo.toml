@@ -1,47 +1,54 @@
-[workspace]
-members = [
-    "bins/fairypam-agent",
-    "bins/fairypam-agent-installer",
-    "bins/fairypam-agentctl",
-    "bins/fairypam-agent-guardian",
-    "crates/fairypam-agent-core",
-    "crates/fairypam-agent-dev-automation",
-    "crates/fairypam-agent-guardian-protocol",
-    "crates/fairypam-agent-input",
-    "crates/fairypam-agent-local-client",
-    "crates/fairypam-agent-local-protocol",
-    "crates/fairypam-agent-protocol",
-    "crates/fairypam-agent-suite",
-    "crates/fairypam-agent-transport",
-    "crates/fairypam-agent-windows",
-]
-default-members = [
-    "bins/fairypam-agent",
-    "bins/fairypam-agentctl",
-    "bins/fairypam-agent-guardian",
-    "crates/fairypam-agent-core",
-    "crates/fairypam-agent-guardian-protocol",
-    "crates/fairypam-agent-input",
-    "crates/fairypam-agent-local-client",
-    "crates/fairypam-agent-local-protocol",
-    "crates/fairypam-agent-protocol",
-    "crates/fairypam-agent-suite",
-    "crates/fairypam-agent-transport",
-    "crates/fairypam-agent-windows",
-]
-resolver = "2"
-
-[workspace.package]
-version = "0.1.1"
+[package]
+name = "fairypam-agent"
+version = "0.1.0"
 edition = "2021"
-publish = false
+description = "FairyPam Agent — Windows game control client"
 
-[workspace.dependencies]
-semver = "1"
+[features]
+default = []
+automation-cli = []
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
 thiserror = "2"
-zip = { version = "2.4", default-features = false, features = ["deflate"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-ed25519-dalek = "2.2"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+shlex = "1"
+data-encoding = "2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+xcap = "0.9.6"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
+
+[[bin]]
+name = "fairypam-agent"
+path = "src/main.rs"
