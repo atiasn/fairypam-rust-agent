@@ -672,10 +672,13 @@ mod native {
     use windows::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
+    use windows::Win32::System::StationsAndDesktops::{
+        GetThreadDesktop, GetUserObjectInformationW, UOI_IO,
+    };
     use windows::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-        WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SYNCHRONIZE,
+        GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken,
+        QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -798,14 +801,30 @@ mod native {
                 return Err(WindowsError::new(
                     "target.focus_failed",
                     format!(
-                        "target did not become the foreground window; request_accepted={foreground_request_accepted}, foreground_hwnd=0x{:x}, foreground_pid={foreground_pid}, target_hwnd=0x{:x}, target_pid={}",
-                        foreground.0 as usize, identity.hwnd as usize, identity.pid
+                        "target did not become the foreground window; request_accepted={foreground_request_accepted}, desktop_receives_input={:?}, foreground_hwnd=0x{:x}, foreground_pid={foreground_pid}, target_hwnd=0x{:x}, target_pid={}",
+                        desktop_receives_input(), foreground.0 as usize, identity.hwnd as usize, identity.pid
                     ),
                 ));
             }
             thread::sleep(Duration::from_millis(10));
         }
         Ok(())
+    }
+
+    fn desktop_receives_input() -> Option<bool> {
+        let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok()?;
+        let mut receives_input = BOOL::default();
+        unsafe {
+            GetUserObjectInformationW(
+                HANDLE(desktop.0),
+                UOI_IO,
+                Some(std::ptr::from_mut(&mut receives_input).cast()),
+                std::mem::size_of::<BOOL>() as u32,
+                None,
+            )
+        }
+        .ok()?;
+        Some(receives_input.as_bool())
     }
 
     pub(super) fn close_target(
