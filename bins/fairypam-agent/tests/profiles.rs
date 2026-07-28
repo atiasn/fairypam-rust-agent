@@ -23,11 +23,11 @@ fn installed_testbed_and_genshin_profiles_verify_and_do_not_share_actions() {
     assert!(genshin
         .profile()
         .actions
-        .contains_key("interaction.confirm"));
+        .contains_key("gadget.quick_use"));
     assert!(!testbed
         .profile()
         .actions
-        .contains_key("interaction.confirm"));
+        .contains_key("gadget.quick_use"));
 }
 
 #[cfg(not(feature = "e2e-live-input"))]

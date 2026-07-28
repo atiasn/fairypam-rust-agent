@@ -479,7 +479,7 @@ mod tests {
                     command_id: "different".into(),
                     ..reference.clone()
                 }),
-                action_id: "interaction.confirm".into(),
+                action_id: "gadget.quick_use".into(),
                 source_frame_sequence: Some(1),
                 task: Some(task),
             })),

@@ -324,7 +324,7 @@ mod tests {
 
         for invalid in [
             ["genshin-impact", "move.forward", NONCE],
-            ["fairypam-test-window", "interaction.confirm", NONCE],
+            ["fairypam-test-window", "gadget.quick_use", NONCE],
             ["fairypam-test-window", "move.forward", "reusable"],
         ] {
             let error = parse_arguments([

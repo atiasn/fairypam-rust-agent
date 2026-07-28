@@ -23,7 +23,7 @@ const MAX_CLOSE_TIMEOUT_MS: u32 = 5_000;
 const MAX_INPUT_LEASE_MS: u32 = 5_000;
 const CAPTURE_NO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-const M1_ACTION_ID: &str = "interaction.confirm";
+const M1_ACTION_ID: &str = "gadget.quick_use";
 type CaptureFailure = (AgentError, Option<AttemptRef>);
 #[cfg(all(windows, feature = "dev-automation"))]
 const DEV_TESTBED_PROFILE_ID: &str = "fairypam-test-window";
@@ -753,7 +753,7 @@ impl CommandExecutor {
                 if value.action_id != M1_ACTION_ID {
                     return Err(AgentError::new(
                         "task_command_not_allowed",
-                        "M1 task allows only interaction.confirm",
+                        "M1 task allows only gadget.quick_use",
                     ));
                 }
                 if let Some(result) = self.task_attempt.replay(task)? {
@@ -2032,7 +2032,7 @@ mod tests {
                     ),
                     (
                         M1_ACTION_ID.into(),
-                        ActionDefinition::Pulse { scan_code: 33 },
+                        ActionDefinition::Pulse { scan_code: 44 },
                     ),
                 ]),
             },
