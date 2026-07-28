@@ -2565,7 +2565,6 @@ mod tests {
             }),
             hub_control_command::Payload::FinishTaskAttempt(protocol::FinishTaskAttempt {
                 task: task.clone(),
-                ..Default::default()
             }),
             hub_control_command::Payload::InspectTaskAttempt(protocol::InspectTaskAttempt { task }),
             hub_control_command::Payload::ReleaseAll(protocol::ReleaseAll::default()),
