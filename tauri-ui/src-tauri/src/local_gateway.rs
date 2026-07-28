@@ -246,7 +246,7 @@ mod tests {
     use fairypam_agent_core::AgentError;
     use serde_json::json;
 
-    use super::{decode_response, ProductionGateway, UiCommandError};
+    use super::{decode_response, UiCommandError};
     use crate::dto::{EnvironmentCheckDto, StatusDto};
 
     #[test]

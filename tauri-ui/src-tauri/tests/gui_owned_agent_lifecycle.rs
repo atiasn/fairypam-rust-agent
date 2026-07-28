@@ -39,6 +39,8 @@ fn embedded_runtime_is_acquired_before_the_session_driver_runs() {
         .find("let driver = GrpcSessionDriver::new(config)")
         .expect("embedded runtime must create the shared driver");
     assert!(acquire < driver);
+    assert!(AGENT_RUNTIME.contains("struct AgentInstance(usize);"));
+    assert!(!AGENT_RUNTIME.contains("unsafe impl Send for AgentInstance"));
     assert!(AGENT_RUNTIME.contains("RuntimeOwner::EmbeddedGui"));
     assert!(AGENT_RUNTIME.contains("local.embedded_command_not_allowed"));
 }

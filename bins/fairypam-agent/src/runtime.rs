@@ -1335,7 +1335,7 @@ fn shutdown_from_local_request(
 }
 
 #[cfg(windows)]
-struct AgentInstance(windows::Win32::Foundation::HANDLE);
+struct AgentInstance(usize);
 
 #[cfg(windows)]
 impl AgentInstance {
@@ -1360,14 +1360,16 @@ impl AgentInstance {
                 "another FairyPam Agent instance is already running",
             ));
         }
-        Ok(Self(handle))
+        Ok(Self(handle.0 as usize))
     }
 }
 
 #[cfg(windows)]
 impl Drop for AgentInstance {
     fn drop(&mut self) {
-        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+        use windows::Win32::Foundation::HANDLE;
+
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(HANDLE(self.0 as _)) };
     }
 }
 
