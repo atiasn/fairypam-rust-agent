@@ -149,7 +149,10 @@ pub fn run() -> tauri::Result<()> {
 
 async fn exit_after_safe_shutdown(app: &AppHandle) {
     let state = app.state::<ProductionGateway>();
-    if commands::shutdown_local_agent_for_exit(&state).await.is_err() {
+    if commands::shutdown_local_agent_for_exit(&state)
+        .await
+        .is_err()
+    {
         show_main_window(app);
         let _ = app.emit("embedded-runtime-failed", ());
         return;
