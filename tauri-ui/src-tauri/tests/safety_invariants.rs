@@ -3,6 +3,8 @@ const FRONTEND: &str = include_str!("../../src/lib/agentApi.ts");
 const CONNECTION_PAGE: &str = include_str!("../../src/pages/ConnectionPage.tsx");
 const GATEWAY: &str = include_str!("../src/local_gateway.rs");
 const AGENT_ENROLLMENT: &str = include_str!("../../../bins/fairypam-agent/src/enrollment.rs");
+const AGENT_OBSERVABILITY: &str =
+    include_str!("../../../bins/fairypam-agent/src/observability.rs");
 const AGENT_RUNTIME: &str = include_str!("../../../bins/fairypam-agent/src/runtime.rs");
 const INSTALLER_PROVISIONER: &str =
     include_str!("../../../bins/fairypam-agent-installer/src/main.rs");
@@ -104,12 +106,14 @@ fn product_uac_and_enrollment_publication_fail_closed() {
         "WinHttpSetTimeouts",
         "CLAIM_DEADLINE",
         "CLAIM_OPERATION_TIMEOUT_MS",
-        "PRODUCTION_AUDIT_STATE_DIR",
         "ensure_private_directory",
-        "append_private(&path",
+        "observability::production_log().and_then",
+        "append_private(&self.path(0)",
     ] {
         assert!(
-            AGENT_ENROLLMENT.contains(required) || AGENT_RUNTIME.contains(required),
+            AGENT_ENROLLMENT.contains(required)
+                || AGENT_RUNTIME.contains(required)
+                || AGENT_OBSERVABILITY.contains(required),
             "missing bounded protected registration behavior: {required}"
         );
     }
