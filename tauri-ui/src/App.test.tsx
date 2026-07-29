@@ -383,9 +383,24 @@ describe('App', () => {
     vi.mocked(agentApi.scanInstalledGames).mockReset().mockResolvedValue({
       games: [{ discovery_id: 'mihoyo:stable-id', name: '原神', version: null, installed: true, supported: true, profile_id: 'signed-profile' }],
     });
+    vi.mocked(agentApi.runEnvironmentCheck).mockReset().mockResolvedValue({
+      registration_ready: true,
+      registration_pending: false,
+      checks: [{ id: 'guardian', status: 'available', code: 'guardian.binary_available', recovery: '无需操作' }],
+    });
+    vi.mocked(agentApi.getConnectionStatus).mockReset().mockResolvedValue({
+      control: 'connected',
+      frame: 'connected',
+      capture_active: true,
+    });
     const app = renderApp();
     const view = within(app.container);
 
+    await user.click(await view.findByRole('button', { name: '环境检查' }));
+    expect(await view.findByText('运行模式：正常服务')).toBeInTheDocument();
+    expect(await view.findByRole('listitem')).toHaveTextContent('守护服务：正常');
+    await user.click(view.getByRole('button', { name: '连接与注册' }));
+    expect(await view.findAllByText('已连接')).toHaveLength(2);
     await user.click(await view.findByRole('button', { name: '游戏' }));
     expect(await view.findByRole('button', { name: '更新截图' })).toBeEnabled();
     expect(view.getByRole('button', { name: '关闭游戏' })).toBeEnabled();
@@ -397,6 +412,17 @@ describe('App', () => {
       act(() => document.dispatchEvent(new Event('visibilitychange')));
       await waitFor(() => expect(view.getByRole('button', { name: '更新截图' })).toBeDisabled());
       expect(view.getByRole('button', { name: '关闭游戏' })).toBeDisabled();
+      expect(view.getByText('状态不可用')).toHaveClass('offline');
+      expect(view.queryByText('已就绪，Hub 已连接')).not.toBeInTheDocument();
+      await user.click(view.getByRole('button', { name: '总览' }));
+      expect(view.getByRole('heading', { name: '本机 Core 状态不可用' })).toBeInTheDocument();
+      await user.click(view.getByRole('button', { name: '环境检查' }));
+      expect(view.getByText('运行模式：不可用')).toBeInTheDocument();
+      expect(view.getByRole('button', { name: '检查本地环境' })).toBeDisabled();
+      expect(view.queryByText('守护服务：正常')).not.toBeInTheDocument();
+      await user.click(view.getByRole('button', { name: '连接与注册' }));
+      expect(view.getByText('本机 Core 状态不可用，暂时无法确认 Hub 连接。')).toBeInTheDocument();
+      expect(view.queryByText('已连接')).not.toBeInTheDocument();
     } finally {
       visibilityState.mockRestore();
     }
@@ -459,9 +485,16 @@ describe('App', () => {
     const view = within(app.container);
 
     expect(await view.findByRole('heading', { name: '本机 Core 状态不可用' })).toBeInTheDocument();
+    expect(view.getByText('状态不可用')).toHaveClass('offline');
+    expect(view.queryByText('已就绪，Hub 已连接')).not.toBeInTheDocument();
     expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
+    await user.click(view.getByRole('button', { name: '环境检查' }));
+    expect(view.getByText('运行模式：不可用')).toBeInTheDocument();
+    expect(view.getByRole('button', { name: '检查本地环境' })).toBeDisabled();
+    expect(view.getByText('本机 Core 状态不可用，请先重试。')).toBeInTheDocument();
     await user.click(view.getByRole('button', { name: '连接与注册' }));
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
+    expect(view.getByText('本机 Core 状态不可用，暂时无法确认 Hub 连接。')).toBeInTheDocument();
     expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
   });
 

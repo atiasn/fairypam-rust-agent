@@ -2,7 +2,7 @@ import type { UseQueryResult } from '@tanstack/react-query';
 
 import type { EnvironmentCheck, Overview } from '../lib/contracts';
 
-type Props = { environment: UseQueryResult<EnvironmentCheck>; overview: UseQueryResult<Overview> };
+type Props = { enabled: boolean; environment: UseQueryResult<EnvironmentCheck>; overview: UseQueryResult<Overview> };
 
 const checkLabels: Record<string, string> = {
   binary_or_task: '服务安装',
@@ -46,16 +46,17 @@ function runtimeLabel(runtime: string | undefined) {
   return runtime ? labels[runtime.toLowerCase()] ?? '正在确认' : '不可用';
 }
 
-export function DiagnosticsPage({ environment, overview }: Props) {
+export function DiagnosticsPage({ enabled, environment, overview }: Props) {
   return (
     <section className="status-card" aria-labelledby="diagnostics-heading">
       <h2 id="diagnostics-heading">环境检查</h2>
-      <p>状态：{serviceStateLabel(overview.data?.status.state)}</p>
-      <p>运行模式：{runtimeLabel(overview.data?.doctor.runtime)}</p>
-      <button disabled={environment.isFetching} onClick={() => void environment.refetch()} type="button">检查本地环境</button>
-      {environment.isFetching && <p>正在检查。</p>}
-      {environment.isError && <p role="status">环境检查失败。</p>}
-      {environment.data && (
+      <p>状态：{serviceStateLabel(enabled ? overview.data?.status.state : undefined)}</p>
+      <p>运行模式：{runtimeLabel(enabled ? overview.data?.doctor.runtime : undefined)}</p>
+      <button disabled={!enabled || environment.isFetching} onClick={() => void environment.refetch()} type="button">检查本地环境</button>
+      {!enabled && <p role="status">本机 Core 状态不可用，请先重试。</p>}
+      {enabled && environment.isFetching && <p>正在检查。</p>}
+      {enabled && environment.isError && <p role="status">环境检查失败。</p>}
+      {enabled && environment.data && (
         <ul className="check-list">
           {environment.data.checks.map((check) => (
             <li key={check.id}><strong>{checkLabels[check.id] ?? '服务项目'}</strong>：{checkStatusLabel(check.status)}</li>

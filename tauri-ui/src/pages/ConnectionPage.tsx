@@ -36,10 +36,12 @@ export function ConnectionPage({
 }: Props) {
   const [registrationStatus, setRegistrationStatus] = useState<'idle' | 'submitting' | 'submitted' | 'completed' | 'error'>('idle');
   const [registrationPendingAt, setRegistrationPendingAt] = useState(0);
+  const coreAvailable = (connection.availability === 'online' || connection.availability === 'emergency')
+    && overview.isSuccess;
   const status = useQuery({
     queryKey: queryKeys.connection,
     queryFn: agentApi.getConnectionStatus,
-    enabled: overview.isSuccess,
+    enabled: coreAvailable,
   });
   const queryClient = useQueryClient();
   const registrationReady = environment.data?.registration_ready === true;
@@ -118,9 +120,10 @@ export function ConnectionPage({
       />
       <section className="status-card" aria-labelledby="hub-connection-heading">
         <h2 id="hub-connection-heading">Hub 连接</h2>
-        {status.isLoading && <p>正在读取 Hub 连接状态。</p>}
-        {status.isError && <p role="status">服务正在恢复连接。</p>}
-        {status.data && (
+        {coreAvailable && status.isLoading && <p>正在读取 Hub 连接状态。</p>}
+        {coreAvailable && status.isError && <p role="status">服务正在恢复连接。</p>}
+        {!coreAvailable && <p role="status">本机 Core 状态不可用，暂时无法确认 Hub 连接。</p>}
+        {coreAvailable && status.data && (
           <dl>
             <dt>控制连接</dt><dd>{connectionStatusLabel(status.data.control)}</dd>
             <dt>画面传输</dt><dd>{connectionStatusLabel(status.data.frame)}</dd>

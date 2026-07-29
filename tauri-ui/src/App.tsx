@@ -52,10 +52,11 @@ export default function App() {
   const runtimeState = queries.overview.data?.status.state.toLowerCase();
   const taskActive = queries.overview.data?.status.task_active ?? false;
   const emergency = runtimeState === 'emergencystopped';
-  const agentReady = startup.isSuccess && !activationState && queries.overview.isSuccess;
-  const canChangeRuntime = agentReady
-    && canMutate(connection)
-    && runtimeState === 'connectedidle';
+  const coreObservable = startup.isSuccess
+    && !activationState
+    && queries.overview.isSuccess
+    && (connection.availability === 'online' || connection.availability === 'emergency');
+  const canChangeRuntime = coreObservable && canMutate(connection) && runtimeState === 'connectedidle';
   const refreshAgentState = useCallback(async () => {
     const startupResult = await startup.refetch();
     if (startupResult.isError) {
@@ -166,11 +167,13 @@ export default function App() {
   };
   const startupText = activationState === 'runtime-failed'
     ? '本机 Core 已停止'
-    : startupLabel(
-      startup.data?.status,
-      startup.isPending || activationState === 'pending',
-      activationState === 'failed' ? new Error('activation failed') : startup.error,
-    );
+    : !activationState && queries.overview.error
+      ? '状态不可用'
+      : startupLabel(
+        startup.data?.status,
+        startup.isPending || activationState === 'pending',
+        activationState === 'failed' ? new Error('activation failed') : startup.error,
+      );
   const statusTone = connection.availability === 'online'
     ? 'green'
     : connection.availability === 'offline' || connection.availability === 'emergency'
@@ -258,13 +261,15 @@ export default function App() {
           )}
           {!activationState && page === 'dashboard' && <DashboardPage {...common} />}
           {!activationState && page === 'connection' && <ConnectionPage {...common} />}
-          {!activationState && page === 'environment' && <DiagnosticsPage environment={queries.environment} overview={queries.overview} />}
-          {!activationState && page === 'logs' && <LogsPage enabled={agentReady} />}
+          {!activationState && page === 'environment' && (
+            <DiagnosticsPage enabled={coreObservable} environment={queries.environment} overview={queries.overview} />
+          )}
+          {!activationState && page === 'logs' && <LogsPage enabled={coreObservable} />}
           {!activationState && page === 'games' && (
             <GamesPage
               canStart={canChangeRuntime}
               emergency={emergency}
-              enabled={agentReady}
+              enabled={coreObservable}
               targetActive={runtimeState === 'targetlocked' && !taskActive}
             />
           )}
