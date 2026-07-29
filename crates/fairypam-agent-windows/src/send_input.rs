@@ -158,6 +158,7 @@ impl<G: GuardianClient> WindowsInput<G> {
         self.executor.apply_lease(lease, permit, now)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_physical_frame(
         &mut self,
         session: SessionKey,
