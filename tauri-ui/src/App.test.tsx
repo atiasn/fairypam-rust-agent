@@ -72,6 +72,7 @@ describe('App', () => {
       status: { state: 'ConnectedIdle', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' },
       doctor: { profiles: ['signed-profile'], runtime: 'production' },
     });
+    vi.mocked(agentApi.getConnectionStatus).mockResolvedValue({ control: 'connected', frame: 'connected', capture_active: false });
     vi.mocked(agentApi.getLogTail).mockResolvedValue({ entries: [] });
     vi.mocked(agentApi.scanInstalledGames).mockResolvedValue({ games: [] });
   });
@@ -90,13 +91,15 @@ describe('App', () => {
     }
   });
 
-  it('连接等待超时时仍以中文说明服务会继续恢复', async () => {
-    vi.mocked(agentApi.ensureLocalAgent).mockResolvedValueOnce({ status: 'hub_wait_timeout' });
+  it('启动快照不覆盖实时 Hub 状态', async () => {
+    vi.mocked(agentApi.getConnectionStatus).mockResolvedValueOnce({ control: 'disconnected', frame: 'disconnected', capture_active: false });
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByText('已就绪，Hub 重连中')).toBeInTheDocument();
-    expect(await view.findByText('Hub 正在重连，您仍可继续使用安全的本地功能。')).toBeInTheDocument();
+    expect(await view.findByText('已就绪')).toBeInTheDocument();
+    expect(await view.findByText('Hub 正在恢复连接，安全的本地功能仍可使用。')).toBeInTheDocument();
+    expect(view.queryByText('Hub 控制与画面连接已就绪。')).not.toBeInTheDocument();
+    expect(view.queryByText(/已就绪，Hub/)).not.toBeInTheDocument();
     expect(view.queryByText('服务启动需要处理')).not.toBeInTheDocument();
   });
 
@@ -104,19 +107,19 @@ describe('App', () => {
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByText('已就绪，Hub 已连接')).toBeInTheDocument();
+    expect(await view.findByText('已就绪')).toBeInTheDocument();
     await waitFor(() => expect(activation.handler).toBeTypeOf('function'));
     vi.mocked(agentApi.ensureLocalAgent).mockRejectedValueOnce(new Error('UAC denied'));
     await act(async () => activation.handler?.());
 
     expect(await view.findByText('服务启动需要处理')).toBeInTheDocument();
-    expect(view.queryByText('已就绪，Hub 已连接')).not.toBeInTheDocument();
+    expect(view.queryByText('已就绪')).not.toBeInTheDocument();
     expect(view.queryByRole('heading', { name: '本机 Core 已就绪' })).not.toBeInTheDocument();
     expect(view.queryByRole('button', { name: '重启后台服务' })).not.toBeInTheDocument();
     expect(view.queryByRole('button', { name: '修复后台服务' })).not.toBeInTheDocument();
     await userEvent.click(view.getByRole('button', { name: '重试启动' }));
     expect(await view.findByRole('heading', { name: '本机 Core 已就绪' })).toBeInTheDocument();
-    expect(view.getByText('已就绪，Hub 已连接')).toHaveClass('online');
+    expect(view.getByText('已就绪')).toHaveClass('online');
   });
 
   it('重复打开恢复期间隐藏旧状态，完成后恢复在线操作', async () => {
@@ -138,7 +141,7 @@ describe('App', () => {
 
     finishStartup!({ status: 'ready' });
 
-    const ready = await view.findByText('已就绪，Hub 已连接');
+    const ready = await view.findByText('已就绪');
     expect(ready).toHaveClass('online');
     expect(await view.findByRole('heading', { name: '本机 Core 已就绪' })).toBeInTheDocument();
     await userEvent.click(view.getByRole('button', { name: '连接与注册' }));
@@ -149,12 +152,12 @@ describe('App', () => {
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByText('已就绪，Hub 已连接')).toBeInTheDocument();
+    expect(await view.findByText('已就绪')).toBeInTheDocument();
     await waitFor(() => expect(runtimeFailure.handler).toBeTypeOf('function'));
     act(() => runtimeFailure.handler?.());
 
     expect(await view.findByRole('heading', { name: '本机 Core 已停止' })).toBeInTheDocument();
-    expect(view.queryByText('已就绪，Hub 已连接')).not.toBeInTheDocument();
+    expect(view.queryByText('已就绪')).not.toBeInTheDocument();
     expect(view.queryByRole('heading', { name: '本机 Core 已就绪' })).not.toBeInTheDocument();
   });
 
@@ -229,7 +232,7 @@ describe('App', () => {
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
     expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
     expect(await view.findByText('注册已完成，正在连接服务。')).toBeInTheDocument();
-    expect(await view.findByText('已就绪，Hub 已连接')).toBeInTheDocument();
+    expect(await view.findByText('已就绪')).toBeInTheDocument();
     expect(agentApi.ensureLocalAgent).toHaveBeenCalledTimes(2);
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
     expect(view.getByLabelText('服务地址')).toHaveValue('');
@@ -280,6 +283,8 @@ describe('App', () => {
 
     await user.click(view.getByRole('button', { name: '游戏' }));
     expect(await view.findByText('原神')).toBeInTheDocument();
+    expect(view.getByRole('button', { name: '启动并锁定' })).toBeDisabled();
+    expect(view.getByText('缺少匹配的签名 Profile，暂不可启动。')).toBeInTheDocument();
     expect(view.queryByText(/C:\\Games|YuanShen\.exe/)).not.toBeInTheDocument();
   });
 
@@ -413,7 +418,7 @@ describe('App', () => {
       await waitFor(() => expect(view.getByRole('button', { name: '更新截图' })).toBeDisabled());
       expect(view.getByRole('button', { name: '关闭游戏' })).toBeDisabled();
       await waitFor(() => expect(view.getByText('状态不可用')).toHaveClass('offline'));
-      expect(view.queryByText('已就绪，Hub 已连接')).not.toBeInTheDocument();
+      expect(view.queryByText('已就绪')).not.toBeInTheDocument();
       await user.click(view.getByRole('button', { name: '总览' }));
       expect(view.getByRole('heading', { name: '本机 Core 状态不可用' })).toBeInTheDocument();
       await user.click(view.getByRole('button', { name: '环境检查' }));
@@ -422,6 +427,27 @@ describe('App', () => {
       expect(view.queryByText('守护服务：正常')).not.toBeInTheDocument();
       await user.click(view.getByRole('button', { name: '连接与注册' }));
       expect(view.getByText('本机 Core 状态不可用，暂时无法确认 Hub 连接。')).toBeInTheDocument();
+      expect(view.queryByText('已连接')).not.toBeInTheDocument();
+    } finally {
+      visibilityState.mockRestore();
+    }
+  });
+
+  it('Hub 状态刷新失败时不显示缓存的已连接结果', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.getConnectionStatus)
+      .mockResolvedValueOnce({ control: 'connected', frame: 'connected', capture_active: false })
+      .mockRejectedValue(new Error('Hub status unavailable'));
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByText('Hub 控制与画面连接已就绪。')).toBeInTheDocument();
+    const visibilityState = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    try {
+      act(() => document.dispatchEvent(new Event('visibilitychange')));
+      expect(await view.findByText('Hub 连接状态暂时无法确认。')).toBeInTheDocument();
+      await user.click(view.getByRole('button', { name: '连接与注册' }));
+      expect(await view.findByText('服务正在恢复连接。')).toBeInTheDocument();
       expect(view.queryByText('已连接')).not.toBeInTheDocument();
     } finally {
       visibilityState.mockRestore();
@@ -486,7 +512,7 @@ describe('App', () => {
 
     expect(await view.findByRole('heading', { name: '本机 Core 状态不可用' })).toBeInTheDocument();
     expect(view.getByText('状态不可用')).toHaveClass('offline');
-    expect(view.queryByText('已就绪，Hub 已连接')).not.toBeInTheDocument();
+    expect(view.queryByText('已就绪')).not.toBeInTheDocument();
     expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
     await user.click(view.getByRole('button', { name: '环境检查' }));
     expect(view.getByText('运行模式：不可用')).toBeInTheDocument();

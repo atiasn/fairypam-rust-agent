@@ -2,20 +2,23 @@ import type { UseQueryResult } from '@tanstack/react-query';
 
 import { StatusPanel } from '../components/StatusPanel';
 import type { ConnectionState } from '../lib/connectionReducer';
-import type { Overview, SupportStatus } from '../lib/contracts';
+import type { ConnectionStatus, Overview, SupportStatus } from '../lib/contracts';
 
 type Props = {
   connection: ConnectionState;
+  hubStatus: UseQueryResult<ConnectionStatus>;
   overview: UseQueryResult<Overview>;
   startup: UseQueryResult<SupportStatus>;
   retryStartup: () => void;
 };
 
-function connectionSummary(status: string | undefined) {
-  if (status === 'ready') return 'Hub 控制与画面连接已就绪。';
-  if (status === 'agent_ready') return '尚未完成注册。请在“连接与注册”中继续。';
-  if (status === 'hub_wait_timeout') return 'Hub 正在重连，您仍可继续使用安全的本地功能。';
-  return '正在恢复 Hub 连接。';
+function connectionSummary(status: ConnectionStatus | undefined, failed: boolean) {
+  if (failed) return 'Hub 连接状态暂时无法确认。';
+  if (!status) return '正在确认 Hub 连接。';
+  if (status.control.toLowerCase() === 'connected' && status.frame.toLowerCase() === 'connected') {
+    return 'Hub 控制与画面连接已就绪。';
+  }
+  return 'Hub 正在恢复连接，安全的本地功能仍可使用。';
 }
 
 function serviceStateLabel(state: string) {
@@ -32,6 +35,7 @@ function serviceStateLabel(state: string) {
 
 export function DashboardPage({
   connection,
+  hubStatus,
   overview,
   startup,
   retryStartup,
@@ -72,7 +76,7 @@ export function DashboardPage({
       />
       <section className="status-card" aria-labelledby="startup-heading">
         <h2 id="startup-heading">Hub 连接摘要</h2>
-        <p>{connectionSummary(startup.data?.status)}</p>
+        <p>{connectionSummary(hubStatus.data, hubStatus.isError)}</p>
         <p>关闭窗口不会停止同一进程内的本机 Core。</p>
       </section>
     </>

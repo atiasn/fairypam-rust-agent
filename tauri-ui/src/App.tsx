@@ -23,7 +23,7 @@ const navigation: Array<{ id: Page; label: string; hint: string }> = [
   { id: 'games', label: '游戏', hint: '本机发现' },
 ];
 
-function startupLabel(status: string | undefined, isPending: boolean, error: unknown) {
+function startupLabel(isPending: boolean, error: unknown) {
   if (isPending) return '正在准备本机 Core';
   if (
     typeof error === 'object'
@@ -32,9 +32,6 @@ function startupLabel(status: string | undefined, isPending: boolean, error: unk
     && error.code === 'startup.agent_repair_required'
   ) return '本机 Core 需要修复';
   if (error) return '服务启动需要处理';
-  if (status === 'ready') return '已就绪，Hub 已连接';
-  if (status === 'hub_wait_timeout') return '已就绪，Hub 重连中';
-  if (status === 'agent_ready') return '已就绪，等待注册';
   return '已就绪';
 }
 
@@ -170,7 +167,6 @@ export default function App() {
     : !activationState && queries.overview.error
       ? '状态不可用'
       : startupLabel(
-        startup.data?.status,
         startup.isPending || activationState === 'pending',
         activationState === 'failed' ? new Error('activation failed') : startup.error,
       );
@@ -259,8 +255,8 @@ export default function App() {
           {emergencyResetFailed && (
             <p role="alert">清理尚未完成，保护状态保持不变。请再次执行紧急停止并释放输入后重试。</p>
           )}
-          {!activationState && page === 'dashboard' && <DashboardPage {...common} />}
-          {!activationState && page === 'connection' && <ConnectionPage {...common} />}
+          {!activationState && page === 'dashboard' && <DashboardPage {...common} hubStatus={queries.hubStatus} />}
+          {!activationState && page === 'connection' && <ConnectionPage {...common} status={queries.hubStatus} />}
           {!activationState && page === 'environment' && (
             <DiagnosticsPage enabled={coreObservable} environment={queries.environment} overview={queries.overview} />
           )}

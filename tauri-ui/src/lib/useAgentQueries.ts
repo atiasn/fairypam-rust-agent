@@ -36,6 +36,13 @@ export function useAgentQueries(enabled: boolean) {
     refetchInterval: registrationObservationInterval,
     refetchIntervalInBackground: false,
   });
+  const hubStatus = useQuery({
+    queryKey: queryKeys.connection,
+    queryFn: agentApi.getConnectionStatus,
+    enabled: enabled && overview.isSuccess,
+    refetchInterval: foregroundInterval,
+    refetchIntervalInBackground: false,
+  });
 
-  return { overview, environment };
+  return { overview, environment, hubStatus };
 }

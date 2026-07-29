@@ -1,10 +1,10 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
+import { useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 
 import { StatusPanel } from '../components/StatusPanel';
 import { agentApi } from '../lib/agentApi';
 import type { ConnectionState } from '../lib/connectionReducer';
-import type { EnvironmentCheck, Overview, SupportStatus } from '../lib/contracts';
+import type { ConnectionStatus, EnvironmentCheck, Overview, SupportStatus } from '../lib/contracts';
 import { queryKeys } from '../lib/queryKeys';
 
 type Props = {
@@ -12,6 +12,7 @@ type Props = {
   canMutate: boolean;
   environment: UseQueryResult<EnvironmentCheck>;
   overview: UseQueryResult<Overview>;
+  status: UseQueryResult<ConnectionStatus>;
   startup: UseQueryResult<SupportStatus>;
   retryStartup: () => void;
 };
@@ -31,6 +32,7 @@ export function ConnectionPage({
   connection,
   environment,
   overview,
+  status,
   startup,
   retryStartup,
 }: Props) {
@@ -38,11 +40,6 @@ export function ConnectionPage({
   const [registrationPendingAt, setRegistrationPendingAt] = useState(0);
   const coreAvailable = (connection.availability === 'online' || connection.availability === 'emergency')
     && overview.isSuccess;
-  const status = useQuery({
-    queryKey: queryKeys.connection,
-    queryFn: agentApi.getConnectionStatus,
-    enabled: coreAvailable,
-  });
   const queryClient = useQueryClient();
   const registrationReady = environment.data?.registration_ready === true;
   const registrationEnabled = canMutate
@@ -123,7 +120,7 @@ export function ConnectionPage({
         {coreAvailable && status.isLoading && <p>正在读取 Hub 连接状态。</p>}
         {coreAvailable && status.isError && <p role="status">服务正在恢复连接。</p>}
         {!coreAvailable && <p role="status">本机 Core 状态不可用，暂时无法确认 Hub 连接。</p>}
-        {coreAvailable && status.data && (
+        {coreAvailable && !status.isError && status.data && (
           <dl>
             <dt>控制连接</dt><dd>{connectionStatusLabel(status.data.control)}</dd>
             <dt>画面传输</dt><dd>{connectionStatusLabel(status.data.frame)}</dd>

@@ -72,11 +72,15 @@ export function GamesPage({ canStart, emergency, enabled, targetActive }: Props)
           <li key={game.discovery_id}>
             <strong>{game.name}</strong>{game.version ? ` ${game.version}` : ''}
             <span>已安装：{game.installed ? '是' : '否'}；支持：{game.supported ? '是' : '否'}</span>
-            {game.profile_id && (
-              <button disabled={!canStart || control.isPending || targetActive} onClick={() => launch(game.profile_id!)} type="button">
-                启动并锁定
-              </button>
-            )}
+            <button
+              disabled={!game.profile_id || !canStart || control.isPending || targetActive}
+              onClick={() => game.profile_id && launch(game.profile_id)}
+              type="button"
+            >
+              启动并锁定
+            </button>
+            {!game.installed && <span>游戏文件未就绪，暂不可启动。</span>}
+            {game.installed && !game.profile_id && <span>缺少匹配的签名 Profile，暂不可启动。</span>}
           </li>
         ))}
       </ul>
