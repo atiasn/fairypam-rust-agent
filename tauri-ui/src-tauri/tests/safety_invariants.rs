@@ -523,6 +523,8 @@ fn active_suite_pointer_is_verified_before_it_can_authorize_rollback() {
 #[test]
 fn installer_exposes_only_install_validation_and_stable_gui_launch() {
     assert!(INSTALLER_PROVISIONER.contains("(\"--launch-ui\", None) => launch_ui(install_root)"));
+    assert!(INSTALLER_PROVISIONER
+        .contains("(\"--prepare-ui-data\", None) => prepare_ui_data(install_root)"));
     for required in [
         "ShellExecuteExW",
         "SHELLEXECUTEINFOW",
@@ -535,6 +537,11 @@ fn installer_exposes_only_install_validation_and_stable_gui_launch() {
         );
     }
     let launcher = source_between(INSTALLER_PROVISIONER, "fn launch_ui(", "fn active_suite(");
+    assert!(launcher.contains("prepare_ui_data(install_root)?"));
+    assert!(
+        launcher.find("prepare_ui_data(install_root)?").unwrap()
+            < launcher.find("unsafe { ShellExecuteExW").unwrap()
+    );
     assert!(!launcher.contains("std::process::Command"));
     for forbidden in [
         "(\"--launch-agent-task\", None)",
@@ -550,6 +557,15 @@ fn installer_exposes_only_install_validation_and_stable_gui_launch() {
     }
     assert!(NSIS_HOOKS.contains("--provision \"$FairyPamInstallDir\""));
     assert!(NSIS_TEMPLATE.contains("--launch-ui \"$INSTDIR\""));
+    assert_eq!(
+        NSIS_TEMPLATE
+            .matches("nsis_tauri_utils::RunAsUser \"$INSTDIR\\resources\\runtime\\fairypam-agent-installer.exe\" '--launch-ui \"$INSTDIR\"'")
+            .count(),
+        2
+    );
+    assert!(!NSIS_TEMPLATE.contains(
+        "ExecWait '\"$INSTDIR\\resources\\runtime\\fairypam-agent-installer.exe\" --launch-ui"
+    ));
     assert!(!NSIS_TEMPLATE.contains("--run-ui-task \"$INSTDIR\""));
     assert!(!NSIS_TEMPLATE.contains("--remove-tasks \"$INSTDIR\""));
     assert!(!NSIS_HOOKS.contains("fairypam-agent.exe"));

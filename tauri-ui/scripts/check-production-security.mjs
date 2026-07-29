@@ -54,11 +54,11 @@ for (const required of [
   'runtime::start_embedded',
   'ProductionGateway::new(runtime)',
   'app.path().app_local_data_dir()?.join("webview")',
-  'let webview_impersonation = begin_webview_impersonation()?',
-  'TokenLinkedToken',
-  'ImpersonateLoggedOnUser',
-  'RevertToSelf',
-  'drop(webview_impersonation)',
+  'let webview_data_guard = pin_webview_data_root(&webview_data_root)?',
+  'FILE_FLAG_OPEN_REPARSE_POINT',
+  'FILE_FLAG_BACKUP_SEMANTICS',
+  'FILE_SHARE_READ | FILE_SHARE_WRITE',
+  'drop(webview_data_guard)',
   '.data_directory(webview_data_root)',
   '.incognito(true)',
   '.devtools(cfg!(debug_assertions))',
@@ -72,14 +72,14 @@ for (const required of [
 ]) {
   if (!app.includes(required)) fail(`missing single-process safety boundary ${required}`);
 }
-if (app.indexOf('.build()?;') > app.indexOf('drop(webview_impersonation)')) {
-  fail('standard-user impersonation must cover Tauri WebviewWindowBuilder::build');
+if (app.indexOf('.build()?;') > app.indexOf('drop(webview_data_guard)')) {
+  fail('the pinned UDF guard must cover Tauri WebviewWindowBuilder::build');
 }
 if (app.includes('std::fs::create_dir_all')) {
-  fail('the elevated host must delegate UDF creation to Tauri under impersonation');
+  fail('the elevated host must not create the ordinary-user UDF');
 }
-if (app.includes('DuplicateTokenEx')) {
-  fail('the UAC linked primary token must be impersonated directly');
+if (app.includes('ImpersonateLoggedOnUser') || app.includes('DuplicateTokenEx')) {
+  fail('the elevated host must not impersonate a linked token');
 }
 for (const required of [
   'for path in [&gui, &pointer]',

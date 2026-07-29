@@ -429,10 +429,7 @@ Var AppStartMenuFolder
 !insertmacro MUI_PAGE_FINISH
 
 Function RunMainBinary
-  ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --launch-ui "$INSTDIR"' $0
-  ${If} $0 != 0
-    MessageBox MB_OK|MB_ICONEXCLAMATION "FairyPam could not start the user interface (error $0). Use the installed shortcut to retry."
-  ${EndIf}
+  nsis_tauri_utils::RunAsUser "$INSTDIR\resources\runtime\fairypam-agent-installer.exe" '--launch-ui "$INSTDIR"'
 FunctionEnd
 
 ; Uninstaller Pages
@@ -682,10 +679,7 @@ Function .onInstSuccess
   ${OrIf} ${Silent}
     ${GetOptions} $CMDLINE "/R" $R0
     ${IfNot} ${Errors}
-      ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --launch-ui "$INSTDIR"' $0
-      ${If} $0 != 0
-        SetErrorLevel $0
-      ${EndIf}
+      nsis_tauri_utils::RunAsUser "$INSTDIR\resources\runtime\fairypam-agent-installer.exe" '--launch-ui "$INSTDIR"'
     ${EndIf}
   ${EndIf}
 FunctionEnd

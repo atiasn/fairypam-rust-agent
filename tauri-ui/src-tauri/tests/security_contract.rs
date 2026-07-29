@@ -29,11 +29,11 @@ fn production_configuration_is_elevated_and_least_privilege() {
     for required in [
         "verify_webview_environment()?",
         "app.path().app_local_data_dir()?.join(\"webview\")",
-        "let webview_impersonation = begin_webview_impersonation()?",
-        "TokenLinkedToken",
-        "ImpersonateLoggedOnUser",
-        "RevertToSelf",
-        "drop(webview_impersonation)",
+        "let webview_data_guard = pin_webview_data_root(&webview_data_root)?",
+        "FILE_FLAG_OPEN_REPARSE_POINT",
+        "FILE_FLAG_BACKUP_SEMANTICS",
+        "FILE_SHARE_READ | FILE_SHARE_WRITE",
+        "drop(webview_data_guard)",
         ".data_directory(webview_data_root)",
         ".incognito(true)",
         ".devtools(cfg!(debug_assertions))",
@@ -42,8 +42,13 @@ fn production_configuration_is_elevated_and_least_privilege() {
     ] {
         assert!(APP.contains(required));
     }
-    assert!(APP.find(".build()?;").unwrap() < APP.find("drop(webview_impersonation)").unwrap());
+    assert!(APP.find(".build()?;").unwrap() < APP.find("drop(webview_data_guard)").unwrap());
     assert!(!APP.contains("std::fs::create_dir_all"));
+    assert!(!APP.contains("ImpersonateLoggedOnUser"));
+    assert!(INSTALLER.contains("(\"--prepare-ui-data\", None) => prepare_ui_data(install_root)"));
+    assert!(INSTALLER.contains("prepare_webview_data_root()"));
+    assert!(INSTALLER.contains("std::fs::create_dir_all(&webview_root)"));
+    assert!(INSTALLER.contains("token_is_elevated()?"));
     assert!(!APP.contains("DuplicateTokenEx"));
     assert!(!ENROLLMENT.contains("WEBVIEW_ROOT"));
     assert!(!INSTALLER.contains("WEBVIEW_ROOT"));

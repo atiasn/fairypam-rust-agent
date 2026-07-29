@@ -15,15 +15,19 @@ const BLOCK_PAGE_SURFACES: &str = "for (const event of ['contextmenu', 'dragente
 const WEBVIEW_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-breakpad --disable-crash-reporter";
 
 #[cfg(windows)]
-struct ImpersonationGuard;
+struct PinnedDirectory(windows::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
-impl Drop for ImpersonationGuard {
+impl Drop for PinnedDirectory {
     fn drop(&mut self) {
-        if unsafe { windows::Win32::Security::RevertToSelf() }.is_err() {
-            std::process::abort();
-        }
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
     }
+}
+
+#[cfg(windows)]
+struct PinnedWebviewData {
+    _app_root: PinnedDirectory,
+    _webview_root: PinnedDirectory,
 }
 
 pub fn run() -> tauri::Result<()> {
@@ -87,25 +91,25 @@ pub fn run() -> tauri::Result<()> {
             #[cfg(windows)]
             let main_window = {
                 let webview_data_root = app.path().app_local_data_dir()?.join("webview");
-                let webview_impersonation = begin_webview_impersonation()?;
+                let webview_data_guard = pin_webview_data_root(&webview_data_root)?;
                 (
                     main_window
                         .data_directory(webview_data_root)
                         .incognito(true)
                         .devtools(cfg!(debug_assertions))
                         .additional_browser_args(WEBVIEW_BROWSER_ARGS),
-                    webview_impersonation,
+                    webview_data_guard,
                 )
             };
             #[cfg(windows)]
-            let (main_window, webview_impersonation) = main_window;
+            let (main_window, webview_data_guard) = main_window;
             let main_window = main_window
                 .on_navigation(allows_application_navigation)
                 .on_new_window(|_, _| NewWindowResponse::Deny)
                 .initialization_script(BLOCK_PAGE_SURFACES)
                 .build()?;
             #[cfg(windows)]
-            drop(webview_impersonation);
+            drop(webview_data_guard);
             disable_default_context_menu(&main_window);
             #[cfg(windows)]
             {
@@ -223,50 +227,54 @@ fn verify_webview_environment() -> tauri::Result<()> {
 }
 
 #[cfg(windows)]
-fn begin_webview_impersonation() -> tauri::Result<ImpersonationGuard> {
-    use windows::Win32::{
-        Foundation::{CloseHandle, HANDLE},
-        Security::{
-            GetTokenInformation, ImpersonateLoggedOnUser, TokenLinkedToken, TOKEN_LINKED_TOKEN,
-            TOKEN_QUERY,
-        },
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
-    };
-
-    struct OwnedHandle(HANDLE);
-
-    impl Drop for OwnedHandle {
-        fn drop(&mut self) {
-            let _ = unsafe { CloseHandle(self.0) };
-        }
-    }
-
-    let mut process_token = HANDLE::default();
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut process_token) }
-        .map_err(webview_token_error)?;
-    let _process_token = OwnedHandle(process_token);
-    let mut linked_token = TOKEN_LINKED_TOKEN::default();
-    let mut returned_length = 0;
-    unsafe {
-        GetTokenInformation(
-            process_token,
-            TokenLinkedToken,
-            Some(std::ptr::from_mut(&mut linked_token).cast()),
-            std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
-            &mut returned_length,
-        )
-    }
-    .map_err(webview_token_error)?;
-    let linked_token = OwnedHandle(linked_token.LinkedToken);
-    unsafe { ImpersonateLoggedOnUser(linked_token.0) }.map_err(webview_token_error)?;
-    Ok(ImpersonationGuard)
+fn pin_webview_data_root(path: &std::path::Path) -> tauri::Result<PinnedWebviewData> {
+    let app_root = path.parent().ok_or_else(webview_data_error)?;
+    Ok(PinnedWebviewData {
+        _app_root: pin_directory(app_root)?,
+        _webview_root: pin_directory(path)?,
+    })
 }
 
 #[cfg(windows)]
-fn webview_token_error(error: windows::core::Error) -> tauri::Error {
-    tauri::Error::Io(std::io::Error::other(format!(
-        "unable to prepare the WebView2 data directory as the standard user: {error}"
-    )))
+fn pin_directory(path: &std::path::Path) -> tauri::Result<PinnedDirectory> {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+
+    let handle = unsafe {
+        CreateFileW(
+            &HSTRING::from(path.to_string_lossy().as_ref()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|_| webview_data_error())?;
+    let directory = PinnedDirectory(handle);
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(directory.0, &mut information) }
+        .map_err(|_| webview_data_error())?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+    {
+        return Err(webview_data_error());
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn webview_data_error() -> tauri::Error {
+    tauri::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "WebView2 data directory must be prepared by the standard-user launcher",
+    ))
 }
 
 fn allows_application_navigation(url: &tauri::Url) -> bool {

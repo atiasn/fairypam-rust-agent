@@ -21,6 +21,7 @@ fn main() {
                 ("--preflight", None) => preflight(install_root),
                 ("--provision", None) => with_install_transaction(|| provision(install_root)),
                 ("--verify-installed-state", None) => installed_preflight(install_root),
+                ("--prepare-ui-data", None) => prepare_ui_data(install_root),
                 ("--launch-ui", None) => launch_ui(install_root),
                 _ => Err(ProvisionFailure::InstallRoots),
             }
@@ -131,7 +132,7 @@ fn launch_ui(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    prepare_ui_data(install_root)?;
     let active = active_suite(install_root)?;
     let gui = active.version_root.join("fairypam-agent-tauri-ui.exe");
     let verb = HSTRING::from("runas");
@@ -152,6 +153,40 @@ fn launch_ui(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     }
     let _ = unsafe { CloseHandle(execute.hProcess) };
     Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_ui_data(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
+    prepare_webview_data_root().map_err(|_| ProvisionFailure::Launch)
+}
+
+#[cfg(windows)]
+fn prepare_webview_data_root() -> Result<(), ()> {
+    let app_root = local_app_data()?.join("app.fairypam.agent.ui");
+    let webview_root = app_root.join("webview");
+    if !token_is_elevated()? {
+        std::fs::create_dir_all(&webview_root).map_err(|_| ())?;
+    }
+    verify_nonreparse_directory(&app_root)?;
+    verify_nonreparse_directory(&webview_root)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn local_app_data() -> Result<std::path::PathBuf, ()> {
+    use windows::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
+    };
+
+    let path = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None) }
+        .map_err(|_| ())?;
+    let result = unsafe { path.to_string() }
+        .map(std::path::PathBuf::from)
+        .map_err(|_| ());
+    unsafe { CoTaskMemFree(Some(path.0.cast())) };
+    result
 }
 
 #[cfg(windows)]
@@ -1062,6 +1097,11 @@ fn write_capable_rights(rights: &str) -> bool {
 
 #[cfg(windows)]
 fn ensure_elevated() -> Result<(), ()> {
+    token_is_elevated()?.then_some(()).ok_or(())
+}
+
+#[cfg(windows)]
+fn token_is_elevated() -> Result<bool, ()> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
@@ -1083,7 +1123,7 @@ fn ensure_elevated() -> Result<(), ()> {
     };
     let _ = unsafe { CloseHandle(token) };
     result.map_err(|_| ())?;
-    (elevation.TokenIsElevated != 0).then_some(()).ok_or(())
+    Ok(elevation.TokenIsElevated != 0)
 }
 
 #[cfg(test)]
