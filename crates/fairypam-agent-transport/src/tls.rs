@@ -1026,10 +1026,13 @@ fn cng_key_security_matches(
             "CNG key security descriptor cannot be verified",
         ));
     }
-    let value = String::from_utf16(unsafe {
-        std::slice::from_raw_parts(text, text_length.saturating_sub(1) as usize)
-    })
-    .map_err(|_| identity_invalid("CNG key security descriptor cannot be verified"));
+    let text_slice = unsafe { std::slice::from_raw_parts(text, text_length as usize) };
+    let text_slice = &text_slice[..text_slice
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(text_slice.len())];
+    let value = String::from_utf16(text_slice)
+        .map_err(|_| identity_invalid("CNG key security descriptor cannot be verified"));
     let _ = unsafe { LocalFree(text.cast()) };
     value.and_then(|value| {
         if cng_security_sddl_matches(&value, authorized_user_sid) {
