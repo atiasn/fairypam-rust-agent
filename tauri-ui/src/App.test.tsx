@@ -132,8 +132,7 @@ describe('App', () => {
 
     act(() => activation.handler?.());
 
-    expect(await view.findByText('正在准备本机 Core')).toBeInTheDocument();
-    expect(view.getByRole('heading', { name: '正在准备本机 Core' })).toBeInTheDocument();
+    expect(await view.findByRole('heading', { name: '正在准备本机 Core' })).toBeInTheDocument();
     expect(view.queryByRole('heading', { name: '本机 Core 已就绪' })).not.toBeInTheDocument();
     expect(view.queryByText(/运行状态：/)).not.toBeInTheDocument();
 
@@ -377,11 +376,11 @@ describe('App', () => {
 
   it('重新打开游戏页时从 Core 锁定状态恢复设备控制', async () => {
     const user = userEvent.setup();
-    vi.mocked(agentApi.getOverview).mockResolvedValueOnce({
+    vi.mocked(agentApi.getOverview).mockReset().mockResolvedValue({
       status: { state: 'TargetLocked', task_active: false, capture_active: true, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'active' },
       doctor: { profiles: ['signed-profile'], runtime: 'production' },
     });
-    vi.mocked(agentApi.scanInstalledGames).mockResolvedValueOnce({
+    vi.mocked(agentApi.scanInstalledGames).mockReset().mockResolvedValue({
       games: [{ discovery_id: 'mihoyo:stable-id', name: '原神', version: null, installed: true, supported: true, profile_id: 'signed-profile' }],
     });
     const app = renderApp();
