@@ -52,8 +52,7 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Security::{
-    GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR,
+    GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
 };
 use x509_parser::extensions::GeneralName;
 use x509_parser::pem::parse_x509_pem;
@@ -650,7 +649,7 @@ pub fn create_cng_machine_key(
     let bits = 2048_u32;
     let export_policy = 0_u32;
     let usage = NCRYPT_ALLOW_SIGNING_FLAG;
-    let security_flags = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let security_flags = DACL_SECURITY_INFORMATION;
     let result = (|| {
         set_cng_property(&key, NCRYPT_LENGTH_PROPERTY, &bits.to_ne_bytes(), 0)?;
         set_cng_property(
@@ -919,7 +918,7 @@ fn set_cng_property(
 #[cfg(windows)]
 fn cng_security_descriptor(authorized_user_sid: &str) -> Result<Vec<u8>, TransportError> {
     validate_windows_sid(authorized_user_sid)?;
-    let sddl = format!("O:SYD:P(A;;GA;;;SY)(A;;GA;;;{authorized_user_sid})");
+    let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{authorized_user_sid})");
     let wide = sddl.encode_utf16().chain([0]).collect::<Vec<_>>();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     if unsafe {
@@ -966,7 +965,7 @@ fn cng_key_security_matches(
     authorized_user_sid: &str,
 ) -> Result<bool, TransportError> {
     validate_windows_sid(authorized_user_sid)?;
-    let flags = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let flags = DACL_SECURITY_INFORMATION;
     let mut size = 0_u32;
     if unsafe {
         NCryptGetProperty(
@@ -1030,9 +1029,10 @@ fn cng_key_security_matches(
 
 #[cfg(any(windows, test))]
 fn cng_security_sddl_matches(value: &str, authorized_user_sid: &str) -> bool {
-    let system_first = format!("O:SYD:P(A;;GA;;;SY)(A;;GA;;;{authorized_user_sid})");
-    let user_first = format!("O:SYD:P(A;;GA;;;{authorized_user_sid})(A;;GA;;;SY)");
-    value == system_first || value == user_first
+    ["P", "PAI"].into_iter().any(|flags| {
+        value == format!("D:{flags}(A;;GA;;;SY)(A;;GA;;;{authorized_user_sid})")
+            || value == format!("D:{flags}(A;;GA;;;{authorized_user_sid})(A;;GA;;;SY)")
+    })
 }
 
 #[cfg(any(windows, test))]
@@ -1398,17 +1398,17 @@ mod tests {
     fn cng_key_dacl_is_exactly_system_and_the_enrolling_user() {
         const USER: &str = "S-1-5-21-1-2-3-1001";
         assert!(cng_security_sddl_matches(
-            "O:SYD:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
+            "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
             USER,
         ));
         assert!(cng_security_sddl_matches(
-            "O:SYD:P(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GA;;;SY)",
+            "D:PAI(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GA;;;SY)",
             USER,
         ));
         for rejected in [
-            "O:BAD:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
-            "O:SYD:AI(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
-            "O:SYD:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GR;;;BU)",
+            "D:AI(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
+            "D:PAI(A;ID;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
+            "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GR;;;BU)",
         ] {
             assert!(!cng_security_sddl_matches(rejected, USER));
         }
