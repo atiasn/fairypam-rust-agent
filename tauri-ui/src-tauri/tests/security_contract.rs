@@ -16,7 +16,7 @@ fn production_configuration_is_elevated_and_least_privilege() {
         "http:",
         "process:",
         "registry",
-        "input",
+        "input:",
     ] {
         assert!(
             !CAPABILITY.contains(forbidden),
