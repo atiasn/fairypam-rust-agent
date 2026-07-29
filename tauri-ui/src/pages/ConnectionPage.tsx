@@ -9,7 +9,6 @@ import { queryKeys } from '../lib/queryKeys';
 
 type Props = {
   connection: ConnectionState;
-  canMutate: boolean;
   environment: UseQueryResult<EnvironmentCheck>;
   overview: UseQueryResult<Overview>;
   status: UseQueryResult<ConnectionStatus>;
@@ -28,7 +27,6 @@ function connectionStatusLabel(status: string) {
 }
 
 export function ConnectionPage({
-  canMutate,
   connection,
   environment,
   overview,
@@ -42,7 +40,7 @@ export function ConnectionPage({
     && overview.isSuccess;
   const queryClient = useQueryClient();
   const registrationReady = environment.data?.registration_ready === true;
-  const registrationEnabled = canMutate
+  const registrationEnabled = connection.availability === 'online'
     && overview.isSuccess
     && startup.isSuccess
     && environment.isSuccess

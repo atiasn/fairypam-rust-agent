@@ -659,15 +659,15 @@ pub fn create_cng_machine_key(
             0,
         )?;
         set_cng_property(&key, NCRYPT_KEY_USAGE_PROPERTY, &usage.to_ne_bytes(), 0)?;
+        if unsafe { NCryptFinalizeKey(key.inner(), NCRYPT_SILENT_FLAG) } != 0 {
+            return Err(identity_invalid("CNG machine key finalization failed"));
+        }
         set_cng_property(
             &key,
             NCRYPT_SECURITY_DESCR_PROPERTY,
             &descriptor,
             security_flags,
         )?;
-        if unsafe { NCryptFinalizeKey(key.inner(), NCRYPT_SILENT_FLAG) } != 0 {
-            return Err(identity_invalid("CNG machine key finalization failed"));
-        }
         validate_cng_key_policy(&key, authorized_user_sid)
     })();
     if result.is_err() {
@@ -1049,8 +1049,11 @@ fn cng_key_security_matches(
 #[cfg(any(windows, test))]
 fn cng_security_sddl_matches(value: &str, authorized_user_sid: &str) -> bool {
     ["P", "PAI"].into_iter().any(|flags| {
-        value == format!("D:{flags}(A;;GA;;;SY)(A;;GA;;;{authorized_user_sid})")
-            || value == format!("D:{flags}(A;;GA;;;{authorized_user_sid})(A;;GA;;;SY)")
+        ["GA", "0x1f019b"].into_iter().any(|rights| {
+            value == format!("D:{flags}(A;;{rights};;;SY)(A;;{rights};;;{authorized_user_sid})")
+                || value
+                    == format!("D:{flags}(A;;{rights};;;{authorized_user_sid})(A;;{rights};;;SY)")
+        })
     })
 }
 
@@ -1479,10 +1482,15 @@ mod tests {
             "D:PAI(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GA;;;SY)",
             USER,
         ));
+        assert!(cng_security_sddl_matches(
+            "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)",
+            USER,
+        ));
         for rejected in [
             "D:AI(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
             "D:PAI(A;ID;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
             "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GR;;;BU)",
+            "D:P(A;;0x1f019a;;;SY)(A;;0x1f019a;;;S-1-5-21-1-2-3-1001)",
         ] {
             assert!(!cng_security_sddl_matches(rejected, USER));
         }

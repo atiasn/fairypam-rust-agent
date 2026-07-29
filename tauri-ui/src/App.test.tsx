@@ -214,6 +214,11 @@ describe('App', () => {
 
   it('显示中文服务状态并直接提交注册，不回显提交内容', async () => {
     const user = userEvent.setup();
+    vi.mocked(agentApi.getOverview).mockResolvedValue({
+      status: { state: 'Disconnected', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' },
+      doctor: { profiles: ['signed-profile'], runtime: 'production' },
+    });
+    vi.mocked(agentApi.getConnectionStatus).mockResolvedValue({ control: 'disconnected', frame: 'disconnected', capture_active: false });
     vi.mocked(agentApi.ensureLocalAgent)
       .mockResolvedValueOnce({ status: 'agent_ready' })
       .mockResolvedValueOnce({ status: 'ready' });
