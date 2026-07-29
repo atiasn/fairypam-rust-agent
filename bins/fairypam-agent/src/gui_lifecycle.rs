@@ -1,8 +1,6 @@
 use std::sync::{Arc, Mutex};
 
 use fairypam_agent_core::AgentError;
-#[cfg(windows)]
-use fairypam_agent_windows::VerifiedGuiOwner;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,21 +123,6 @@ impl GuiLifetime {
         Ok(())
     }
 
-    #[cfg(windows)]
-    #[cfg_attr(test, allow(dead_code))]
-    pub fn bind_verified(&self, owner: VerifiedGuiOwner) -> Result<(), AgentError> {
-        let pid = owner.pid();
-        self.state.lock().map_err(lock_error)?.bind(pid)?;
-        if let Err(error) = self.watch_verified_process(owner) {
-            self.shutdown.cancel();
-            if let Ok(mut lifecycle) = self.state.lock() {
-                lifecycle.watcher_failed(pid);
-            }
-            return Err(error);
-        }
-        Ok(())
-    }
-
     #[cfg_attr(test, allow(dead_code))]
     pub fn confirm_bound(&self, pid: u32) -> Result<(), AgentError> {
         self.state
@@ -171,37 +154,6 @@ impl GuiLifetime {
     #[cfg_attr(test, allow(dead_code))]
     pub fn exit_reason(&self) -> Result<Option<GuiExitReason>, AgentError> {
         Ok(self.state.lock().map_err(lock_error)?.exit_reason())
-    }
-
-    #[cfg(windows)]
-    #[cfg_attr(test, allow(dead_code))]
-    fn watch_verified_process(&self, owner: VerifiedGuiOwner) -> Result<(), AgentError> {
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::{
-            Foundation::{HANDLE, WAIT_OBJECT_0},
-            System::Threading::{WaitForSingleObject, INFINITE},
-        };
-
-        let (pid, process) = owner.into_parts();
-        let state = Arc::clone(&self.state);
-        let shutdown = self.shutdown.clone();
-        std::thread::Builder::new()
-            .name("fairypam-gui-lifetime".to_owned())
-            .spawn(move || {
-                let handle = HANDLE(process.as_raw_handle());
-                // SAFETY: this is the same owned process handle used for GUI authentication.
-                let exited = unsafe { WaitForSingleObject(handle, INFINITE) } == WAIT_OBJECT_0;
-                if let Ok(mut lifecycle) = state.lock() {
-                    if exited {
-                        lifecycle.process_exited(pid);
-                    } else {
-                        lifecycle.watcher_failed(pid);
-                    }
-                }
-                shutdown.cancel();
-            })
-            .map_err(|error| AgentError::new("local.lifecycle.watch_failed", error.to_string()))?;
-        Ok(())
     }
 
     #[cfg(test)]
