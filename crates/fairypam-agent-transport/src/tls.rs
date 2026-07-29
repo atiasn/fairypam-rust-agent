@@ -361,6 +361,7 @@ fn identity_key_error(error: rustls::Error) -> TransportError {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn verify_agent_uri_san(
     certificate_pem: &[u8],
     agent_id: &str,
@@ -1037,10 +1038,12 @@ fn cng_security_sddl_matches(value: &str, authorized_user_sid: &str) -> bool {
 #[cfg(any(windows, test))]
 fn validate_windows_sid(value: &str) -> Result<(), TransportError> {
     if value.len() > 184
-        || !value.starts_with("S-1-")
-        || value
-            .bytes()
-            .any(|byte| !(byte.is_ascii_digit() || byte == b'-'))
+        || value.strip_prefix("S-1-").is_none_or(|suffix| {
+            suffix.is_empty()
+                || !suffix.split('-').all(|component| {
+                    !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
     {
         return Err(identity_invalid("invalid authorized Windows SID"));
     }
@@ -1408,6 +1411,17 @@ mod tests {
             "O:SYD:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GR;;;BU)",
         ] {
             assert!(!cng_security_sddl_matches(rejected, USER));
+        }
+    }
+
+    #[test]
+    fn windows_sid_validation_rejects_sddl_injection() {
+        assert!(validate_windows_sid("S-1-5-21-1-2-3-1001").is_ok());
+        for rejected in ["S-1-", "S-1-5--21", "S-1-5)(A;;GA;;;BU"] {
+            assert_eq!(
+                validate_windows_sid(rejected).unwrap_err().code(),
+                "transport.identity_invalid"
+            );
         }
     }
 
