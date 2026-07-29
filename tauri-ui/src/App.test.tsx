@@ -359,6 +359,32 @@ describe('App', () => {
     expect(view.queryByRole('alert')).not.toBeInTheDocument();
   });
 
+  it('托盘事件丢失时仍以当前 Core 状态解除黏滞保护', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.getOverview)
+      .mockResolvedValueOnce({
+        status: { state: 'EmergencyStopped', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'emergency_stopped' },
+        doctor: { profiles: ['signed-profile'], runtime: 'production' },
+      })
+      .mockResolvedValue({
+        status: { state: 'ConnectedIdle', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' },
+        doctor: { profiles: ['signed-profile'], runtime: 'production' },
+      });
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByRole('heading', { name: '本机 Core 处于保护状态' })).toBeInTheDocument();
+    const visibilityState = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    try {
+      act(() => document.dispatchEvent(new Event('visibilitychange')));
+      expect(await view.findByRole('heading', { name: '本机 Core 已就绪' })).toBeInTheDocument();
+      await user.click(view.getByRole('button', { name: '连接与注册' }));
+      expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
+    } finally {
+      visibilityState.mockRestore();
+    }
+  });
+
   it('活动任务期间保留只读页面并禁用新的本地游戏启动', async () => {
     const user = userEvent.setup();
     vi.mocked(agentApi.getOverview).mockResolvedValueOnce({

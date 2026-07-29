@@ -108,8 +108,12 @@ export default function App() {
   useEffect(() => {
     if (emergency) {
       dispatch({ type: 'ExplicitEmergency', code: 'agent.guardian.emergency' });
+    } else if (connection.availability === 'emergency' && queries.overview.isSuccess) {
+      setEmergencyResetFailed(false);
+      dispatch({ type: 'Reset' });
+      dispatch({ type: 'QuerySucceeded' });
     }
-  }, [dispatch, emergency]);
+  }, [connection.availability, dispatch, emergency, queries.overview.isSuccess]);
 
   const refreshAfterEmergencyReset = useCallback(async () => {
     const overviewResult = await queries.overview.refetch();
