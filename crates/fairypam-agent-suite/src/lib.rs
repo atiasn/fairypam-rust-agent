@@ -430,6 +430,7 @@ fn reject_forbidden_executables(
                 .to_ascii_lowercase();
             if is_executable_member(&relative)
                 && !allowed_product_executable(&relative)
+                && relative != "uninstall.exe"
                 && entry.path() != bootstrap_helper
             {
                 return Err(SuiteError::new(
@@ -713,6 +714,7 @@ mod tests {
             .join(".fairypam-installer/payload/resources/runtime/fairypam-agent-installer.exe");
         fs::create_dir_all(bootstrap_helper.parent().unwrap()).unwrap();
         fs::write(&bootstrap_helper, b"helper").unwrap();
+        fs::write(directory.join("uninstall.exe"), b"uninstaller").unwrap();
 
         validate_flat_layout(&directory, &manifest, &bootstrap_helper).unwrap();
         fs::write(directory.join("unexpected.exe"), b"unexpected").unwrap();
