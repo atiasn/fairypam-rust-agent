@@ -443,7 +443,7 @@ impl RuntimeLogMessage {
     const fn text(self) -> &'static str {
         match self {
             Self::AwaitingRegistration => "本机 Core 正在等待完成安全注册",
-            Self::Started => "本机 Core 已启动，正在准备 Hub 连接",
+            Self::Started => "本机 Core 已启动，正在准备远程连接",
             Self::ControlConnectionStarting => "正在建立服务连接",
             Self::ControlConnectionEstablished => "服务连接已建立",
             Self::FrameConnectionEstablished => "画面服务已准备就绪",
