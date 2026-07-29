@@ -1,10 +1,11 @@
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 
 import { agentApi } from '../lib/agentApi';
 import { queryKeys } from '../lib/queryKeys';
 
 export function GamesPage({ enabled }: { enabled: boolean }) {
+  const queryClient = useQueryClient();
   const games = useQuery({ queryKey: queryKeys.games, queryFn: agentApi.scanInstalledGames, enabled });
   const [activeProfile, setActiveProfile] = useState<string>();
   const [previewUrl, setPreviewUrl] = useState<string>();
@@ -13,6 +14,17 @@ export function GamesPage({ enabled }: { enabled: boolean }) {
     mutationFn: async (operation: () => Promise<string>) => operation(),
     onSuccess: (value) => setMessage(value),
     onError: () => setMessage('操作失败，请确认游戏处于前台且当前 Profile 允许此操作。'),
+  });
+  const emergencyStop = useMutation({
+    mutationFn: agentApi.releaseAll,
+    onSuccess: (released) => {
+      setActiveProfile(undefined);
+      setMessage(!released.cleanup_complete
+        ? '紧急停止未完全收口，请保持程序运行并联系管理员。'
+        : '已紧急停止并释放全部输入。');
+    },
+    onError: () => setMessage('紧急停止结果无法确认。请保持 FairyPam 运行、停止操作游戏并联系管理员。'),
+    onSettled: () => void queryClient.invalidateQueries({ queryKey: queryKeys.overview }),
   });
 
   useEffect(() => () => {
@@ -75,6 +87,7 @@ export function GamesPage({ enabled }: { enabled: boolean }) {
       )}
       {message && <p role="status">{message}</p>}
       {previewUrl && <img className="game-preview" src={previewUrl} alt="当前游戏窗口截图" />}
+      <button disabled={control.isPending || emergencyStop.isPending} onClick={() => emergencyStop.mutate()} type="button">紧急停止并释放输入</button>
       <p className="notice">启动功能只会使用已识别的游戏，不会读取或显示任意程序路径。</p>
     </section>
   );

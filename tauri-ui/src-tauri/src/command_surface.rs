@@ -8,6 +8,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "close_game",
     "capture_preview",
     "input_probe",
+    "release_all",
     "register_hub",
     "ensure_local_agent",
 ];

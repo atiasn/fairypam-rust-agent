@@ -11,6 +11,13 @@ pub enum LogLevel {
     Info,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputProbeAction {
+    MoveForward,
+    QuickUse,
+    MouseLeft,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeCommand {
     Status,
@@ -48,12 +55,8 @@ pub enum RuntimeCommand {
     },
     CloseTarget,
     CapturePreview,
-    InputKeyPulse {
-        scan_code: u16,
-        extended: bool,
-    },
-    InputMouseClick {
-        button: i32,
+    InputProbe {
+        action: InputProbeAction,
     },
     ShutdownAgent,
     RegisterHub {

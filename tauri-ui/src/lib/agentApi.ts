@@ -11,6 +11,7 @@ import type {
   LogTail,
   Overview,
   PreviewDto,
+  ReleaseAll,
   RegistrationStatus,
   SupportStatus,
 } from './contracts';
@@ -35,6 +36,7 @@ export const agentApi = {
   capturePreview: () => invoke<PreviewDto>('capture_preview'),
   inputProbe: (action: 'move_forward' | 'quick_use' | 'mouse_left') =>
     invoke<InputResult>('input_probe', { action }),
+  releaseAll: () => invoke<ReleaseAll>('release_all'),
   registerHub: (hubAddress: string, registrationCode: string) =>
     invoke<RegistrationStatus>('register_hub', { hubAddress, registrationCode }),
 };

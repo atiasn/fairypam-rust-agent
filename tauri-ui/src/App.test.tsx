@@ -30,6 +30,7 @@ vi.mock('./lib/agentApi', () => ({
     closeGame: vi.fn().mockResolvedValue({ profile_id: 'signed-profile', closed: true, state: 'ConnectedIdle' }),
     capturePreview: vi.fn().mockResolvedValue({ mime_type: 'image/jpeg', width: 1, height: 1, bytes: [1] }),
     inputProbe: vi.fn().mockResolvedValue({ state: 'released' }),
+    releaseAll: vi.fn().mockResolvedValue({ state: 'EmergencyStopped', holds: 0, cleanup_complete: true, error_code: null }),
     registerHub: vi.fn().mockResolvedValue({ status: 'pending' }),
   },
 }));
@@ -276,6 +277,33 @@ describe('App', () => {
     expect(agentApi.inputProbe).toHaveBeenCalledWith('move_forward');
     await user.click(view.getByRole('button', { name: '关闭游戏' }));
     expect(agentApi.closeGame).toHaveBeenCalledOnce();
+    await user.click(view.getByRole('button', { name: '紧急停止并释放输入' }));
+    expect(agentApi.releaseAll).toHaveBeenCalledOnce();
+    expect(await view.findByText('已紧急停止并释放全部输入。')).toBeInTheDocument();
+  });
+
+  it('紧急停止结果未知时提示保持程序运行', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.releaseAll).mockRejectedValueOnce(new Error('unknown cleanup state'));
+    const app = renderApp();
+    const view = within(app.container);
+
+    await user.click(view.getByRole('button', { name: '游戏' }));
+    await user.click(view.getByRole('button', { name: '紧急停止并释放输入' }));
+
+    expect(await view.findByText('紧急停止结果无法确认。请保持 FairyPam 运行、停止操作游戏并联系管理员。')).toBeInTheDocument();
+  });
+
+  it('紧急停止未完全收口时保持安全警告', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.releaseAll).mockResolvedValueOnce({ state: 'EmergencyStopped', holds: 0, cleanup_complete: false, error_code: 'cleanup_incomplete' });
+    const app = renderApp();
+    const view = within(app.container);
+
+    await user.click(view.getByRole('button', { name: '游戏' }));
+    await user.click(view.getByRole('button', { name: '紧急停止并释放输入' }));
+
+    expect(await view.findByText('紧急停止未完全收口，请保持程序运行并联系管理员。')).toBeInTheDocument();
   });
 
   it('未知运行模式保持中性中文状态', async () => {

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 #[cfg(windows)]
 use fairypam_agent::runtime::EmbeddedRuntimeHandle;
-use fairypam_agent::runtime_api::{LogLevel, RuntimeCommand as LocalCommand};
+use fairypam_agent::runtime_api::{InputProbeAction, LogLevel, RuntimeCommand as LocalCommand};
 use fairypam_agent_core::AgentError;
 #[cfg(windows)]
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use tokio::sync::MutexGuard;
 
 use crate::dto::{
     ClosedGameDto, ConnectionStatusDto, EnvironmentCheckDto, InputResultDto, InstalledGamesDto,
-    LaunchedGameDto, LogTailDto, OverviewDto, PreviewDto, RegistrationStatusDto,
+    LaunchedGameDto, LogTailDto, OverviewDto, PreviewDto, RegistrationStatusDto, ReleaseAllDto,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -174,20 +174,15 @@ impl ProductionGateway {
         self.request(LocalCommand::CapturePreview).await
     }
 
-    pub async fn input_key_pulse(
+    pub async fn input_probe(
         &self,
-        scan_code: u16,
-        extended: bool,
+        action: InputProbeAction,
     ) -> Result<InputResultDto, UiCommandError> {
-        self.request(LocalCommand::InputKeyPulse {
-            scan_code,
-            extended,
-        })
-        .await
+        self.request(LocalCommand::InputProbe { action }).await
     }
 
-    pub async fn input_mouse_click(&self, button: i32) -> Result<InputResultDto, UiCommandError> {
-        self.request(LocalCommand::InputMouseClick { button }).await
+    pub async fn release_all(&self) -> Result<ReleaseAllDto, UiCommandError> {
+        self.request(LocalCommand::ReleaseAll).await
     }
 
     pub async fn register_hub(
@@ -261,11 +256,29 @@ fn decode_response<T: DeserializeOwned>(response: serde_json::Value) -> Result<T
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use fairypam_agent::runtime::EmbeddedRuntimeHandle;
     use fairypam_agent_core::AgentError;
     use serde_json::json;
 
     use super::{decode_response, UiCommandError};
+    #[cfg(windows)]
+    use super::{LocalCommand, ProductionGateway};
     use crate::dto::{EnvironmentCheckDto, StatusDto};
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn gui_gateway_reaches_embedded_runtime_executor_for_release_all() {
+        let gateway = ProductionGateway::new(EmbeddedRuntimeHandle::for_test());
+
+        let stopped = gateway.release_all().await.expect("release_all succeeds");
+
+        assert_eq!(stopped.state, "EmergencyStopped");
+        assert_eq!(stopped.holds, 0);
+        assert!(stopped.cleanup_complete);
+        let status: StatusDto = gateway.request(LocalCommand::Status).await.unwrap();
+        assert_eq!(status.state, "EmergencyStopped");
+    }
 
     #[test]
     fn rejects_unknown_response_fields() {

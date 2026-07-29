@@ -82,6 +82,7 @@ pub fn run() -> tauri::Result<()> {
             commands::close_game,
             commands::capture_preview,
             commands::input_probe,
+            commands::release_all,
             commands::register_hub,
             commands::ensure_local_agent,
         ])

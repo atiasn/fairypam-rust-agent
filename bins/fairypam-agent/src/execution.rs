@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::runtime_api::RuntimeCommand as LocalCommand;
+use crate::runtime_api::{InputProbeAction, RuntimeCommand as LocalCommand};
 use fairypam_agent_core::profile::{CaptureRegion, VerifiedProfile};
 use fairypam_agent_core::target::{TargetBinding, TargetCandidate, TargetSelector, TargetSnapshot};
 use fairypam_agent_core::AgentError;
@@ -308,6 +308,11 @@ impl CommandExecutor {
         Self::with_platform_and_attempts(profiles, platform, TaskAttemptRuntime::memory())
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn without_devices_for_test() -> Self {
+        Self::with_platform(ProfileStore::default(), Box::new(UnsupportedPlatform))
+    }
+
     fn with_platform_and_attempts(
         profiles: ProfileStore,
         platform: Box<dyn RuntimePlatform>,
@@ -559,17 +564,23 @@ impl CommandExecutor {
                     json!({"mime_type": "image/jpeg", "width": frame.width, "height": frame.height, "bytes": frame.bytes}),
                 )
             }
-            LocalCommand::InputKeyPulse {
-                scan_code,
-                extended,
-            } => self.local_input_pulse(
-                &[v2::PhysicalKey {
-                    scan_code: u32::from(*scan_code),
-                    extended: *extended,
-                }],
-                &[],
-            ),
-            LocalCommand::InputMouseClick { button } => self.local_input_pulse(&[], &[*button]),
+            LocalCommand::InputProbe { action } => match action {
+                InputProbeAction::MoveForward => self.local_input_pulse(
+                    &[v2::PhysicalKey {
+                        scan_code: 17,
+                        extended: false,
+                    }],
+                    &[],
+                ),
+                InputProbeAction::QuickUse => self.local_input_pulse(
+                    &[v2::PhysicalKey {
+                        scan_code: 44,
+                        extended: false,
+                    }],
+                    &[],
+                ),
+                InputProbeAction::MouseLeft => self.local_input_pulse(&[], &[1]),
+            },
             LocalCommand::EnumerateTargets { profile_id } => {
                 self.stop_capture(None)?;
                 let profile = self.profiles.get(profile_id)?.clone();
@@ -1332,11 +1343,19 @@ impl CommandExecutor {
             target_closed,
             error_code,
         )?;
+        let cleanup_complete = receipt
+            .as_ref()
+            .and_then(|value| value.cleanup_complete)
+            .unwrap_or(release_error.is_none() && capture_error.is_none() && target_closed);
+        let response_error_code = receipt
+            .as_ref()
+            .and_then(|value| value.error_code.as_deref())
+            .or(error_code);
         Ok(json!({
             "state": "EmergencyStopped",
             "holds": 0,
-            "cleanup_complete": receipt.as_ref().and_then(|value| value.cleanup_complete),
-            "error_code": receipt.as_ref().and_then(|value| value.error_code.as_deref()),
+            "cleanup_complete": cleanup_complete,
+            "error_code": response_error_code,
         }))
     }
 
@@ -1553,10 +1572,10 @@ fn production_platform() -> Box<dyn RuntimePlatform> {
     Box::new(UnsupportedPlatform)
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), feature = "test-support"))]
 struct UnsupportedPlatform;
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), feature = "test-support"))]
 impl RuntimePlatform for UnsupportedPlatform {
     fn start_task_target(
         &mut self,
@@ -2700,9 +2719,8 @@ mod tests {
             .unwrap();
         assert_eq!(preview["bytes"], json!([1, 2, 3]));
         executor
-            .execute_local(&LocalCommand::InputKeyPulse {
-                scan_code: 17,
-                extended: false,
+            .execute_local(&LocalCommand::InputProbe {
+                action: InputProbeAction::MoveForward,
             })
             .unwrap();
         assert!(!state.lock().unwrap().input_active);

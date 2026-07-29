@@ -1020,10 +1020,15 @@ impl EmbeddedRuntimeHandle {
             LocalCommand::Status
             | LocalCommand::Doctor
             | LocalCommand::ListProfiles
+            | LocalCommand::ReleaseAll
             | LocalCommand::GetConnectionStatus
             | LocalCommand::RunEnvironmentCheck
             | LocalCommand::GetLogTail { .. }
             | LocalCommand::ScanInstalledGames
+            | LocalCommand::LaunchTarget { .. }
+            | LocalCommand::CloseTarget
+            | LocalCommand::CapturePreview
+            | LocalCommand::InputProbe { .. }
             | LocalCommand::RegisterHub { .. } => self.runtime.execute_embedded(command),
             LocalCommand::ShutdownAgent => {
                 self.runtime.record_local_operation(command);
@@ -1033,8 +1038,19 @@ impl EmbeddedRuntimeHandle {
             }
             _ => Err(AgentError::new(
                 "local.embedded_command_not_allowed",
-                "the embedded GUI runtime does not expose device commands",
+                "the embedded GUI runtime does not expose this command",
             )),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn for_test() -> Self {
+        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        *driver.execution.lock().expect("test execution lock") =
+            CommandExecutor::without_devices_for_test();
+        Self {
+            runtime: driver.local_runtime(),
+            completion: Arc::new(EmbeddedRuntimeCompletion::default()),
         }
     }
 
@@ -1611,7 +1627,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_runtime_exposes_observability_but_not_device_commands() {
+    fn embedded_runtime_exposes_fixed_local_domain_commands() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
         let shutdown = driver.gui_shutdown.clone();
         let completion = Arc::new(EmbeddedRuntimeCompletion::default());
@@ -1621,9 +1637,27 @@ mod tests {
         };
 
         assert!(handle.execute(&LocalCommand::Status).is_ok());
+        for command in [
+            LocalCommand::LaunchTarget {
+                profile_id: "missing-profile".into(),
+            },
+            LocalCommand::CloseTarget,
+            LocalCommand::CapturePreview,
+            LocalCommand::InputProbe {
+                action: crate::runtime_api::InputProbeAction::MoveForward,
+            },
+        ] {
+            assert_ne!(
+                handle.execute(&command).unwrap_err().code(),
+                "local.embedded_command_not_allowed"
+            );
+        }
+        let released = handle.execute(&LocalCommand::ReleaseAll).unwrap();
+        assert_eq!(released["state"], "EmergencyStopped");
+        assert_eq!(released["cleanup_complete"], true);
         assert_eq!(
             handle
-                .execute(&LocalCommand::ReleaseAll)
+                .execute(&LocalCommand::ResetEmergencyStop)
                 .unwrap_err()
                 .code(),
             "local.embedded_command_not_allowed"

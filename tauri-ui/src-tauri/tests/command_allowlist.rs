@@ -16,6 +16,7 @@ fn registered_build_and_capability_surfaces_match() {
         "close_game",
         "capture_preview",
         "input_probe",
+        "release_all",
         "register_hub",
         "ensure_local_agent",
     ] {

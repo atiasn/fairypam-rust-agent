@@ -17,6 +17,7 @@ vi.mock('./lib/agentApi', () => ({
     closeGame: vi.fn(),
     capturePreview: vi.fn(),
     inputProbe: vi.fn(),
+    releaseAll: vi.fn(),
     registerHub: vi.fn().mockResolvedValue({ status: 'pending' }),
   },
 }));

@@ -7,11 +7,12 @@ use std::{
 use crate::{
     dto::{
         ClosedGameDto, ConnectionStatusDto, EnvironmentCheckDto, InputResultDto, InstalledGamesDto,
-        LaunchedGameDto, LogTailDto, OverviewDto, PreviewDto, RegistrationStatusDto,
+        LaunchedGameDto, LogTailDto, OverviewDto, PreviewDto, RegistrationStatusDto, ReleaseAllDto,
         SupportStatusDto,
     },
     local_gateway::{ProductionGateway, UiCommandError},
 };
+use fairypam_agent::runtime_api::InputProbeAction;
 use tauri::State;
 
 type CommandResult<T> = Result<T, UiCommandError>;
@@ -110,14 +111,19 @@ pub async fn input_probe(
     state: State<'_, ProductionGateway>,
 ) -> CommandResult<InputResultDto> {
     match action.as_str() {
-        "move_forward" => state.input_key_pulse(17, false).await,
-        "quick_use" => state.input_key_pulse(44, false).await,
-        "mouse_left" => state.input_mouse_click(1).await,
+        "move_forward" => state.input_probe(InputProbeAction::MoveForward).await,
+        "quick_use" => state.input_probe(InputProbeAction::QuickUse).await,
+        "mouse_left" => state.input_probe(InputProbeAction::MouseLeft).await,
         _ => Err(UiCommandError::unavailable(
             "local.command.invalid_argument",
             "input action is invalid",
         )),
     }
+}
+
+#[tauri::command]
+pub async fn release_all(state: State<'_, ProductionGateway>) -> CommandResult<ReleaseAllDto> {
+    state.release_all().await
 }
 
 #[tauri::command]

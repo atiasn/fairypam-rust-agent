@@ -26,7 +26,12 @@ export type FocusedTarget = {
   capturable: boolean;
 };
 export type CaptureState = { capture_source_id: string; state: string };
-export type ReleaseAll = { state: string; holds: number };
+export type ReleaseAll = {
+  state: string;
+  holds: number;
+  cleanup_complete: boolean;
+  error_code: string | null;
+};
 export type SupportStatus = { status: string };
 export type RegistrationStatus = { status: 'pending' };
 export type ExportResult = { saved: boolean; reasonCode?: string };

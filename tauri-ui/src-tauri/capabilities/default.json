@@ -17,6 +17,7 @@
     "allow-close-game",
     "allow-capture-preview",
     "allow-input-probe",
+    "allow-release-all",
     "allow-register-hub",
     "allow-ensure-local-agent"
   ]

@@ -124,6 +124,15 @@ pub struct InputResultDto {
     pub state: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseAllDto {
+    pub state: String,
+    pub holds: u32,
+    pub cleanup_complete: bool,
+    pub error_code: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverviewDto {
