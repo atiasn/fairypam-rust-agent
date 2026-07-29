@@ -305,18 +305,26 @@ mod tests {
 
     #[test]
     fn rejects_unknown_response_fields() {
-        let error = decode_response::<StatusDto>(
-            json!({ "state": "ConnectedIdle", "capture_active": false, "unexpected": true }),
-        )
+        let error = decode_response::<StatusDto>(json!({
+            "state": "ConnectedIdle",
+            "task_active": false,
+            "capture_active": false,
+            "build_id": "product-installer-1-1",
+            "suite_version": "0.1.1",
+            "guardian_state": "idle_no_holds",
+            "unexpected": true
+        }))
         .expect_err("DTO must deny unexpected protocol fields");
 
         assert_eq!(error.code, "local.protocol.invalid");
+        assert!(error.message.contains("unknown field `unexpected`"));
     }
 
     #[test]
     fn decodes_runtime_status_contract() {
         let status = decode_response::<StatusDto>(json!({
             "state": "ConnectedIdle",
+            "task_active": false,
             "capture_active": false,
             "build_id": "product-installer-1-1",
             "suite_version": "0.1.1",
@@ -325,6 +333,7 @@ mod tests {
         .expect("GUI status DTO must match the Agent runtime status contract");
 
         assert_eq!(status.build_id, "product-installer-1-1");
+        assert!(!status.task_active);
         assert_eq!(status.suite_version, "0.1.1");
         assert_eq!(status.guardian_state, "idle_no_holds");
     }
