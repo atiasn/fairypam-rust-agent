@@ -308,7 +308,7 @@ impl CommandExecutor {
         Self::with_platform_and_attempts(profiles, platform, TaskAttemptRuntime::memory())
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn without_devices_for_test() -> Self {
         Self::with_platform(ProfileStore::default(), Box::new(UnsupportedPlatform))
     }
@@ -1572,10 +1572,10 @@ fn production_platform() -> Box<dyn RuntimePlatform> {
     Box::new(UnsupportedPlatform)
 }
 
-#[cfg(any(not(windows), feature = "test-support"))]
+#[cfg(any(not(windows), test, feature = "test-support"))]
 struct UnsupportedPlatform;
 
-#[cfg(any(not(windows), feature = "test-support"))]
+#[cfg(any(not(windows), test, feature = "test-support"))]
 impl RuntimePlatform for UnsupportedPlatform {
     fn start_task_target(
         &mut self,

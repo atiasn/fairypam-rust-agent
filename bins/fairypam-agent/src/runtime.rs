@@ -363,6 +363,7 @@ struct RuntimeState {
     frame_state: ConnectionState,
     last_error_code: String,
     logs: VecDeque<AgentLogRecord>,
+    persist_logs: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -395,6 +396,7 @@ impl Default for RuntimeState {
             frame_state: ConnectionState::Offline,
             last_error_code: "runtime.offline".to_owned(),
             logs: VecDeque::new(),
+            persist_logs: true,
         }
     }
 }
@@ -493,10 +495,12 @@ impl RuntimeState {
         self.logs
             .push_back(AgentLogRecord::new(level.clone(), message));
         #[cfg(windows)]
-        if let Err(error) =
-            observability::production_log().and_then(|log| log.append(level, message))
-        {
-            tracing::warn!(code = error.code(), "protected Agent log write failed");
+        if self.persist_logs {
+            if let Err(error) =
+                observability::production_log().and_then(|log| log.append(level, message))
+            {
+                tracing::warn!(code = error.code(), "protected Agent log write failed");
+            }
         }
     }
 }
@@ -536,6 +540,25 @@ impl GrpcSessionDriver {
             registration_in_progress: Arc::new(AtomicBool::new(false)),
             registration_worker: Arc::new(Mutex::new(None)),
             gui_shutdown,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn for_test() -> Self {
+        let config = RuntimeConfig::unregistered();
+        Self {
+            config: Arc::new(Mutex::new(config)),
+            state: Arc::new(Mutex::new(RuntimeState {
+                last_error_code: "runtime.not_registered".to_owned(),
+                persist_logs: false,
+                ..RuntimeState::default()
+            })),
+            execution: Arc::new(Mutex::new(CommandExecutor::without_devices_for_test())),
+            enrollment_ready: Arc::new(tokio::sync::Notify::new()),
+            reconnect_requested: Arc::new(tokio::sync::Notify::new()),
+            registration_in_progress: Arc::new(AtomicBool::new(false)),
+            registration_worker: Arc::new(Mutex::new(None)),
+            gui_shutdown: CancellationToken::new(),
         }
     }
 
@@ -667,6 +690,7 @@ impl SessionDriver for GrpcSessionDriver {
             .map_err(map_transport)?;
         let mut state = self.state.lock().map_err(lock_error)?;
         let logs = std::mem::take(&mut state.logs);
+        let persist_logs = state.persist_logs;
         *state = RuntimeState {
             control: Some(control),
             sender: Some(sender),
@@ -676,6 +700,7 @@ impl SessionDriver for GrpcSessionDriver {
             frame_state: ConnectionState::Connecting,
             last_error_code: "runtime.frame_connecting".to_owned(),
             logs,
+            persist_logs,
         };
         state.record(
             LogLevel::Info,
@@ -939,11 +964,13 @@ impl SupervisorHooks for RuntimeSafetyHooks {
         }
         if let Ok(mut state) = self.state.lock() {
             let logs = std::mem::take(&mut state.logs);
+            let persist_logs = state.persist_logs;
             *state = RuntimeState {
                 control_state: ConnectionState::Reconnecting,
                 frame_state: ConnectionState::Reconnecting,
                 last_error_code: "runtime.reconnecting".to_owned(),
                 logs,
+                persist_logs,
                 ..RuntimeState::default()
             };
             state.record(LogLevel::Warn, RuntimeLogMessage::SessionCleared);
@@ -1043,11 +1070,9 @@ impl EmbeddedRuntimeHandle {
         }
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_test() -> Self {
-        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
-        *driver.execution.lock().expect("test execution lock") =
-            CommandExecutor::without_devices_for_test();
+        let driver = GrpcSessionDriver::for_test();
         Self {
             runtime: driver.local_runtime(),
             completion: Arc::new(EmbeddedRuntimeCompletion::default()),
@@ -1628,13 +1653,9 @@ mod tests {
 
     #[test]
     fn embedded_runtime_exposes_fixed_local_domain_commands() {
-        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
-        let shutdown = driver.gui_shutdown.clone();
-        let completion = Arc::new(EmbeddedRuntimeCompletion::default());
-        let handle = EmbeddedRuntimeHandle {
-            runtime: driver.local_runtime(),
-            completion: Arc::clone(&completion),
-        };
+        let handle = EmbeddedRuntimeHandle::for_test();
+        let shutdown = handle.runtime.gui_shutdown.clone();
+        let completion = Arc::clone(&handle.completion);
 
         assert!(handle.execute(&LocalCommand::Status).is_ok());
         for command in [
