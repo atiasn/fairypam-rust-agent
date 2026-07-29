@@ -406,7 +406,7 @@ describe('App', () => {
     expect(view.getByRole('button', { name: '关闭游戏' })).toBeEnabled();
     expect(view.getByRole('button', { name: '启动并锁定' })).toBeDisabled();
 
-    vi.mocked(agentApi.getOverview).mockRejectedValueOnce(new Error('overview unavailable'));
+    vi.mocked(agentApi.getOverview).mockRejectedValue(new Error('overview unavailable'));
     const visibilityState = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
     try {
       act(() => document.dispatchEvent(new Event('visibilitychange')));
