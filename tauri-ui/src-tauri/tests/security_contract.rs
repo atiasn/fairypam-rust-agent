@@ -20,14 +20,23 @@ fn production_configuration_is_elevated_and_least_privilege() {
     ] {
         assert!(
             !CAPABILITY.contains(forbidden),
-            "forbidden capability: {forbidden}"
+            "forbidden capability: {}",
+            forbidden
         );
     }
     assert!(TAURI_CONFIG.contains("script-src 'self'"));
     assert!(!TAURI_CONFIG.contains("script-src 'self' https://"));
     for required in [
-        "verified_webview_data_root()?",
-        ".data_directory(webview_data_root.clone())",
+        "verify_webview_environment()?",
+        "app.path().app_local_data_dir()?.join(\"webview\")",
+        "let webview_impersonation = begin_webview_impersonation()?",
+        "TokenLinkedToken",
+        "DuplicateTokenEx",
+        "SecurityImpersonation",
+        "ImpersonateLoggedOnUser",
+        "RevertToSelf",
+        "drop(webview_impersonation)",
+        ".data_directory(webview_data_root)",
         ".incognito(true)",
         ".devtools(cfg!(debug_assertions))",
         "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
@@ -35,7 +44,8 @@ fn production_configuration_is_elevated_and_least_privilege() {
     ] {
         assert!(APP.contains(required));
     }
-    assert!(ENROLLMENT.contains("pub const WEBVIEW_ROOT"));
-    assert!(ENROLLMENT.contains("ensure_private_directory(&root)?"));
-    assert!(INSTALLER.contains("(WEBVIEW_ROOT, ProvisionFailure::WebView)"));
+    assert!(APP.find(".build()?;").unwrap() < APP.find("drop(webview_impersonation)").unwrap());
+    assert!(!APP.contains("std::fs::create_dir_all"));
+    assert!(!ENROLLMENT.contains("WEBVIEW_ROOT"));
+    assert!(!INSTALLER.contains("WEBVIEW_ROOT"));
 }

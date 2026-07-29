@@ -14,6 +14,18 @@ use crate::{
 const BLOCK_PAGE_SURFACES: &str = "for (const event of ['contextmenu', 'dragenter', 'dragover', 'drop']) { window.addEventListener(event, (value) => value.preventDefault(), { capture: true }); }";
 const WEBVIEW_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-breakpad --disable-crash-reporter";
 
+#[cfg(windows)]
+struct ImpersonationGuard;
+
+#[cfg(windows)]
+impl Drop for ImpersonationGuard {
+    fn drop(&mut self) {
+        if unsafe { windows::Win32::Security::RevertToSelf() }.is_err() {
+            std::process::abort();
+        }
+    }
+}
+
 pub fn run() -> tauri::Result<()> {
     #[cfg(windows)]
     commands::verify_active_gui().map_err(|error| {
@@ -30,7 +42,7 @@ pub fn run() -> tauri::Result<()> {
         }
     };
     #[cfg(windows)]
-    let webview_data_root = verified_webview_data_root()?;
+    verify_webview_environment()?;
     #[cfg(windows)]
     let (runtime, runtime_task) = fairypam_agent::runtime::start_embedded(
         fairypam_agent::runtime::RuntimeConfig::from_production().map_err(runtime_error)?,
@@ -73,16 +85,27 @@ pub fn run() -> tauri::Result<()> {
             let main_config = &app.config().app.windows[0];
             let main_window = tauri::WebviewWindowBuilder::from_config(app.handle(), main_config)?;
             #[cfg(windows)]
-            let main_window = main_window
-                .data_directory(webview_data_root.clone())
-                .incognito(true)
-                .devtools(cfg!(debug_assertions))
-                .additional_browser_args(WEBVIEW_BROWSER_ARGS);
+            let main_window = {
+                let webview_data_root = app.path().app_local_data_dir()?.join("webview");
+                let webview_impersonation = begin_webview_impersonation()?;
+                (
+                    main_window
+                        .data_directory(webview_data_root)
+                        .incognito(true)
+                        .devtools(cfg!(debug_assertions))
+                        .additional_browser_args(WEBVIEW_BROWSER_ARGS),
+                    webview_impersonation,
+                )
+            };
+            #[cfg(windows)]
+            let (main_window, webview_impersonation) = main_window;
             let main_window = main_window
                 .on_navigation(allows_application_navigation)
                 .on_new_window(|_, _| NewWindowResponse::Deny)
                 .initialization_script(BLOCK_PAGE_SURFACES)
                 .build()?;
+            #[cfg(windows)]
+            drop(webview_impersonation);
             disable_default_context_menu(&main_window);
             #[cfg(windows)]
             {
@@ -182,7 +205,7 @@ fn runtime_error(error: fairypam_agent_core::AgentError) -> tauri::Error {
 }
 
 #[cfg(windows)]
-fn verified_webview_data_root() -> tauri::Result<std::path::PathBuf> {
+fn verify_webview_environment() -> tauri::Result<()> {
     for variable in [
         "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
         "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
@@ -196,7 +219,68 @@ fn verified_webview_data_root() -> tauri::Result<std::path::PathBuf> {
             )));
         }
     }
-    fairypam_agent::enrollment::verified_webview_root().map_err(runtime_error)
+    Ok(())
+}
+
+#[cfg(windows)]
+fn begin_webview_impersonation() -> tauri::Result<ImpersonationGuard> {
+    use windows::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        Security::{
+            DuplicateTokenEx, GetTokenInformation, ImpersonateLoggedOnUser, SecurityImpersonation,
+            TokenImpersonation, TokenLinkedToken, TOKEN_IMPERSONATE, TOKEN_LINKED_TOKEN,
+            TOKEN_QUERY,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    let mut process_token = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut process_token) }
+        .map_err(webview_token_error)?;
+    let _process_token = OwnedHandle(process_token);
+    let mut linked_token = TOKEN_LINKED_TOKEN::default();
+    let mut returned_length = 0;
+    unsafe {
+        GetTokenInformation(
+            process_token,
+            TokenLinkedToken,
+            Some(std::ptr::from_mut(&mut linked_token).cast()),
+            std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+            &mut returned_length,
+        )
+    }
+    .map_err(webview_token_error)?;
+    let linked_token = OwnedHandle(linked_token.LinkedToken);
+    let mut impersonation_token = HANDLE::default();
+    unsafe {
+        DuplicateTokenEx(
+            linked_token.0,
+            TOKEN_QUERY | TOKEN_IMPERSONATE,
+            None,
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut impersonation_token,
+        )
+    }
+    .map_err(webview_token_error)?;
+    let impersonation_token = OwnedHandle(impersonation_token);
+    unsafe { ImpersonateLoggedOnUser(impersonation_token.0) }.map_err(webview_token_error)?;
+    Ok(ImpersonationGuard)
+}
+
+#[cfg(windows)]
+fn webview_token_error(error: windows::core::Error) -> tauri::Error {
+    tauri::Error::Io(std::io::Error::other(format!(
+        "unable to prepare the WebView2 data directory as the standard user: {error}"
+    )))
 }
 
 fn allows_application_navigation(url: &tauri::Url) -> bool {

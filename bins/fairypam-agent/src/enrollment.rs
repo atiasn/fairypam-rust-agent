@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::Write;
 use std::os::windows::io::FromRawHandle;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fairypam_agent_core::AgentError;
@@ -41,7 +41,6 @@ pub(crate) const STATE_PARENT: &str = r"C:\ProgramData\FairyPam.Agent\Agent";
 pub(crate) const STATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\enrollment";
 pub(crate) const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\audit";
 pub(crate) const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
-pub const WEBVIEW_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\webview";
 pub(crate) const UPDATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\updates";
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 const CLAIM_DEADLINE: Duration = Duration::from_secs(15);
@@ -367,8 +366,7 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), AgentError> {
     let audit = Path::new(AUDIT_ROOT);
     let logs = Path::new(LOG_ROOT);
     let updates = Path::new(UPDATE_ROOT);
-    let webview = Path::new(WEBVIEW_ROOT);
-    if path != enrollment && path != audit && path != logs && path != updates && path != webview {
+    if path != enrollment && path != audit && path != logs && path != updates {
         return Err(failed());
     }
 
@@ -376,12 +374,6 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), AgentError> {
     verify_private_directory(Path::new(PRODUCT_STATE_ROOT))?;
     verify_private_directory(Path::new(STATE_PARENT))?;
     verify_private_directory(path)
-}
-
-pub fn verified_webview_root() -> Result<PathBuf, AgentError> {
-    let root = PathBuf::from(WEBVIEW_ROOT);
-    ensure_private_directory(&root)?;
-    Ok(root)
 }
 
 fn verify_nonreparse_directory(path: &Path) -> Result<(), AgentError> {

@@ -53,7 +53,15 @@ for (const forbidden of [
 for (const required of [
   'runtime::start_embedded',
   'ProductionGateway::new(runtime)',
-  '.data_directory(webview_data_root.clone())',
+  'app.path().app_local_data_dir()?.join("webview")',
+  'let webview_impersonation = begin_webview_impersonation()?',
+  'TokenLinkedToken',
+  'DuplicateTokenEx',
+  'SecurityImpersonation',
+  'ImpersonateLoggedOnUser',
+  'RevertToSelf',
+  'drop(webview_impersonation)',
+  '.data_directory(webview_data_root)',
   '.incognito(true)',
   '.devtools(cfg!(debug_assertions))',
   '.additional_browser_args(WEBVIEW_BROWSER_ARGS)',
@@ -65,6 +73,12 @@ for (const required of [
   'window.destroy()',
 ]) {
   if (!app.includes(required)) fail(`missing single-process safety boundary ${required}`);
+}
+if (app.indexOf('.build()?;') > app.indexOf('drop(webview_impersonation)')) {
+  fail('standard-user impersonation must cover Tauri WebviewWindowBuilder::build');
+}
+if (app.includes('std::fs::create_dir_all')) {
+  fail('the elevated host must delegate UDF creation to Tauri under impersonation');
 }
 for (const required of [
   'for path in [&gui, &pointer]',

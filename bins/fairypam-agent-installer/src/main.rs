@@ -45,8 +45,6 @@ const ENROLLMENT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\enrollment";
 const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\audit";
 #[cfg(windows)]
 const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
-#[cfg(windows)]
-const WEBVIEW_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\webview";
 #[cfg(any(windows, test))]
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 #[cfg(any(windows, test))]
@@ -77,7 +75,6 @@ enum ProvisionFailure {
     Rollback = 10,
     Launch = 11,
     Transaction = 16,
-    WebView = 25,
 }
 
 #[cfg(windows)]
@@ -180,7 +177,6 @@ fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
             (ENROLLMENT_ROOT, ProvisionFailure::Enrollment),
             (AUDIT_ROOT, ProvisionFailure::Audit),
             (LOG_ROOT, ProvisionFailure::Logs),
-            (WEBVIEW_ROOT, ProvisionFailure::WebView),
         ] {
             match create_or_verify_private_directory(std::path::Path::new(path)) {
                 Ok(change) => changes.push((path, change)),
