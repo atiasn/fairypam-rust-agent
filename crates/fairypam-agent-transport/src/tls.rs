@@ -47,8 +47,8 @@ use windows_sys::Win32::Security::Cryptography::{
     CERT_SYSTEM_STORE_LOCAL_MACHINE, CRYPT_KEY_PROV_INFO, CRYPT_MACHINE_KEYSET,
     MS_KEY_STORAGE_PROVIDER, NCRYPT_ALLOW_SIGNING_FLAG, NCRYPT_EXPORT_POLICY_PROPERTY,
     NCRYPT_KEY_USAGE_PROPERTY, NCRYPT_LENGTH_PROPERTY, NCRYPT_MACHINE_KEY_FLAG,
-    NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SECURITY_DESCR_PROPERTY, NCRYPT_SILENT_FLAG, PKCS_7_ASN_ENCODING,
-    X509_ASN_ENCODING,
+    NCRYPT_PAD_PKCS1_FLAG, NCRYPT_PERSIST_FLAG, NCRYPT_SECURITY_DESCR_PROPERTY, NCRYPT_SILENT_FLAG,
+    PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Security::{
@@ -649,7 +649,7 @@ pub fn create_cng_machine_key(
     let bits = 2048_u32;
     let export_policy = 0_u32;
     let usage = NCRYPT_ALLOW_SIGNING_FLAG;
-    let security_flags = DACL_SECURITY_INFORMATION;
+    let security_flags = NCRYPT_PERSIST_FLAG | DACL_SECURITY_INFORMATION;
     let result = (|| {
         set_cng_property(&key, NCRYPT_LENGTH_PROPERTY, &bits.to_ne_bytes(), 0)?;
         set_cng_property(
