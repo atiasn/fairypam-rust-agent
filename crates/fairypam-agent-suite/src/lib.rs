@@ -253,12 +253,16 @@ pub fn validate_active_layout(
     reject_extra_executables(version_root, version_root, &expected_versioned_executables)
 }
 
-pub fn validate_flat_layout(root: &Path, manifest: &SuiteManifest) -> Result<(), SuiteError> {
+pub fn validate_flat_layout(
+    root: &Path,
+    manifest: &SuiteManifest,
+    bootstrap_helper: &Path,
+) -> Result<(), SuiteError> {
     validate_manifest(manifest)?;
     for member in &manifest.members {
         validate_file_identity(&root.join(path_from_manifest(&member.path)), member)?;
     }
-    reject_forbidden_executables(root, root)
+    reject_forbidden_executables(root, root, bootstrap_helper)
 }
 
 pub fn read_current_pointer(path: &Path) -> Result<CurrentPointer, SuiteError> {
@@ -390,7 +394,11 @@ fn reject_extra_executables(
     Ok(())
 }
 
-fn reject_forbidden_executables(root: &Path, directory: &Path) -> Result<(), SuiteError> {
+fn reject_forbidden_executables(
+    root: &Path,
+    directory: &Path,
+    bootstrap_helper: &Path,
+) -> Result<(), SuiteError> {
     for entry in fs::read_dir(directory)
         .map_err(|error| io_error("suite.layout_invalid", directory, error))?
     {
@@ -406,7 +414,7 @@ fn reject_forbidden_executables(root: &Path, directory: &Path) -> Result<(), Sui
             ));
         }
         if metadata.is_dir() {
-            reject_forbidden_executables(root, &entry.path())?;
+            reject_forbidden_executables(root, &entry.path(), bootstrap_helper)?;
         } else if !metadata.is_file() {
             return Err(SuiteError::new(
                 "suite.layout_invalid",
@@ -420,7 +428,10 @@ fn reject_forbidden_executables(root: &Path, directory: &Path) -> Result<(), Sui
                 .to_string_lossy()
                 .replace('\\', "/")
                 .to_ascii_lowercase();
-            if is_executable_member(&relative) && !allowed_product_executable(&relative) {
+            if is_executable_member(&relative)
+                && !allowed_product_executable(&relative)
+                && entry.path() != bootstrap_helper
+            {
                 return Err(SuiteError::new(
                     "suite.layout_invalid",
                     "executable member is outside the exact product allowlist",
@@ -662,6 +673,54 @@ mod tests {
         assert_eq!(
             resolve_active_suite(&directory).unwrap_err().code(),
             "suite.pointer_identity_mismatch"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn flat_layout_allows_only_the_running_bootstrap_helper() {
+        let manifest = manifest();
+        let directory = std::env::temp_dir().join(format!(
+            "fairypam-flat-suite-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for (path, contents) in [
+            (
+                directory.join("resources/runtime/fairypam-agent-installer.exe"),
+                b"helper".as_slice(),
+            ),
+            (
+                directory.join("fairypam-agent-guardian.exe"),
+                b"guardian".as_slice(),
+            ),
+            (
+                directory.join("fairypam-agent-tauri-ui.exe"),
+                b"gui".as_slice(),
+            ),
+            (
+                directory.join("profiles/default/profile.json"),
+                b"profile".as_slice(),
+            ),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let bootstrap_helper = directory
+            .join(".fairypam-installer/payload/resources/runtime/fairypam-agent-installer.exe");
+        fs::create_dir_all(bootstrap_helper.parent().unwrap()).unwrap();
+        fs::write(&bootstrap_helper, b"helper").unwrap();
+
+        validate_flat_layout(&directory, &manifest, &bootstrap_helper).unwrap();
+        fs::write(directory.join("unexpected.exe"), b"unexpected").unwrap();
+        assert_eq!(
+            validate_flat_layout(&directory, &manifest, &bootstrap_helper)
+                .unwrap_err()
+                .code(),
+            "suite.layout_invalid"
         );
         fs::remove_dir_all(directory).unwrap();
     }

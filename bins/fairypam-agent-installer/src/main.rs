@@ -213,7 +213,9 @@ impl InstallActivation {
         let manifest_path = install_root.join(MANIFEST_FILE);
         let (manifest, manifest_bytes) =
             read_manifest(&manifest_path).map_err(|_| ProvisionFailure::InstallRoots)?;
-        validate_flat_layout(install_root, &manifest)
+        let bootstrap_helper =
+            std::env::current_exe().map_err(|_| ProvisionFailure::InstallRoots)?;
+        validate_flat_layout(install_root, &manifest, &bootstrap_helper)
             .map_err(|_| ProvisionFailure::InstallRoots)?;
         let versions = install_root.join("versions");
         std::fs::create_dir_all(&versions).map_err(|_| ProvisionFailure::InstallRoots)?;
