@@ -129,14 +129,32 @@ fn with_install_transaction<T>(
 
 #[cfg(windows)]
 fn launch_ui(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
     verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
     let active = active_suite(install_root)?;
     let gui = active.version_root.join("fairypam-agent-tauri-ui.exe");
-    std::process::Command::new(&gui)
-        .current_dir(&active.version_root)
-        .spawn()
-        .map(|_| ())
-        .map_err(|_| ProvisionFailure::Launch)
+    let verb = HSTRING::from("runas");
+    let file = HSTRING::from(gui.to_string_lossy().as_ref());
+    let directory = HSTRING::from(active.version_root.to_string_lossy().as_ref());
+    let mut execute = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpDirectory: PCWSTR(directory.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut execute) }.map_err(|_| ProvisionFailure::Launch)?;
+    if execute.hProcess.is_invalid() {
+        return Err(ProvisionFailure::Launch);
+    }
+    let _ = unsafe { CloseHandle(execute.hProcess) };
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -867,17 +885,8 @@ fn verify_nonreparse_directory(path: &std::path::Path) -> Result<(), ()> {
 
 #[cfg(windows)]
 fn verify_trusted_install_entry(path: &std::path::Path, directory: bool) -> Result<(), ()> {
-    let metadata = path.symlink_metadata().map_err(|_| ())?;
-    if metadata.file_type().is_symlink()
-        || (directory && !metadata.is_dir())
-        || (!directory && !metadata.is_file())
-    {
-        return Err(());
-    }
-    verify_nonreparse_attributes(path)?;
-    trusted_program_files_security(&security_sddl(path)?)
-        .then_some(())
-        .ok_or(())
+    fairypam_agent_suite::windows_security::verify_trusted_install_entry(path, directory)
+        .map_err(|_| ())
 }
 
 #[cfg(windows)]
@@ -975,10 +984,6 @@ fn security_sddl_with_information(
     let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
     let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
     result
-}
-
-fn trusted_program_files_security(sddl: &str) -> bool {
-    trusted_install_owner(sddl) && !dacl_grants_untrusted_write(sddl, true)
 }
 
 fn trusted_install_owner(sddl: &str) -> bool {
@@ -1126,19 +1131,6 @@ mod tests {
     }
 
     #[test]
-    fn program_files_acl_rejects_untrusted_owner_or_write() {
-        assert!(trusted_program_files_security(
-            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
-        ));
-        assert!(!trusted_program_files_security(
-            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FW;;;BU)"
-        ));
-        assert!(!trusted_program_files_security(
-            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)"
-        ));
-    }
-
-    #[test]
     fn staged_payload_requires_trusted_owner_and_high_no_write_up_label() {
         let trusted_install_owned = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
         let high_no_write_up = "S:(ML;OICI;NW;;;HI)";
@@ -1149,9 +1141,6 @@ mod tests {
         assert!(!staged_payload_security(
             "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)",
             high_no_write_up
-        ));
-        assert!(trusted_program_files_security(
-            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;CO)"
         ));
         assert!(!staged_payload_security(
             "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;CO)",
@@ -1240,9 +1229,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_active_allows_missing_label_but_stage_does_not() {
+    fn staged_payload_requires_a_high_label() {
         let legacy_active = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
-        assert!(trusted_program_files_security(legacy_active));
         assert!(!staged_payload_security(legacy_active, ""));
         assert!(!staged_payload_security(
             legacy_active,

@@ -258,16 +258,12 @@ fn untrusted_install_root() -> UiCommandError {
 mod install_security {
     use std::{fs, path::Path};
 
+    use fairypam_agent_suite::windows_security;
     use windows::{
         core::{GUID, HSTRING},
         Win32::{
-            Foundation::{CloseHandle, ERROR_ACCESS_DENIED},
             Storage::FileSystem::{
-                CreateFileW, GetFileAttributesW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY,
-                FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-                FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
-                FILE_SHARE_WRITE, FILE_WRITE_DATA, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
-                WRITE_DAC, WRITE_OWNER,
+                GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
             },
             System::Com::CoTaskMemFree,
             UI::Shell::{
@@ -312,12 +308,15 @@ mod install_security {
             return Ok(false);
         };
         let mut current = root.to_path_buf();
-        if path_is_writable(&current)? {
+        if windows_security::verify_trusted_install_entry(&current, true).is_err() {
             return Ok(false);
         }
         for component in relative {
             current.push(component);
-            if has_reparse_component(&current) || path_is_writable(&current)? {
+            if has_reparse_component(&current)
+                || windows_security::verify_trusted_install_entry(&current, current != target)
+                    .is_err()
+            {
                 return Ok(false);
             }
         }
@@ -353,59 +352,6 @@ mod install_security {
             }
         }
         false
-    }
-
-    fn path_is_writable(path: &Path) -> CommandResult<bool> {
-        let Ok(metadata) = fs::metadata(path) else {
-            return Ok(true);
-        };
-        let (access, flags) = if metadata.is_dir() {
-            (
-                [
-                    DELETE.0,
-                    FILE_ADD_FILE.0,
-                    FILE_ADD_SUBDIRECTORY.0,
-                    FILE_DELETE_CHILD.0,
-                    WRITE_DAC.0,
-                    WRITE_OWNER.0,
-                ],
-                FILE_FLAG_BACKUP_SEMANTICS,
-            )
-        } else {
-            (
-                [
-                    DELETE.0,
-                    FILE_WRITE_DATA.0,
-                    FILE_APPEND_DATA.0,
-                    WRITE_DAC.0,
-                    WRITE_OWNER.0,
-                    0,
-                ],
-                FILE_ATTRIBUTE_NORMAL,
-            )
-        };
-        for access in access.into_iter().filter(|access| *access != 0) {
-            let handle = unsafe {
-                CreateFileW(
-                    &HSTRING::from(path.to_string_lossy().as_ref()),
-                    access,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    None,
-                    OPEN_EXISTING,
-                    flags,
-                    None,
-                )
-            };
-            match handle {
-                Ok(handle) => {
-                    let _ = unsafe { CloseHandle(handle) };
-                    return Ok(true);
-                }
-                Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => {}
-                Err(_) => return Err(untrusted_install_root()),
-            }
-        }
-        Ok(false)
     }
 
     fn known_folder_path(folder: &GUID) -> CommandResult<String> {

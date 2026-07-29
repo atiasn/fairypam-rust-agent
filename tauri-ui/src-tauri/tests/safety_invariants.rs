@@ -80,7 +80,7 @@ fn product_uac_and_enrollment_publication_fail_closed() {
     for required in [
         "for path in [&gui, &pointer]",
         "CURRENT_POINTER_FILE",
-        "verify_protected_program_files_path(path)",
+        "windows_security::verify_trusted_install_entry",
         "startup.install_root_untrusted",
     ] {
         assert!(
@@ -503,9 +503,9 @@ fn embedded_gateway_has_no_pipe_or_sibling_core() {
     assert!(!GATEWAY.contains("WindowsNamedPipeClientTransport"));
     assert!(!AGENT_RUNTIME.contains("run_local_control"));
     assert!(!AGENT_RUNTIME.contains("RuntimeOwner"));
-    assert!(commands.contains("verify_protected_program_files_path(path)"));
-    assert!(commands.contains("FILE_DELETE_CHILD"));
-    assert!(commands.contains("ERROR_ACCESS_DENIED"));
+    assert!(commands.contains("windows_security::verify_trusted_install_entry"));
+    assert!(!commands.contains("fn path_is_writable"));
+    assert!(!commands.contains("FILE_DELETE_CHILD"));
 }
 
 #[test]
@@ -523,6 +523,19 @@ fn active_suite_pointer_is_verified_before_it_can_authorize_rollback() {
 #[test]
 fn installer_exposes_only_install_validation_and_stable_gui_launch() {
     assert!(INSTALLER_PROVISIONER.contains("(\"--launch-ui\", None) => launch_ui(install_root)"));
+    for required in [
+        "ShellExecuteExW",
+        "SHELLEXECUTEINFOW",
+        "SEE_MASK_NOCLOSEPROCESS",
+        "HSTRING::from(\"runas\")",
+    ] {
+        assert!(
+            INSTALLER_PROVISIONER.contains(required),
+            "stable GUI launcher must request elevation through: {required}"
+        );
+    }
+    let launcher = source_between(INSTALLER_PROVISIONER, "fn launch_ui(", "fn active_suite(");
+    assert!(!launcher.contains("std::process::Command"));
     for forbidden in [
         "(\"--launch-agent-task\", None)",
         "(\"--prepare-install\", None)",

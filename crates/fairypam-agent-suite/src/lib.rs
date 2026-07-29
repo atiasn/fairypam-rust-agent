@@ -25,6 +25,146 @@ const INSTALLER_OWNED_EXECUTABLES: [&str; 2] = [
     ".fairypam-installer/payload/fairypam-agent-guardian.exe",
 ];
 
+pub mod windows_security {
+    #[cfg(windows)]
+    use super::SuiteError;
+
+    const TRUSTED_INSTALLER_SID: &str =
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+    pub fn trusted_program_files_security(sddl: &str) -> bool {
+        trusted_install_owner(sddl) && !dacl_grants_untrusted_write(sddl)
+    }
+
+    fn trusted_install_owner(sddl: &str) -> bool {
+        sddl.starts_with("O:BA")
+            || sddl.starts_with("O:SY")
+            || sddl.starts_with("O:TI")
+            || sddl.starts_with(&format!("O:{TRUSTED_INSTALLER_SID}"))
+    }
+
+    fn dacl_grants_untrusted_write(sddl: &str) -> bool {
+        let Some(dacl) = sddl.split_once("D:").map(|(_, dacl)| dacl) else {
+            return true;
+        };
+        dacl.split('(').skip(1).any(|raw| {
+            let ace = raw.split(')').next().unwrap_or_default();
+            let fields = ace.split(';').collect::<Vec<_>>();
+            if fields.len() < 6 || !fields[0].ends_with('A') {
+                return false;
+            }
+            if matches!(fields[5], "SY" | "BA" | "CO") || fields[5] == TRUSTED_INSTALLER_SID {
+                return false;
+            }
+            write_capable_rights(fields[2])
+        })
+    }
+
+    fn write_capable_rights(rights: &str) -> bool {
+        if let Some(mask) = rights.strip_prefix("0x") {
+            return u32::from_str_radix(mask, 16).map_or(true, |mask| mask & 0x500D_0156 != 0);
+        }
+        let allowed = ["GR", "GX", "RC", "FR", "FX", "KR", "KX", "NR", "NX"];
+        rights
+            .as_bytes()
+            .chunks_exact(2)
+            .any(|right| !allowed.iter().any(|allowed| allowed.as_bytes() == right))
+    }
+
+    #[cfg(windows)]
+    pub fn verify_trusted_install_entry(
+        path: &std::path::Path,
+        directory: bool,
+    ) -> Result<(), SuiteError> {
+        let metadata = path
+            .symlink_metadata()
+            .map_err(|_| invalid_install_security())?;
+        if metadata.file_type().is_symlink()
+            || (directory && !metadata.is_dir())
+            || (!directory && !metadata.is_file())
+        {
+            return Err(invalid_install_security());
+        }
+        verify_nonreparse(path)?;
+        trusted_program_files_security(&security_sddl(path)?)
+            .then_some(())
+            .ok_or_else(invalid_install_security)
+    }
+
+    #[cfg(windows)]
+    fn verify_nonreparse(path: &std::path::Path) -> Result<(), SuiteError> {
+        use windows::core::HSTRING;
+        use windows::Win32::Storage::FileSystem::{
+            GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
+        };
+
+        let attributes =
+            unsafe { GetFileAttributesW(&HSTRING::from(path.to_string_lossy().as_ref())) };
+        if attributes == INVALID_FILE_ATTRIBUTES || attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        {
+            return Err(invalid_install_security());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn security_sddl(path: &std::path::Path) -> Result<String, SuiteError> {
+        use windows::core::{HSTRING, PWSTR};
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows::Win32::Security::{
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        };
+
+        let information = OWNER_SECURITY_INFORMATION
+            | DACL_SECURITY_INFORMATION
+            | PROTECTED_DACL_SECURITY_INFORMATION;
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                &HSTRING::from(path.to_string_lossy().as_ref()),
+                SE_FILE_OBJECT,
+                information,
+                None,
+                None,
+                None,
+                None,
+                &mut descriptor,
+            )
+        };
+        if status.0 != 0 {
+            return Err(invalid_install_security());
+        }
+        let mut text = PWSTR::null();
+        let result = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                information,
+                &mut text,
+                None,
+            )
+        }
+        .map_err(|_| invalid_install_security())
+        .and_then(|_| unsafe { text.to_string().map_err(|_| invalid_install_security()) });
+        let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+        let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0.cast()))) };
+        result
+    }
+
+    #[cfg(windows)]
+    fn invalid_install_security() -> SuiteError {
+        SuiteError::new(
+            "suite.install_security_invalid",
+            "installed entry owner, DACL, or reparse state is untrusted",
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberScope {
@@ -530,6 +670,19 @@ fn io_error(code: &'static str, path: &Path, error: io::Error) -> SuiteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_files_acl_rejects_untrusted_owner_or_write() {
+        assert!(windows_security::trusted_program_files_security(
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
+        ));
+        assert!(!windows_security::trusted_program_files_security(
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FW;;;BU)"
+        ));
+        assert!(!windows_security::trusted_program_files_security(
+            "O:BUD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        ));
+    }
 
     fn member(path: &str, scope: MemberScope, contents: &[u8]) -> SuiteMember {
         SuiteMember {
