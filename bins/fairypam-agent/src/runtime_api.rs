@@ -60,7 +60,7 @@ pub enum RuntimeCommand {
     },
     ShutdownAgent,
     RegisterHub {
-        hub_address: String,
-        registration_code: String,
+        registration_code: Zeroizing<String>,
     },
 }
+use zeroize::Zeroizing;

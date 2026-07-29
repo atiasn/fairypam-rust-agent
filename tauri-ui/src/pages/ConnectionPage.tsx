@@ -68,19 +68,16 @@ export function ConnectionPage({
 
     const form = event.currentTarget;
     const data = new FormData(form);
-    const hubAddress = data.get('hubAddress');
     const registrationCode = data.get('registrationCode');
-    if (typeof hubAddress !== 'string' || typeof registrationCode !== 'string') return;
+    if (typeof registrationCode !== 'string') return;
     const clearRegistrationFields = () => {
-      for (const name of ['hubAddress', 'registrationCode']) {
-        const input = form.elements.namedItem(name);
-        if (input instanceof HTMLInputElement) input.value = '';
-      }
+      const input = form.elements.namedItem('registrationCode');
+      if (input instanceof HTMLInputElement) input.value = '';
     };
 
     setRegistrationStatus('submitting');
     setRegistrationPendingAt(0);
-    void agentApi.registerHub(hubAddress.trim(), registrationCode).then(
+    void agentApi.registerHub(registrationCode).then(
       async () => {
         clearRegistrationFields();
         const environmentResult = await environment.refetch();
@@ -131,10 +128,6 @@ export function ConnectionPage({
           className="enrollment-form"
           onSubmit={submitRegistration}
         >
-          <label>
-            服务地址
-            <input autoComplete="off" name="hubAddress" placeholder="https://" required type="url" />
-          </label>
           <label>
             一次性注册码
             <input autoComplete="off" name="registrationCode" required type="password" />

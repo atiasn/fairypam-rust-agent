@@ -41,6 +41,6 @@ export const agentApi = {
     listen('emergency-reset', handler),
   onEmergencyResetFailed: (handler: () => void) =>
     listen('emergency-reset-failed', handler),
-  registerHub: (hubAddress: string, registrationCode: string) =>
-    invoke<RegistrationStatus>('register_hub', { hubAddress, registrationCode }),
+  registerHub: (registrationCode: string) =>
+    invoke<RegistrationStatus>('register_hub', { registrationCode }),
 };

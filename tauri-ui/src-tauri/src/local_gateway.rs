@@ -10,6 +10,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
 #[cfg(windows)]
 use tokio::sync::MutexGuard;
+use zeroize::Zeroizing;
 
 use crate::dto::{
     ClosedGameDto, ConnectionStatusDto, EnvironmentCheckDto, InputResultDto, InstalledGamesDto,
@@ -192,13 +193,9 @@ impl ProductionGateway {
 
     pub async fn register_hub(
         &self,
-        hub_address: String,
-        registration_code: String,
+        registration_code: Zeroizing<String>,
     ) -> Result<RegistrationStatusDto, UiCommandError> {
-        let command = LocalCommand::RegisterHub {
-            hub_address,
-            registration_code,
-        };
+        let command = LocalCommand::RegisterHub { registration_code };
         #[cfg(windows)]
         {
             return self

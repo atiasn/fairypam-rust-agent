@@ -23,6 +23,7 @@ fn main() {
                 ("--verify-installed-state", None) => installed_preflight(install_root),
                 ("--prepare-ui-data", None) => prepare_ui_data(install_root),
                 ("--launch-ui", None) => launch_ui(install_root),
+                ("--remove-runtime-state", None) => remove_runtime_state(install_root),
                 _ => Err(ProvisionFailure::InstallRoots),
             }
             .map_or_else(|failure| failure as i32, |_| 0)
@@ -547,6 +548,189 @@ fn verify_uninstaller_copy(
     (installed_hash == copy_hash)
         .then_some(())
         .ok_or(ProvisionFailure::InstallRoots)
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentRuntimeDocument {
+    agent_id: String,
+    authorized_user_sid: String,
+    certificate_sha256: String,
+    control_endpoint: String,
+    expires_at: String,
+    frame_endpoint: String,
+    hub_server_name: String,
+    key_name: String,
+    profile_root_public_key_hex: String,
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingEnrollmentDocument {
+    schema_version: u32,
+    key_name: String,
+    authorized_user_sid: String,
+    certificate_sha256: Option<String>,
+    generation: Option<String>,
+}
+
+#[cfg(windows)]
+fn remove_runtime_state(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    installed_preflight(install_root)?;
+    let product_root = std::path::Path::new(PRODUCT_ROOT);
+    match product_root.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(ProvisionFailure::ProductRoot),
+        Ok(_) => {
+            verify_private_directory(product_root).map_err(|_| ProvisionFailure::ProductRoot)?
+        }
+    }
+    let enrollment_root = std::path::Path::new(ENROLLMENT_ROOT);
+    if enrollment_root.exists() {
+        verify_private_directory(enrollment_root).map_err(|_| ProvisionFailure::Enrollment)?;
+        let pending_path = enrollment_root.join("pending.json");
+        if pending_path.exists() {
+            verify_private_file(&pending_path).map_err(|_| ProvisionFailure::Enrollment)?;
+            let bytes = std::fs::read(&pending_path).map_err(|_| ProvisionFailure::Enrollment)?;
+            if bytes.len() > 128 * 1024 {
+                return Err(ProvisionFailure::Enrollment);
+            }
+            let pending: PendingEnrollmentDocument =
+                serde_json::from_slice(&bytes).map_err(|_| ProvisionFailure::Enrollment)?;
+            validate_pending_enrollment_record(&pending)?;
+            if let Some(value) = pending.certificate_sha256.as_deref() {
+                fairypam_agent_transport::delete_local_machine_certificate(
+                    &decode_enrollment_fingerprint(value)?,
+                )
+                .map_err(|_| ProvisionFailure::Enrollment)?;
+            }
+            fairypam_agent_transport::delete_cng_machine_key(&pending.key_name)
+                .map_err(|_| ProvisionFailure::Enrollment)?;
+        }
+        for entry in std::fs::read_dir(enrollment_root).map_err(|_| ProvisionFailure::Enrollment)? {
+            let entry = entry.map_err(|_| ProvisionFailure::Enrollment)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !valid_enrollment_generation(name) {
+                continue;
+            }
+            let directory = entry.path();
+            verify_private_directory(&directory).map_err(|_| ProvisionFailure::Enrollment)?;
+            let runtime_path = directory.join("runtime.json");
+            verify_private_file(&runtime_path).map_err(|_| ProvisionFailure::Enrollment)?;
+            let bytes = std::fs::read(&runtime_path).map_err(|_| ProvisionFailure::Enrollment)?;
+            if bytes.len() > 128 * 1024 {
+                return Err(ProvisionFailure::Enrollment);
+            }
+            let document: EnrollmentRuntimeDocument =
+                serde_json::from_slice(&bytes).map_err(|_| ProvisionFailure::Enrollment)?;
+            validate_enrollment_record(&document)?;
+            let fingerprint = decode_enrollment_fingerprint(&document.certificate_sha256)?;
+            fairypam_agent_transport::delete_local_machine_certificate(&fingerprint)
+                .map_err(|_| ProvisionFailure::Enrollment)?;
+            fairypam_agent_transport::delete_cng_machine_key(&document.key_name)
+                .map_err(|_| ProvisionFailure::Enrollment)?;
+        }
+    }
+    std::fs::remove_dir_all(product_root).map_err(|_| ProvisionFailure::ProductRoot)
+}
+
+#[cfg(windows)]
+fn validate_pending_enrollment_record(
+    document: &PendingEnrollmentDocument,
+) -> Result<(), ProvisionFailure> {
+    validate_enrollment_key_name(&document.key_name)?;
+    if document.schema_version != 1
+        || !document.authorized_user_sid.starts_with("S-1-")
+        || document.authorized_user_sid.len() > 184
+        || document
+            .certificate_sha256
+            .as_deref()
+            .is_some_and(|value| decode_enrollment_fingerprint(value).is_err())
+        || document
+            .generation
+            .as_deref()
+            .is_some_and(|value| !valid_enrollment_generation(value))
+    {
+        return Err(ProvisionFailure::Enrollment);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_enrollment_record(
+    document: &EnrollmentRuntimeDocument,
+) -> Result<(), ProvisionFailure> {
+    validate_enrollment_key_name(&document.key_name)?;
+    if document.agent_id.is_empty()
+        || document.authorized_user_sid.is_empty()
+        || document.control_endpoint.is_empty()
+        || document.expires_at.is_empty()
+        || document.frame_endpoint.is_empty()
+        || document.hub_server_name.is_empty()
+        || document.profile_root_public_key_hex.is_empty()
+    {
+        return Err(ProvisionFailure::Enrollment);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_enrollment_key_name(value: &str) -> Result<(), ProvisionFailure> {
+    let suffix = value.strip_prefix("FairyPam.Agent.").unwrap_or_default();
+    (!suffix.is_empty()
+        && value.len() <= 128
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')))
+    .then_some(())
+    .ok_or(ProvisionFailure::Enrollment)
+}
+
+#[cfg(windows)]
+fn decode_enrollment_fingerprint(value: &str) -> Result<[u8; 32], ProvisionFailure> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ProvisionFailure::Enrollment);
+    }
+    let mut fingerprint = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        fingerprint[index] = u8::from_str_radix(
+            std::str::from_utf8(chunk).map_err(|_| ProvisionFailure::Enrollment)?,
+            16,
+        )
+        .map_err(|_| ProvisionFailure::Enrollment)?;
+    }
+    Ok(fingerprint)
+}
+
+#[cfg(any(windows, test))]
+fn valid_enrollment_generation(value: &str) -> bool {
+    value.starts_with("g-")
+        && value.len() <= 80
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+#[cfg(windows)]
+fn verify_private_file(path: &std::path::Path) -> Result<(), ()> {
+    let metadata = path.symlink_metadata().map_err(|_| ())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(());
+    }
+    verify_nonreparse_attributes(path)?;
+    security_sddl(path)
+        .is_ok_and(|value| private_security_sddl(&value).is_ok())
+        .then_some(())
+        .ok_or(())
 }
 
 #[cfg(windows)]

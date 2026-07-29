@@ -18,18 +18,20 @@ use fairypam_agent_protocol::v2::{
     agent_control_event, AgentControlEvent, AgentRuntimeState, AgentStatus, Heartbeat, SessionRef,
 };
 #[cfg(windows)]
-use fairypam_agent_transport::validate_transport_config;
-#[cfg(windows)]
 use fairypam_agent_transport::CappedBackoff;
 use fairypam_agent_transport::{
     connect_control, connect_frame, control_queue, open_control_tunnel, open_frame_tunnel,
-    receive_hub_hello, ControlSender, ControlSession, SessionFrameSlot, TransportConfig,
-    TransportError, VerifiedSession,
+    receive_hub_hello, ControlSender, ControlSession, IdentityKey, SessionFrameSlot,
+    TransportConfig, TransportError, VerifiedSession,
 };
+#[cfg(windows)]
+use fairypam_agent_transport::{validate_transport_candidate, validate_transport_config};
 use http::Uri;
 #[cfg(any(windows, test))]
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use zeroize::Zeroizing;
 
 use crate::execution::{CommandExecutor, CommandOutcome, ExecutionSession, FrameSink};
 #[cfg(any(windows, test))]
@@ -59,8 +61,11 @@ impl RuntimeConfig {
     /// authenticated enrollment pipe before any Hub credentials exist.
     #[cfg(windows)]
     pub fn from_production() -> Result<Self, AgentError> {
-        if enrollment_state_exists() {
-            match Self::from_enrollment_state() {
+        let root = PathBuf::from(crate::enrollment::STATE_ROOT);
+        crate::enrollment::ensure_private_directory(&root)?;
+        crate::enrollment::cleanup_pending_identity(&root)?;
+        if enrollment_state_exists_at(&root) {
+            match Self::from_enrollment_state_at(&root) {
                 Ok(config) => Ok(config),
                 Err(error) => {
                     tracing::warn!(
@@ -111,7 +116,7 @@ impl RuntimeConfig {
                 agent_id: "unregistered".to_owned(),
                 ca_pem: PathBuf::new(),
                 identity_cert_pem: PathBuf::new(),
-                identity_key_pem: PathBuf::new(),
+                identity_key: IdentityKey::Pem(PathBuf::new()),
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -145,7 +150,7 @@ impl RuntimeConfig {
                 agent_id: required("FAIRYPAM_AGENT_ID")?,
                 ca_pem: required_path("FAIRYPAM_CA_PEM")?,
                 identity_cert_pem: required_path("FAIRYPAM_AGENT_CERT_PEM")?,
-                identity_key_pem: required_path("FAIRYPAM_AGENT_KEY_PEM")?,
+                identity_key: IdentityKey::Pem(required_path("FAIRYPAM_AGENT_KEY_PEM")?),
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -168,55 +173,55 @@ impl RuntimeConfig {
     #[cfg(windows)]
     fn from_enrollment_state_at(root: &Path) -> Result<Self, AgentError> {
         crate::enrollment::ensure_private_directory(root)?;
-        let pointer = load_private_json(&root.join("current.json"))?;
-        let generation = enrollment_field(&pointer, "generation")?;
-        Self::from_enrollment_candidate(root, generation)
+        crate::enrollment::cleanup_pending_identity(root)?;
+        let pointer: EnrollmentPointer = load_private_json(&root.join("current.json"))?;
+        let generation = pointer.generation;
+        let config = Self::from_enrollment_candidate(root, generation)?;
+        let _ = crate::enrollment::cleanup_retired_generations(root);
+        Ok(config)
     }
 
     #[cfg(windows)]
     fn from_enrollment_candidate(root: &Path, generation: String) -> Result<Self, AgentError> {
-        if !generation.starts_with("g-")
-            || generation.len() > 80
-            || generation
-                .bytes()
-                .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
-        {
+        if !crate::enrollment::valid_generation(&generation) {
             return Err(AgentError::new(
                 "runtime.enrollment_invalid",
                 "invalid enrollment generation",
             ));
         }
         let directory = root.join(&generation);
-        let document = load_private_json(&directory.join("runtime.json"))?;
-        validate_enrollment_expiry(&enrollment_field(&document, "expires_at")?)?;
-        let verifier = Ed25519SignatureVerifier::from_public_key_hex(&enrollment_field(
-            &document,
-            "profile_root_public_key_hex",
-        )?)?;
+        let document: crate::enrollment::EnrollmentRuntimeDocument =
+            load_private_json(&directory.join("runtime.json"))?;
+        let expires_at = validate_enrollment_expiry(&document.expires_at)?;
+        let verifier =
+            Ed25519SignatureVerifier::from_public_key_hex(&document.profile_root_public_key_hex)?;
         let profiles = ProfileStore::load_optional(&enrollment_profile_directory()?, &verifier)?;
         Ok(Self {
             transport: TransportConfig {
-                control_endpoint: enrollment_field(&document, "control_endpoint")?
-                    .parse()
-                    .map_err(|error| {
-                        AgentError::new(
-                            "runtime.enrollment_invalid",
-                            format!("invalid control endpoint: {error}"),
-                        )
-                    })?,
-                frame_endpoint: enrollment_field(&document, "frame_endpoint")?
-                    .parse()
-                    .map_err(|error| {
-                        AgentError::new(
-                            "runtime.enrollment_invalid",
-                            format!("invalid frame endpoint: {error}"),
-                        )
-                    })?,
-                server_name: enrollment_field(&document, "hub_server_name")?,
-                agent_id: enrollment_field(&document, "agent_id")?,
+                control_endpoint: document.control_endpoint.parse().map_err(|error| {
+                    AgentError::new(
+                        "runtime.enrollment_invalid",
+                        format!("invalid control endpoint: {error}"),
+                    )
+                })?,
+                frame_endpoint: document.frame_endpoint.parse().map_err(|error| {
+                    AgentError::new(
+                        "runtime.enrollment_invalid",
+                        format!("invalid frame endpoint: {error}"),
+                    )
+                })?,
+                server_name: document.hub_server_name,
+                agent_id: document.agent_id,
                 ca_pem: private_file(&directory, "ca.pem")?,
                 identity_cert_pem: private_file(&directory, "client-cert.pem")?,
-                identity_key_pem: private_file(&directory, "client-key.pem")?,
+                identity_key: IdentityKey::CngMachine {
+                    key_name: document.key_name,
+                    authorized_user_sid: document.authorized_user_sid,
+                    certificate_sha256: crate::enrollment::decode_fingerprint(
+                        &document.certificate_sha256,
+                    )?,
+                    expires_at_unix_seconds: expires_at.unix_timestamp(),
+                },
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -232,7 +237,7 @@ impl RuntimeConfig {
 }
 
 #[cfg(any(windows, test))]
-fn validate_enrollment_expiry(value: &str) -> Result<(), AgentError> {
+fn validate_enrollment_expiry(value: &str) -> Result<OffsetDateTime, AgentError> {
     let expires_at = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
         AgentError::new(
             "runtime.enrollment_invalid",
@@ -240,7 +245,7 @@ fn validate_enrollment_expiry(value: &str) -> Result<(), AgentError> {
         )
     })?;
     (expires_at > OffsetDateTime::now_utc())
-        .then_some(())
+        .then_some(expires_at)
         .ok_or_else(|| {
             AgentError::new(
                 "runtime.enrollment_invalid",
@@ -260,6 +265,21 @@ pub(crate) fn validate_enrollment_candidate(
         AgentError::new(
             "runtime.enrollment_invalid",
             "enrollment transport identity is invalid",
+        )
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn validate_enrollment_candidate_before_install(
+    root: &Path,
+    generation: &str,
+) -> Result<(), AgentError> {
+    crate::enrollment::ensure_private_directory(root)?;
+    let candidate = RuntimeConfig::from_enrollment_candidate(root, generation.to_owned())?;
+    validate_transport_candidate(&candidate.transport).map_err(|_| {
+        AgentError::new(
+            "runtime.enrollment_invalid",
+            "enrollment transport candidate is invalid",
         )
     })
 }
@@ -296,7 +316,7 @@ fn enrollment_profile_directory() -> Result<PathBuf, AgentError> {
 }
 
 #[cfg(windows)]
-fn load_private_json(path: &Path) -> Result<serde_json::Value, AgentError> {
+fn load_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, AgentError> {
     let mut file = crate::enrollment::open_private_read(path).map_err(|_| {
         AgentError::new(
             "runtime.enrollment_invalid",
@@ -325,21 +345,10 @@ fn load_private_json(path: &Path) -> Result<serde_json::Value, AgentError> {
 }
 
 #[cfg(windows)]
-fn enrollment_field(
-    document: &serde_json::Value,
-    name: &'static str,
-) -> Result<String, AgentError> {
-    document
-        .get(name)
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            AgentError::new(
-                "runtime.enrollment_invalid",
-                format!("enrollment field {name} is missing"),
-            )
-        })
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentPointer {
+    generation: String,
 }
 
 #[cfg(windows)]
@@ -627,8 +636,8 @@ impl GrpcSessionDriver {
                 )
             })?;
             crate::enrollment::ensure_private_directory(&root)?;
-            let pointer = load_private_json(&root.join("current.json"))?;
-            Ok(enrollment_field(&pointer, "generation")? != expected)
+            let pointer: EnrollmentPointer = load_private_json(&root.join("current.json"))?;
+            Ok(pointer.generation != expected)
         }
         #[cfg(not(windows))]
         Ok(false)
@@ -1266,10 +1275,9 @@ impl SharedRuntime {
             LocalCommand::GetLogTail { lines, level } => self.log_tail(*lines, level),
             LocalCommand::ScanInstalledGames => self.scan_installed_games(),
             #[cfg(windows)]
-            LocalCommand::RegisterHub {
-                hub_address,
-                registration_code,
-            } => self.register_hub(hub_address, registration_code),
+            LocalCommand::RegisterHub { registration_code } => {
+                self.register_hub(registration_code.clone())
+            }
             #[cfg(all(test, not(windows)))]
             LocalCommand::RegisterHub { .. } => Err(AgentError::new(
                 "enrollment.platform_unsupported",
@@ -1306,8 +1314,7 @@ impl SharedRuntime {
     #[cfg(windows)]
     fn register_hub(
         &self,
-        hub_address: &str,
-        registration_code: &str,
+        registration_code: Zeroizing<String>,
     ) -> Result<serde_json::Value, AgentError> {
         // Return while the direct claim runs so the GUI remains responsive to
         // status and retry requests.
@@ -1326,11 +1333,9 @@ impl SharedRuntime {
         }
         self.mark_registration_started();
         let runtime = self.clone();
-        let hub_address = hub_address.to_owned();
-        let registration_code = registration_code.to_owned();
         let worker = std::thread::Builder::new()
             .name("fairypam-enrollment".to_owned())
-            .spawn(move || runtime.finish_registration(hub_address, registration_code))
+            .spawn(move || runtime.finish_registration(registration_code))
             .map_err(|_| {
                 AgentError::new(
                     "enrollment.unavailable",
@@ -1362,7 +1367,7 @@ impl SharedRuntime {
     }
 
     #[cfg(windows)]
-    fn finish_registration(&self, hub_address: String, registration_code: String) {
+    fn finish_registration(&self, registration_code: Zeroizing<String>) {
         let was_waiting = self
             .config
             .lock()
@@ -1381,7 +1386,7 @@ impl SharedRuntime {
                 )
             })
             .and_then(|root| {
-                crate::enrollment::register_at(&root, &hub_address, &registration_code)?;
+                crate::enrollment::register_at_signed(&root, registration_code.as_str())?;
                 RuntimeConfig::from_enrollment_state_at(&root)
             })
             .and_then(|config| self.activate_enrollment(config))
@@ -1459,18 +1464,20 @@ impl SharedRuntime {
         };
         let (awaiting_enrollment, profiles_configured, certificate_ready, games_available) = {
             let config = self.config.lock().map_err(lock_error)?;
-            let certificate_paths = [
-                config.transport.ca_pem.clone(),
-                config.transport.identity_cert_pem.clone(),
-                config.transport.identity_key_pem.clone(),
-            ];
+            let certificate_ready = regular_nonempty_file(&config.transport.ca_pem)
+                && regular_nonempty_file(&config.transport.identity_cert_pem)
+                && match &config.transport.identity_key {
+                    IdentityKey::Pem(path) => regular_nonempty_file(path),
+                    #[cfg(windows)]
+                    IdentityKey::CngMachine { .. } => {
+                        validate_transport_config(&config.transport).is_ok()
+                    }
+                };
             let games_available = observability::scan_installed_games(&config.profiles).is_ok();
             (
                 config.awaiting_enrollment,
                 !config.profiles.ids().is_empty(),
-                certificate_paths
-                    .into_iter()
-                    .all(|path| regular_nonempty_file(&path)),
+                certificate_ready,
                 games_available,
             )
         };
@@ -1482,6 +1489,10 @@ impl SharedRuntime {
                 regular_nonempty_file(&directory.join("fairypam-agent-guardian.exe"))
             })
         });
+        #[cfg(windows)]
+        let bootstrap_ready = crate::enrollment::bootstrap_enrollment_base_url().is_ok();
+        #[cfg(all(test, not(windows)))]
+        let bootstrap_ready = true;
         let (game_status, game_code) = if games_available {
             ("available", "game.discovery_ready")
         } else {
@@ -1495,7 +1506,7 @@ impl SharedRuntime {
                 "recovery": "请检查本地服务注册状态和服务连接是否可用。",
             })
         };
-        let registration_ready = binary_ready && guardian_ready;
+        let registration_ready = binary_ready && guardian_ready && bootstrap_ready;
         let enrollment_check = |id: &str, status: ConnectionState| {
             if awaiting_enrollment {
                 serde_json::json!({"id": id, "status": "pending", "code": "enrollment.required", "recovery": "请先完成本地服务注册，再检查服务连接。"})
@@ -1511,6 +1522,7 @@ impl SharedRuntime {
                 enrollment_check("control", control_state),
                 enrollment_check("frame", frame_state),
                 {"id": "guardian", "status": if guardian_ready { "available" } else { "unavailable" }, "code": if guardian_ready { "guardian.binary_available" } else { "guardian.binary_unavailable" }, "recovery": "本地服务组件不完整，请重新安装 FairyPam。"},
+                {"id": "bootstrap", "status": if bootstrap_ready { "available" } else { "unavailable" }, "code": if bootstrap_ready { "enrollment.bootstrap_available" } else { "enrollment.bootstrap_invalid" }, "recovery": "注册配置无效，请重新安装 FairyPam。"},
                 {"id": "profiles", "status": if profiles_configured { "available" } else { "unavailable" }, "code": if profiles_configured { "profile.available" } else { "profile.unavailable" }, "recovery": "请安装已签名配置文件后再选择游戏。"},
                 {"id": "game_discovery", "status": game_status, "code": game_code, "recovery": "启动器更新后，请重新扫描已安装游戏。"}
             ]}),

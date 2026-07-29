@@ -83,7 +83,10 @@ pub enum ReleaseReason {
 pub enum GuardianRequest {
     RegisterAgent {
         agent_pid: u32,
+        agent_process_handle: u64,
         heartbeat_timeout_ms: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation_key_name: Option<String>,
     },
     Heartbeat {
         sequence: u64,
@@ -104,7 +107,10 @@ pub enum GuardianRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GuardianResponse {
-    Ack {},
+    Ack {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolation_status: Option<i32>,
+    },
     Status {
         agent_pid: Option<u32>,
         committed_hold_count: usize,

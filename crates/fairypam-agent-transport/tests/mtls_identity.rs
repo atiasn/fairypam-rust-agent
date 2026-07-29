@@ -9,7 +9,8 @@ use fairypam_agent_protocol::v2::{
     HubHello, SessionRef,
 };
 use fairypam_agent_transport::{
-    connect_control, control_queue, open_control_tunnel, receive_hub_hello, TransportConfig,
+    connect_control, control_queue, open_control_tunnel, receive_hub_hello, IdentityKey,
+    TransportConfig,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -146,6 +147,10 @@ impl Certificates {
 
         let client_key = KeyPair::generate().unwrap();
         let mut client_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        client_params.distinguished_name = rcgen::DistinguishedName::new();
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, AGENT_A);
         client_params.subject_alt_names.push(SanType::URI(
             format!("spiffe://fairypam/agent/{AGENT_A}")
                 .try_into()
@@ -185,7 +190,7 @@ impl Certificates {
             agent_id: agent_id.into(),
             ca_pem: self.ca_path.clone(),
             identity_cert_pem: self.client_cert_path.clone(),
-            identity_key_pem: self.client_key_path.clone(),
+            identity_key: IdentityKey::Pem(self.client_key_path.clone()),
             connect_timeout: Duration::from_secs(2),
         }
     }

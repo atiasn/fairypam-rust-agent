@@ -15,8 +15,15 @@ pub use frame::{
     open_frame_tunnel, FrameSession, LatestFrameSlot, SessionFrameSlot, VerifiedFrameDirective,
 };
 pub use tls::{
-    connect_control, connect_frame, validate_transport_config, ControlChannel, FrameChannel,
-    TransportConfig,
+    certificate_sha256, connect_control, connect_frame, validate_transport_config, ControlChannel,
+    FrameChannel, IdentityKey, TransportConfig,
+};
+#[cfg(windows)]
+pub use tls::{
+    cng_machine_rsa_public_key_der, create_cng_machine_key, delete_cng_machine_key,
+    delete_local_machine_certificate, install_local_machine_certificate,
+    prove_cng_machine_key_signature, sign_cng_machine_key_sha256, validate_cng_machine_key_policy,
+    validate_transport_candidate,
 };
 
 use thiserror::Error;

@@ -8,7 +8,8 @@
 正式入口：
 
 ```bash
-bash scripts/sync-rust-agent-public.sh --profile all --timeout-minutes 25
+bash scripts/sync-rust-agent-public.sh --profile all --timeout-minutes 25 \
+  --enrollment-base-url https://hub.example.com
 ```
 
 同步脚本只接受同时匹配私有 source commit、公共 mirror commit、Actions run 和

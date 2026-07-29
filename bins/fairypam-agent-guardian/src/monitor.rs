@@ -14,6 +14,7 @@ pub trait ReleaseDriver {
 pub struct GuardianMonitor<R> {
     release_driver: R,
     agent_pid: Option<u32>,
+    agent_process_handle: Option<u64>,
     heartbeat_timeout: Option<Duration>,
     heartbeat_deadline: Option<Instant>,
     last_sequence: u64,
@@ -27,6 +28,7 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
         Self {
             release_driver,
             agent_pid: None,
+            agent_process_handle: None,
             heartbeat_timeout: None,
             heartbeat_deadline: None,
             last_sequence: 0,
@@ -39,10 +41,12 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
     pub fn register_agent(
         &mut self,
         agent_pid: u32,
+        agent_process_handle: u64,
         heartbeat_timeout: Duration,
         now: Instant,
     ) -> Result<(), String> {
         if agent_pid == 0
+            || agent_process_handle == 0
             || heartbeat_timeout.is_zero()
             || heartbeat_timeout > Duration::from_secs(5)
         {
@@ -52,6 +56,7 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
             return Err("guardian.agent_already_registered".into());
         }
         self.agent_pid = Some(agent_pid);
+        self.agent_process_handle = Some(agent_process_handle);
         self.heartbeat_timeout = Some(heartbeat_timeout);
         self.heartbeat_deadline = Some(now + heartbeat_timeout);
         Ok(())
@@ -104,6 +109,7 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
         if !agent_alive {
             self.release_all(ReleaseReason::AgentExited)?;
             self.agent_pid = None;
+            self.agent_process_handle = None;
             self.heartbeat_deadline = None;
             return Ok(());
         }
@@ -141,9 +147,12 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
         let result = match request {
             GuardianRequest::RegisterAgent {
                 agent_pid,
+                agent_process_handle,
                 heartbeat_timeout_ms,
+                isolation_key_name: _,
             } => self.register_agent(
                 agent_pid,
+                agent_process_handle,
                 Duration::from_millis(u64::from(heartbeat_timeout_ms)),
                 now,
             ),
@@ -162,7 +171,9 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
             }
         };
         match result {
-            Ok(()) => GuardianResponse::Ack {},
+            Ok(()) => GuardianResponse::Ack {
+                isolation_status: None,
+            },
             Err(message) => GuardianResponse::Error {
                 code: message.clone(),
                 message,
@@ -172,6 +183,10 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
 
     pub const fn agent_pid(&self) -> Option<u32> {
         self.agent_pid
+    }
+
+    pub const fn agent_process_handle(&self) -> Option<u64> {
+        self.agent_process_handle
     }
 
     pub fn committed_holds(&self) -> &[PhysicalHold] {

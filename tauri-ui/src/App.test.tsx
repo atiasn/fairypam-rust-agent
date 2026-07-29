@@ -221,8 +221,6 @@ describe('App', () => {
     const view = within(app.container);
 
     await user.click(view.getByRole('button', { name: '连接与注册' }));
-    await user.clear(view.getByLabelText('服务地址'));
-    await user.type(view.getByLabelText('服务地址'), 'https://register.example');
     await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
     vi.mocked(agentApi.runEnvironmentCheck).mockResolvedValue({
       registration_ready: true,
@@ -230,14 +228,12 @@ describe('App', () => {
       checks: [{ id: 'certificate', status: 'available', code: 'runtime.certificate_files_available', recovery: '无需操作' }],
     });
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
-    expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
+    expect(agentApi.registerHub).toHaveBeenCalledWith('0123456789abcdef');
     expect(await view.findByText('注册已完成，正在连接服务。')).toBeInTheDocument();
     expect(await view.findByText('已就绪')).toBeInTheDocument();
     expect(agentApi.ensureLocalAgent).toHaveBeenCalledTimes(2);
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
-    expect(view.getByLabelText('服务地址')).toHaveValue('');
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
-    expect(view.getByLabelText('服务地址')).toHaveAttribute('autocomplete', 'off');
     expect(view.getByLabelText('一次性注册码')).toHaveAttribute('autocomplete', 'off');
     expect(view.getByText(/注册码只会通过受保护的通道提交/)).toBeInTheDocument();
     expect(view.queryByText(/UAC|注册窗口|系统确认/)).not.toBeInTheDocument();
@@ -251,13 +247,10 @@ describe('App', () => {
     const view = within(app.container);
 
     await user.click(view.getByRole('button', { name: '连接与注册' }));
-    await user.clear(view.getByLabelText('服务地址'));
-    await user.type(view.getByLabelText('服务地址'), 'https://register.example');
     await user.type(view.getByLabelText('一次性注册码'), '0123456789abcdef');
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
 
     expect(await view.findByText('注册未完成。请获取新的注册码后重试。')).toBeInTheDocument();
-    expect(view.getByLabelText('服务地址')).toHaveValue('');
     expect(view.getByLabelText('一次性注册码')).toHaveValue('');
     expect(view.queryByText('registration-code=not-for-display')).not.toBeInTheDocument();
   });

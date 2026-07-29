@@ -47,6 +47,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             MemberScope::Versioned,
         )?,
         identity(
+            required_path(&options, "--bootstrap")?,
+            "agent-bootstrap.json",
+            MemberScope::Versioned,
+        )?,
+        identity(
+            required_path(&options, "--bootstrap-signature")?,
+            "agent-bootstrap.json.sig",
+            MemberScope::Versioned,
+        )?,
+        identity(
             required_path(&options, "--helper")?,
             "resources/runtime/fairypam-agent-installer.exe",
             MemberScope::Stable,

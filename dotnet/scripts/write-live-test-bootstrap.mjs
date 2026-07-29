@@ -13,13 +13,14 @@ if (!endpoint || !outputDirectory) {
 }
 
 const url = new URL(endpoint);
+const canonical = url.pathname === '/' ? url.origin : url.toString();
 if (
   url.protocol !== 'https:'
   || url.username
   || url.password
   || url.search
   || url.hash
-  || url.toString() !== endpoint
+  || canonical !== endpoint
 ) {
   throw new Error('live-test enrollment base URL must be canonical HTTPS without credentials, query, or fragment');
 }

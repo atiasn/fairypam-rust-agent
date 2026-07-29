@@ -6,6 +6,8 @@ publish.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 fairypam-agent-suite = { path = "../../crates/fairypam-agent-suite" }
+fairypam-agent-transport = { path = "../../crates/fairypam-agent-transport" }
+serde.workspace = true
 serde_json.workspace = true
 windows = { version = "0.62", features = [
     "Win32_Foundation",

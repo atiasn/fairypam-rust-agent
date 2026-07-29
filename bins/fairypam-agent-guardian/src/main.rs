@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use fairypam_agent_guardian::monitor::{GuardianMonitor, ReleaseDriver};
 use fairypam_agent_guardian_protocol::{
-    decode_request, encode_line, read_bounded_line, GuardianResponse, PhysicalHold, ReleaseReason,
+    decode_request, encode_line, read_bounded_line, GuardianRequest, GuardianResponse,
+    PhysicalHold, ReleaseReason,
 };
 
 enum StdinEvent {
@@ -26,8 +27,6 @@ fn main() {
 }
 
 fn self_test() -> Result<(), String> {
-    use fairypam_agent_guardian_protocol::GuardianRequest;
-
     let mut monitor = GuardianMonitor::new(SystemReleaseDriver);
     let now = Instant::now();
     let pid = std::process::id();
@@ -35,13 +34,19 @@ fn self_test() -> Result<(), String> {
         (
             GuardianRequest::RegisterAgent {
                 agent_pid: pid,
+                agent_process_handle: 1,
                 heartbeat_timeout_ms: 5_000,
+                isolation_key_name: None,
             },
-            GuardianResponse::Ack {},
+            GuardianResponse::Ack {
+                isolation_status: None,
+            },
         ),
         (
             GuardianRequest::Heartbeat { sequence: 0 },
-            GuardianResponse::Ack {},
+            GuardianResponse::Ack {
+                isolation_status: None,
+            },
         ),
         (
             GuardianRequest::Status {},
@@ -55,7 +60,9 @@ fn self_test() -> Result<(), String> {
             GuardianRequest::ReleaseAll {
                 reason: ReleaseReason::EmergencyStop,
             },
-            GuardianResponse::Ack {},
+            GuardianResponse::Ack {
+                isolation_status: None,
+            },
         ),
     ] {
         if monitor.handle(request, now) != expected {
@@ -98,6 +105,18 @@ fn run() -> Result<(), String> {
         match receiver.recv_timeout(Duration::from_millis(25)) {
             Ok(StdinEvent::Line(line)) => {
                 let response = match decode_request(&line) {
+                    Ok(GuardianRequest::RegisterAgent {
+                        agent_pid,
+                        agent_process_handle,
+                        heartbeat_timeout_ms,
+                        isolation_key_name,
+                    }) => register_agent(
+                        &mut monitor,
+                        agent_pid,
+                        agent_process_handle,
+                        heartbeat_timeout_ms,
+                        isolation_key_name.as_deref(),
+                    ),
                     Ok(request) => monitor.handle(request, Instant::now()),
                     Err(error) => GuardianResponse::Error {
                         code: "guardian.invalid_message".into(),
@@ -120,7 +139,7 @@ fn run() -> Result<(), String> {
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let alive = monitor.agent_pid().is_none_or(agent_is_alive);
+                let alive = monitor.agent_process_handle().is_none_or(agent_is_alive);
                 if let Err(error) = monitor.tick(Instant::now(), alive) {
                     eprintln!("guardian release failed: {error}");
                 }
@@ -128,6 +147,101 @@ fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn register_agent<R: ReleaseDriver>(
+    monitor: &mut GuardianMonitor<R>,
+    agent_pid: u32,
+    agent_process_handle: u64,
+    heartbeat_timeout_ms: u32,
+    isolation_key_name: Option<&str>,
+) -> GuardianResponse {
+    if agent_process_handle == 0 {
+        return GuardianResponse::Error {
+            code: "guardian.registration_invalid".into(),
+            message: "guardian.registration_invalid".into(),
+        };
+    }
+    let isolation_status = match isolation_key_name.map(probe_cng_key_access).transpose() {
+        Ok(status) => status,
+        Err(response) => return response,
+    };
+    match monitor.handle(
+        GuardianRequest::RegisterAgent {
+            agent_pid,
+            agent_process_handle,
+            heartbeat_timeout_ms,
+            isolation_key_name: None,
+        },
+        Instant::now(),
+    ) {
+        GuardianResponse::Ack { .. } => GuardianResponse::Ack { isolation_status },
+        response => response,
+    }
+}
+
+#[cfg(windows)]
+fn probe_cng_key_access(key_name: &str) -> Result<i32, GuardianResponse> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{E_ACCESSDENIED, NTE_PERM};
+    use windows::Win32::Security::Cryptography::{
+        NCryptFreeObject, NCryptOpenKey, NCryptOpenStorageProvider, CERT_KEY_SPEC,
+        MS_KEY_STORAGE_PROVIDER, NCRYPT_KEY_HANDLE, NCRYPT_MACHINE_KEY_FLAG, NCRYPT_PROV_HANDLE,
+        NCRYPT_SILENT_FLAG,
+    };
+
+    let suffix = key_name.strip_prefix("FairyPam.Agent.").unwrap_or_default();
+    if suffix.is_empty()
+        || key_name.len() > 128
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return Err(GuardianResponse::Error {
+            code: "guardian.key_name_invalid".into(),
+            message: "guardian.key_name_invalid".into(),
+        });
+    }
+    let mut provider = NCRYPT_PROV_HANDLE::default();
+    if unsafe { NCryptOpenStorageProvider(&mut provider, MS_KEY_STORAGE_PROVIDER, 0) }.is_err() {
+        return Err(GuardianResponse::Error {
+            code: "guardian.key_probe_failed".into(),
+            message: "guardian.key_probe_failed".into(),
+        });
+    }
+    let mut key = NCRYPT_KEY_HANDLE::default();
+    let result = unsafe {
+        NCryptOpenKey(
+            provider,
+            &mut key,
+            &HSTRING::from(key_name),
+            CERT_KEY_SPEC(0),
+            NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG,
+        )
+    };
+    let _ = unsafe { NCryptFreeObject(provider.into()) };
+    match result {
+        Ok(()) => {
+            let _ = unsafe { NCryptFreeObject(key.into()) };
+            Err(GuardianResponse::Error {
+                code: "guardian.key_access_unexpected".into(),
+                message: "guardian.key_access_unexpected".into(),
+            })
+        }
+        Err(error) if matches!(error.code(), NTE_PERM | E_ACCESSDENIED) => Ok(error.code().0),
+        Err(error) => Err(GuardianResponse::Error {
+            code: "guardian.key_probe_failed".into(),
+            message: format!("guardian.key_probe_failed:{:08x}", error.code().0 as u32),
+        }),
+    }
+}
+
+#[cfg(not(windows))]
+fn probe_cng_key_access(_key_name: &str) -> Result<i32, GuardianResponse> {
+    Err(GuardianResponse::Error {
+        code: "guardian.key_probe_unsupported".into(),
+        message: "guardian.key_probe_unsupported".into(),
+    })
 }
 
 fn write_response_or_release<R: ReleaseDriver, W: Write>(
@@ -249,26 +363,16 @@ impl ReleaseDriver for SystemReleaseDriver {
 }
 
 #[cfg(windows)]
-fn agent_is_alive(pid: u32) -> bool {
-    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-    use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+fn agent_is_alive(handle: u64) -> bool {
+    use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
 
-    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
-        return false;
-    };
-    let mut exit_code = 0_u32;
-    let alive = unsafe { GetExitCodeProcess(handle, &mut exit_code) }.is_ok()
-        && windows::Win32::Foundation::NTSTATUS(exit_code as i32) == STILL_ACTIVE;
-    unsafe {
-        let _ = CloseHandle(handle);
-    }
-    alive
+    handle <= usize::MAX as u64
+        && unsafe { WaitForSingleObject(HANDLE(handle as usize as *mut _), 0) } == WAIT_TIMEOUT
 }
 
 #[cfg(not(windows))]
-fn agent_is_alive(_pid: u32) -> bool {
+fn agent_is_alive(_handle: u64) -> bool {
     true
 }
 
@@ -314,7 +418,7 @@ mod tests {
         let now = Instant::now();
         let mut monitor = GuardianMonitor::new(RecordingRelease::default());
         monitor
-            .register_agent(42, Duration::from_millis(300), now)
+            .register_agent(42, 1, Duration::from_millis(300), now)
             .unwrap();
         monitor
             .register_intent(
@@ -328,9 +432,14 @@ mod tests {
             .unwrap();
         monitor.commit_holds(1).unwrap();
 
-        let error =
-            write_response_or_release(&mut monitor, &mut BrokenWriter, &GuardianResponse::Ack {})
-                .unwrap_err();
+        let error = write_response_or_release(
+            &mut monitor,
+            &mut BrokenWriter,
+            &GuardianResponse::Ack {
+                isolation_status: None,
+            },
+        )
+        .unwrap_err();
 
         assert!(error.contains("reader closed"));
         assert_eq!(monitor.release_driver().calls, 1);

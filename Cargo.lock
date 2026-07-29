@@ -405,6 +405,7 @@ dependencies = [
  "fairypam-agent-transport",
  "fairypam-agent-windows",
  "http",
+ "rcgen",
  "serde",
  "serde_json",
  "sha2",
@@ -414,6 +415,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows",
+ "zeroize",
 ]
 
 [[package]]
@@ -459,6 +461,7 @@ dependencies = [
  "fairypam-agent-guardian-protocol",
  "serde_json",
  "thiserror",
+ "windows",
 ]
 
 [[package]]
@@ -466,6 +469,8 @@ name = "fairypam-agent-installer"
 version = "0.1.1"
 dependencies = [
  "fairypam-agent-suite",
+ "fairypam-agent-transport",
+ "serde",
  "serde_json",
  "windows",
 ]
@@ -502,16 +507,23 @@ dependencies = [
  "fairypam-agent-protocol",
  "fastrand",
  "http",
+ "hyper-util",
  "rcgen",
  "rustls",
+ "rustls-cng",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tower",
  "uuid",
+ "windows-sys 0.61.2",
  "x509-parser",
+ "yasna",
 ]
 
 [[package]]
@@ -1450,6 +1462,17 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-cng"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "807615e3031830a0b598a65be815a8a195a4a8eff5e037959f134e449998e13d"
+dependencies = [
+ "bitflags",
+ "rustls",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

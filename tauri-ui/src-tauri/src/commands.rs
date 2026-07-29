@@ -14,6 +14,7 @@ use crate::{
 };
 use fairypam_agent::runtime_api::InputProbeAction;
 use tauri::State;
+use zeroize::Zeroizing;
 
 type CommandResult<T> = Result<T, UiCommandError>;
 
@@ -128,11 +129,10 @@ pub async fn release_all(state: State<'_, ProductionGateway>) -> CommandResult<R
 
 #[tauri::command]
 pub async fn register_hub(
-    hub_address: String,
     registration_code: String,
     state: State<'_, ProductionGateway>,
 ) -> CommandResult<RegistrationStatusDto> {
-    state.register_hub(hub_address, registration_code).await
+    state.register_hub(Zeroizing::new(registration_code)).await
 }
 
 #[tauri::command]

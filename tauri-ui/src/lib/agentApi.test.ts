@@ -15,12 +15,11 @@ describe('agentApi', () => {
   it('uses fixed local Gateway commands without command-line registration secrets', async () => {
     await agentApi.ensureLocalAgent();
     await agentApi.getLogTail(100, 'warn');
-    await agentApi.registerHub('https://hub.test', '0123456789abcdef');
+    await agentApi.registerHub('0123456789abcdef');
 
     expect(invoke).toHaveBeenNthCalledWith(1, 'ensure_local_agent');
     expect(invoke).toHaveBeenNthCalledWith(2, 'get_log_tail', { lines: 100, level: 'warn' });
     expect(invoke).toHaveBeenNthCalledWith(3, 'register_hub', {
-      hubAddress: 'https://hub.test',
       registrationCode: '0123456789abcdef',
     });
   });

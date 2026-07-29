@@ -8,6 +8,7 @@ publish.workspace = true
 test-support = []
 
 [dependencies]
+ed25519-dalek.workspace = true
 fairypam-agent-core = { path = "../../crates/fairypam-agent-core" }
 fairypam-agent-input = { path = "../../crates/fairypam-agent-input" }
 fairypam-agent-protocol = { path = "../../crates/fairypam-agent-protocol" }
@@ -23,11 +24,10 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 time = { version = "0.3", features = ["parsing"] }
-
-[dev-dependencies]
-ed25519-dalek.workspace = true
+zeroize = "1"
 
 [target.'cfg(windows)'.dependencies]
+rcgen = "0.14"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp",

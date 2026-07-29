@@ -2067,6 +2067,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             &Self::task_guardian_path()?,
             action_map.physical_holds(),
             Duration::from_millis(300),
+            None,
         )
         .map_err(|error| AgentError::new("guardian.unavailable", error.to_string()))?;
         let input = self

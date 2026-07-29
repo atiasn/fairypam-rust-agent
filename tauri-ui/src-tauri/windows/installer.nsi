@@ -734,6 +734,14 @@ Section Uninstall
 
   !insertmacro CheckIfAppIsRunning "fairypam-agent-guardian.exe" "FairyPam Agent Guardian"
 
+  ${If} $UpdateMode <> 1
+    ExecWait '"$INSTDIR\resources\runtime\fairypam-agent-installer.exe" --remove-runtime-state "$INSTDIR"' $0
+    IfErrors fairypam_uninstall_runtime_cleanup_failed 0
+    ${If} $0 != 0
+      Goto fairypam_uninstall_runtime_cleanup_failed
+    ${EndIf}
+  ${EndIf}
+
   ; Delete the app directory and its content from disk
   ; Copy main executable
   Delete "$INSTDIR\${MAINBINARYNAME}.exe"
@@ -848,6 +856,11 @@ Section Uninstall
   ${OrIf} $UpdateMode = 1
     SetAutoClose true
   ${EndIf}
+  Goto fairypam_uninstall_complete
+
+fairypam_uninstall_runtime_cleanup_failed:
+  Abort "FairyPam could not remove the Agent device identity and runtime state."
+fairypam_uninstall_complete:
 SectionEnd
 
 Function RestorePreviousInstallLocation

@@ -28,7 +28,7 @@ fn second_intent_is_rejected_without_overwriting_first() {
     let now = Instant::now();
     let mut monitor = GuardianMonitor::new(FakeRelease::default());
     monitor
-        .register_agent(42, Duration::from_millis(300), now)
+        .register_agent(42, 1, Duration::from_millis(300), now)
         .unwrap();
     monitor.register_intent(1, vec![hold()]).unwrap();
 
@@ -54,7 +54,7 @@ fn failed_release_preserves_holds_for_retry() {
         ..FakeRelease::default()
     });
     monitor
-        .register_agent(42, Duration::from_millis(300), now)
+        .register_agent(42, 1, Duration::from_millis(300), now)
         .unwrap();
     monitor.register_intent(1, vec![hold()]).unwrap();
 
@@ -78,7 +78,7 @@ fn guardian_releases_when_agent_pid_exits() {
     let now = Instant::now();
     let mut monitor = GuardianMonitor::new(FakeRelease::default());
     monitor
-        .register_agent(42, Duration::from_millis(300), now)
+        .register_agent(42, 1, Duration::from_millis(300), now)
         .unwrap();
     monitor.register_intent(1, vec![hold()]).unwrap();
     monitor.commit_holds(1).unwrap();
@@ -98,7 +98,7 @@ fn heartbeat_timeout_releases_committed_holds() {
     let now = Instant::now();
     let mut monitor = GuardianMonitor::new(FakeRelease::default());
     monitor
-        .register_agent(42, Duration::from_millis(300), now)
+        .register_agent(42, 1, Duration::from_millis(300), now)
         .unwrap();
     monitor.register_intent(1, vec![hold()]).unwrap();
     monitor.commit_holds(1).unwrap();
@@ -124,7 +124,7 @@ fn crash_between_intent_and_commit_releases_pending_hold() {
     let now = Instant::now();
     let mut monitor = GuardianMonitor::new(FakeRelease::default());
     monitor
-        .register_agent(42, Duration::from_millis(300), now)
+        .register_agent(42, 1, Duration::from_millis(300), now)
         .unwrap();
     monitor.register_intent(1, vec![hold()]).unwrap();
 

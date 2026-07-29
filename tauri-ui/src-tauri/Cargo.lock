@@ -1040,6 +1040,7 @@ dependencies = [
  "tauri-build",
  "tokio",
  "windows 0.62.2",
+ "zeroize",
 ]
 
 [[package]]
