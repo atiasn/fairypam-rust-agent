@@ -1,0 +1,341 @@
+syntax = "proto3";
+
+package fairypam.agent.v2;
+
+option csharp_namespace = "FairyPam.Agent.Protocol.V2";
+
+service AgentControlService {
+  rpc ControlTunnel(stream AgentControlEvent) returns (stream HubControlCommand);
+}
+
+service AgentFrameService {
+  rpc FrameTunnel(stream FramePacket) returns (stream FrameDirective);
+}
+
+message SessionRef {
+  string agent_id = 1;
+  string session_id = 2;
+  uint64 generation = 3;
+}
+
+message CommandRef {
+  SessionRef session = 1;
+  string command_id = 2;
+  uint64 sequence = 3;
+  int64 expires_at_unix_ms = 4;
+}
+
+message AttemptRef {
+  string task_run_id = 1;
+  string attempt_id = 2;
+  uint32 contract_version = 3;
+  string contract_digest = 4;
+}
+
+message TaskCommandRef {
+  CommandRef command = 1;
+  AttemptRef attempt = 2;
+  string payload_digest = 3;
+}
+
+message CommandIdentity {
+  oneof value {
+    CommandRef command = 1;
+    TaskCommandRef task = 2;
+  }
+}
+
+enum ExecutionCapability {
+  EXECUTION_CAPABILITY_UNSPECIFIED = 0;
+  EXECUTION_CAPABILITY_TARGET_START = 1;
+  EXECUTION_CAPABILITY_TARGET_CLOSE = 2;
+  EXECUTION_CAPABILITY_CAPTURE = 3;
+  EXECUTION_CAPABILITY_INPUT_KEYBOARD = 4;
+  EXECUTION_CAPABILITY_INPUT_MOUSE_BUTTON = 5;
+  EXECUTION_CAPABILITY_INPUT_WHEEL = 6;
+}
+
+enum CleanupPolicy {
+  CLEANUP_POLICY_UNSPECIFIED = 0;
+  CLEANUP_POLICY_RELEASE_INPUT_AND_CLOSE_OWNED_TARGET = 1;
+}
+
+message ExecutionContract {
+  string task_run_id = 1;
+  string attempt_id = 2;
+  string agent_build_id = 3;
+  string profile_id = 4;
+  string profile_digest = 5;
+  repeated ExecutionCapability allowed_capabilities = 6;
+  int64 deadline_unix_ms = 7;
+  uint32 max_input_lease_ms = 8;
+  CleanupPolicy cleanup_policy = 9;
+  uint32 contract_version = 10;
+  string contract_digest = 11;
+}
+
+enum CommandOutcome {
+  COMMAND_OUTCOME_UNSPECIFIED = 0;
+  COMMAND_OUTCOME_APPLIED = 1;
+  COMMAND_OUTCOME_NOT_APPLIED = 2;
+  COMMAND_OUTCOME_UNCERTAIN = 3;
+}
+
+enum AttemptState {
+  ATTEMPT_STATE_UNSPECIFIED = 0;
+  ATTEMPT_STATE_NOT_FOUND = 1;
+  ATTEMPT_STATE_CLAIMED = 2;
+  ATTEMPT_STATE_TARGET_READY = 3;
+  ATTEMPT_STATE_ACTIVE = 4;
+  ATTEMPT_STATE_STOPPING = 5;
+  ATTEMPT_STATE_TERMINAL = 6;
+}
+
+enum SideEffectState {
+  SIDE_EFFECT_STATE_UNSPECIFIED = 0;
+  SIDE_EFFECT_STATE_NONE = 1;
+  SIDE_EFFECT_STATE_INTENT_RECORDED = 2;
+  SIDE_EFFECT_STATE_APPLIED = 3;
+  SIDE_EFFECT_STATE_NOT_APPLIED = 4;
+  SIDE_EFFECT_STATE_UNCERTAIN = 5;
+}
+
+enum InputState {
+  INPUT_STATE_UNSPECIFIED = 0;
+  INPUT_STATE_RELEASED = 1;
+  INPUT_STATE_ACTIVE = 2;
+  INPUT_STATE_UNKNOWN = 3;
+}
+
+enum CaptureState {
+  CAPTURE_STATE_UNSPECIFIED = 0;
+  CAPTURE_STATE_NOT_STARTED = 1;
+  CAPTURE_STATE_RUNNING = 2;
+  CAPTURE_STATE_STOPPED = 3;
+  CAPTURE_STATE_UNKNOWN = 4;
+}
+
+enum OwnedTargetState {
+  OWNED_TARGET_STATE_UNSPECIFIED = 0;
+  OWNED_TARGET_STATE_NOT_STARTED = 1;
+  OWNED_TARGET_STATE_RUNNING = 2;
+  OWNED_TARGET_STATE_CLOSED = 3;
+  OWNED_TARGET_STATE_UNKNOWN = 4;
+}
+
+message AttemptReceipt {
+  uint32 receipt_version = 1;
+  AttemptRef attempt = 2;
+  AttemptState attempt_state = 3;
+  TaskCommandRef last_command = 4;
+  CommandOutcome last_command_outcome = 5;
+  optional uint64 last_command_source_frame_sequence = 6;
+  SideEffectState side_effect_state = 7;
+  string last_side_effect_command_id = 8;
+  InputState input_state = 9;
+  CaptureState capture_state = 10;
+  OwnedTargetState owned_target_state = 11;
+  optional bool cleanup_complete = 12;
+  optional string error_code = 13;
+}
+
+message InstalledProfile {
+  string profile_id = 1;
+  uint32 schema_version = 2;
+  string content_digest = 3;
+}
+
+message AgentHello {
+  string agent_id = 1;
+  string agent_version = 2;
+  uint32 protocol_major = 3;
+  uint32 protocol_minor = 4;
+  string build_commit = 5;
+  string suite_build_id = 6;
+  repeated InstalledProfile installed_profiles = 7;
+}
+
+message HubHello {
+  SessionRef session = 1;
+  uint32 heartbeat_interval_ms = 2;
+  uint32 max_input_lease_ms = 3;
+  uint32 max_frame_bytes = 4;
+  uint32 accepted_protocol_minor = 5;
+}
+
+enum AgentRuntimeState {
+  AGENT_RUNTIME_STATE_UNSPECIFIED = 0;
+  AGENT_RUNTIME_STATE_CONNECTED_IDLE = 1;
+  AGENT_RUNTIME_STATE_EXECUTING = 2;
+  AGENT_RUNTIME_STATE_EMERGENCY_STOPPED = 3;
+  AGENT_RUNTIME_STATE_RECOVERY_BLOCKED = 4;
+  AGENT_RUNTIME_STATE_STOPPING = 5;
+}
+
+message AgentControlEvent {
+  oneof payload {
+    AgentHello hello = 1;
+    Heartbeat heartbeat = 2;
+    AgentStatus status = 3;
+    CommandResult command_result = 4;
+    DiscoverySnapshot discovery_snapshot = 5;
+    SafetyEvent safety_event = 6;
+  }
+}
+
+message HubControlCommand {
+  oneof payload {
+    HubHello hello = 1;
+    LaunchTarget launch_target = 2;
+    CloseTarget close_target = 3;
+    BeginAttempt begin_attempt = 4;
+    StartAttemptTarget start_attempt_target = 5;
+    StartCapture start_capture = 6;
+    StopCapture stop_capture = 7;
+    InputFrame input_frame = 8;
+    ReleaseAll release_all = 9;
+    FinishAttempt finish_attempt = 10;
+    InspectAttempt inspect_attempt = 11;
+    StopSession stop_session = 12;
+  }
+}
+
+message Heartbeat {
+  SessionRef session = 1;
+  int64 sent_at_unix_ms = 2;
+}
+
+message AgentStatus {
+  SessionRef session = 1;
+  AgentRuntimeState state = 2;
+  string profile_id = 3;
+  AttemptRef attempt = 4;
+}
+
+message CommandResult {
+  CommandIdentity reference = 1;
+  CommandOutcome outcome = 2;
+  optional uint64 source_frame_sequence = 3;
+  AttemptReceipt attempt_receipt = 4;
+  optional string error_code = 5;
+}
+
+message DiscoveredGame {
+  reserved 1;
+  string profile_id = 2;
+  string normalized_install_root = 3;
+  string executable_name = 4;
+  string process_name = 5;
+  string publisher_subject = 6;
+  optional string executable_sha256 = 7;
+  bool available = 8;
+}
+
+message DiscoverySnapshot {
+  SessionRef session = 1;
+  string scan_id = 2;
+  int64 observed_at_unix_ms = 3;
+  string payload_digest = 4;
+  repeated DiscoveredGame games = 5;
+}
+
+message SafetyEvent {
+  SessionRef session = 1;
+  string reason_code = 2;
+  AgentRuntimeState state = 3;
+  AttemptRef attempt = 4;
+  AttemptReceipt attempt_receipt = 5;
+}
+
+message LaunchTarget {
+  CommandIdentity reference = 1;
+  string profile_id = 2;
+}
+
+message CloseTarget {
+  CommandIdentity reference = 1;
+  uint32 timeout_ms = 2;
+}
+
+message BeginAttempt {
+  CommandIdentity reference = 1;
+  ExecutionContract contract = 2;
+}
+
+message StartAttemptTarget {
+  CommandIdentity reference = 1;
+}
+
+message StartCapture {
+  CommandIdentity reference = 1;
+  string capture_source_id = 2;
+  uint32 fps = 3;
+  string encoding = 4;
+  uint32 quality = 5;
+}
+
+message StopCapture {
+  CommandIdentity reference = 1;
+  string capture_source_id = 2;
+}
+
+message PhysicalKey {
+  uint32 scan_code = 1;
+  bool extended = 2;
+}
+
+enum MouseButton {
+  MOUSE_BUTTON_UNSPECIFIED = 0;
+  MOUSE_BUTTON_LEFT = 1;
+  MOUSE_BUTTON_RIGHT = 2;
+  MOUSE_BUTTON_MIDDLE = 3;
+  MOUSE_BUTTON_X1 = 4;
+  MOUSE_BUTTON_X2 = 5;
+}
+
+message InputFrame {
+  CommandIdentity reference = 1;
+  uint64 input_sequence = 2;
+  uint32 lease_ms = 3;
+  repeated PhysicalKey held_keys = 4;
+  repeated MouseButton held_mouse_buttons = 5;
+  sint32 wheel_delta = 6;
+  optional uint64 source_frame_sequence = 7;
+}
+
+message ReleaseAll {
+  CommandIdentity reference = 1;
+  string reason_code = 2;
+}
+
+message FinishAttempt {
+  CommandIdentity reference = 1;
+}
+
+message InspectAttempt {
+  CommandIdentity reference = 1;
+}
+
+message StopSession {
+  CommandIdentity reference = 1;
+  string reason_code = 2;
+}
+
+message FramePacket {
+  SessionRef session = 1;
+  string capture_source_id = 2;
+  uint64 frame_sequence = 3;
+  int64 captured_at_unix_us = 4;
+  uint32 width = 5;
+  uint32 height = 6;
+  string encoding = 7;
+  bytes payload = 8;
+  AttemptRef attempt = 9;
+}
+
+message FrameDirective {
+  SessionRef session = 1;
+  string capture_source_id = 2;
+  optional uint64 accepted_frame_sequence = 3;
+  bool accept_frames = 4;
+}

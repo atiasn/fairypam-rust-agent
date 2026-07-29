@@ -1,0 +1,24 @@
+[package]
+name = "fairypam-agent-guardian"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+fairypam-agent-guardian-protocol = { path = "../../crates/fairypam-agent-guardian-protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[[bin]]
+name = "fairypam-agent-guardian"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"

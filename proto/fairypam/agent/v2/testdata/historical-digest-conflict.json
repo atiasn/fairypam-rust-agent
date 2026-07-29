@@ -1,0 +1,7 @@
+{
+  "command_id": "33333333-3333-4333-8333-333333333333",
+  "sequence": 7,
+  "incoming_payload_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "stored_payload_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "error_code": "command.payload_digest_conflict"
+}

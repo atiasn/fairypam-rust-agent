@@ -1,0 +1,10 @@
+{
+  "business_command_results": 496,
+  "recovery_command_results": 16,
+  "inspect_command_results": 8,
+  "release_command_results": 4,
+  "finish_command_results": 4,
+  "wood_felling_max_rounds": 99,
+  "wood_felling_fixed_business_commands": 3,
+  "wood_felling_commands_per_round": 4
+}

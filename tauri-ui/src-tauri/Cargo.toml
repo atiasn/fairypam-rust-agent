@@ -7,13 +7,32 @@ edition = "2021"
 name = "fairypam_agent_tauri_ui"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[workspace]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-anyhow = "1"
-fairypam-agent = { path = "../.." }
+fairypam-agent = { path = "../../bins/fairypam-agent" }
+fairypam-agent-core = { path = "../../crates/fairypam-agent-core" }
+fairypam-agent-suite = { path = "../../crates/fairypam-agent-suite" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = [] }
-tokio = { version = "1", features = ["sync"] }
+tauri = { version = "2", features = ["tray-icon"] }
+tokio = { version = "1", features = ["sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
