@@ -1804,7 +1804,7 @@ mod tests {
         };
         assert!(messages
             .iter()
-            .any(|message| message == "本机 Core 已启动，正在准备 Hub 连接"));
+            .any(|message| message == "本机 Core 已启动，正在准备远程连接"));
         assert!(messages.iter().any(|message| message == "界面请求环境检查"));
 
         let mut enrolled = RuntimeConfig::unregistered();
