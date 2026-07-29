@@ -392,9 +392,14 @@ describe('App', () => {
     expect(view.getByRole('button', { name: '启动并锁定' })).toBeDisabled();
 
     vi.mocked(agentApi.getOverview).mockRejectedValueOnce(new Error('overview unavailable'));
-    act(() => document.dispatchEvent(new Event('visibilitychange')));
-    await waitFor(() => expect(view.getByRole('button', { name: '更新截图' })).toBeDisabled());
-    expect(view.getByRole('button', { name: '关闭游戏' })).toBeDisabled();
+    const visibilityState = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    try {
+      act(() => document.dispatchEvent(new Event('visibilitychange')));
+      await waitFor(() => expect(view.getByRole('button', { name: '更新截图' })).toBeDisabled());
+      expect(view.getByRole('button', { name: '关闭游戏' })).toBeDisabled();
+    } finally {
+      visibilityState.mockRestore();
+    }
   });
 
   it('紧急停止结果未知时提示保持程序运行', async () => {
