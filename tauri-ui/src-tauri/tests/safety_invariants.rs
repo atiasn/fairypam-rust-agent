@@ -3,8 +3,7 @@ const FRONTEND: &str = include_str!("../../src/lib/agentApi.ts");
 const CONNECTION_PAGE: &str = include_str!("../../src/pages/ConnectionPage.tsx");
 const GATEWAY: &str = include_str!("../src/local_gateway.rs");
 const AGENT_ENROLLMENT: &str = include_str!("../../../bins/fairypam-agent/src/enrollment.rs");
-const AGENT_OBSERVABILITY: &str =
-    include_str!("../../../bins/fairypam-agent/src/observability.rs");
+const AGENT_OBSERVABILITY: &str = include_str!("../../../bins/fairypam-agent/src/observability.rs");
 const AGENT_RUNTIME: &str = include_str!("../../../bins/fairypam-agent/src/runtime.rs");
 const INSTALLER_PROVISIONER: &str =
     include_str!("../../../bins/fairypam-agent-installer/src/main.rs");
