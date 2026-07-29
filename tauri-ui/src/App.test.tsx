@@ -412,7 +412,7 @@ describe('App', () => {
       act(() => document.dispatchEvent(new Event('visibilitychange')));
       await waitFor(() => expect(view.getByRole('button', { name: '更新截图' })).toBeDisabled());
       expect(view.getByRole('button', { name: '关闭游戏' })).toBeDisabled();
-      expect(view.getByText('状态不可用')).toHaveClass('offline');
+      await waitFor(() => expect(view.getByText('状态不可用')).toHaveClass('offline'));
       expect(view.queryByText('已就绪，Hub 已连接')).not.toBeInTheDocument();
       await user.click(view.getByRole('button', { name: '总览' }));
       expect(view.getByRole('heading', { name: '本机 Core 状态不可用' })).toBeInTheDocument();
