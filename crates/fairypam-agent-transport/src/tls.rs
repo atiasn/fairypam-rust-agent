@@ -948,13 +948,20 @@ fn validate_cng_key_policy(
     key: &NCryptKey,
     authorized_user_sid: &str,
 ) -> Result<(), TransportError> {
-    if key.algorithm_group().ok() != Some(AlgorithmGroup::Rsa)
-        || key.bits().ok() != Some(2048)
-        || cng_u32_property(key, NCRYPT_EXPORT_POLICY_PROPERTY)? != 0
-        || cng_u32_property(key, NCRYPT_KEY_USAGE_PROPERTY)? != NCRYPT_ALLOW_SIGNING_FLAG
-        || !cng_key_security_matches(key, authorized_user_sid)?
-    {
-        return Err(identity_invalid("CNG key policy is invalid"));
+    if key.algorithm_group().ok() != Some(AlgorithmGroup::Rsa) {
+        return Err(identity_invalid("CNG key algorithm policy is invalid"));
+    }
+    if key.bits().ok() != Some(2048) {
+        return Err(identity_invalid("CNG key length policy is invalid"));
+    }
+    if cng_u32_property(key, NCRYPT_EXPORT_POLICY_PROPERTY)? != 0 {
+        return Err(identity_invalid("CNG key export policy is invalid"));
+    }
+    if cng_u32_property(key, NCRYPT_KEY_USAGE_PROPERTY)? != NCRYPT_ALLOW_SIGNING_FLAG {
+        return Err(identity_invalid("CNG key usage policy is invalid"));
+    }
+    if !cng_key_security_matches(key, authorized_user_sid)? {
+        return Err(identity_invalid("CNG key DACL policy is invalid"));
     }
     Ok(())
 }
