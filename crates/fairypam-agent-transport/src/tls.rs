@@ -1031,7 +1031,16 @@ fn cng_key_security_matches(
     })
     .map_err(|_| identity_invalid("CNG key security descriptor cannot be verified"));
     let _ = unsafe { LocalFree(text.cast()) };
-    value.map(|value| cng_security_sddl_matches(&value, authorized_user_sid))
+    value.and_then(|value| {
+        if cng_security_sddl_matches(&value, authorized_user_sid) {
+            Ok(true)
+        } else {
+            Err(identity_invalid(format!(
+                "CNG key DACL policy is invalid ({})",
+                cng_security_sddl_summary(&value, authorized_user_sid)
+            )))
+        }
+    })
 }
 
 #[cfg(any(windows, test))]
@@ -1040,6 +1049,61 @@ fn cng_security_sddl_matches(value: &str, authorized_user_sid: &str) -> bool {
         value == format!("D:{flags}(A;;GA;;;SY)(A;;GA;;;{authorized_user_sid})")
             || value == format!("D:{flags}(A;;GA;;;{authorized_user_sid})(A;;GA;;;SY)")
     })
+}
+
+#[cfg(any(windows, test))]
+fn cng_security_sddl_summary(value: &str, authorized_user_sid: &str) -> String {
+    let dacl_flags = value
+        .strip_prefix("D:")
+        .map(|value| value.split_once('(').map_or(value, |(flags, _)| flags))
+        .unwrap_or("");
+    let mut ace_count = 0;
+    let mut summaries = Vec::new();
+    for raw in value.split('(').skip(1) {
+        ace_count += 1;
+        if summaries.len() == 4 {
+            continue;
+        }
+        let Some(body) = raw.strip_suffix(')') else {
+            summaries.push("invalid".to_owned());
+            continue;
+        };
+        let fields = body.split(';').collect::<Vec<_>>();
+        if fields.len() != 6 {
+            summaries.push("invalid".to_owned());
+            continue;
+        }
+        let rights = match fields[2] {
+            "GA" => "GA",
+            "FA" => "FA",
+            value
+                if value.strip_prefix("0x").is_some_and(|hex| {
+                    !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }) =>
+            {
+                "HEX"
+            }
+            _ => "OTHER",
+        };
+        let principal = if fields[5] == "SY" {
+            "SYSTEM"
+        } else if fields[5] == authorized_user_sid {
+            "USER"
+        } else {
+            "OTHER"
+        };
+        summaries.push(format!(
+            "allow={},flags_empty={},rights={rights},principal={principal}",
+            fields[0] == "A",
+            fields[1].is_empty()
+        ));
+    }
+    format!(
+        "protected={},auto_inherited={},ace_count={ace_count},aces=[{}]",
+        dacl_flags.contains('P'),
+        dacl_flags.contains("AI"),
+        summaries.join("|")
+    )
 }
 
 #[cfg(any(windows, test))]
@@ -1429,6 +1493,32 @@ mod tests {
                 validate_windows_sid(rejected).unwrap_err().code(),
                 "transport.identity_invalid"
             );
+        }
+    }
+
+    #[test]
+    fn sddl_diagnostic_never_contains_principal_values() {
+        let summary = cng_security_sddl_summary(
+            "D:P(A;;0xf01ff;;;S-1-0x28651FE848-12-72-9-110)(A;;GR;;;S-1-5-32-545)",
+            "S-1-5-32-545",
+        );
+        assert_eq!(
+            summary,
+            "protected=true,auto_inherited=false,ace_count=2,aces=[allow=true,flags_empty=true,rights=HEX,principal=OTHER|allow=true,flags_empty=true,rights=OTHER,principal=USER]"
+        );
+        assert!(!summary.contains("S-1-"));
+        assert!(!summary.contains("28651FE848"));
+        for (flags, expected) in [
+            ("AI", "protected=false,auto_inherited=true"),
+            ("PAI", "protected=true,auto_inherited=true"),
+            ("P", "protected=true,auto_inherited=false"),
+        ] {
+            let summary =
+                cng_security_sddl_summary(&format!("D:{flags}(A;;GA;;;SY)"), "S-1-5-32-545");
+            assert!(summary.starts_with(expected));
+            let empty_summary = cng_security_sddl_summary(&format!("D:{flags}"), "S-1-5-32-545");
+            assert!(empty_summary.starts_with(expected));
+            assert!(empty_summary.contains("ace_count=0"));
         }
     }
 
