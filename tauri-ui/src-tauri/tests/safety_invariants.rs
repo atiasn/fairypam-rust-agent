@@ -1,4 +1,5 @@
 const COMMANDS: &str = include_str!("../src/command_surface.rs");
+const APP: &str = include_str!("../src/app.rs");
 const FRONTEND: &str = include_str!("../../src/lib/agentApi.ts");
 const CONNECTION_PAGE: &str = include_str!("../../src/pages/ConnectionPage.tsx");
 const GATEWAY: &str = include_str!("../src/local_gateway.rs");
@@ -21,7 +22,7 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[test]
-fn production_ui_cannot_arm_inject_or_reset_emergency() {
+fn renderer_cannot_arm_inject_or_reset_emergency() {
     for forbidden in [
         "arm",
         "send_input",
@@ -36,6 +37,18 @@ fn production_ui_cannot_arm_inject_or_reset_emergency() {
         assert!(
             !FRONTEND.contains(forbidden),
             "forbidden frontend surface: {forbidden}"
+        );
+    }
+
+    for required in [
+        "MenuItemBuilder::with_id(\"reset-emergency\"",
+        "state.reset_emergency_stop().await",
+        "app.emit(\"emergency-reset\", ())",
+        "app.emit(\"emergency-reset-failed\", ())",
+    ] {
+        assert!(
+            APP.contains(required),
+            "missing native recovery boundary: {required}"
         );
     }
 

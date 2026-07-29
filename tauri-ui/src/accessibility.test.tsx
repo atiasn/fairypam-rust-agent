@@ -8,7 +8,9 @@ vi.mock('./lib/agentApi', () => ({
     ensureLocalAgent: vi.fn().mockResolvedValue({ status: 'ready' }),
     onLocalAgentActivation: vi.fn().mockResolvedValue(() => {}),
     onEmbeddedRuntimeFailed: vi.fn().mockResolvedValue(() => {}),
-    getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' }, doctor: { profiles: [], runtime: 'dry_run' } }),
+    onEmergencyReset: vi.fn().mockResolvedValue(() => {}),
+    onEmergencyResetFailed: vi.fn().mockResolvedValue(() => {}),
+    getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' }, doctor: { profiles: [], runtime: 'production' } }),
     getConnectionStatus: vi.fn().mockResolvedValue({ control: 'offline', frame: 'offline', capture_active: false }),
     runEnvironmentCheck: vi.fn().mockResolvedValue({ registration_ready: true, registration_pending: false, checks: [] }),
     getLogTail: vi.fn().mockResolvedValue({ entries: [] }),
@@ -30,7 +32,7 @@ it('has no structural axe violations in the main UI', async () => {
       <App />
     </QueryClientProvider>,
   );
-  await findByRole('heading', { name: '后台服务已就绪' });
+  await findByRole('heading', { name: '本机 Core 已就绪' });
   const result = await axe.run(container, { rules: { 'color-contrast': { enabled: false } } });
   expect(result.violations).toEqual([]);
 });

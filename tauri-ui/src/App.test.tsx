@@ -5,6 +5,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const activation = vi.hoisted(() => ({ handler: undefined as undefined | (() => void) }));
 const runtimeFailure = vi.hoisted(() => ({ handler: undefined as undefined | (() => void) }));
+const emergencyReset = vi.hoisted(() => ({ handler: undefined as undefined | (() => void) }));
+const emergencyResetFailed = vi.hoisted(() => ({ handler: undefined as undefined | (() => void) }));
 
 vi.mock('./lib/agentApi', () => ({
   agentApi: {
@@ -21,7 +23,19 @@ vi.mock('./lib/agentApi', () => ({
         runtimeFailure.handler = undefined;
       };
     }),
-    getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' }, doctor: { profiles: ['signed-profile'], runtime: 'dry_run' } }),
+    onEmergencyReset: vi.fn(async (handler: () => void) => {
+      emergencyReset.handler = handler;
+      return () => {
+        emergencyReset.handler = undefined;
+      };
+    }),
+    onEmergencyResetFailed: vi.fn(async (handler: () => void) => {
+      emergencyResetFailed.handler = handler;
+      return () => {
+        emergencyResetFailed.handler = undefined;
+      };
+    }),
+    getOverview: vi.fn().mockResolvedValue({ status: { state: 'ConnectedIdle', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' }, doctor: { profiles: ['signed-profile'], runtime: 'production' } }),
     getConnectionStatus: vi.fn().mockResolvedValue({ control: 'connected', frame: 'connected', capture_active: false }),
     runEnvironmentCheck: vi.fn().mockResolvedValue({ registration_ready: true, registration_pending: false, checks: [] }),
     getLogTail: vi.fn().mockResolvedValue({ entries: [] }),
@@ -51,15 +65,22 @@ describe('App', () => {
     vi.clearAllMocks();
     activation.handler = undefined;
     runtimeFailure.handler = undefined;
+    emergencyReset.handler = undefined;
+    emergencyResetFailed.handler = undefined;
     vi.mocked(agentApi.ensureLocalAgent).mockResolvedValue({ status: 'ready' });
+    vi.mocked(agentApi.getOverview).mockResolvedValue({
+      status: { state: 'ConnectedIdle', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' },
+      doctor: { profiles: ['signed-profile'], runtime: 'production' },
+    });
     vi.mocked(agentApi.getLogTail).mockResolvedValue({ entries: [] });
+    vi.mocked(agentApi.scanInstalledGames).mockResolvedValue({ games: [] });
   });
 
-  it('仅显示中文产品导航并自动准备后台服务', async () => {
+  it('仅显示中文产品导航并自动准备本机 Core', async () => {
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
+    expect(await view.findByRole('heading', { name: '本机 Core 已就绪' })).toBeInTheDocument();
     expect(agentApi.ensureLocalAgent).toHaveBeenCalledOnce();
     for (const label of ['总览', '连接与注册', '环境检查', '日志', '游戏']) {
       expect(view.getByRole('button', { name: label })).toBeInTheDocument();
@@ -74,8 +95,8 @@ describe('App', () => {
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByText('服务已就绪，正在重试连接')).toBeInTheDocument();
-    expect(await view.findByText('正在持续尝试连接，您仍可继续使用本地功能。')).toBeInTheDocument();
+    expect(await view.findByText('已就绪，Hub 重连中')).toBeInTheDocument();
+    expect(await view.findByText('Hub 正在重连，您仍可继续使用安全的本地功能。')).toBeInTheDocument();
     expect(view.queryByText('服务启动需要处理')).not.toBeInTheDocument();
   });
 
@@ -83,19 +104,19 @@ describe('App', () => {
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByText('服务已连接')).toBeInTheDocument();
+    expect(await view.findByText('已就绪，Hub 已连接')).toBeInTheDocument();
     await waitFor(() => expect(activation.handler).toBeTypeOf('function'));
     vi.mocked(agentApi.ensureLocalAgent).mockRejectedValueOnce(new Error('UAC denied'));
     await act(async () => activation.handler?.());
 
     expect(await view.findByText('服务启动需要处理')).toBeInTheDocument();
-    expect(view.queryByText('服务已连接')).not.toBeInTheDocument();
-    expect(view.queryByRole('heading', { name: '后台服务已就绪' })).not.toBeInTheDocument();
+    expect(view.queryByText('已就绪，Hub 已连接')).not.toBeInTheDocument();
+    expect(view.queryByRole('heading', { name: '本机 Core 已就绪' })).not.toBeInTheDocument();
     expect(view.queryByRole('button', { name: '重启后台服务' })).not.toBeInTheDocument();
     expect(view.queryByRole('button', { name: '修复后台服务' })).not.toBeInTheDocument();
     await userEvent.click(view.getByRole('button', { name: '重试启动' }));
-    expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
-    expect(view.getByText('服务已连接')).toHaveClass('online');
+    expect(await view.findByRole('heading', { name: '本机 Core 已就绪' })).toBeInTheDocument();
+    expect(view.getByText('已就绪，Hub 已连接')).toHaveClass('online');
   });
 
   it('重复打开恢复期间隐藏旧状态，完成后恢复在线操作', async () => {
@@ -103,7 +124,7 @@ describe('App', () => {
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
+    expect(await view.findByRole('heading', { name: '本机 Core 已就绪' })).toBeInTheDocument();
     await waitFor(() => expect(activation.handler).toBeTypeOf('function'));
     vi.mocked(agentApi.ensureLocalAgent).mockImplementationOnce(() => new Promise((resolve) => {
       finishStartup = resolve;
@@ -111,16 +132,16 @@ describe('App', () => {
 
     act(() => activation.handler?.());
 
-    expect(await view.findByText('正在准备本机服务')).toBeInTheDocument();
-    expect(view.getByRole('heading', { name: '正在准备服务' })).toBeInTheDocument();
-    expect(view.queryByRole('heading', { name: '后台服务已就绪' })).not.toBeInTheDocument();
+    expect(await view.findByText('正在准备本机 Core')).toBeInTheDocument();
+    expect(view.getByRole('heading', { name: '正在准备本机 Core' })).toBeInTheDocument();
+    expect(view.queryByRole('heading', { name: '本机 Core 已就绪' })).not.toBeInTheDocument();
     expect(view.queryByText(/运行状态：/)).not.toBeInTheDocument();
 
     finishStartup!({ status: 'ready' });
 
-    const ready = await view.findByText('服务已连接');
+    const ready = await view.findByText('已就绪，Hub 已连接');
     expect(ready).toHaveClass('online');
-    expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
+    expect(await view.findByRole('heading', { name: '本机 Core 已就绪' })).toBeInTheDocument();
     await userEvent.click(view.getByRole('button', { name: '连接与注册' }));
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
   });
@@ -129,13 +150,13 @@ describe('App', () => {
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByText('服务已连接')).toBeInTheDocument();
+    expect(await view.findByText('已就绪，Hub 已连接')).toBeInTheDocument();
     await waitFor(() => expect(runtimeFailure.handler).toBeTypeOf('function'));
     act(() => runtimeFailure.handler?.());
 
-    expect(await view.findByRole('heading', { name: '本机服务已停止' })).toBeInTheDocument();
-    expect(view.queryByText('服务已连接')).not.toBeInTheDocument();
-    expect(view.queryByRole('heading', { name: '后台服务已就绪' })).not.toBeInTheDocument();
+    expect(await view.findByRole('heading', { name: '本机 Core 已停止' })).toBeInTheDocument();
+    expect(view.queryByText('已就绪，Hub 已连接')).not.toBeInTheDocument();
+    expect(view.queryByRole('heading', { name: '本机 Core 已就绪' })).not.toBeInTheDocument();
   });
 
   it('启动后自动检查本机环境，并在未就绪时禁用注册', async () => {
@@ -148,7 +169,7 @@ describe('App', () => {
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByRole('heading', { name: '后台服务已就绪' })).toBeInTheDocument();
+    expect(await view.findByRole('heading', { name: '本机 Core 已就绪' })).toBeInTheDocument();
     await waitFor(() => expect(agentApi.runEnvironmentCheck).toHaveBeenCalledOnce());
     await user.click(view.getByRole('button', { name: '连接与注册' }));
 
@@ -209,7 +230,7 @@ describe('App', () => {
     await user.click(view.getByRole('button', { name: '注册或重新注册' }));
     expect(agentApi.registerHub).toHaveBeenCalledWith('https://register.example', '0123456789abcdef');
     expect(await view.findByText('注册已完成，正在连接服务。')).toBeInTheDocument();
-    expect(await view.findByText('服务已连接')).toBeInTheDocument();
+    expect(await view.findByText('已就绪，Hub 已连接')).toBeInTheDocument();
     expect(agentApi.ensureLocalAgent).toHaveBeenCalledTimes(2);
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeEnabled();
     expect(view.getByLabelText('服务地址')).toHaveValue('');
@@ -253,6 +274,7 @@ describe('App', () => {
     const view = within(app.container);
 
     await user.click(view.getByRole('button', { name: '环境检查' }));
+    expect(await view.findByText('运行模式：正常服务')).toBeInTheDocument();
     expect(await view.findByRole('listitem')).toHaveTextContent('守护服务：正常');
     expect(view.queryByText('无需操作')).not.toBeInTheDocument();
     expect(view.queryByText('guardian.binary_available')).not.toBeInTheDocument();
@@ -264,6 +286,19 @@ describe('App', () => {
 
   it('只为已签名 Profile 暴露固定的本地游戏控制', async () => {
     const user = userEvent.setup();
+    vi.mocked(agentApi.getOverview)
+      .mockResolvedValueOnce({
+        status: { state: 'ConnectedIdle', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' },
+        doctor: { profiles: ['signed-profile'], runtime: 'production' },
+      })
+      .mockResolvedValueOnce({
+        status: { state: 'TargetLocked', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'active' },
+        doctor: { profiles: ['signed-profile'], runtime: 'production' },
+      })
+      .mockResolvedValue({
+        status: { state: 'ConnectedIdle', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' },
+        doctor: { profiles: ['signed-profile'], runtime: 'production' },
+      });
     vi.mocked(agentApi.scanInstalledGames).mockResolvedValueOnce({
       games: [{ discovery_id: 'mihoyo:stable-id', name: '原神', version: null, installed: true, supported: true, profile_id: 'signed-profile' }],
     });
@@ -280,6 +315,87 @@ describe('App', () => {
     await user.click(view.getByRole('button', { name: '紧急停止并释放输入' }));
     expect(agentApi.releaseAll).toHaveBeenCalledOnce();
     expect(await view.findByText('已紧急停止并释放全部输入。')).toBeInTheDocument();
+  });
+
+  it('保护状态仍展示日志和已发现游戏，并在确认恢复前禁用启动', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.getOverview)
+      .mockResolvedValueOnce({
+        status: { state: 'EmergencyStopped', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'emergency_stopped' },
+        doctor: { profiles: ['signed-profile'], runtime: 'production' },
+      })
+      .mockResolvedValue({
+        status: { state: 'ConnectedIdle', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' },
+        doctor: { profiles: ['signed-profile'], runtime: 'production' },
+      });
+    vi.mocked(agentApi.scanInstalledGames).mockResolvedValueOnce({
+      games: [{ discovery_id: 'mihoyo:stable-id', name: '原神', version: null, installed: true, supported: true, profile_id: 'signed-profile' }],
+    });
+    const app = renderApp();
+    const view = within(app.container);
+
+    expect(await view.findByRole('heading', { name: '本机 Core 处于保护状态' })).toBeInTheDocument();
+    await waitFor(() => expect(emergencyResetFailed.handler).toBeTypeOf('function'));
+    act(() => emergencyResetFailed.handler?.());
+    expect(view.getByRole('alert')).toHaveTextContent('清理尚未完成，保护状态保持不变');
+    expect(view.getByRole('heading', { name: '本机 Core 处于保护状态' })).toBeInTheDocument();
+    await user.click(view.getByRole('button', { name: '日志' }));
+    expect(await view.findByText('暂时没有可显示的运行记录。服务正常时，记录可能为空。')).toBeInTheDocument();
+    expect(agentApi.getLogTail).toHaveBeenCalled();
+
+    await user.click(view.getByRole('button', { name: '游戏' }));
+    expect(await view.findByText('原神')).toBeInTheDocument();
+    expect(view.getByText(/当前处于保护状态/)).toBeInTheDocument();
+    const launch = view.getByRole('button', { name: '启动并锁定' });
+    expect(launch).toBeDisabled();
+    expect(view.getByText(/请从系统托盘选择“解除保护”/)).toBeInTheDocument();
+    await waitFor(() => expect(emergencyReset.handler).toBeTypeOf('function'));
+    act(() => emergencyReset.handler?.());
+    await waitFor(() => expect(launch).toBeEnabled());
+    expect(view.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('活动任务期间保留只读页面并禁用新的本地游戏启动', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.getOverview).mockResolvedValueOnce({
+      status: { state: 'TargetLocked', task_active: true, capture_active: true, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'active' },
+      doctor: { profiles: ['signed-profile'], runtime: 'production' },
+    });
+    vi.mocked(agentApi.scanInstalledGames).mockResolvedValueOnce({
+      games: [{ discovery_id: 'mihoyo:stable-id', name: '原神', version: null, installed: true, supported: true, profile_id: 'signed-profile' }],
+    });
+    const app = renderApp();
+    const view = within(app.container);
+
+    await user.click(await view.findByRole('button', { name: '日志' }));
+    expect(await view.findByText('暂时没有可显示的运行记录。服务正常时，记录可能为空。')).toBeInTheDocument();
+    await user.click(view.getByRole('button', { name: '游戏' }));
+    expect(await view.findByText('原神')).toBeInTheDocument();
+    expect(view.getByRole('button', { name: '启动并锁定' })).toBeDisabled();
+    expect(view.queryByRole('button', { name: '更新截图' })).not.toBeInTheDocument();
+  });
+
+  it('重新打开游戏页时从 Core 锁定状态恢复设备控制', async () => {
+    const user = userEvent.setup();
+    vi.mocked(agentApi.getOverview).mockResolvedValueOnce({
+      status: { state: 'TargetLocked', task_active: false, capture_active: true, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'active' },
+      doctor: { profiles: ['signed-profile'], runtime: 'production' },
+    });
+    vi.mocked(agentApi.scanInstalledGames).mockResolvedValueOnce({
+      games: [{ discovery_id: 'mihoyo:stable-id', name: '原神', version: null, installed: true, supported: true, profile_id: 'signed-profile' }],
+    });
+    const app = renderApp();
+    const view = within(app.container);
+
+    await user.click(await view.findByRole('button', { name: '游戏' }));
+    expect(await view.findByRole('button', { name: '更新截图' })).toBeEnabled();
+    expect(view.getByRole('button', { name: '关闭游戏' })).toBeEnabled();
+    expect(view.getByRole('button', { name: '启动并锁定' })).toBeDisabled();
+
+    vi.mocked(agentApi.getOverview).mockRejectedValueOnce(new Error('overview unavailable'));
+    act(() => document.dispatchEvent(new Event('visibilitychange')));
+    await waitFor(() => expect(view.getByRole('button', { name: '更新截图' })).toBeDisabled());
+    expect(view.getByRole('button', { name: '关闭游戏' })).toBeDisabled();
   });
 
   it('紧急停止结果未知时提示保持程序运行', async () => {
@@ -309,7 +425,7 @@ describe('App', () => {
   it('未知运行模式保持中性中文状态', async () => {
     const user = userEvent.setup();
     vi.mocked(agentApi.getOverview).mockResolvedValueOnce({
-      status: { state: 'ConnectedIdle', capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' },
+      status: { state: 'ConnectedIdle', task_active: false, capture_active: false, build_id: 'test-build', suite_version: '0.1.1', guardian_state: 'idle_no_holds' },
       doctor: { profiles: ['signed-profile'], runtime: 'future_mode' },
     });
     const app = renderApp();
@@ -338,14 +454,14 @@ describe('App', () => {
     const app = renderApp();
     const view = within(app.container);
 
-    expect(await view.findByRole('heading', { name: '服务暂时无法使用' })).toBeInTheDocument();
+    expect(await view.findByRole('heading', { name: '本机 Core 状态不可用' })).toBeInTheDocument();
     expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
     await user.click(view.getByRole('button', { name: '连接与注册' }));
     expect(view.getByRole('button', { name: '注册或重新注册' })).toBeDisabled();
     expect(view.getByRole('button', { name: '重试启动' })).toBeInTheDocument();
   });
 
-  it('后台服务异常时只提供原进程内重试', async () => {
+  it('本机 Core 异常时只提供原进程内重试', async () => {
     vi.mocked(agentApi.ensureLocalAgent).mockRejectedValueOnce({
       code: 'startup.agent_repair_required',
       message: '需要修复',
@@ -354,12 +470,12 @@ describe('App', () => {
     const view = within(app.container);
 
     expect(await view.findByRole('button', { name: '重试启动' })).toBeInTheDocument();
-    expect(view.getByText('后台服务需要修复')).toBeInTheDocument();
+    expect(view.getByText('本机 Core 需要修复')).toBeInTheDocument();
     expect(view.queryByRole('button', { name: '重启后台服务' })).not.toBeInTheDocument();
     expect(view.queryByRole('button', { name: '修复后台服务' })).not.toBeInTheDocument();
   });
 
-  it('日志和游戏在后台服务就绪前不请求本地通道', async () => {
+  it('日志和游戏在本机 Core 就绪前不请求固定命令面', async () => {
     const user = userEvent.setup();
     let resolveStartup: (value: { status: string }) => void;
     vi.mocked(agentApi.ensureLocalAgent).mockImplementationOnce(() => new Promise((resolve) => {
@@ -369,7 +485,7 @@ describe('App', () => {
     const view = within(app.container);
 
     await user.click(view.getByRole('button', { name: '日志' }));
-    expect(view.getByText('正在等待后台服务就绪。')).toBeInTheDocument();
+    expect(view.getByText('正在等待本机 Core 就绪。')).toBeInTheDocument();
     expect(agentApi.getLogTail).not.toHaveBeenCalled();
     resolveStartup!({ status: 'ready' });
     expect(await view.findByText('暂时没有可显示的运行记录。服务正常时，记录可能为空。')).toBeInTheDocument();

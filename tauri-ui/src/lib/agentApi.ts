@@ -37,6 +37,10 @@ export const agentApi = {
   inputProbe: (action: 'move_forward' | 'quick_use' | 'mouse_left') =>
     invoke<InputResult>('input_probe', { action }),
   releaseAll: () => invoke<ReleaseAll>('release_all'),
+  onEmergencyReset: (handler: () => void) =>
+    listen('emergency-reset', handler),
+  onEmergencyResetFailed: (handler: () => void) =>
+    listen('emergency-reset-failed', handler),
   registerHub: (hubAddress: string, registrationCode: string) =>
     invoke<RegistrationStatus>('register_hub', { hubAddress, registrationCode }),
 };

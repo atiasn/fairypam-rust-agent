@@ -12,11 +12,6 @@ export type ConnectionAction =
   | { type: 'ExplicitEmergency'; code: string }
   | { type: 'Reset' };
 
-const offlineCode = (code: string) =>
-  code === 'local.transport.timeout' ||
-  code === 'local.transport.disconnected' ||
-  code === 'local.transport.pipe_not_found';
-
 export const initialConnectionState: ConnectionState = { availability: 'unknown' };
 
 export function connectionReducer(
@@ -28,7 +23,7 @@ export function connectionReducer(
   }
   if (state.availability === 'emergency' && action.type !== 'Reset') return state;
   if (action.type === 'QuerySucceeded') return { availability: 'online' };
-  if (action.type === 'QueryFailed' && offlineCode(action.code)) {
+  if (action.type === 'QueryFailed') {
     return { availability: 'offline', reasonCode: action.code };
   }
   if (action.type === 'ExplicitOffline') return { availability: 'offline', reasonCode: action.code };

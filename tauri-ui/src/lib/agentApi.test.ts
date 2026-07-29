@@ -38,4 +38,18 @@ describe('agentApi', () => {
 
     expect(listen).toHaveBeenCalledWith('embedded-runtime-failed', handler);
   });
+
+  it('subscribes to native emergency recovery', async () => {
+    const handler = vi.fn();
+    await agentApi.onEmergencyReset(handler);
+
+    expect(listen).toHaveBeenCalledWith('emergency-reset', handler);
+  });
+
+  it('subscribes to rejected native emergency recovery', async () => {
+    const handler = vi.fn();
+    await agentApi.onEmergencyResetFailed(handler);
+
+    expect(listen).toHaveBeenCalledWith('emergency-reset-failed', handler);
+  });
 });

@@ -4,10 +4,16 @@ import { useEffect, useState } from 'react';
 import { agentApi } from '../lib/agentApi';
 import { queryKeys } from '../lib/queryKeys';
 
-export function GamesPage({ enabled }: { enabled: boolean }) {
+type Props = {
+  canStart: boolean;
+  emergency: boolean;
+  enabled: boolean;
+  targetActive: boolean;
+};
+
+export function GamesPage({ canStart, emergency, enabled, targetActive }: Props) {
   const queryClient = useQueryClient();
   const games = useQuery({ queryKey: queryKeys.games, queryFn: agentApi.scanInstalledGames, enabled });
-  const [activeProfile, setActiveProfile] = useState<string>();
   const [previewUrl, setPreviewUrl] = useState<string>();
   const [message, setMessage] = useState<string>();
   const control = useMutation({
@@ -18,7 +24,6 @@ export function GamesPage({ enabled }: { enabled: boolean }) {
   const emergencyStop = useMutation({
     mutationFn: agentApi.releaseAll,
     onSuccess: (released) => {
-      setActiveProfile(undefined);
       setMessage(!released.cleanup_complete
         ? '紧急停止未完全收口，请保持程序运行并联系管理员。'
         : '已紧急停止并释放全部输入。');
@@ -26,14 +31,12 @@ export function GamesPage({ enabled }: { enabled: boolean }) {
     onError: () => setMessage('紧急停止结果无法确认。请保持 FairyPam 运行、停止操作游戏并联系管理员。'),
     onSettled: () => void queryClient.invalidateQueries({ queryKey: queryKeys.overview }),
   });
-
   useEffect(() => () => {
     if (previewUrl) URL.revokeObjectURL(previewUrl);
   }, [previewUrl]);
-
   const launch = (profileId: string) => control.mutate(async () => {
     await agentApi.launchGame(profileId);
-    setActiveProfile(profileId);
+    await queryClient.invalidateQueries({ queryKey: queryKeys.overview });
     return '游戏已启动并锁定为当前目标。';
   });
   const capture = () => control.mutate(async () => {
@@ -52,14 +55,15 @@ export function GamesPage({ enabled }: { enabled: boolean }) {
     });
   const close = () => control.mutate(async () => {
     await agentApi.closeGame();
-    setActiveProfile(undefined);
+    await queryClient.invalidateQueries({ queryKey: queryKeys.overview });
     return '游戏已安全关闭。';
   });
 
   return (
     <section className="status-card" aria-labelledby="games-heading">
       <h2 id="games-heading">已发现的米哈游游戏</h2>
-      {!enabled && <p role="status">正在等待后台服务就绪。</p>}
+      {!enabled && <p role="status">正在等待本机 Core 就绪。</p>}
+      {emergency && <p role="status">当前处于保护状态：输入已释放，启动和设备操作已锁定。</p>}
       {enabled && games.isLoading && <p>正在扫描受支持的启动器安装。</p>}
       {enabled && games.isError && <p role="status">游戏扫描失败。</p>}
       {games.data?.games.length === 0 && <p>未发现可用游戏。</p>}
@@ -69,25 +73,26 @@ export function GamesPage({ enabled }: { enabled: boolean }) {
             <strong>{game.name}</strong>{game.version ? ` ${game.version}` : ''}
             <span>已安装：{game.installed ? '是' : '否'}；支持：{game.supported ? '是' : '否'}</span>
             {game.profile_id && (
-              <button disabled={control.isPending || Boolean(activeProfile)} onClick={() => launch(game.profile_id!)} type="button">
+              <button disabled={!canStart || control.isPending || targetActive} onClick={() => launch(game.profile_id!)} type="button">
                 启动并锁定
               </button>
             )}
           </li>
         ))}
       </ul>
-      {activeProfile && (
+      {targetActive && (
         <div className="game-controls" aria-label="本地设备控制">
-          <button disabled={control.isPending} onClick={capture} type="button">更新截图</button>
-          <button disabled={control.isPending} onClick={() => input('move_forward')} type="button">W 前进探针</button>
-          <button disabled={control.isPending} onClick={() => input('quick_use')} type="button">快速使用探针</button>
-          <button disabled={control.isPending} onClick={() => input('mouse_left')} type="button">左键探针</button>
-          <button disabled={control.isPending} onClick={close} type="button">关闭游戏</button>
+          <button disabled={!enabled || emergency || control.isPending} onClick={capture} type="button">更新截图</button>
+          <button disabled={!enabled || emergency || control.isPending} onClick={() => input('move_forward')} type="button">W 前进探针</button>
+          <button disabled={!enabled || emergency || control.isPending} onClick={() => input('quick_use')} type="button">快速使用探针</button>
+          <button disabled={!enabled || emergency || control.isPending} onClick={() => input('mouse_left')} type="button">左键探针</button>
+          <button disabled={!enabled || emergency || control.isPending} onClick={close} type="button">关闭游戏</button>
         </div>
       )}
       {message && <p role="status">{message}</p>}
       {previewUrl && <img className="game-preview" src={previewUrl} alt="当前游戏窗口截图" />}
       <button disabled={control.isPending || emergencyStop.isPending} onClick={() => emergencyStop.mutate()} type="button">紧急停止并释放输入</button>
+      {emergency && <p className="notice">确认任务清理完成后，请从系统托盘选择“解除保护”。</p>}
       <p className="notice">启动功能只会使用已识别的游戏，不会读取或显示任意程序路径。</p>
     </section>
   );

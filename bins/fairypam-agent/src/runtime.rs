@@ -442,15 +442,15 @@ impl RuntimeLogMessage {
 
     const fn text(self) -> &'static str {
         match self {
-            Self::AwaitingRegistration => "后台服务正在等待完成安全注册",
-            Self::Started => "后台服务已启动，正在准备连接",
+            Self::AwaitingRegistration => "本机 Core 正在等待完成安全注册",
+            Self::Started => "本机 Core 已启动，正在准备 Hub 连接",
             Self::ControlConnectionStarting => "正在建立服务连接",
             Self::ControlConnectionEstablished => "服务连接已建立",
             Self::FrameConnectionEstablished => "画面服务已准备就绪",
             Self::EnrollmentRefreshFailed => "注册信息刷新失败，连接将保持安全关闭",
             Self::SessionCleared => "连接已重置，正在重新连接",
-            Self::LocalShutdownRequested => "后台服务收到安全停止请求",
-            Self::LocalUiShutdownRequested => "界面请求安全停止后台服务",
+            Self::LocalShutdownRequested => "本机 Core 收到安全停止请求",
+            Self::LocalUiShutdownRequested => "界面请求安全停止本机 Core",
             Self::LocalEnvironmentCheckRequested => "界面请求环境检查",
             Self::LocalGameScanRequested => "界面请求扫描已安装游戏",
             Self::LocalRegistrationRequested => "界面请求注册服务",
@@ -1048,6 +1048,7 @@ impl EmbeddedRuntimeHandle {
             | LocalCommand::Doctor
             | LocalCommand::ListProfiles
             | LocalCommand::ReleaseAll
+            | LocalCommand::ResetEmergencyStop
             | LocalCommand::GetConnectionStatus
             | LocalCommand::RunEnvironmentCheck
             | LocalCommand::GetLogTail { .. }
@@ -1677,11 +1678,8 @@ mod tests {
         assert_eq!(released["state"], "EmergencyStopped");
         assert_eq!(released["cleanup_complete"], true);
         assert_eq!(
-            handle
-                .execute(&LocalCommand::ResetEmergencyStop)
-                .unwrap_err()
-                .code(),
-            "local.embedded_command_not_allowed"
+            handle.execute(&LocalCommand::ResetEmergencyStop).unwrap()["state"],
+            "ConnectedIdle"
         );
         assert!(!shutdown.is_cancelled());
         assert!(handle.execute(&LocalCommand::ShutdownAgent).is_ok());
@@ -1806,7 +1804,7 @@ mod tests {
         };
         assert!(messages
             .iter()
-            .any(|message| message == "后台服务已启动，正在准备连接"));
+            .any(|message| message == "本机 Core 已启动，正在准备 Hub 连接"));
         assert!(messages.iter().any(|message| message == "界面请求环境检查"));
 
         let mut enrolled = RuntimeConfig::unregistered();

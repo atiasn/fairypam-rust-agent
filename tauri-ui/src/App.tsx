@@ -24,23 +24,24 @@ const navigation: Array<{ id: Page; label: string; hint: string }> = [
 ];
 
 function startupLabel(status: string | undefined, isPending: boolean, error: unknown) {
-  if (isPending) return '正在准备本机服务';
+  if (isPending) return '正在准备本机 Core';
   if (
     typeof error === 'object'
     && error !== null
     && 'code' in error
     && error.code === 'startup.agent_repair_required'
-  ) return '后台服务需要修复';
+  ) return '本机 Core 需要修复';
   if (error) return '服务启动需要处理';
-  if (status === 'ready') return '服务已连接';
-  if (status === 'hub_wait_timeout') return '服务已就绪，正在重试连接';
-  if (status === 'agent_ready') return '服务已就绪，等待注册';
-  return '服务已就绪';
+  if (status === 'ready') return '已就绪，Hub 已连接';
+  if (status === 'hub_wait_timeout') return '已就绪，Hub 重连中';
+  if (status === 'agent_ready') return '已就绪，等待注册';
+  return '已就绪';
 }
 
 export default function App() {
   const [page, setPage] = useState<Page>('dashboard');
   const [activationState, setActivationState] = useState<'pending' | 'failed' | 'runtime-failed'>();
+  const [emergencyResetFailed, setEmergencyResetFailed] = useState(false);
   const startup = useQuery({
     queryKey: queryKeys.startup,
     queryFn: agentApi.ensureLocalAgent,
@@ -48,6 +49,13 @@ export default function App() {
   });
   const queries = useAgentQueries(startup.isSuccess);
   const { connection, dispatch } = useConnectionState(queries.overview.isSuccess, queries.overview.error);
+  const runtimeState = queries.overview.data?.status.state.toLowerCase();
+  const taskActive = queries.overview.data?.status.task_active ?? false;
+  const emergency = runtimeState === 'emergencystopped';
+  const agentReady = startup.isSuccess && !activationState && queries.overview.isSuccess;
+  const canChangeRuntime = agentReady
+    && canMutate(connection)
+    && runtimeState === 'connectedidle';
   const refreshAgentState = useCallback(async () => {
     const startupResult = await startup.refetch();
     if (startupResult.isError) {
@@ -100,14 +108,55 @@ export default function App() {
   }, [dispatch]);
 
   useEffect(() => {
-    if (queries.overview.data?.status.state.toLowerCase().includes('emergency')) {
+    if (emergency) {
       dispatch({ type: 'ExplicitEmergency', code: 'agent.guardian.emergency' });
     }
-  }, [dispatch, queries.overview.data?.status.state]);
+  }, [dispatch, emergency]);
+
+  const refreshAfterEmergencyReset = useCallback(async () => {
+    const overviewResult = await queries.overview.refetch();
+    if (overviewResult.isError || overviewResult.data?.status.state.toLowerCase() === 'emergencystopped') {
+      return;
+    }
+    setEmergencyResetFailed(false);
+    dispatch({ type: 'Reset' });
+    dispatch({ type: 'QuerySucceeded' });
+    void queries.environment.refetch();
+  }, [dispatch, queries.environment.refetch, queries.overview.refetch]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void agentApi.onEmergencyReset(() => {
+      void refreshAfterEmergencyReset();
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [refreshAfterEmergencyReset]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void agentApi.onEmergencyResetFailed(() => {
+      setEmergencyResetFailed(true);
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   const common = {
     connection,
-    canMutate: canMutate(connection),
+    canMutate: canChangeRuntime,
     environment: queries.environment,
     overview: queries.overview,
     startup,
@@ -115,9 +164,8 @@ export default function App() {
       void refreshAgentState();
     },
   };
-  const agentReady = startup.isSuccess && !activationState && queries.overview.isSuccess;
   const startupText = activationState === 'runtime-failed'
-    ? '本机服务已停止'
+    ? '本机 Core 已停止'
     : startupLabel(
       startup.data?.status,
       startup.isPending || activationState === 'pending',
@@ -143,7 +191,7 @@ export default function App() {
         <div className="status-strip">
           <p aria-live="polite" className={`chip ${statusTone}`}>
             <span aria-hidden="true" className={`led ${statusTone}`} />
-            本机服务 <strong className={connection.availability}>{startupText}</strong>
+            本机 Core <strong className={connection.availability}>{startupText}</strong>
           </p>
           <p className="chip">协议 <strong>gRPC + mTLS V2</strong></p>
         </div>
@@ -168,7 +216,7 @@ export default function App() {
               <span>{item.label}<small>{item.hint}</small></span>
             </button>
           ))}
-          <p className="nav-note">关闭窗口不会停止后台服务。安全退出请使用系统托盘。</p>
+          <p className="nav-note">关闭窗口不会停止本机 Core。安全退出请使用系统托盘。</p>
         </nav>
         <main className="main">
           <div className="page-head">
@@ -180,18 +228,18 @@ export default function App() {
             <span className="mode">SECURE CHANNEL / V2</span>
           </div>
           {activationState === 'pending' && (
-            <StatusPanel availability="unknown" title="正在准备服务" detail="正在检查服务状态。" />
+            <StatusPanel availability="unknown" title="正在准备本机 Core" detail="正在检查本机运行状态。" />
           )}
           {activationState === 'runtime-failed' && (
             <StatusPanel
               availability="offline"
-              title="本机服务已停止"
+              title="本机 Core 已停止"
               detail="为保护游戏操作，本次会话已锁定。请从系统托盘安全退出 FairyPam，然后重新启动。"
             />
           )}
           {activationState === 'failed' && (
             <>
-              <StatusPanel availability="offline" title="服务暂时无法使用" detail="请重试检查本机服务。" />
+              <StatusPanel availability="offline" title="本机 Core 暂时无法使用" detail="请重试检查本机运行状态。" />
               <div className="actions">
                 <button
                   onClick={() => {
@@ -205,11 +253,21 @@ export default function App() {
               </div>
             </>
           )}
+          {emergencyResetFailed && (
+            <p role="alert">清理尚未完成，保护状态保持不变。请再次执行紧急停止并释放输入后重试。</p>
+          )}
           {!activationState && page === 'dashboard' && <DashboardPage {...common} />}
           {!activationState && page === 'connection' && <ConnectionPage {...common} />}
           {!activationState && page === 'environment' && <DiagnosticsPage environment={queries.environment} overview={queries.overview} />}
           {!activationState && page === 'logs' && <LogsPage enabled={agentReady} />}
-          {!activationState && page === 'games' && <GamesPage enabled={agentReady} />}
+          {!activationState && page === 'games' && (
+            <GamesPage
+              canStart={canChangeRuntime}
+              emergency={emergency}
+              enabled={agentReady}
+              targetActive={runtimeState === 'targetlocked' && !taskActive}
+            />
+          )}
         </main>
         <aside className="operator" aria-label="值守状态">
           <section className="operator-card">

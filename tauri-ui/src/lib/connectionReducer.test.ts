@@ -3,14 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { canMutate, connectionReducer, initialConnectionState } from './connectionReducer';
 
 describe('connectionReducer', () => {
-  it('lets a transport failure override a stale successful query', () => {
+  it('lets any overview failure override a stale successful query', () => {
     const online = connectionReducer(initialConnectionState, { type: 'QuerySucceeded' });
     const offline = connectionReducer(online, {
       type: 'QueryFailed',
-      code: 'local.transport.disconnected',
+      code: 'task_command_not_allowed',
     });
 
-    expect(offline).toEqual({ availability: 'offline', reasonCode: 'local.transport.disconnected' });
+    expect(offline).toEqual({ availability: 'offline', reasonCode: 'task_command_not_allowed' });
     expect(canMutate(offline)).toBe(false);
   });
 

@@ -2,6 +2,7 @@ export type UiCommandError = { code: string; message: string };
 
 export type Status = {
   state: string;
+  task_active: boolean;
   capture_active: boolean;
   build_id: string;
   suite_version: string;

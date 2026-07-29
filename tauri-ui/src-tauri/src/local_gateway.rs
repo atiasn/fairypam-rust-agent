@@ -14,6 +14,7 @@ use tokio::sync::MutexGuard;
 use crate::dto::{
     ClosedGameDto, ConnectionStatusDto, EnvironmentCheckDto, InputResultDto, InstalledGamesDto,
     LaunchedGameDto, LogTailDto, OverviewDto, PreviewDto, RegistrationStatusDto, ReleaseAllDto,
+    ResetEmergencyStopDto,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -185,6 +186,10 @@ impl ProductionGateway {
         self.request(LocalCommand::ReleaseAll).await
     }
 
+    pub async fn reset_emergency_stop(&self) -> Result<ResetEmergencyStopDto, UiCommandError> {
+        self.request(LocalCommand::ResetEmergencyStop).await
+    }
+
     pub async fn register_hub(
         &self,
         hub_address: String,
@@ -278,6 +283,24 @@ mod tests {
         assert!(stopped.cleanup_complete);
         let status: StatusDto = gateway.request(LocalCommand::Status).await.unwrap();
         assert_eq!(status.state, "EmergencyStopped");
+
+        let protected = gateway
+            .overview()
+            .await
+            .expect("read-only overview remains available while protected");
+        assert_eq!(protected.status.state, "EmergencyStopped");
+        assert_eq!(protected.doctor.runtime, "dry_run");
+
+        let recovered = gateway
+            .reset_emergency_stop()
+            .await
+            .expect("completed cleanup can leave protected state");
+        assert_eq!(recovered.state, "ConnectedIdle");
+        assert_eq!(recovered.holds, 0);
+        assert_eq!(
+            gateway.overview().await.unwrap().status.state,
+            "ConnectedIdle"
+        );
     }
 
     #[test]

@@ -113,12 +113,12 @@ export function ConnectionPage({
     <>
       <StatusPanel
         availability={connection.availability}
-        title="后台服务"
-        detail={startup.isError ? '后台服务尚未就绪。' : '打开界面时会自动准备后台服务。'}
+        title="本机 Core"
+        detail={startup.isError ? '本机 Core 尚未就绪。' : '打开界面时会自动准备同一进程内的本机 Core。'}
       />
       <section className="status-card" aria-labelledby="hub-connection-heading">
-        <h2 id="hub-connection-heading">服务连接</h2>
-        {status.isLoading && <p>正在读取服务连接状态。</p>}
+        <h2 id="hub-connection-heading">Hub 连接</h2>
+        {status.isLoading && <p>正在读取 Hub 连接状态。</p>}
         {status.isError && <p role="status">服务正在恢复连接。</p>}
         {status.data && (
           <dl>
@@ -147,7 +147,7 @@ export function ConnectionPage({
         {registrationStatus === 'error' && <p role="status">注册未完成。请获取新的注册码后重试。</p>}
         {!registrationReady && <p role="status">请先完成本机环境检查，再提交注册。</p>}
         {environment.isError && <p role="status">本机环境暂时无法确认，请稍后重试。</p>}
-        {!startup.isSuccess && <p role="status">请先等待后台服务就绪，再提交注册。</p>}
+        {!startup.isSuccess && <p role="status">请先等待本机 Core 就绪，再提交注册。</p>}
         <p className="notice">注册码只会通过受保护的通道提交，界面不会保存它。</p>
       </section>
       {(startup.isError || overview.isError) && (

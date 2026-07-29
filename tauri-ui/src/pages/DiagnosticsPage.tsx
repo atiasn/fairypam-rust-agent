@@ -6,7 +6,7 @@ type Props = { environment: UseQueryResult<EnvironmentCheck>; overview: UseQuery
 
 const checkLabels: Record<string, string> = {
   binary_or_task: '服务安装',
-  agent: '后台服务',
+  agent: '本机 Core',
   guardian: '守护服务',
   certificate: '证书',
   control: '控制连接',
@@ -28,9 +28,12 @@ function checkStatusLabel(status: string) {
 
 function serviceStateLabel(state: string | undefined) {
   const labels: Record<string, string> = {
-    connectedidle: '已连接，等待操作',
+    connectedidle: 'Core 空闲，等待操作',
     disconnected: '未连接',
+    emergencystopped: '保护状态，输入已释放',
     starting: '正在启动',
+    taskactive: '正在执行 Hub 任务',
+    targetlocked: '已锁定游戏目标',
   };
   return state ? labels[state.toLowerCase()] ?? '正在更新' : '不可用';
 }

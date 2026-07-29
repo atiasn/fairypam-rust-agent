@@ -288,6 +288,7 @@ fn join_capture_thread(thread: JoinHandle<()>) -> Result<(), AgentError> {
 pub struct CommandExecutor {
     profiles: ProfileStore,
     platform: Box<dyn RuntimePlatform>,
+    runtime_mode: &'static str,
     active_profile: Option<VerifiedProfile>,
     binding: Option<TargetBinding>,
     capture: Option<CaptureWorker>,
@@ -301,11 +302,17 @@ impl CommandExecutor {
             profiles,
             production_platform(),
             TaskAttemptRuntime::production(),
+            "production",
         )
     }
 
     pub fn with_platform(profiles: ProfileStore, platform: Box<dyn RuntimePlatform>) -> Self {
-        Self::with_platform_and_attempts(profiles, platform, TaskAttemptRuntime::memory())
+        Self::with_platform_and_attempts(
+            profiles,
+            platform,
+            TaskAttemptRuntime::memory(),
+            "dry_run",
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -317,10 +324,12 @@ impl CommandExecutor {
         profiles: ProfileStore,
         platform: Box<dyn RuntimePlatform>,
         task_attempt: TaskAttemptRuntime,
+        runtime_mode: &'static str,
     ) -> Self {
         Self {
             profiles,
             platform,
+            runtime_mode,
             active_profile: None,
             binding: None,
             capture: None,
@@ -458,11 +467,17 @@ impl CommandExecutor {
         &mut self,
         command: &LocalCommand,
     ) -> Result<serde_json::Value, AgentError> {
+        let read_only = matches!(
+            command,
+            LocalCommand::Status | LocalCommand::Doctor | LocalCommand::ListProfiles
+        );
         let emergency_stopped = self.task_attempt.emergency_stopped()?;
+        let task_active = self.task_attempt.is_active()?;
         if emergency_stopped
+            && !read_only
             && !matches!(
                 command,
-                LocalCommand::Status | LocalCommand::ReleaseAll | LocalCommand::ResetEmergencyStop
+                LocalCommand::ReleaseAll | LocalCommand::ResetEmergencyStop
             )
         {
             return Err(AgentError::new(
@@ -470,9 +485,7 @@ impl CommandExecutor {
                 "only local emergency cleanup or reset is allowed while stopped",
             ));
         }
-        if self.task_attempt.is_active()?
-            && !matches!(command, LocalCommand::Status | LocalCommand::ReleaseAll)
-        {
+        if task_active && !read_only && !matches!(command, LocalCommand::ReleaseAll) {
             return Err(AgentError::new(
                 "task_command_not_allowed",
                 "active M1 task attempt rejects this local command",
@@ -484,9 +497,12 @@ impl CommandExecutor {
                     "EmergencyStopped"
                 } else if self.binding.is_some() {
                     "TargetLocked"
+                } else if task_active {
+                    "TaskActive"
                 } else {
                     "ConnectedIdle"
                 },
+                "task_active": task_active,
                 "capture_active": self.capture.is_some(),
                 "build_id": option_env!("FAIRYPAM_BUILD_ID").unwrap_or("unknown"),
                 "suite_version": env!("CARGO_PKG_VERSION"),
@@ -499,7 +515,7 @@ impl CommandExecutor {
                 },
             })),
             LocalCommand::Doctor => {
-                Ok(json!({"profiles": self.profiles.ids(), "runtime": "dry_run"}))
+                Ok(json!({"profiles": self.profiles.ids(), "runtime": self.runtime_mode}))
             }
             LocalCommand::ListProfiles => Ok(json!({"profiles": self.profiles.ids()})),
             LocalCommand::LaunchTarget { profile_id } => {
@@ -2705,6 +2721,13 @@ mod tests {
     }
 
     #[test]
+    fn production_executor_reports_production_runtime_mode() {
+        let executor = CommandExecutor::production(ProfileStore::default());
+
+        assert_eq!(executor.runtime_mode, "production");
+    }
+
+    #[test]
     fn local_gui_reuses_launch_capture_input_and_close_safety_path() {
         let (mut executor, state) = executor_with_state();
 
@@ -3089,15 +3112,28 @@ mod tests {
             }),
         );
         let sink = Arc::new(CollectFrames::default());
+        let begin = HubControlCommand {
+            payload: Some(hub_control_command::Payload::BeginTaskAttempt(
+                BeginTaskAttempt {
+                    task: Some(task_ref(&contract, "begin-emergency")),
+                    contract: Some(contract.clone()),
+                },
+            )),
+        };
+        assert!(matches!(
+            executor.execute(&begin, &ExecutionSession::test(), sink.clone()),
+            CommandOutcome::TaskAck { .. }
+        ));
+        assert_eq!(
+            executor.execute_local(&LocalCommand::Status).unwrap()["state"],
+            "TaskActive"
+        );
+        assert_eq!(
+            executor.execute_local(&LocalCommand::Status).unwrap()["task_active"],
+            true
+        );
+
         for command in [
-            HubControlCommand {
-                payload: Some(hub_control_command::Payload::BeginTaskAttempt(
-                    BeginTaskAttempt {
-                        task: Some(task_ref(&contract, "begin-emergency")),
-                        contract: Some(contract.clone()),
-                    },
-                )),
-            },
             HubControlCommand {
                 payload: Some(hub_control_command::Payload::StartTaskTarget(
                     StartTaskTarget {
@@ -3129,6 +3165,19 @@ mod tests {
             ));
         }
 
+        assert_eq!(
+            executor.execute_local(&LocalCommand::Doctor).unwrap()["runtime"],
+            "dry_run"
+        );
+        assert_eq!(
+            executor.execute_local(&LocalCommand::Status).unwrap()["state"],
+            "TargetLocked"
+        );
+        assert_eq!(
+            executor.execute_local(&LocalCommand::Status).unwrap()["task_active"],
+            true
+        );
+
         let stopped = executor.execute_local(&LocalCommand::ReleaseAll).unwrap();
         assert_eq!(stopped["state"], "EmergencyStopped");
         assert_eq!(stopped["cleanup_complete"], true);
@@ -3137,6 +3186,14 @@ mod tests {
         assert_eq!(
             executor.execute_local(&LocalCommand::Status).unwrap()["state"],
             "EmergencyStopped"
+        );
+        assert_eq!(
+            executor.execute_local(&LocalCommand::Status).unwrap()["task_active"],
+            false
+        );
+        assert_eq!(
+            executor.execute_local(&LocalCommand::Doctor).unwrap()["runtime"],
+            "dry_run"
         );
 
         let new_attempt = HubControlCommand {
@@ -3160,6 +3217,10 @@ mod tests {
         assert_eq!(
             executor.execute_local(&LocalCommand::Status).unwrap()["state"],
             "ConnectedIdle"
+        );
+        assert_eq!(
+            executor.execute_local(&LocalCommand::Status).unwrap()["task_active"],
+            false
         );
     }
 

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct StatusDto {
     pub state: String,
+    pub task_active: bool,
     pub capture_active: bool,
     pub build_id: String,
     pub suite_version: String,
@@ -131,6 +132,13 @@ pub struct ReleaseAllDto {
     pub holds: u32,
     pub cleanup_complete: bool,
     pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetEmergencyStopDto {
+    pub state: String,
+    pub holds: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]

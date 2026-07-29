@@ -797,11 +797,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let log = FixedLog::open(&root).unwrap();
-        log.append(LogLevel::Info, "后台服务已启动，正在准备连接")
+        log.append(LogLevel::Info, "本机 Core 已启动，正在准备 Hub 连接")
             .unwrap();
         assert_eq!(
             log.tail(10, &LogLevel::Info).unwrap()["entries"][0]["message"],
-            "后台服务已启动，正在准备连接"
+            "本机 Core 已启动，正在准备 Hub 连接"
         );
         log.append(LogLevel::Info, "token=must-not-appear").unwrap();
         let tail = log.tail(10, &LogLevel::Info).unwrap();

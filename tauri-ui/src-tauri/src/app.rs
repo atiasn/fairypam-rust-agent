@@ -138,15 +138,32 @@ pub fn run() -> tauri::Result<()> {
             })?;
 
             let show_main = MenuItemBuilder::with_id("show-main", "显示主窗口").build(app)?;
+            let reset_emergency =
+                MenuItemBuilder::with_id("reset-emergency", "确认清理完成并解除保护").build(app)?;
             let exit_ui = MenuItemBuilder::with_id("exit-ui", "退出界面").build(app)?;
             let menu = MenuBuilder::new(app)
-                .items(&[&show_main, &exit_ui])
+                .items(&[&show_main, &reset_emergency, &exit_ui])
                 .build()?;
             TrayIconBuilder::new()
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show-main" => show_main_window(app),
+                    "reset-emergency" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = app.state::<ProductionGateway>();
+                            match state.reset_emergency_stop().await {
+                                Ok(_) => {
+                                    let _ = app.emit("emergency-reset", ());
+                                }
+                                Err(_) => {
+                                    let _ = app.emit("emergency-reset-failed", ());
+                                }
+                            }
+                            show_main_window(&app);
+                        });
+                    }
                     "exit-ui" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {

@@ -41,7 +41,7 @@ export function LogsPage({ enabled }: { enabled: boolean }) {
           <option value="info">信息</option>
         </select>
       </label>
-      {!enabled && <p role="status">正在等待后台服务就绪。</p>}
+      {!enabled && <p role="status">正在等待本机 Core 就绪。</p>}
       {enabled && logs.isError && <p role="status">无法读取固定日志源。</p>}
       {logs.isSuccess && logs.data.entries.length === 0 && <p role="status">暂时没有可显示的运行记录。服务正常时，记录可能为空。</p>}
       <ul className="log-list">
