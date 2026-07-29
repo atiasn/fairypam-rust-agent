@@ -31,8 +31,6 @@ fn production_configuration_is_elevated_and_least_privilege() {
         "app.path().app_local_data_dir()?.join(\"webview\")",
         "let webview_impersonation = begin_webview_impersonation()?",
         "TokenLinkedToken",
-        "DuplicateTokenEx",
-        "SecurityImpersonation",
         "ImpersonateLoggedOnUser",
         "RevertToSelf",
         "drop(webview_impersonation)",
@@ -46,6 +44,7 @@ fn production_configuration_is_elevated_and_least_privilege() {
     }
     assert!(APP.find(".build()?;").unwrap() < APP.find("drop(webview_impersonation)").unwrap());
     assert!(!APP.contains("std::fs::create_dir_all"));
+    assert!(!APP.contains("DuplicateTokenEx"));
     assert!(!ENROLLMENT.contains("WEBVIEW_ROOT"));
     assert!(!INSTALLER.contains("WEBVIEW_ROOT"));
 }

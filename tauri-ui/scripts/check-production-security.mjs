@@ -56,8 +56,6 @@ for (const required of [
   'app.path().app_local_data_dir()?.join("webview")',
   'let webview_impersonation = begin_webview_impersonation()?',
   'TokenLinkedToken',
-  'DuplicateTokenEx',
-  'SecurityImpersonation',
   'ImpersonateLoggedOnUser',
   'RevertToSelf',
   'drop(webview_impersonation)',
@@ -79,6 +77,9 @@ if (app.indexOf('.build()?;') > app.indexOf('drop(webview_impersonation)')) {
 }
 if (app.includes('std::fs::create_dir_all')) {
   fail('the elevated host must delegate UDF creation to Tauri under impersonation');
+}
+if (app.includes('DuplicateTokenEx')) {
+  fail('the UAC linked primary token must be impersonated directly');
 }
 for (const required of [
   'for path in [&gui, &pointer]',

@@ -227,8 +227,7 @@ fn begin_webview_impersonation() -> tauri::Result<ImpersonationGuard> {
     use windows::Win32::{
         Foundation::{CloseHandle, HANDLE},
         Security::{
-            DuplicateTokenEx, GetTokenInformation, ImpersonateLoggedOnUser, SecurityImpersonation,
-            TokenImpersonation, TokenLinkedToken, TOKEN_IMPERSONATE, TOKEN_LINKED_TOKEN,
+            GetTokenInformation, ImpersonateLoggedOnUser, TokenLinkedToken, TOKEN_LINKED_TOKEN,
             TOKEN_QUERY,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
@@ -259,20 +258,7 @@ fn begin_webview_impersonation() -> tauri::Result<ImpersonationGuard> {
     }
     .map_err(webview_token_error)?;
     let linked_token = OwnedHandle(linked_token.LinkedToken);
-    let mut impersonation_token = HANDLE::default();
-    unsafe {
-        DuplicateTokenEx(
-            linked_token.0,
-            TOKEN_QUERY | TOKEN_IMPERSONATE,
-            None,
-            SecurityImpersonation,
-            TokenImpersonation,
-            &mut impersonation_token,
-        )
-    }
-    .map_err(webview_token_error)?;
-    let impersonation_token = OwnedHandle(impersonation_token);
-    unsafe { ImpersonateLoggedOnUser(impersonation_token.0) }.map_err(webview_token_error)?;
+    unsafe { ImpersonateLoggedOnUser(linked_token.0) }.map_err(webview_token_error)?;
     Ok(ImpersonationGuard)
 }
 
