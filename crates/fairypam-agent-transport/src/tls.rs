@@ -1246,12 +1246,12 @@ fn identity_invalid(message: impl Into<String>) -> TransportError {
 }
 
 fn endpoint(uri: &Uri, connect_timeout: Duration) -> Result<Endpoint, TransportError> {
-    Endpoint::from_shared(uri.to_string())
+    Ok(Endpoint::from_shared(uri.to_string())
         .map_err(|error| TransportError::new("transport.endpoint_invalid", error.to_string()))?
         .connect_timeout(connect_timeout)
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .http2_keep_alive_interval(Duration::from_secs(15))
-        .keep_alive_timeout(Duration::from_secs(5))
+        .keep_alive_timeout(Duration::from_secs(5)))
 }
 
 fn validate_config(config: &TransportConfig) -> Result<(), TransportError> {
