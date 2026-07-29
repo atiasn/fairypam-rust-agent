@@ -55,7 +55,6 @@ pub enum RuntimeCommand {
     InputMouseClick {
         button: i32,
     },
-    BindUiLifetime,
     ShutdownAgent,
     RegisterHub {
         hub_address: String,

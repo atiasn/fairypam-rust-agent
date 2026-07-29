@@ -32,7 +32,6 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::{CommandExecutor, CommandOutcome, ExecutionSession, FrameSink};
-use crate::gui_lifecycle::GuiLifetime;
 #[cfg(any(windows, test))]
 use crate::observability;
 use crate::observability::AgentLogRecord;
@@ -410,7 +409,6 @@ enum RuntimeLogMessage {
     EnrollmentRefreshFailed,
     SessionCleared,
     LocalShutdownRequested,
-    LocalUiBound,
     LocalUiShutdownRequested,
     LocalEnvironmentCheckRequested,
     LocalGameScanRequested,
@@ -431,7 +429,6 @@ impl RuntimeLogMessage {
         Self::EnrollmentRefreshFailed,
         Self::SessionCleared,
         Self::LocalShutdownRequested,
-        Self::LocalUiBound,
         Self::LocalUiShutdownRequested,
         Self::LocalEnvironmentCheckRequested,
         Self::LocalGameScanRequested,
@@ -451,7 +448,6 @@ impl RuntimeLogMessage {
             Self::EnrollmentRefreshFailed => "注册信息刷新失败，连接将保持安全关闭",
             Self::SessionCleared => "连接已重置，正在重新连接",
             Self::LocalShutdownRequested => "后台服务收到安全停止请求",
-            Self::LocalUiBound => "界面已连接到后台服务",
             Self::LocalUiShutdownRequested => "界面请求安全停止后台服务",
             Self::LocalEnvironmentCheckRequested => "界面请求环境检查",
             Self::LocalGameScanRequested => "界面请求扫描已安装游戏",
@@ -514,7 +510,6 @@ pub struct GrpcSessionDriver {
     registration_in_progress: Arc<AtomicBool>,
     registration_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     gui_shutdown: CancellationToken,
-    gui_lifetime: GuiLifetime,
 }
 
 impl GrpcSessionDriver {
@@ -540,7 +535,6 @@ impl GrpcSessionDriver {
             reconnect_requested: Arc::new(tokio::sync::Notify::new()),
             registration_in_progress: Arc::new(AtomicBool::new(false)),
             registration_worker: Arc::new(Mutex::new(None)),
-            gui_lifetime: GuiLifetime::new(gui_shutdown.clone()),
             gui_shutdown,
         }
     }
@@ -555,7 +549,7 @@ impl GrpcSessionDriver {
             reconnect_requested: Arc::clone(&self.reconnect_requested),
             registration_in_progress: Arc::clone(&self.registration_in_progress),
             registration_worker: Arc::clone(&self.registration_worker),
-            gui_lifetime: self.gui_lifetime.clone(),
+            gui_shutdown: self.gui_shutdown.clone(),
         }
     }
 
@@ -1034,7 +1028,7 @@ impl EmbeddedRuntimeHandle {
             LocalCommand::ShutdownAgent => {
                 self.runtime.record_local_operation(command);
                 self.runtime.execution.lock().map_err(lock_error)?.reset()?;
-                self.runtime.gui_lifetime.request_maintenance_shutdown()?;
+                self.runtime.gui_shutdown.cancel();
                 Ok(serde_json::json!({"state": "shutting_down"}))
             }
             _ => Err(AgentError::new(
@@ -1217,7 +1211,7 @@ struct SharedRuntime {
     reconnect_requested: Arc<tokio::sync::Notify>,
     registration_in_progress: Arc<AtomicBool>,
     registration_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    gui_lifetime: GuiLifetime,
+    gui_shutdown: CancellationToken,
 }
 
 #[cfg(any(windows, test))]
@@ -1249,7 +1243,6 @@ impl SharedRuntime {
 
     fn record_local_operation(&self, command: &LocalCommand) {
         let message = match command {
-            LocalCommand::BindUiLifetime => Some(RuntimeLogMessage::LocalUiBound),
             LocalCommand::ShutdownAgent => Some(RuntimeLogMessage::LocalUiShutdownRequested),
             LocalCommand::RunEnvironmentCheck => {
                 Some(RuntimeLogMessage::LocalEnvironmentCheckRequested)
@@ -1620,6 +1613,7 @@ mod tests {
     #[test]
     fn embedded_runtime_exposes_observability_but_not_device_commands() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        let shutdown = driver.gui_shutdown.clone();
         let completion = Arc::new(EmbeddedRuntimeCompletion::default());
         let handle = EmbeddedRuntimeHandle {
             runtime: driver.local_runtime(),
@@ -1634,6 +1628,9 @@ mod tests {
                 .code(),
             "local.embedded_command_not_allowed"
         );
+        assert!(!shutdown.is_cancelled());
+        assert!(handle.execute(&LocalCommand::ShutdownAgent).is_ok());
+        assert!(shutdown.is_cancelled());
         completion.finish(&Err(AgentError::new("runtime.test_failure", "stopped")));
         assert_eq!(
             handle.execute(&LocalCommand::Status).unwrap_err().code(),
