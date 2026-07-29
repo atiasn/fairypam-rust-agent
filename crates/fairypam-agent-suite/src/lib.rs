@@ -20,6 +20,10 @@ pub const MAX_MEMBER_BYTES: u64 = 256 * 1024 * 1024;
 const REQUIRED_VERSIONED_EXECUTABLES: [&str; 2] =
     ["fairypam-agent-guardian.exe", "fairypam-agent-tauri-ui.exe"];
 const REQUIRED_STABLE_EXECUTABLE: &str = "resources/runtime/fairypam-agent-installer.exe";
+const INSTALLER_OWNED_EXECUTABLES: [&str; 2] = [
+    "uninstall.exe",
+    ".fairypam-installer/payload/fairypam-agent-guardian.exe",
+];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -430,7 +434,7 @@ fn reject_forbidden_executables(
                 .to_ascii_lowercase();
             if is_executable_member(&relative)
                 && !allowed_product_executable(&relative)
-                && relative != "uninstall.exe"
+                && !INSTALLER_OWNED_EXECUTABLES.contains(&relative.as_str())
                 && entry.path() != bootstrap_helper
             {
                 return Err(SuiteError::new(
@@ -714,6 +718,11 @@ mod tests {
             .join(".fairypam-installer/payload/resources/runtime/fairypam-agent-installer.exe");
         fs::create_dir_all(bootstrap_helper.parent().unwrap()).unwrap();
         fs::write(&bootstrap_helper, b"helper").unwrap();
+        fs::write(
+            directory.join(".fairypam-installer/payload/fairypam-agent-guardian.exe"),
+            b"guardian",
+        )
+        .unwrap();
         fs::write(directory.join("uninstall.exe"), b"uninstaller").unwrap();
 
         validate_flat_layout(&directory, &manifest, &bootstrap_helper).unwrap();
