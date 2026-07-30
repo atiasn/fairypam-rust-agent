@@ -918,7 +918,7 @@ fn set_cng_property(
 #[cfg(windows)]
 fn cng_security_descriptor(authorized_user_sid: &str) -> Result<Vec<u8>, TransportError> {
     validate_windows_sid(authorized_user_sid)?;
-    let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{authorized_user_sid})");
+    let sddl = format!("D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;{authorized_user_sid})");
     let wide = sddl.encode_utf16().chain([0]).collect::<Vec<_>>();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     if unsafe {
@@ -1008,6 +1008,24 @@ fn cng_key_security_matches(
             "CNG key security descriptor is unavailable",
         ));
     }
+    let value = security_descriptor_to_sddl(&mut descriptor, flags)?;
+    let mut expected_descriptor = cng_security_descriptor(authorized_user_sid)?;
+    let expected = security_descriptor_to_sddl(&mut expected_descriptor, flags)?;
+    if cng_security_sddl_matches(&value, &expected) {
+        Ok(true)
+    } else {
+        Err(identity_invalid(format!(
+            "CNG key DACL policy is invalid ({})",
+            cng_security_sddl_summary(&value, authorized_user_sid)
+        )))
+    }
+}
+
+#[cfg(windows)]
+fn security_descriptor_to_sddl(
+    descriptor: &mut [u8],
+    flags: u32,
+) -> Result<String, TransportError> {
     let mut text = std::ptr::null_mut();
     let mut text_length = 0_u32;
     if unsafe {
@@ -1034,27 +1052,31 @@ fn cng_key_security_matches(
     let value = String::from_utf16(text_slice)
         .map_err(|_| identity_invalid("CNG key security descriptor cannot be verified"));
     let _ = unsafe { LocalFree(text.cast()) };
-    value.and_then(|value| {
-        if cng_security_sddl_matches(&value, authorized_user_sid) {
-            Ok(true)
-        } else {
-            Err(identity_invalid(format!(
-                "CNG key DACL policy is invalid ({})",
-                cng_security_sddl_summary(&value, authorized_user_sid)
-            )))
-        }
-    })
+    value
 }
 
 #[cfg(any(windows, test))]
-fn cng_security_sddl_matches(value: &str, authorized_user_sid: &str) -> bool {
-    ["P", "PAI"].into_iter().any(|flags| {
-        ["GA", "0x1f019b"].into_iter().any(|rights| {
-            value == format!("D:{flags}(A;;{rights};;;SY)(A;;{rights};;;{authorized_user_sid})")
-                || value
-                    == format!("D:{flags}(A;;{rights};;;{authorized_user_sid})(A;;{rights};;;SY)")
-        })
-    })
+fn cng_security_sddl_matches(value: &str, expected: &str) -> bool {
+    let Some(mut actual_aces) = cng_security_sddl_aces(value) else {
+        return false;
+    };
+    let Some(mut expected_aces) = cng_security_sddl_aces(expected) else {
+        return false;
+    };
+    actual_aces.sort_unstable();
+    expected_aces.sort_unstable();
+    actual_aces == expected_aces
+}
+
+#[cfg(any(windows, test))]
+fn cng_security_sddl_aces(value: &str) -> Option<Vec<&str>> {
+    let value = value.strip_prefix("D:")?;
+    let (flags, value) = value.split_once('(')?;
+    if !matches!(flags, "P" | "PAI") {
+        return None;
+    }
+    let aces = value.strip_suffix(')')?.split(")(").collect::<Vec<_>>();
+    (aces.len() == 2).then_some(aces)
 }
 
 #[cfg(any(windows, test))]
@@ -1473,26 +1495,28 @@ mod tests {
 
     #[test]
     fn cng_key_dacl_is_exactly_system_and_the_enrolling_user() {
-        const USER: &str = "S-1-5-21-1-2-3-1001";
-        assert!(cng_security_sddl_matches(
-            "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
-            USER,
-        ));
-        assert!(cng_security_sddl_matches(
-            "D:PAI(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GA;;;SY)",
-            USER,
-        ));
+        const EXPECTED: &str = "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)";
         assert!(cng_security_sddl_matches(
             "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)",
-            USER,
+            EXPECTED,
+        ));
+        assert!(cng_security_sddl_matches(
+            "D:PAI(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)(A;;0x1f019b;;;SY)",
+            EXPECTED,
+        ));
+        assert!(cng_security_sddl_matches(
+            "D:PAI(A;;0x1f019b;;;AC)(A;;0x1f019b;;;SY)",
+            "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;AC)",
         ));
         for rejected in [
-            "D:AI(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
-            "D:PAI(A;ID;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)",
-            "D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-21-1-2-3-1001)(A;;GR;;;BU)",
+            "D:AI(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)",
+            "D:PAI(A;ID;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)",
+            "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)(A;;GR;;;BU)",
             "D:P(A;;0x1f019a;;;SY)(A;;0x1f019a;;;S-1-5-21-1-2-3-1001)",
+            "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1002)",
+            "D:P(A;;0x1f019b;;;SY)",
         ] {
-            assert!(!cng_security_sddl_matches(rejected, USER));
+            assert!(!cng_security_sddl_matches(rejected, EXPECTED));
         }
     }
 
