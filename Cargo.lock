@@ -553,6 +553,7 @@ dependencies = [
  "rustls",
  "rustls-cng",
  "sha2",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",

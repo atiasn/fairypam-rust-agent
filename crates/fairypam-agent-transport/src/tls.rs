@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,8 @@ use rustls_cng::signer::CngSigningKey;
 #[cfg(windows)]
 use rustls_cng::store::{CertStore, CertStoreType};
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use socket2::{SockRef, TcpKeepalive};
 #[cfg(windows)]
 use tokio::net::TcpStream;
 #[cfg(windows)]
@@ -546,6 +549,8 @@ async fn connect_cng(
         let tls = tls.clone();
         async move {
             let tcp = TcpStream::connect(address).await?;
+            SockRef::from(&tcp)
+                .set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(30)))?;
             let stream = tls.connect(server_name, tcp).await?;
             if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
                 return Err(std::io::Error::other("TLS peer did not negotiate HTTP/2"));
@@ -1410,9 +1415,7 @@ fn endpoint(uri: &Uri, connect_timeout: Duration) -> Result<Endpoint, TransportE
     Ok(Endpoint::from_shared(uri.to_string())
         .map_err(|error| TransportError::new("transport.endpoint_invalid", error.to_string()))?
         .connect_timeout(connect_timeout)
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .http2_keep_alive_interval(Duration::from_secs(15))
-        .keep_alive_timeout(Duration::from_secs(5)))
+        .tcp_keepalive(Some(Duration::from_secs(30))))
 }
 
 fn validate_config(config: &TransportConfig) -> Result<(), TransportError> {
@@ -1623,8 +1626,12 @@ mod tests {
         .unwrap();
         let mismatch = validate_transport_config(&config).unwrap_err();
         assert_eq!(mismatch.code(), "transport.identity_key_mismatch");
-        let IdentityKey::Pem(key_path) = &config.identity_key else {
-            unreachable!()
+        #[cfg(not(windows))]
+        let IdentityKey::Pem(key_path) = &config.identity_key;
+        #[cfg(windows)]
+        let key_path = match &config.identity_key {
+            IdentityKey::Pem(path) => path,
+            IdentityKey::CngMachine { .. } => unreachable!(),
         };
         fs::write(key_path, "not a private key").unwrap();
         let error = validate_transport_config(&config).unwrap_err();

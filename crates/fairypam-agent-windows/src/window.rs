@@ -139,7 +139,12 @@ impl WindowsApi for FakeWindows {
         let current = self.snapshot(identity.hwnd)?;
         require_same_identity(identity, &current.identity)?;
         for candidate in &mut self.candidates {
-            candidate.foreground = candidate.identity.hwnd == identity.hwnd;
+            let target = candidate.identity.hwnd == identity.hwnd;
+            candidate.foreground = target;
+            if target {
+                candidate.minimized = false;
+                candidate.capturable = true;
+            }
         }
         Ok(())
     }
@@ -367,14 +372,34 @@ fn binding_identity(binding: &TargetBinding) -> Result<TargetIdentity, AgentErro
     })
 }
 
+fn revalidate_or_focus_target(
+    api: &mut dyn WindowsApi,
+    binding: &TargetBinding,
+) -> Result<WindowsTargetCandidate, AgentError> {
+    let expected = binding_identity(binding)?;
+    let current = revalidate_identity(api, &expected)?;
+    if current.foreground && !current.minimized {
+        return Ok(current);
+    }
+    api.focus_target(&current.identity)?;
+    let current = revalidate_identity(api, &expected)?;
+    if !current.foreground {
+        return Err(WindowsError::new(
+            "target.focus_failed",
+            "target did not become the foreground window",
+        )
+        .into());
+    }
+    Ok(current)
+}
+
 #[cfg(any(windows, test))]
 fn revalidate_input_target(
     api: &mut dyn WindowsApi,
     binding: &TargetBinding,
 ) -> Result<LockedInputTarget, AgentError> {
-    let expected = binding_identity(binding)?;
-    let current = revalidate_identity(api, &expected)?;
-    if !current.foreground || current.minimized || !current.capturable {
+    let current = revalidate_or_focus_target(api, binding)?;
+    if current.minimized || !current.capturable {
         return Err(WindowsError::new(
             "target.input_not_permitted",
             "input target must be foreground, visible, and capturable",
@@ -399,8 +424,8 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
         &mut self,
         binding: &TargetBinding,
     ) -> Result<TargetIdentity, AgentError> {
-        let current = revalidate_identity(&mut self.api, &binding_identity(binding)?)?;
-        if !current.foreground || current.minimized || !current.capturable {
+        let current = revalidate_or_focus_target(&mut self.api, binding)?;
+        if current.minimized || !current.capturable {
             return Err(WindowsError::new(
                 "target.capture_not_permitted",
                 "capture target must be foreground, visible, and capturable",
@@ -571,26 +596,39 @@ mod tests {
     }
 
     #[test]
-    fn input_and_capture_require_live_foreground_revalidation() {
+    fn input_and_capture_refocus_the_live_locked_target() {
         let mut foreground = FakeWindows::with_candidates(vec![input_candidate(true)]);
         let locked = revalidate_input_target(&mut foreground, &input_binding()).unwrap();
         assert_eq!(locked.identity().client_rect.left, 10);
 
         let binding = input_binding();
-        let mut targets =
-            WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![input_candidate(false)]));
-        assert_eq!(
-            targets.lock_input_target(&binding).unwrap_err().code(),
-            "target.input_not_permitted"
-        );
-        assert_eq!(
-            targets.capture_identity(&binding).unwrap_err().code(),
-            "target.capture_not_permitted"
-        );
+        let mut other = input_candidate(true);
+        other.identity.hwnd = 200;
+        other.identity.pid = 43;
+        let background_game = input_candidate(false);
+        let mut input_targets = WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![
+            background_game.clone(),
+            other.clone(),
+        ]));
+        input_targets.lock_input_target(&binding).unwrap();
+        assert!(input_targets.api().candidates[0].foreground);
+        assert!(!input_targets.api().candidates[1].foreground);
 
-        assert!(targets.focus(&binding).unwrap().foreground);
-        targets.lock_input_target(&binding).unwrap();
-        targets.capture_identity(&binding).unwrap();
+        let mut capture_targets =
+            WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![background_game, other]));
+        capture_targets.capture_identity(&binding).unwrap();
+        assert!(capture_targets.api().candidates[0].foreground);
+        assert!(!capture_targets.api().candidates[1].foreground);
+
+        for foreground in [true, false] {
+            let mut minimized = input_candidate(foreground);
+            minimized.minimized = true;
+            minimized.capturable = false;
+            let mut targets =
+                WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![minimized]));
+            targets.capture_identity(&binding).unwrap();
+            assert!(!targets.api().candidates[0].minimized);
+        }
     }
 
     #[test]
@@ -684,7 +722,7 @@ mod native {
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowTextW,
         GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
-        ShowWindow, SW_RESTORE, WM_CLOSE,
+        ShowWindowAsync, SW_RESTORE, WM_CLOSE,
     };
 
     use crate::{normalized_process_path_sha256, validate_dpi};
@@ -790,7 +828,28 @@ mod native {
         let current = candidate_from_raw_hwnd(identity.hwnd)?;
         require_same_identity(identity, &current.identity)?;
         let hwnd = HWND(identity.hwnd as *mut c_void);
-        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+        if current.foreground && !current.minimized {
+            return Ok(());
+        }
+        if desktop_receives_input() == Some(false) {
+            return Err(WindowsError::new(
+                "target.noninteractive_desktop",
+                "agent desktop is not receiving user input",
+            ));
+        }
+        if current.minimized {
+            let _ = unsafe { ShowWindowAsync(hwnd, SW_RESTORE) };
+            let deadline = Instant::now() + Duration::from_millis(750);
+            while unsafe { IsIconic(hwnd).as_bool() } {
+                if Instant::now() >= deadline {
+                    return Err(WindowsError::new(
+                        "target.restore_timeout",
+                        "target remained minimized after the restore request",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
         let foreground_request_accepted = unsafe { SetForegroundWindow(hwnd) }.as_bool();
         let deadline = Instant::now() + Duration::from_millis(500);
         while unsafe { GetForegroundWindow() } != hwnd {
