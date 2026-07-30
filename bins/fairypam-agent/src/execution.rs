@@ -227,6 +227,7 @@ pub enum CommandOutcome {
         result: String,
         outcome: Option<TaskCommandOutcomeV1>,
         receipt: Box<TaskAttemptReceiptV1>,
+        local_diagnostic: Option<String>,
     },
     Nack {
         code: String,
@@ -247,6 +248,26 @@ impl CommandOutcome {
             result: "{}".into(),
             outcome: Some(result.outcome),
             receipt: Box::new(result.receipt),
+            local_diagnostic: None,
+        }
+    }
+
+    fn task_with_diagnostic(result: TaskCommandResult, error: &AgentError) -> Self {
+        Self::TaskAck {
+            result: "{}".into(),
+            outcome: Some(result.outcome),
+            receipt: Box::new(result.receipt),
+            local_diagnostic: Some(error.to_string()),
+        }
+    }
+
+    pub(crate) fn local_diagnostic(&self) -> Option<&str> {
+        match self {
+            Self::TaskAck {
+                local_diagnostic: Some(message),
+                ..
+            } => Some(message),
+            _ => None,
         }
     }
 }
@@ -401,6 +422,7 @@ impl CommandExecutor {
                 result: "{}".into(),
                 outcome: None,
                 receipt: Box::new(self.task_attempt.begin_v2(task, contract)?),
+                local_diagnostic: None,
             })
         })();
         result.unwrap_or_else(CommandOutcome::from_error)
@@ -1023,9 +1045,10 @@ impl CommandExecutor {
                         self.task_attempt
                             .complete_capture_frame(task, Some(sequence), None)?,
                     )),
-                    Err(error) => Ok(CommandOutcome::task(
+                    Err(error) => Ok(CommandOutcome::task_with_diagnostic(
                         self.task_attempt
                             .complete_capture_frame(task, None, Some(error.code()))?,
+                        &error,
                     )),
                 }
             }
@@ -1196,6 +1219,7 @@ impl CommandExecutor {
                     result: "{}".into(),
                     outcome: None,
                     receipt: Box::new(self.task_attempt.begin(task, contract)?),
+                    local_diagnostic: None,
                 })
             }
             Some(Payload::InspectTaskAttempt(value)) => {
@@ -1204,6 +1228,7 @@ impl CommandExecutor {
                     result: "{}".into(),
                     outcome: None,
                     receipt: Box::new(self.task_attempt.inspect(task)?),
+                    local_diagnostic: None,
                 })
             }
             Some(Payload::StartTaskTarget(value)) => {
@@ -2508,6 +2533,7 @@ mod tests {
         input_active: bool,
         pulse_calls: Vec<String>,
         fail_close: bool,
+        capture_error: Option<AgentError>,
     }
 
     #[derive(Default)]
@@ -2562,6 +2588,9 @@ mod tests {
             _region: CaptureRegion,
             _encoding: RuntimeCaptureEncoding,
         ) -> Result<Box<dyn RuntimeCapture>, AgentError> {
+            if let Some(error) = self.state.lock().unwrap().capture_error.clone() {
+                return Err(error);
+            }
             Ok(Box::new(FakeCapture {
                 frames: VecDeque::from([RuntimeCapturedFrame {
                     bytes: vec![1, 2, 3],
@@ -3397,7 +3426,7 @@ mod tests {
     fn task_capture_frame_publishes_exactly_one_receipted_frame() {
         let profile = verified_profile();
         let contract = task_contract(&profile);
-        let (mut executor, _) = executor_with_state();
+        let (mut executor, state) = executor_with_state();
         let sink = Arc::new(CollectFrames::default());
         for command in [
             HubControlCommand {
@@ -3468,6 +3497,34 @@ mod tests {
                     == TaskCommandOutcomeState::NotApplied as i32
                     && outcome.as_ref().unwrap().source_frame_sequence.is_none()
                     && receipt.error_code.as_deref() == Some("transport.frame_paused")
+        ));
+
+        state.lock().unwrap().capture_error = Some(AgentError::new(
+            "target.focus_failed",
+            "target did not become the foreground window; request_accepted=false, foreground_pid=42, target_pid=84",
+        ));
+        let focus_failed = HubControlCommand {
+            payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {
+                source_id: "client".into(),
+                encoding: "jpeg".into(),
+                quality: 85,
+                task: Some(task_ref(&contract, "capture-frame-focus-failed")),
+                ..CaptureFrame::default()
+            })),
+        };
+        assert!(matches!(
+            executor.execute(&focus_failed, &ExecutionSession::test(), sink),
+            CommandOutcome::TaskAck {
+                ref outcome,
+                ref receipt,
+                local_diagnostic: Some(ref diagnostic),
+                ..
+            } if outcome.as_ref().unwrap().outcome
+                    == TaskCommandOutcomeState::NotApplied as i32
+                && receipt.error_code.as_deref() == Some("target.focus_failed")
+                && diagnostic.contains("request_accepted=false")
+                && diagnostic.contains("foreground_pid=42")
+                && diagnostic.contains("target_pid=84")
         ));
     }
 

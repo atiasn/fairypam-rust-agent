@@ -472,6 +472,12 @@ impl RuntimeState {
         );
     }
 
+    fn record_command_diagnostic(&mut self, outcome: &CommandOutcome) {
+        if let Some(message) = outcome.local_diagnostic() {
+            self.record_text(LogLevel::Warn, message);
+        }
+    }
+
     fn record_text(&mut self, level: LogLevel, message: &str) {
         if self.logs.len() == 200 {
             self.logs.pop_front();
@@ -808,6 +814,9 @@ impl SessionDriver for GrpcSessionDriver {
                                 .execute_v2_input_frame(&task, &frame)
                         }
                     };
+                    if let Ok(mut state) = self.state.lock() {
+                        state.record_command_diagnostic(&outcome);
+                    }
                     let event = v2_adapter::result(identity, outcome);
                     sender.try_send(event).map_err(map_transport)?;
                 }
@@ -1723,6 +1732,29 @@ mod tests {
             assert!(!output.contains(forbidden), "log tail exposed {forbidden}");
         }
         assert_eq!(state.logs.len(), RuntimeLogMessage::ALL.len());
+    }
+
+    #[test]
+    fn capture_frame_diagnostic_is_recorded_locally() {
+        let mut state = RuntimeState {
+            persist_logs: false,
+            ..RuntimeState::default()
+        };
+        state.record_command_diagnostic(&CommandOutcome::TaskAck {
+            result: "{}".into(),
+            outcome: None,
+            receipt: Box::default(),
+            local_diagnostic: Some(
+                "target.focus_failed: request_accepted=false, foreground_pid=42, target_pid=84"
+                    .into(),
+            ),
+        });
+
+        assert_eq!(state.logs.len(), 1);
+        assert_eq!(
+            state.logs.front().unwrap().message,
+            "target.focus_failed: request_accepted=false, foreground_pid=42, target_pid=84"
+        );
     }
 
     #[tokio::test]

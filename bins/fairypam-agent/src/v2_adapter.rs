@@ -1028,6 +1028,7 @@ mod tests {
                     error_code: Some(vector["error_code"].as_str().unwrap().into()),
                     ..internal::TaskAttemptReceiptV1::default()
                 }),
+                local_diagnostic: None,
             },
         );
         let wire::agent_control_event::Payload::CommandResult(result) = event.payload.unwrap()
