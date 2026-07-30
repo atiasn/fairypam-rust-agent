@@ -73,6 +73,13 @@ fn self_test() -> Result<(), String> {
 }
 
 fn run() -> Result<(), String> {
+    if std::env::vars_os().any(|(name, _)| {
+        name.to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("FAIRYPAM_")
+    }) {
+        return Err("guardian environment contains a forbidden FairyPam variable".into());
+    }
     let (sender, receiver) = mpsc::sync_channel::<StdinEvent>(1);
     std::thread::Builder::new()
         .name("guardian-stdin".into())

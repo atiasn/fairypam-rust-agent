@@ -55,7 +55,7 @@ impl GuardianProcessClient {
         }
         #[cfg(windows)]
         let (child_id, stdin, stdout, agent_process_handle) =
-            spawn_restricted_guardian(executable)?;
+            spawn_privilege_limited_guardian(executable)?;
         #[cfg(not(windows))]
         let (child, stdin, stdout, agent_process_handle) = {
             let mut child = Command::new(executable)
@@ -266,9 +266,10 @@ fn exchange<W: Write, R: BufRead>(
 }
 
 #[cfg(windows)]
-fn spawn_restricted_guardian(
+fn spawn_privilege_limited_guardian(
     executable: &Path,
 ) -> Result<(u32, std::fs::File, std::fs::File, u64), SafetyError> {
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
     use windows::core::HSTRING;
@@ -276,63 +277,22 @@ fn spawn_restricted_guardian(
         CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT,
     };
     use windows::Win32::Security::{
-        CreateRestrictedToken, CreateWellKnownSid, EqualSid, TokenGroups, TokenRestrictedSids,
-        WinBuiltinUsersSid, DISABLE_MAX_PRIVILEGE, PSID, SECURITY_ATTRIBUTES,
-        SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-        TOKEN_GROUPS, TOKEN_QUERY,
+        CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SECURITY_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY,
+        TOKEN_DUPLICATE, TOKEN_QUERY,
     };
     use windows::Win32::System::Pipes::CreatePipe;
-    use windows::Win32::System::SystemServices::SE_GROUP_LOGON_ID;
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess,
         GetCurrentProcessId, InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
-        UpdateProcThreadAttribute, CREATE_NO_WINDOW, EXTENDED_STARTUPINFO_PRESENT,
-        LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+        UpdateProcThreadAttribute, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+        EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+        PROCESS_SYNCHRONIZE, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, STARTUPINFOW,
     };
 
     fn owned(handle: HANDLE) -> OwnedHandle {
         // SAFETY: each returned Windows handle is transferred into exactly one owner.
         unsafe { OwnedHandle::from_raw_handle(handle.0) }
-    }
-
-    fn token_groups_buffer(
-        token: HANDLE,
-        class: windows::Win32::Security::TOKEN_INFORMATION_CLASS,
-    ) -> Result<Vec<usize>, SafetyError> {
-        use windows::Win32::Security::GetTokenInformation;
-
-        let mut bytes = 0_u32;
-        let _ = unsafe { GetTokenInformation(token, class, None, 0, &mut bytes) };
-        if bytes < std::mem::size_of::<TOKEN_GROUPS>() as u32 || bytes > 1024 * 1024 {
-            return Err(SafetyError::new(
-                "guardian.token_invalid",
-                "Windows token groups are unavailable",
-            ));
-        }
-        let words = (bytes as usize).div_ceil(std::mem::size_of::<usize>());
-        let mut buffer = vec![0_usize; words];
-        unsafe {
-            GetTokenInformation(
-                token,
-                class,
-                Some(buffer.as_mut_ptr().cast()),
-                bytes,
-                &mut bytes,
-            )
-        }
-        .map_err(|_| {
-            SafetyError::new(
-                "guardian.token_invalid",
-                "Windows token groups are unavailable",
-            )
-        })?;
-        Ok(buffer)
-    }
-
-    fn group_slice(buffer: &[usize]) -> &[SID_AND_ATTRIBUTES] {
-        let groups = unsafe { &*buffer.as_ptr().cast::<TOKEN_GROUPS>() };
-        unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) }
     }
 
     let mut source = HANDLE::default();
@@ -345,27 +305,6 @@ fn spawn_restricted_guardian(
     }
     .map_err(|_| SafetyError::new("guardian.token_failed", "Agent token is unavailable"))?;
     let source = owned(source);
-    let groups = token_groups_buffer(HANDLE(source.as_raw_handle()), TokenGroups)?;
-    let logon = group_slice(&groups)
-        .iter()
-        .find(|group| group.Attributes & SE_GROUP_LOGON_ID as u32 == SE_GROUP_LOGON_ID as u32)
-        .ok_or_else(|| SafetyError::new("guardian.token_failed", "logon SID is unavailable"))?;
-
-    let mut users_buffer = vec![0_usize; (SECURITY_MAX_SID_SIZE as usize).div_ceil(8)];
-    let users_sid = PSID(users_buffer.as_mut_ptr().cast());
-    let mut users_size = SECURITY_MAX_SID_SIZE;
-    unsafe { CreateWellKnownSid(WinBuiltinUsersSid, None, Some(users_sid), &mut users_size) }
-        .map_err(|_| SafetyError::new("guardian.token_failed", "Users SID is unavailable"))?;
-    let restricting = [
-        SID_AND_ATTRIBUTES {
-            Sid: logon.Sid,
-            Attributes: Default::default(),
-        },
-        SID_AND_ATTRIBUTES {
-            Sid: users_sid,
-            Attributes: Default::default(),
-        },
-    ];
     let mut restricted = HANDLE::default();
     unsafe {
         CreateRestrictedToken(
@@ -373,32 +312,17 @@ fn spawn_restricted_guardian(
             DISABLE_MAX_PRIVILEGE,
             None,
             None,
-            Some(&restricting),
+            None,
             &mut restricted,
         )
     }
     .map_err(|_| {
         SafetyError::new(
             "guardian.token_failed",
-            "restricted Guardian token could not be created",
+            "privilege-limited Guardian token could not be created",
         )
     })?;
     let restricted = owned(restricted);
-    let restricted_groups =
-        token_groups_buffer(HANDLE(restricted.as_raw_handle()), TokenRestrictedSids)?;
-    let restricted_groups = group_slice(&restricted_groups);
-    if restricted_groups.len() != 2
-        || !restricting.iter().all(|expected| {
-            restricted_groups
-                .iter()
-                .any(|actual| unsafe { EqualSid(actual.Sid, expected.Sid) }.is_ok())
-        })
-    {
-        return Err(SafetyError::new(
-            "guardian.token_invalid",
-            "restricted Guardian token did not preserve the exact SID boundary",
-        ));
-    }
 
     let agent_process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, true, GetCurrentProcessId()) }
         .map(owned)
@@ -522,6 +446,29 @@ fn spawn_restricted_guardian(
     let directory = executable.parent().ok_or_else(|| {
         SafetyError::new("guardian.spawn_failed", "Guardian directory is unavailable")
     })?;
+    let mut environment = std::env::vars_os()
+        .filter(|(name, _)| {
+            !name
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("FAIRYPAM_")
+        })
+        .map(|(name, value)| {
+            let mut entry = name;
+            entry.push("=");
+            entry.push(value);
+            entry
+        })
+        .collect::<Vec<_>>();
+    environment.sort_by_key(|entry| entry.to_string_lossy().to_ascii_uppercase());
+    let mut environment_block = environment
+        .iter()
+        .flat_map(|entry| entry.encode_wide().chain(std::iter::once(0)))
+        .collect::<Vec<_>>();
+    if environment_block.is_empty() {
+        environment_block.push(0);
+    }
+    environment_block.push(0);
     let created = unsafe {
         CreateProcessAsUserW(
             Some(HANDLE(restricted.as_raw_handle())),
@@ -530,8 +477,8 @@ fn spawn_restricted_guardian(
             None,
             None,
             true,
-            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
-            None,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+            Some(environment_block.as_ptr().cast()),
             &HSTRING::from(directory.to_string_lossy().as_ref()),
             (&startup as *const STARTUPINFOEXW).cast(),
             &mut process,
@@ -541,7 +488,7 @@ fn spawn_restricted_guardian(
     created.map_err(|_| {
         SafetyError::new(
             "guardian.spawn_failed",
-            "restricted Guardian process could not be created",
+            "privilege-limited Guardian process could not be created",
         )
     })?;
     let _ = unsafe { CloseHandle(process.hThread) };
