@@ -253,7 +253,7 @@ fn register_before(
 fn registration_identity() -> Result<PendingDeviceIdentity, AgentError> {
     let key =
         KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048).map_err(|_| failed())?;
-    let key_pem = Zeroizing::new(key.serialize_pem());
+    let key_pem = Zeroizing::new(key.serialize_pem().replace("\r\n", "\n"));
     let mut params = CertificateParams::default();
     params.distinguished_name = DistinguishedName::new();
     params
@@ -262,7 +262,8 @@ fn registration_identity() -> Result<PendingDeviceIdentity, AgentError> {
     let csr_pem = params
         .serialize_request(&key)
         .and_then(|csr| csr.pem())
-        .map_err(|_| failed())?;
+        .map_err(|_| failed())?
+        .replace("\r\n", "\n");
     if csr_pem.len() > 16 * 1024
         || !csr_pem.starts_with("-----BEGIN CERTIFICATE REQUEST-----\n")
         || !csr_pem.ends_with("-----END CERTIFICATE REQUEST-----\n")

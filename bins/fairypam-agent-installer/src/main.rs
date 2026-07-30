@@ -607,19 +607,6 @@ fn valid_enrollment_generation(value: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn verify_private_file(path: &std::path::Path) -> Result<(), ()> {
-    let metadata = path.symlink_metadata().map_err(|_| ())?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(());
-    }
-    verify_nonreparse_attributes(path)?;
-    security_sddl(path)
-        .is_ok_and(|value| private_security_sddl(&value).is_ok())
-        .then_some(())
-        .ok_or(())
-}
-
-#[cfg(windows)]
 fn verify_bootstrap_install_root(install_root: &std::path::Path) -> Result<(), ()> {
     let expected_helper = install_root
         .join(INSTALL_BOOTSTRAP_DIRECTORY)
