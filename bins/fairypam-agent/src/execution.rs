@@ -993,7 +993,7 @@ impl CommandExecutor {
                     ));
                 }
                 let attempt = self.task_attempt.attempt_ref(task)?;
-                let result = (|| {
+                let result: Result<u64, AgentError> = (|| {
                     let mut capture = self.platform.start_capture(&binding, region, encoding)?;
                     let frame = capture.next_frame(Instant::now() + CAPTURE_NO_FRAME_TIMEOUT)?;
                     let frame_sequence = Arc::clone(
