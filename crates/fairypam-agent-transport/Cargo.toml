@@ -17,20 +17,6 @@ tonic = { version = "0.14", features = ["tls-ring"] }
 uuid = "1"
 x509-parser = { version = "0.18", features = ["verify"] }
 
-[target.'cfg(windows)'.dependencies]
-hyper-util = { version = "0.1", features = ["tokio"] }
-rustls-cng = { version = "0.7", default-features = false, features = ["ring"] }
-socket2 = "0.6"
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
-tower = { version = "0.5", features = ["util"] }
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_Security_Cryptography",
-] }
-yasna = "0.6"
-
 [dev-dependencies]
 rcgen = "0.14"
 tempfile = "3"

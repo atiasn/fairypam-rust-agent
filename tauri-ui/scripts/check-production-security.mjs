@@ -3,7 +3,9 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = process.env.FAIRYPAM_TAURI_UI_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const agentRoot = process.env.FAIRYPAM_AGENT_ROOT ?? resolve(root, '..');
 const read = (relativePath) => readFileSync(resolve(root, relativePath), 'utf8');
+const readAgent = (relativePath) => readFileSync(resolve(agentRoot, relativePath), 'utf8');
 const fail = (message) => {
   throw new Error(`production security check failed: ${message}`);
 };
@@ -90,6 +92,28 @@ for (const required of [
 }
 if (!gateway.includes('EmbeddedRuntimeHandle') || !gateway.includes('runtime.execute(&command)')) {
   fail('Tauri Gateway must call the embedded runtime directly');
+}
+
+const transport = readAgent('crates/fairypam-agent-transport/src/tls.rs');
+const transportManifest = readAgent('crates/fairypam-agent-transport/Cargo.toml');
+const transportLocks = `${readAgent('Cargo.lock')}\n${read('src-tauri/Cargo.lock')}`;
+for (const forbidden of ['CngMachine', 'rustls-cng', 'rustls_cng', 'Microsoft Software KSP']) {
+  if (transport.includes(forbidden) || transportManifest.includes(forbidden) || transportLocks.includes(forbidden)) {
+    fail(`obsolete transport identity path ${forbidden}`);
+  }
+}
+if (!transport.includes('identity_key_pem')) fail('transport must use the protected PEM identity');
+
+const windowsTarget = readAgent('crates/fairypam-agent-windows/src/window.rs');
+for (const required of ['for _ in 0..2', 'api.focus_target(&current.identity, true)', 'api.click_target_point(&current.identity, 1, 1)']) {
+  if (!windowsTarget.includes(required)) fail(`missing shared foreground recovery ${required}`);
+}
+const execution = readAgent('bins/fairypam-agent/src/execution.rs');
+if ((execution.match(/self\.focus_task_input_target\(binding\)\?/g) ?? []).length !== 2
+    || (execution.match(/self\.validate_task_input_session\(session\)\?/g) ?? []).length !== 2
+    || !execution.includes('self.targets.focus(binding).map_err(|error|')
+    || !execution.includes('let release_error = self.release_task_input().err();')) {
+  fail('capture and input must share the foreground recovery boundary');
 }
 
 console.log('production security check passed');

@@ -15,6 +15,7 @@ function fixture(capability = '"core:window:default"', protectPointer = true) {
   mkdirSync(join(root, 'src-tauri/src'), { recursive: true });
   writeFileSync(join(root, 'src-tauri/windows-app-manifest.xml'), '<requestedExecutionLevel level="requireAdministrator" uiAccess="false" />');
   writeFileSync(join(root, 'src-tauri/Cargo.toml'), 'fairypam-agent = { path = "agent" }');
+  writeFileSync(join(root, 'src-tauri/Cargo.lock'), '');
   writeFileSync(join(root, 'src-tauri/capabilities/default.json'), `{ "permissions": [${capability}] }`);
   writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ app: { security: { csp: "script-src 'self'" } } }));
   const commands = readFileSync(join(uiRoot, 'src-tauri/src/commands.rs'), 'utf8');
@@ -50,6 +51,7 @@ test('production security scanner accepts the single-process fixture', () => {
       env: {
         ...process.env,
         FAIRYPAM_TAURI_UI_ROOT: root,
+        FAIRYPAM_AGENT_ROOT: resolve(uiRoot, '..'),
         FAIRYPAM_INSTALL_GUARD_SOURCE: join(root, 'install-guard.rs'),
       },
     });
@@ -65,6 +67,7 @@ test('production security scanner rejects a broad core capability', () => {
       env: {
         ...process.env,
         FAIRYPAM_TAURI_UI_ROOT: root,
+        FAIRYPAM_AGENT_ROOT: resolve(uiRoot, '..'),
         FAIRYPAM_INSTALL_GUARD_SOURCE: join(root, 'install-guard.rs'),
       },
     }));
@@ -80,6 +83,7 @@ test('production security scanner rejects an unguarded active-suite pointer', ()
       env: {
         ...process.env,
         FAIRYPAM_TAURI_UI_ROOT: root,
+        FAIRYPAM_AGENT_ROOT: resolve(uiRoot, '..'),
         FAIRYPAM_INSTALL_GUARD_SOURCE: join(root, 'install-guard.rs'),
       },
     }));

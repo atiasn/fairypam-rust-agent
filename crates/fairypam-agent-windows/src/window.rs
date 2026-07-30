@@ -57,6 +57,15 @@ impl Rect {
             height,
         })
     }
+
+    fn contains(&self, x: i32, y: i32) -> bool {
+        let right = i64::from(self.left) + i64::from(self.width);
+        let bottom = i64::from(self.top) + i64::from(self.height);
+        i64::from(x) >= i64::from(self.left)
+            && i64::from(x) < right
+            && i64::from(y) >= i64::from(self.top)
+            && i64::from(y) < bottom
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +117,12 @@ pub trait WindowsApi: Send {
         identity: &TargetIdentity,
         allow_activation_probe: bool,
     ) -> Result<(), WindowsError>;
+    fn click_target_point(
+        &mut self,
+        identity: &TargetIdentity,
+        screen_x: i32,
+        screen_y: i32,
+    ) -> Result<(), WindowsError>;
     fn close_target(
         &mut self,
         identity: &TargetIdentity,
@@ -119,6 +134,8 @@ pub trait WindowsApi: Send {
 pub struct FakeWindows {
     candidates: Vec<WindowsTargetCandidate>,
     focus_activation_probe: Vec<bool>,
+    focus_failures_remaining: usize,
+    target_point_clicks: Vec<(i32, i32)>,
 }
 
 impl FakeWindows {
@@ -126,7 +143,15 @@ impl FakeWindows {
         Self {
             candidates,
             focus_activation_probe: Vec::new(),
+            focus_failures_remaining: 0,
+            target_point_clicks: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_focus_failures(mut self, failures: usize) -> Self {
+        self.focus_failures_remaining = failures;
+        self
     }
 }
 
@@ -151,6 +176,13 @@ impl WindowsApi for FakeWindows {
         let current = self.snapshot(identity.hwnd)?;
         require_same_identity(identity, &current.identity)?;
         self.focus_activation_probe.push(allow_activation_probe);
+        if self.focus_failures_remaining > 0 {
+            self.focus_failures_remaining -= 1;
+            return Err(WindowsError::new(
+                "target.focus_failed",
+                "simulated foreground rejection",
+            ));
+        }
         for candidate in &mut self.candidates {
             let target = candidate.identity.hwnd == identity.hwnd;
             candidate.foreground = target;
@@ -158,6 +190,27 @@ impl WindowsApi for FakeWindows {
                 candidate.minimized = false;
                 candidate.capturable = true;
             }
+        }
+        Ok(())
+    }
+
+    fn click_target_point(
+        &mut self,
+        identity: &TargetIdentity,
+        screen_x: i32,
+        screen_y: i32,
+    ) -> Result<(), WindowsError> {
+        let current = self.snapshot(identity.hwnd)?;
+        require_same_identity(identity, &current.identity)?;
+        if !current.identity.client_rect.contains(screen_x, screen_y) {
+            return Err(WindowsError::new(
+                "target.focus_click_outside_target",
+                "foreground fallback point is outside the target client area",
+            ));
+        }
+        self.target_point_clicks.push((screen_x, screen_y));
+        for candidate in &mut self.candidates {
+            candidate.foreground = candidate.identity.hwnd == identity.hwnd;
         }
         Ok(())
     }
@@ -388,23 +441,33 @@ fn binding_identity(binding: &TargetBinding) -> Result<TargetIdentity, AgentErro
 fn revalidate_or_focus_target(
     api: &mut dyn WindowsApi,
     binding: &TargetBinding,
-    allow_activation_probe: bool,
 ) -> Result<WindowsTargetCandidate, AgentError> {
     let expected = binding_identity(binding)?;
-    let current = revalidate_identity(api, &expected)?;
+    let mut current = revalidate_identity(api, &expected)?;
+    for _ in 0..2 {
+        if current.foreground && !current.minimized {
+            return Ok(current);
+        }
+        if let Err(error) = api.focus_target(&current.identity, true) {
+            if error.code() != "target.focus_failed" {
+                return Err(error.into());
+            }
+        }
+        current = revalidate_identity(api, &expected)?;
+    }
     if current.foreground && !current.minimized {
         return Ok(current);
     }
-    api.focus_target(&current.identity, allow_activation_probe)?;
-    let current = revalidate_identity(api, &expected)?;
-    if !current.foreground {
-        return Err(WindowsError::new(
-            "target.focus_failed",
-            "target did not become the foreground window",
-        )
-        .into());
+    api.click_target_point(&current.identity, 1, 1)?;
+    current = revalidate_identity(api, &expected)?;
+    if current.foreground && !current.minimized {
+        return Ok(current);
     }
-    Ok(current)
+    Err(WindowsError::new(
+        "target.focus_failed",
+        "target did not become the foreground window after two activation attempts and one target-bound click",
+    )
+    .into())
 }
 
 #[cfg(any(windows, test))]
@@ -412,7 +475,7 @@ fn revalidate_input_target(
     api: &mut dyn WindowsApi,
     binding: &TargetBinding,
 ) -> Result<LockedInputTarget, AgentError> {
-    let current = revalidate_or_focus_target(api, binding, false)?;
+    let current = revalidate_or_focus_target(api, binding)?;
     if current.minimized || !current.capturable {
         return Err(WindowsError::new(
             "target.input_not_permitted",
@@ -438,7 +501,7 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
         &mut self,
         binding: &TargetBinding,
     ) -> Result<TargetIdentity, AgentError> {
-        let current = revalidate_or_focus_target(&mut self.api, binding, false)?;
+        let current = revalidate_or_focus_target(&mut self.api, binding)?;
         if current.minimized || !current.capturable {
             return Err(WindowsError::new(
                 "target.capture_not_permitted",
@@ -488,8 +551,7 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
     }
 
     pub fn focus(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError> {
-        let current = revalidate_identity(&mut self.api, &binding_identity(binding)?)?;
-        self.api.focus_target(&current.identity, true)?;
+        revalidate_or_focus_target(&mut self.api, binding)?;
         let snapshot = self.revalidate(binding)?;
         if !snapshot.foreground {
             return Err(WindowsError::new(
@@ -627,14 +689,14 @@ mod tests {
         input_targets.lock_input_target(&binding).unwrap();
         assert!(input_targets.api().candidates[0].foreground);
         assert!(!input_targets.api().candidates[1].foreground);
-        assert_eq!(input_targets.api().focus_activation_probe, [false]);
+        assert_eq!(input_targets.api().focus_activation_probe, [true]);
 
         let mut capture_targets =
             WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![background_game, other]));
         capture_targets.capture_identity(&binding).unwrap();
         assert!(capture_targets.api().candidates[0].foreground);
         assert!(!capture_targets.api().candidates[1].foreground);
-        assert_eq!(capture_targets.api().focus_activation_probe, [false]);
+        assert_eq!(capture_targets.api().focus_activation_probe, [true]);
 
         for foreground in [true, false] {
             let mut minimized = input_candidate(foreground);
@@ -645,6 +707,29 @@ mod tests {
             targets.capture_identity(&binding).unwrap();
             assert!(!targets.api().candidates[0].minimized);
         }
+    }
+
+    #[test]
+    fn input_and_capture_click_the_live_fullscreen_target_after_two_focus_rejections() {
+        let binding = input_binding();
+        let mut fullscreen = input_candidate(false);
+        fullscreen.identity.client_rect = Rect::new(0, 0, 1280, 720).unwrap();
+        let mut targets = WindowsTargetPlatform::new(
+            FakeWindows::with_candidates(vec![fullscreen]).with_focus_failures(2),
+        );
+
+        targets.capture_identity(&binding).unwrap();
+
+        assert_eq!(targets.api().focus_activation_probe, [true, true]);
+        assert_eq!(targets.api().target_point_clicks, [(1, 1)]);
+        assert!(targets.api().candidates[0].foreground);
+
+        let mut offset = WindowsTargetPlatform::new(
+            FakeWindows::with_candidates(vec![input_candidate(false)]).with_focus_failures(2),
+        );
+        let error = offset.capture_identity(&binding).unwrap_err();
+        assert_eq!(error.code(), "target.focus_click_outside_target");
+        assert!(offset.api().target_point_clicks.is_empty());
     }
 
     #[test]
@@ -706,6 +791,15 @@ impl WindowsApi for NativeWindows {
         native::focus_target(identity, allow_activation_probe)
     }
 
+    fn click_target_point(
+        &mut self,
+        identity: &TargetIdentity,
+        screen_x: i32,
+        screen_y: i32,
+    ) -> Result<(), WindowsError> {
+        native::click_target_point(identity, screen_x, screen_y)
+    }
+
     fn close_target(
         &mut self,
         identity: &TargetIdentity,
@@ -746,7 +840,7 @@ mod native {
         SetForegroundWindow, ShowWindowAsync, SW_RESTORE, WM_CLOSE,
     };
 
-    use crate::send_input::send_foreground_activation_probe;
+    use crate::send_input::{send_foreground_activation_probe, send_foreground_fallback_click};
     use crate::{normalized_process_path_sha256, validate_dpi};
 
     use super::{
@@ -927,6 +1021,37 @@ mod native {
                 identity.pid
             ),
         ))
+    }
+
+    pub(super) fn click_target_point(
+        identity: &TargetIdentity,
+        screen_x: i32,
+        screen_y: i32,
+    ) -> Result<(), WindowsError> {
+        let current = candidate_from_raw_hwnd(identity.hwnd)?;
+        require_same_identity(identity, &current.identity)?;
+        if !current.identity.client_rect.contains(screen_x, screen_y) {
+            return Err(WindowsError::new(
+                "target.focus_click_outside_target",
+                "foreground fallback point is outside the target client area",
+            ));
+        }
+        let sent = send_foreground_fallback_click(screen_x, screen_y);
+        if sent != 3 {
+            return Err(WindowsError::new(
+                "target.focus_click_failed",
+                format!("SendInput sent {sent}/3 foreground fallback events"),
+            ));
+        }
+        let hwnd = HWND(identity.hwnd as *mut c_void);
+        if wait_for_foreground(hwnd, Duration::from_millis(800)) {
+            Ok(())
+        } else {
+            Err(WindowsError::new(
+                "target.focus_failed",
+                "target-bound foreground fallback click did not activate the target",
+            ))
+        }
     }
 
     fn desktop_receives_input() -> Option<bool> {

@@ -29,6 +29,15 @@ pub(crate) fn send_foreground_activation_probe() -> u32 {
     unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) }
 }
 
+pub(crate) fn send_foreground_fallback_click(screen_x: i32, screen_y: i32) -> u32 {
+    let inputs = SendInputPlatform::screen_point_click_inputs(
+        SemanticMouseButton::Left,
+        i64::from(screen_x),
+        i64::from(screen_y),
+    );
+    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
+}
+
 #[derive(Debug)]
 struct SendInputPlatform {
     client_left: i32,
@@ -126,6 +135,35 @@ impl SendInputPlatform {
                 },
             },
         }
+    }
+
+    fn screen_point_click_inputs(
+        button: SemanticMouseButton,
+        screen_x: i64,
+        screen_y: i64,
+    ) -> [INPUT; 3] {
+        let virtual_left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let virtual_top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let virtual_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+        let virtual_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+        let relative_x =
+            (screen_x - i64::from(virtual_left)).clamp(0, i64::from(virtual_width - 1));
+        let relative_y =
+            (screen_y - i64::from(virtual_top)).clamp(0, i64::from(virtual_height - 1));
+        let absolute_x = (relative_x * 65_535 / i64::from((virtual_width - 1).max(1))) as i32;
+        let absolute_y = (relative_y * 65_535 / i64::from((virtual_height - 1).max(1))) as i32;
+        let (down, down_data) = mouse_button_event(button, false);
+        let (up, up_data) = mouse_button_event(button, true);
+        [
+            Self::mouse(
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                absolute_x,
+                absolute_y,
+                0,
+            ),
+            Self::mouse(down, 0, 0, down_data),
+            Self::mouse(up, 0, 0, up_data),
+        ]
     }
 }
 
@@ -409,26 +447,7 @@ impl InputPlatform for SendInputPlatform {
             + i64::from(self.client_width.saturating_sub(1)) * i64::from(x_ppm) / 1_000_000;
         let y = i64::from(self.client_top)
             + i64::from(self.client_height.saturating_sub(1)) * i64::from(y_ppm) / 1_000_000;
-        let virtual_left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-        let virtual_top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-        let virtual_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
-        let virtual_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
-        let relative_x = (x - i64::from(virtual_left)).clamp(0, i64::from(virtual_width - 1));
-        let relative_y = (y - i64::from(virtual_top)).clamp(0, i64::from(virtual_height - 1));
-        let absolute_x = (relative_x * 65_535 / i64::from((virtual_width - 1).max(1))) as i32;
-        let absolute_y = (relative_y * 65_535 / i64::from((virtual_height - 1).max(1))) as i32;
-        let (down, down_data) = mouse_button_event(button, false);
-        let (up, up_data) = mouse_button_event(button, true);
-        self.send(&[
-            Self::mouse(
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                absolute_x,
-                absolute_y,
-                0,
-            ),
-            Self::mouse(down, 0, 0, down_data),
-            Self::mouse(up, 0, 0, up_data),
-        ])
+        self.send(&Self::screen_point_click_inputs(button, x, y))
     }
 }
 

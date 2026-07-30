@@ -17,12 +17,14 @@ use fairypam_agent_core::AgentError;
 use fairypam_agent_protocol::v2::{
     agent_control_event, AgentControlEvent, AgentRuntimeState, AgentStatus, Heartbeat, SessionRef,
 };
+#[cfg(any(windows, test))]
+use fairypam_agent_transport::validate_transport_config;
 #[cfg(windows)]
 use fairypam_agent_transport::CappedBackoff;
 use fairypam_agent_transport::{
     connect_control, connect_frame, control_queue, open_control_tunnel, open_frame_tunnel,
-    receive_hub_hello, validate_transport_config, ControlSender, ControlSession, IdentityKey,
-    SessionFrameSlot, TransportConfig, TransportError, VerifiedSession,
+    receive_hub_hello, ControlSender, ControlSession, SessionFrameSlot, TransportConfig,
+    TransportError, VerifiedSession,
 };
 use http::Uri;
 #[cfg(any(windows, test))]
@@ -114,7 +116,7 @@ impl RuntimeConfig {
                 agent_id: "unregistered".to_owned(),
                 ca_pem: PathBuf::new(),
                 identity_cert_pem: PathBuf::new(),
-                identity_key: IdentityKey::Pem(PathBuf::new()),
+                identity_key_pem: PathBuf::new(),
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -148,7 +150,7 @@ impl RuntimeConfig {
                 agent_id: required("FAIRYPAM_AGENT_ID")?,
                 ca_pem: required_path("FAIRYPAM_CA_PEM")?,
                 identity_cert_pem: required_path("FAIRYPAM_AGENT_CERT_PEM")?,
-                identity_key: IdentityKey::Pem(required_path("FAIRYPAM_AGENT_KEY_PEM")?),
+                identity_key_pem: required_path("FAIRYPAM_AGENT_KEY_PEM")?,
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -211,7 +213,7 @@ impl RuntimeConfig {
                 agent_id: document.agent_id,
                 ca_pem: private_file(&directory, "ca.pem")?,
                 identity_cert_pem: private_file(&directory, "client-cert.pem")?,
-                identity_key: IdentityKey::Pem(private_file(&directory, "client-key.pem")?),
+                identity_key_pem: private_file(&directory, "client-key.pem")?,
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),

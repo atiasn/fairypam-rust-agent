@@ -2213,32 +2213,19 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         mouse_buttons: &[i32],
         wheel_delta: i32,
     ) -> Result<(), AgentError> {
-        use fairypam_agent_core::platform::TargetPlatform;
         use fairypam_agent_input::{InputPermit, SemanticMouseButton};
 
         if self.task_input.is_none() {
             self.start_task_input(profile, binding, session, expires_at)?;
         }
         let now = Instant::now();
-        let snapshot = self.targets.revalidate(binding)?;
+        self.validate_task_input_session(session)?;
+        let snapshot = self.focus_task_input_target(binding)?;
         if !snapshot.foreground || snapshot.minimized || !snapshot.capturable {
             let _ = self.release_task_input();
             return Err(AgentError::new(
                 "local_authorization_denied",
                 "task target lost foreground or capture eligibility",
-            ));
-        }
-        let expected = self.task_input.as_ref().ok_or_else(|| {
-            AgentError::new("input_lease_invalid", "task input lease is not active")
-        })?;
-        if expected.session.agent_id != session.agent_id
-            || expected.session.session_id != session.session_id
-            || expected.session.generation != session.generation
-        {
-            let _ = self.release_task_input();
-            return Err(AgentError::new(
-                "input_lease_invalid",
-                "task input lease belongs to another Control session",
             ));
         }
         let buttons = mouse_buttons
@@ -2287,28 +2274,15 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         action_id: &str,
         now: Instant,
     ) -> Result<(), AgentError> {
-        use fairypam_agent_core::platform::TargetPlatform;
         use fairypam_agent_input::{ActionId, InputPermit};
 
-        let snapshot = self.targets.revalidate(binding)?;
+        self.validate_task_input_session(session)?;
+        let snapshot = self.focus_task_input_target(binding)?;
         if !snapshot.foreground || snapshot.minimized || !snapshot.capturable {
             let _ = self.release_task_input();
             return Err(AgentError::new(
                 "local_authorization_denied",
                 "task target lost foreground or capture eligibility",
-            ));
-        }
-        let input = self.task_input.as_ref().ok_or_else(|| {
-            AgentError::new("input_lease_invalid", "task input lease is not active")
-        })?;
-        if input.session.agent_id != session.agent_id
-            || input.session.session_id != session.session_id
-            || input.session.generation != session.generation
-        {
-            let _ = self.release_task_input();
-            return Err(AgentError::new(
-                "input_lease_invalid",
-                "task input lease belongs to another Control session",
             ));
         }
         let input = self.task_input.as_mut().ok_or_else(|| {
@@ -2323,6 +2297,49 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             .input
             .execute_pulse(&action, &input.session, &permit, now)
             .map_err(|error| AgentError::new(error.code(), error.to_string()))
+    }
+
+    fn validate_task_input_session(&mut self, session: &SessionRef) -> Result<(), AgentError> {
+        let Some(input) = self.task_input.as_ref() else {
+            return Err(AgentError::new(
+                "input_lease_invalid",
+                "task input lease is not active",
+            ));
+        };
+        let matches = {
+            input.session.agent_id == session.agent_id
+                && input.session.session_id == session.session_id
+                && input.session.generation == session.generation
+        };
+        if matches {
+            return Ok(());
+        }
+        let release_error = self.release_task_input().err();
+        Err(AgentError::new(
+            "input_lease_invalid",
+            match release_error {
+                Some(error) => format!(
+                    "task input lease belongs to another Control session; release failed: {error}"
+                ),
+                None => "task input lease belongs to another Control session".into(),
+            },
+        ))
+    }
+
+    fn focus_task_input_target(
+        &mut self,
+        binding: &TargetBinding,
+    ) -> Result<TargetSnapshot, AgentError> {
+        self.targets.focus(binding).map_err(|error| {
+            let release_error = self.release_task_input().err();
+            AgentError::new(
+                error.code(),
+                match release_error {
+                    Some(release) => format!("{error}; input release failed: {release}"),
+                    None => error.to_string(),
+                },
+            )
+        })
     }
 
     fn release_task_input(&mut self) -> Result<(), AgentError> {

@@ -9,8 +9,7 @@ use fairypam_agent_protocol::v2::{
     HubHello, SessionRef,
 };
 use fairypam_agent_transport::{
-    connect_control, control_queue, open_control_tunnel, receive_hub_hello, IdentityKey,
-    TransportConfig,
+    connect_control, control_queue, open_control_tunnel, receive_hub_hello, TransportConfig,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -190,7 +189,7 @@ impl Certificates {
             agent_id: agent_id.into(),
             ca_pem: self.ca_path.clone(),
             identity_cert_pem: self.client_cert_path.clone(),
-            identity_key: IdentityKey::Pem(self.client_key_path.clone()),
+            identity_key_pem: self.client_key_path.clone(),
             connect_timeout: Duration::from_secs(2),
         }
     }
