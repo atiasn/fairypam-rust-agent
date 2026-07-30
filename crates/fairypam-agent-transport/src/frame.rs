@@ -91,6 +91,10 @@ impl VerifiedSession {
 
 impl SessionFrameSlot {
     pub fn publish(&self, frame: FramePacket) -> Result<(), TransportError> {
+        self.publish_if_accepting(frame).map(drop)
+    }
+
+    pub fn publish_if_accepting(&self, frame: FramePacket) -> Result<bool, TransportError> {
         let session = frame.session.as_ref().ok_or_else(|| {
             TransportError::new(
                 "transport.frame_session_invalid",
@@ -109,8 +113,9 @@ impl SessionFrameSlot {
         }
         if self.accept_frames.load(Ordering::Acquire) {
             self.frames.publish(frame);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub fn set_accept_frames(&self, accept: bool) {
@@ -221,7 +226,7 @@ mod tests {
                 heartbeat_interval_ms: 1_000,
                 max_input_lease_ms: 500,
                 max_frame_bytes: 4,
-                accepted_protocol_minor: 0,
+                accepted_protocol_minor: 1,
             },
             "agent-a",
         )
@@ -284,8 +289,8 @@ mod tests {
         assert_eq!(stream.next().await.unwrap().frame_sequence, 0);
 
         frames.set_accept_frames(false);
-        frames
-            .publish(FramePacket {
+        assert!(!frames
+            .publish_if_accepting(FramePacket {
                 session: Some(SessionRef {
                     agent_id: "agent-a".into(),
                     session_id: "session-1".into(),
@@ -295,7 +300,7 @@ mod tests {
                 payload: vec![1],
                 ..FramePacket::default()
             })
-            .unwrap();
+            .unwrap());
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(1), stream.next())
                 .await

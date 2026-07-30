@@ -196,6 +196,7 @@ pub(crate) fn verify_hub_hello(
         || hello.heartbeat_interval_ms == 0
         || hello.max_input_lease_ms == 0
         || hello.max_frame_bytes == 0
+        || hello.accepted_protocol_minor != 1
     {
         return Err(TransportError::new(
             "transport.session_invalid",
@@ -251,6 +252,7 @@ fn command_ref(command: &HubControlCommand) -> Option<&CommandRef> {
         Payload::BeginAttempt(value) => task_ref(value.reference.as_ref()),
         Payload::StartAttemptTarget(value) => task_ref(value.reference.as_ref()),
         Payload::StartCapture(value) => task_ref(value.reference.as_ref()),
+        Payload::CaptureFrame(value) => task_ref(value.reference.as_ref()),
         Payload::StopCapture(value) => task_ref(value.reference.as_ref()),
         Payload::InputFrame(value) => task_ref(value.reference.as_ref()),
         Payload::ReleaseAll(value) => identity_ref(value.reference.as_ref()),
@@ -287,6 +289,7 @@ fn task_identity(command: &HubControlCommand) -> bool {
         Some(Payload::BeginAttempt(value)) => value.reference.as_ref(),
         Some(Payload::StartAttemptTarget(value)) => value.reference.as_ref(),
         Some(Payload::StartCapture(value)) => value.reference.as_ref(),
+        Some(Payload::CaptureFrame(value)) => value.reference.as_ref(),
         Some(Payload::StopCapture(value)) => value.reference.as_ref(),
         Some(Payload::InputFrame(value)) => value.reference.as_ref(),
         Some(Payload::ReleaseAll(value)) => value.reference.as_ref(),
@@ -343,7 +346,7 @@ mod v2_tests {
                 heartbeat_interval_ms: 1_000,
                 max_input_lease_ms: 500,
                 max_frame_bytes: 1_024,
-                accepted_protocol_minor: 0,
+                accepted_protocol_minor: 1,
             },
             "agent-a",
         )
@@ -361,6 +364,26 @@ mod v2_tests {
             sequence,
             expires_at_unix_ms: i64::MAX,
         }
+    }
+
+    #[test]
+    fn hub_hello_requires_current_protocol_minor() {
+        let hello = HubHello {
+            session: Some(SessionRef {
+                agent_id: "agent-a".into(),
+                session_id: "session-1".into(),
+                generation: 1,
+            }),
+            heartbeat_interval_ms: 1_000,
+            max_input_lease_ms: 500,
+            max_frame_bytes: 1_024,
+            accepted_protocol_minor: 0,
+        };
+
+        assert_eq!(
+            verify_hub_hello(hello, "agent-a").unwrap_err().code(),
+            "transport.session_invalid"
+        );
     }
 
     #[test]

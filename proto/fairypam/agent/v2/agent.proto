@@ -197,6 +197,7 @@ message HubControlCommand {
     FinishAttempt finish_attempt = 10;
     InspectAttempt inspect_attempt = 11;
     StopSession stop_session = 12;
+    CaptureFrame capture_frame = 13;
   }
 }
 
@@ -272,6 +273,13 @@ message StartCapture {
   uint32 fps = 3;
   string encoding = 4;
   uint32 quality = 5;
+}
+
+message CaptureFrame {
+  CommandIdentity reference = 1;
+  string capture_source_id = 2;
+  string encoding = 3;
+  uint32 quality = 4;
 }
 
 message StopCapture {

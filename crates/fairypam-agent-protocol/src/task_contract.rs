@@ -168,6 +168,15 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
                 "quality": value.quality,
             }),
         ),
+        Some(Payload::CaptureFrame(value)) => (
+            task(value.reference.as_ref())?,
+            "CaptureFrame",
+            serde_json::json!({
+                "capture_source_id": value.capture_source_id,
+                "encoding": value.encoding,
+                "quality": value.quality,
+            }),
+        ),
         Some(Payload::StopCapture(value)) => (
             task(value.reference.as_ref())?,
             "StopCapture",

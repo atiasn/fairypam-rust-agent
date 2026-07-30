@@ -39,6 +39,20 @@ fn frame_sequence_key(source_id: &str, attempt: Option<&AttemptRef>) -> String {
     )
 }
 
+fn next_frame_sequence(sequence: &AtomicU64) -> Result<u64, AgentError> {
+    sequence
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .map_err(|_| {
+            AgentError::new(
+                "capture.sequence_exhausted",
+                "capture frame sequence exhausted",
+            )
+        })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeCaptureEncoding {
     Jpeg { quality: u8 },
@@ -59,6 +73,10 @@ pub trait RuntimeCapture: Send {
 pub trait FrameSink: Send + Sync {
     fn publish(&self, frame: FramePacket) -> Result<(), AgentError>;
 
+    fn publish_required(&self, frame: FramePacket) -> Result<(), AgentError> {
+        self.publish(frame)
+    }
+
     fn overwritten_frames(&self) -> u64 {
         0
     }
@@ -72,6 +90,17 @@ impl FrameSink for SessionFrameSlot {
 
     fn overwritten_frames(&self) -> u64 {
         SessionFrameSlot::overwritten_frames(self)
+    }
+
+    fn publish_required(&self, frame: FramePacket) -> Result<(), AgentError> {
+        match SessionFrameSlot::publish_if_accepting(self, v2_frame(frame)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(AgentError::new(
+                "transport.frame_paused",
+                "single-frame capture cannot be published while Frame transmission is paused",
+            )),
+            Err(error) => Err(AgentError::new(error.code(), error.to_string())),
+        }
     }
 }
 
@@ -924,6 +953,82 @@ impl CommandExecutor {
                     json!({"capture_source_id": value.source_id, "state": "running"}).to_string(),
                 ))
             }
+            Some(Payload::CaptureFrame(value)) => {
+                let task = value.task.as_ref().ok_or_else(task_reference_invalid)?;
+                let profile = self.active_profile.clone().ok_or_else(|| {
+                    AgentError::new("profile.not_active", "capture requires an active Profile")
+                })?;
+                let binding = self.binding.clone().ok_or_else(|| {
+                    AgentError::new("target.not_locked", "capture requires a locked target")
+                })?;
+                let source = profile
+                    .profile()
+                    .capture_sources
+                    .iter()
+                    .find(|source| source.id == value.source_id)
+                    .ok_or_else(|| {
+                        AgentError::new(
+                            "capture.source_not_allowed",
+                            "capture source is not declared by the active Profile",
+                        )
+                    })?;
+                let region = source.region.clone();
+                let encoding = parse_encoding(&value.encoding, value.quality, &source.encodings)?;
+                if self.task_attempt.profile_id(task)? != profile.profile().id {
+                    return Err(AgentError::new(
+                        "profile_mismatch",
+                        "task capture Profile does not match the claimed attempt",
+                    ));
+                }
+                if let Some(result) = self.task_attempt.prepare(task, false)? {
+                    return Ok(CommandOutcome::task(result));
+                }
+                if self.capture.is_some() {
+                    return Ok(CommandOutcome::task(
+                        self.task_attempt.complete_capture_frame(
+                            task,
+                            None,
+                            Some("capture.already_started"),
+                        )?,
+                    ));
+                }
+                let attempt = self.task_attempt.attempt_ref(task)?;
+                let result = (|| {
+                    let mut capture = self.platform.start_capture(&binding, region, encoding)?;
+                    let frame = capture.next_frame(Instant::now() + CAPTURE_NO_FRAME_TIMEOUT)?;
+                    let frame_sequence = Arc::clone(
+                        self.frame_sequences
+                            .entry(frame_sequence_key(&value.source_id, Some(&attempt)))
+                            .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+                    );
+                    let sequence = next_frame_sequence(&frame_sequence)?;
+                    frames.publish_required(FramePacket {
+                        session: Some(session.reference.clone()),
+                        capture_source_id: value.source_id.clone(),
+                        frame_sequence: sequence,
+                        captured_at_unix_us: now_unix_us(),
+                        width: frame.width,
+                        height: frame.height,
+                        encoding: match encoding {
+                            RuntimeCaptureEncoding::Jpeg { .. } => "jpeg".into(),
+                            RuntimeCaptureEncoding::Png => "png".into(),
+                        },
+                        payload: frame.bytes,
+                        attempt: Some(attempt),
+                    })?;
+                    Ok(sequence)
+                })();
+                match result {
+                    Ok(sequence) => Ok(CommandOutcome::task(
+                        self.task_attempt
+                            .complete_capture_frame(task, Some(sequence), None)?,
+                    )),
+                    Err(error) => Ok(CommandOutcome::task(
+                        self.task_attempt
+                            .complete_capture_frame(task, None, Some(error.code()))?,
+                    )),
+                }
+            }
             Some(Payload::StopCapture(value)) => {
                 if let Some(task) = value.task.as_ref() {
                     if let Some(result) = self.task_attempt.prepare(task, false)? {
@@ -1397,6 +1502,7 @@ fn task_payload_allowed(payload: Option<&hub_control_command::Payload>) -> bool 
             | Payload::InspectTaskAttempt(_),
         ) => true,
         Some(Payload::StartCapture(value)) => value.task.is_some(),
+        Some(Payload::CaptureFrame(value)) => value.task.is_some(),
         Some(Payload::StopCapture(value)) => value.task.is_some(),
         Some(Payload::InputLease(value)) => value.task.is_some(),
         Some(Payload::PulseAction(value)) => value.task.is_some(),
@@ -1466,21 +1572,10 @@ fn spawn_capture_worker(
                 let started = Instant::now();
                 match capture.next_frame(started + interval) {
                     Ok(frame) => {
-                        let sequence = match frame_sequence.fetch_update(
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                            |value| value.checked_add(1),
-                        ) {
-                            Ok(previous) => previous + 1,
-                            Err(_) => {
-                                record_capture_failure(
-                                    &worker_failure,
-                                    AgentError::new(
-                                        "capture.sequence_exhausted",
-                                        "capture frame sequence exhausted",
-                                    ),
-                                    attempt.clone(),
-                                );
+                        let sequence = match next_frame_sequence(&frame_sequence) {
+                            Ok(sequence) => sequence,
+                            Err(error) => {
+                                record_capture_failure(&worker_failure, error, attempt.clone());
                                 break;
                             }
                         };
@@ -2252,10 +2347,10 @@ mod tests {
     };
     use fairypam_agent_core::target::{ClientRect, IntegrityLevel, TargetSnapshot};
     use fairypam_agent_protocol::v1::{
-        AgentAttemptContractV1, AttemptRef, BeginTaskAttempt, CloseTarget, CommandRef,
-        EnumerateTargets, FinishTaskAttempt, FocusTarget, InputLease, InspectTaskAttempt,
-        LaunchTarget, LockTarget, PulseAction, SessionRef, StartCapture, StartTaskTarget,
-        StopCapture, TaskAttemptState, TaskCommandOutcomeState, TaskCommandRef,
+        AgentAttemptContractV1, AttemptRef, BeginTaskAttempt, CaptureFrame, CloseTarget,
+        CommandRef, EnumerateTargets, FinishTaskAttempt, FocusTarget, InputLease,
+        InspectTaskAttempt, LaunchTarget, LockTarget, PulseAction, SessionRef, StartCapture,
+        StartTaskTarget, StopCapture, TaskAttemptState, TaskCommandOutcomeState, TaskCommandRef,
         TaskSideEffectState,
     };
     use sha2::{Digest, Sha256};
@@ -2560,6 +2655,21 @@ mod tests {
         fn publish(&self, frame: FramePacket) -> Result<(), AgentError> {
             self.0.lock().unwrap().push(frame);
             Ok(())
+        }
+    }
+
+    struct PausedFrames;
+
+    impl FrameSink for PausedFrames {
+        fn publish(&self, _frame: FramePacket) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        fn publish_required(&self, _frame: FramePacket) -> Result<(), AgentError> {
+            Err(AgentError::new(
+                "transport.frame_paused",
+                "Frame transmission is paused",
+            ))
         }
     }
 
@@ -3281,6 +3391,84 @@ mod tests {
         assert_eq!(frames[0].frame_sequence, 1);
         assert_eq!(frames[1].frame_sequence, 2);
         assert_eq!(frames[0].payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn task_capture_frame_publishes_exactly_one_receipted_frame() {
+        let profile = verified_profile();
+        let contract = task_contract(&profile);
+        let (mut executor, _) = executor_with_state();
+        let sink = Arc::new(CollectFrames::default());
+        for command in [
+            HubControlCommand {
+                payload: Some(hub_control_command::Payload::BeginTaskAttempt(
+                    BeginTaskAttempt {
+                        task: Some(task_ref(&contract, "begin-capture-frame")),
+                        contract: Some(contract.clone()),
+                    },
+                )),
+            },
+            HubControlCommand {
+                payload: Some(hub_control_command::Payload::StartTaskTarget(
+                    StartTaskTarget {
+                        task: Some(task_ref(&contract, "target-capture-frame")),
+                    },
+                )),
+            },
+        ] {
+            assert!(matches!(
+                executor.execute(&command, &ExecutionSession::test(), sink.clone()),
+                CommandOutcome::TaskAck { .. }
+            ));
+        }
+
+        let capture = HubControlCommand {
+            payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {
+                source_id: "client".into(),
+                encoding: "jpeg".into(),
+                quality: 85,
+                task: Some(task_ref(&contract, "capture-frame-1")),
+                ..CaptureFrame::default()
+            })),
+        };
+        assert!(matches!(
+            executor.execute(&capture, &ExecutionSession::test(), sink.clone()),
+            CommandOutcome::TaskAck { ref outcome, ref receipt, .. }
+                if outcome.as_ref().unwrap().source_frame_sequence == Some(1)
+                    && receipt.capture_state == fairypam_agent_protocol::v1::TaskCaptureState::Stopped as i32
+        ));
+        assert!(executor.capture.is_none());
+        let frames = sink.0.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame_sequence, 1);
+        assert_eq!(frames[0].payload, vec![1, 2, 3]);
+        assert_eq!(
+            frames[0].attempt.as_ref().unwrap().attempt_id,
+            contract.attempt_id
+        );
+        drop(frames);
+
+        let paused_capture = HubControlCommand {
+            payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {
+                source_id: "client".into(),
+                encoding: "jpeg".into(),
+                quality: 85,
+                task: Some(task_ref(&contract, "capture-frame-paused")),
+                ..CaptureFrame::default()
+            })),
+        };
+        assert!(matches!(
+            executor.execute(
+                &paused_capture,
+                &ExecutionSession::test(),
+                Arc::new(PausedFrames),
+            ),
+            CommandOutcome::TaskAck { ref outcome, ref receipt, .. }
+                if outcome.as_ref().unwrap().outcome
+                    == TaskCommandOutcomeState::NotApplied as i32
+                    && outcome.as_ref().unwrap().source_frame_sequence.is_none()
+                    && receipt.error_code.as_deref() == Some("transport.frame_paused")
+        ));
     }
 
     #[test]

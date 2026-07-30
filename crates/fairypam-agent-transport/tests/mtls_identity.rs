@@ -55,7 +55,7 @@ impl AgentControlService for HelloService {
                         heartbeat_interval_ms: 1_000,
                         max_input_lease_ms: 500,
                         max_frame_bytes: 1_024,
-                        accepted_protocol_minor: 0,
+                        accepted_protocol_minor: 1,
                     })),
                 }))
                 .await
@@ -100,7 +100,7 @@ async fn control_mtls_is_agent_bound_and_independent_from_frame_availability() {
                 agent_id: AGENT_A.into(),
                 agent_version: "0.1.0".into(),
                 protocol_major: 2,
-                protocol_minor: 0,
+                protocol_minor: 1,
                 build_commit: "test".into(),
                 installed_profiles: Vec::new(),
                 ..Default::default()

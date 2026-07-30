@@ -113,7 +113,7 @@ pub fn hello(
                 agent_id,
                 agent_version,
                 protocol_major: 2,
-                protocol_minor: 0,
+                protocol_minor: 1,
                 build_commit,
                 suite_build_id: option_env!("FAIRYPAM_BUILD_ID")
                     .unwrap_or("unknown")
@@ -239,6 +239,7 @@ pub fn identity(command: &wire::HubControlCommand) -> Option<wire::CommandIdenti
         Payload::BeginAttempt(value) => value.reference.clone(),
         Payload::StartAttemptTarget(value) => value.reference.clone(),
         Payload::StartCapture(value) => value.reference.clone(),
+        Payload::CaptureFrame(value) => value.reference.clone(),
         Payload::StopCapture(value) => value.reference.clone(),
         Payload::InputFrame(value) => value.reference.clone(),
         Payload::ReleaseAll(value) => value.reference.clone(),
@@ -336,6 +337,25 @@ fn translate(
                 quality: value.quality,
                 task: task_command(value.reference.as_ref())?,
                 ..internal::StartCapture::default()
+            })
+        }
+        Some(Payload::CaptureFrame(value)) => {
+            translator.require_capability(value.reference.as_ref(), 3)?;
+            if value.capture_source_id.is_empty()
+                || value.encoding != "jpeg"
+                || !(1..=100).contains(&value.quality)
+            {
+                return Err(AgentError::new(
+                    "capture.command_invalid",
+                    "single-frame capture command is outside v2 bounds",
+                ));
+            }
+            internal::hub_control_command::Payload::CaptureFrame(internal::CaptureFrame {
+                source_id: value.capture_source_id.clone(),
+                encoding: value.encoding.clone(),
+                quality: value.quality,
+                task: task_command(value.reference.as_ref())?,
+                ..internal::CaptureFrame::default()
             })
         }
         Some(Payload::StopCapture(value)) => {
@@ -888,6 +908,15 @@ mod tests {
                     "quality": value.quality,
                 }),
             ),
+            hub_control_command::Payload::CaptureFrame(value) => (
+                value.reference.as_ref().unwrap(),
+                "CaptureFrame",
+                serde_json::json!({
+                    "capture_source_id": value.capture_source_id,
+                    "encoding": value.encoding,
+                    "quality": value.quality,
+                }),
+            ),
             _ => unreachable!(),
         };
         let task = wire_task(Some(identity)).unwrap();
@@ -912,6 +941,7 @@ mod tests {
             hub_control_command::Payload::BeginAttempt(value) => value.reference.as_mut().unwrap(),
             hub_control_command::Payload::InputFrame(value) => value.reference.as_mut().unwrap(),
             hub_control_command::Payload::StartCapture(value) => value.reference.as_mut().unwrap(),
+            hub_control_command::Payload::CaptureFrame(value) => value.reference.as_mut().unwrap(),
             _ => unreachable!(),
         };
         match identity.value.as_mut().unwrap() {
@@ -1125,6 +1155,69 @@ mod tests {
                             capture_source_id: source.into(),
                             encoding: encoding.into(),
                             fps,
+                            quality,
+                        },
+                    )),
+                }))
+                .unwrap_err();
+            assert_eq!(error.code(), "capture.command_invalid");
+        }
+    }
+
+    #[test]
+    fn translator_accepts_attempt_bound_single_frame_capture() {
+        let contract = contract(vec![1, 3]);
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract);
+
+        let translated = translator
+            .translate(&with_digest(wire::HubControlCommand {
+                payload: Some(hub_control_command::Payload::CaptureFrame(
+                    wire::CaptureFrame {
+                        reference: Some(task_identity(&contract, 2)),
+                        capture_source_id: "client".into(),
+                        encoding: "jpeg".into(),
+                        quality: 85,
+                    },
+                )),
+            }))
+            .unwrap();
+
+        assert!(matches!(
+            translated,
+            TranslatedCommand::Internal(internal::HubControlCommand {
+                payload: Some(internal::hub_control_command::Payload::CaptureFrame(
+                    internal::CaptureFrame {
+                        ref source_id,
+                        ref encoding,
+                        quality: 85,
+                        task: Some(_),
+                        ..
+                    }
+                ))
+            }) if source_id == "client" && encoding == "jpeg"
+        ));
+    }
+
+    #[test]
+    fn translator_rejects_invalid_single_frame_capture() {
+        let contract = contract(vec![1, 3]);
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract);
+
+        for (sequence, source, encoding, quality) in [
+            (2, "", "jpeg", 85),
+            (3, "client", "png", 85),
+            (4, "client", "jpeg", 0),
+            (5, "client", "jpeg", 101),
+        ] {
+            let error = translator
+                .translate(&with_digest(wire::HubControlCommand {
+                    payload: Some(hub_control_command::Payload::CaptureFrame(
+                        wire::CaptureFrame {
+                            reference: Some(task_identity(&contract, sequence)),
+                            capture_source_id: source.into(),
+                            encoding: encoding.into(),
                             quality,
                         },
                     )),

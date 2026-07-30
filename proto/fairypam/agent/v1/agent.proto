@@ -180,6 +180,7 @@ message HubControlCommand {
     FinishTaskAttempt finish_task_attempt = 17;
     InspectTaskAttempt inspect_task_attempt = 18;
     LaunchTarget launch_target = 19;
+    CaptureFrame capture_frame = 20;
   }
 }
 
@@ -291,6 +292,14 @@ message StartCapture {
   string encoding = 4;
   uint32 quality = 5;
   TaskCommandRef task = 6;
+}
+
+message CaptureFrame {
+  CommandRef command = 1;
+  string source_id = 2;
+  string encoding = 3;
+  uint32 quality = 4;
+  TaskCommandRef task = 5;
 }
 
 message StopCapture {

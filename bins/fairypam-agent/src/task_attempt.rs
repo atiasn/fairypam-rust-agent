@@ -662,6 +662,31 @@ impl TaskAttemptRuntime {
         )
     }
 
+    pub fn complete_capture_frame(
+        &mut self,
+        task: &TaskCommandRef,
+        source_frame_sequence: Option<u64>,
+        error_code: Option<&str>,
+    ) -> Result<TaskCommandResult, AgentError> {
+        self.complete(
+            task,
+            if error_code.is_none() {
+                TaskCommandOutcomeState::Applied
+            } else {
+                TaskCommandOutcomeState::NotApplied
+            },
+            source_frame_sequence,
+            error_code,
+            false,
+            |state| {
+                if error_code.is_none() {
+                    state.attempt_state = TaskAttemptState::Active as i32;
+                    state.capture_state = TaskCaptureState::Stopped as i32;
+                }
+            },
+        )
+    }
+
     pub fn complete_input_lease(
         &mut self,
         task: &TaskCommandRef,
