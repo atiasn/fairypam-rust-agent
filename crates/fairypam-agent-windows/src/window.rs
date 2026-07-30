@@ -106,7 +106,7 @@ pub trait WindowsApi: Send {
     fn focus_target(
         &mut self,
         identity: &TargetIdentity,
-        allow_queue_attach: bool,
+        allow_activation_probe: bool,
     ) -> Result<(), WindowsError>;
     fn close_target(
         &mut self,
@@ -118,14 +118,14 @@ pub trait WindowsApi: Send {
 #[derive(Clone, Debug, Default)]
 pub struct FakeWindows {
     candidates: Vec<WindowsTargetCandidate>,
-    focus_queue_attach: Vec<bool>,
+    focus_activation_probe: Vec<bool>,
 }
 
 impl FakeWindows {
     pub fn with_candidates(candidates: Vec<WindowsTargetCandidate>) -> Self {
         Self {
             candidates,
-            focus_queue_attach: Vec::new(),
+            focus_activation_probe: Vec::new(),
         }
     }
 }
@@ -146,11 +146,11 @@ impl WindowsApi for FakeWindows {
     fn focus_target(
         &mut self,
         identity: &TargetIdentity,
-        allow_queue_attach: bool,
+        allow_activation_probe: bool,
     ) -> Result<(), WindowsError> {
         let current = self.snapshot(identity.hwnd)?;
         require_same_identity(identity, &current.identity)?;
-        self.focus_queue_attach.push(allow_queue_attach);
+        self.focus_activation_probe.push(allow_activation_probe);
         for candidate in &mut self.candidates {
             let target = candidate.identity.hwnd == identity.hwnd;
             candidate.foreground = target;
@@ -388,14 +388,14 @@ fn binding_identity(binding: &TargetBinding) -> Result<TargetIdentity, AgentErro
 fn revalidate_or_focus_target(
     api: &mut dyn WindowsApi,
     binding: &TargetBinding,
-    allow_queue_attach: bool,
+    allow_activation_probe: bool,
 ) -> Result<WindowsTargetCandidate, AgentError> {
     let expected = binding_identity(binding)?;
     let current = revalidate_identity(api, &expected)?;
     if current.foreground && !current.minimized {
         return Ok(current);
     }
-    api.focus_target(&current.identity, allow_queue_attach)?;
+    api.focus_target(&current.identity, allow_activation_probe)?;
     let current = revalidate_identity(api, &expected)?;
     if !current.foreground {
         return Err(WindowsError::new(
@@ -627,14 +627,14 @@ mod tests {
         input_targets.lock_input_target(&binding).unwrap();
         assert!(input_targets.api().candidates[0].foreground);
         assert!(!input_targets.api().candidates[1].foreground);
-        assert_eq!(input_targets.api().focus_queue_attach, [false]);
+        assert_eq!(input_targets.api().focus_activation_probe, [false]);
 
         let mut capture_targets =
             WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![background_game, other]));
         capture_targets.capture_identity(&binding).unwrap();
         assert!(capture_targets.api().candidates[0].foreground);
         assert!(!capture_targets.api().candidates[1].foreground);
-        assert_eq!(capture_targets.api().focus_queue_attach, [false]);
+        assert_eq!(capture_targets.api().focus_activation_probe, [false]);
 
         for foreground in [true, false] {
             let mut minimized = input_candidate(foreground);
@@ -655,7 +655,7 @@ mod tests {
 
         let focused = targets.focus(&binding).unwrap();
         assert!(focused.foreground);
-        assert_eq!(targets.api().focus_queue_attach, [true]);
+        assert_eq!(targets.api().focus_activation_probe, [true]);
 
         targets.close(&binding, Duration::from_secs(1)).unwrap();
         let error = targets.revalidate(&binding).unwrap_err();
@@ -701,9 +701,9 @@ impl WindowsApi for NativeWindows {
     fn focus_target(
         &mut self,
         identity: &TargetIdentity,
-        allow_queue_attach: bool,
+        allow_activation_probe: bool,
     ) -> Result<(), WindowsError> {
-        native::focus_target(identity, allow_queue_attach)
+        native::focus_target(identity, allow_activation_probe)
     }
 
     fn close_target(
@@ -735,7 +735,7 @@ mod native {
         GetThreadDesktop, GetUserObjectInformationW, UOI_IO,
     };
     use windows::Win32::System::Threading::{
-        AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken,
+        GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken,
         QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
@@ -760,50 +760,6 @@ mod native {
             if !self.0.is_invalid() {
                 unsafe {
                     let _ = CloseHandle(self.0);
-                }
-            }
-        }
-    }
-
-    struct InputQueueAttachment {
-        source_thread_id: u32,
-        target_thread_id: u32,
-        attached: bool,
-    }
-
-    impl InputQueueAttachment {
-        fn attach(source_thread_id: u32, target_thread_id: u32) -> Option<Self> {
-            if source_thread_id == 0
-                || target_thread_id == 0
-                || source_thread_id == target_thread_id
-            {
-                return None;
-            }
-            unsafe { AttachThreadInput(source_thread_id, target_thread_id, true) }
-                .as_bool()
-                .then_some(Self {
-                    source_thread_id,
-                    target_thread_id,
-                    attached: true,
-                })
-        }
-
-        fn detach(&mut self) -> bool {
-            let detached =
-                unsafe { AttachThreadInput(self.source_thread_id, self.target_thread_id, false) }
-                    .as_bool();
-            if detached {
-                self.attached = false;
-            }
-            detached
-        }
-    }
-
-    impl Drop for InputQueueAttachment {
-        fn drop(&mut self) {
-            if self.attached {
-                unsafe {
-                    let _ = AttachThreadInput(self.source_thread_id, self.target_thread_id, false);
                 }
             }
         }
@@ -908,7 +864,7 @@ mod native {
 
     pub(super) fn focus_target(
         identity: &TargetIdentity,
-        allow_queue_attach: bool,
+        allow_activation_probe: bool,
     ) -> Result<(), WindowsError> {
         let current = candidate_from_raw_hwnd(identity.hwnd)?;
         require_same_identity(identity, &current.identity)?;
@@ -942,54 +898,18 @@ mod native {
             return Ok(());
         }
 
-        let noop_input_sent = send_foreground_activation_probe();
-        let (input_retry_accepted, input_retry_succeeded) =
-            request_foreground(hwnd, Duration::from_millis(300));
-        if input_retry_succeeded {
-            return Ok(());
-        }
-
-        let foreground_before_attach = unsafe { GetForegroundWindow() };
-        let calling_thread_id = unsafe { GetCurrentThreadId() };
-        let target_thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
-        let foreground_thread_id = if foreground_before_attach.0.is_null() {
-            0
-        } else {
-            unsafe { GetWindowThreadProcessId(foreground_before_attach, None) }
-        };
-        let mut queues_attached = false;
-        let mut queues_detached = true;
+        let mut noop_input_sent = 0;
         let mut brought_to_top = false;
-        let mut attached_request_accepted = false;
-
-        if allow_queue_attach && calling_thread_id == foreground_thread_id && calling_thread_id != 0
-        {
+        let mut input_retry_accepted = false;
+        if allow_activation_probe {
+            let refreshed = candidate_from_raw_hwnd(identity.hwnd)?;
+            require_same_identity(identity, &refreshed.identity)?;
+            noop_input_sent = send_foreground_activation_probe();
             brought_to_top = unsafe { BringWindowToTop(hwnd) }.is_ok();
-            let (accepted, succeeded) = request_foreground(hwnd, Duration::from_millis(900));
-            attached_request_accepted = accepted;
+            let (accepted, succeeded) = request_foreground(hwnd, Duration::from_millis(800));
+            input_retry_accepted = accepted;
             if succeeded {
                 return Ok(());
-            }
-        } else if allow_queue_attach {
-            if let Some(mut attachment) =
-                InputQueueAttachment::attach(calling_thread_id, foreground_thread_id)
-            {
-                queues_attached = true;
-                brought_to_top = unsafe { BringWindowToTop(hwnd) }.is_ok();
-                let (accepted, succeeded) = request_foreground(hwnd, Duration::from_millis(900));
-                attached_request_accepted = accepted;
-                queues_detached = attachment.detach();
-                if !queues_detached {
-                    return Err(WindowsError::new(
-                        "target.focus_detach_failed",
-                        format!(
-                            "foreground input queues could not be detached; calling_thread_id={calling_thread_id}, foreground_thread_id={foreground_thread_id}"
-                        ),
-                    ));
-                }
-                if succeeded {
-                    return Ok(());
-                }
             }
         }
 
@@ -1000,7 +920,7 @@ mod native {
         Err(WindowsError::new(
             "target.focus_failed",
             format!(
-                "target did not become the foreground window; desktop_receives_input={input_desktop:?}, minimized={}, direct_accepted={direct_accepted}, noop_input_sent={noop_input_sent}, input_retry_accepted={input_retry_accepted}, allow_queue_attach={allow_queue_attach}, calling_thread_id={calling_thread_id}, target_thread_id={target_thread_id}, foreground_thread_id_before={foreground_thread_id}, queues_attached={queues_attached}, queues_detached={queues_detached}, brought_to_top={brought_to_top}, attached_request_accepted={attached_request_accepted}, foreground_hwnd=0x{:x}, foreground_thread_id_after={foreground_thread_id_after}, foreground_pid={foreground_pid}, target_hwnd=0x{:x}, target_pid={}",
+                "target did not become the foreground window; desktop_receives_input={input_desktop:?}, minimized={}, direct_accepted={direct_accepted}, allow_activation_probe={allow_activation_probe}, noop_input_sent={noop_input_sent}, brought_to_top={brought_to_top}, input_retry_accepted={input_retry_accepted}, foreground_hwnd=0x{:x}, foreground_thread_id={foreground_thread_id_after}, foreground_pid={foreground_pid}, target_hwnd=0x{:x}, target_pid={}",
                 current.minimized,
                 foreground.0 as usize,
                 identity.hwnd as usize,
