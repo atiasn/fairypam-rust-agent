@@ -918,9 +918,14 @@ fn set_cng_property(
 }
 
 #[cfg(windows)]
+const MICROSOFT_SOFTWARE_KSP_FULL_CONTROL_MASK: u32 = 0x8000_0000 | 0x4000_0000 | 0x001f_019b;
+
+#[cfg(windows)]
 fn cng_security_descriptor(authorized_user_sid: &str) -> Result<Vec<u8>, TransportError> {
     validate_windows_sid(authorized_user_sid)?;
-    let sddl = format!("D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;{authorized_user_sid})");
+    let sddl = format!(
+        "D:P(A;;0x{MICROSOFT_SOFTWARE_KSP_FULL_CONTROL_MASK:08x};;;SY)(A;;0x{MICROSOFT_SOFTWARE_KSP_FULL_CONTROL_MASK:08x};;;{authorized_user_sid})"
+    );
     let wide = sddl.encode_utf16().chain([0]).collect::<Vec<_>>();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     if unsafe {
@@ -1107,7 +1112,7 @@ fn cng_dacl_sids(descriptor: PSECURITY_DESCRIPTOR) -> Result<[PSID; 2], Transpor
         }
         let ace = raw.cast::<ACCESS_ALLOWED_ACE>();
         let mask = unsafe { (*ace).Mask };
-        if mask != 0x1f019b {
+        if mask != MICROSOFT_SOFTWARE_KSP_FULL_CONTROL_MASK {
             return Err(identity_invalid(format!(
                 "CNG key DACL policy is invalid (reason=mask,index={index},value=0x{mask:08x})"
             )));
