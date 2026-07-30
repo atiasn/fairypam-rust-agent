@@ -1,25 +1,16 @@
 //! Elevated Agent-side enrollment. Registration material is accepted only from
 //! the authenticated local pipe and is never included in an error or log.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::windows::io::FromRawHandle;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use fairypam_agent_core::AgentError;
-use fairypam_agent_input::{
-    ActionId, GuardianClient, GuardianProcessClient, PhysicalHold, ReleaseReason,
-};
-use fairypam_agent_transport::{
-    certificate_sha256, cng_machine_rsa_public_key_der, create_cng_machine_key,
-    delete_cng_machine_key, delete_local_machine_certificate, install_local_machine_certificate,
-    prove_cng_machine_key_signature, sign_cng_machine_key_sha256, validate_cng_machine_key_policy,
-};
 use http::Uri;
-use rcgen::{CertificateParams, DistinguishedName, DnType, PublicKeyData, SigningKey};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, RsaKeySize, PKCS_RSA_SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest;
@@ -32,14 +23,14 @@ use windows::Win32::Networking::WinHttp::{
     WINHTTP_QUERY_STATUS_CODE,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1,
     SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, TokenElevation, TokenUser, DACL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, TokenElevation, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFileAttributesW, MoveFileExW, CREATE_NEW, FILE_APPEND_DATA,
@@ -57,6 +48,8 @@ pub(crate) const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\audit"
 pub(crate) const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
 pub(crate) const UPDATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\updates";
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+const PRIVATE_KEY_BEGIN: &str = concat!("-----BEGIN ", "PRIVATE KEY-----\n");
+const PRIVATE_KEY_END: &str = concat!("-----END ", "PRIVATE KEY-----\n");
 const CLAIM_DEADLINE: Duration = Duration::from_secs(15);
 const CLAIM_OPERATION_TIMEOUT_MS: i32 = 5_000;
 
@@ -77,13 +70,10 @@ struct EnrollmentResponse {
 #[serde(deny_unknown_fields)]
 pub(crate) struct EnrollmentRuntimeDocument {
     pub(crate) agent_id: String,
-    pub(crate) authorized_user_sid: String,
-    pub(crate) certificate_sha256: String,
     pub(crate) control_endpoint: String,
     pub(crate) expires_at: String,
     pub(crate) frame_endpoint: String,
     pub(crate) hub_server_name: String,
-    pub(crate) key_name: String,
     pub(crate) profile_root_public_key_hex: String,
 }
 
@@ -100,87 +90,9 @@ struct BootstrapDocument {
     schema_version: u32,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PendingEnrollmentDocument {
-    schema_version: u32,
-    key_name: String,
-    authorized_user_sid: String,
-    certificate_sha256: Option<String>,
-    generation: Option<String>,
-}
-
 struct PendingDeviceIdentity {
-    root: PathBuf,
-    key_name: String,
-    authorized_user_sid: String,
     csr_pem: String,
-    committed: bool,
-}
-
-impl PendingDeviceIdentity {
-    fn update_journal(
-        &self,
-        certificate_sha256: Option<String>,
-        generation: Option<String>,
-    ) -> Result<(), AgentError> {
-        replace_private_json(
-            &self.root.join("pending.json"),
-            &PendingEnrollmentDocument {
-                schema_version: 1,
-                key_name: self.key_name.clone(),
-                authorized_user_sid: self.authorized_user_sid.clone(),
-                certificate_sha256,
-                generation,
-            },
-        )
-    }
-
-    fn install_certificate(
-        &self,
-        certificate_pem: &[u8],
-        fingerprint: [u8; 32],
-    ) -> Result<(), AgentError> {
-        install_local_machine_certificate(certificate_pem, &self.key_name, &fingerprint)
-            .map_err(|_| failed())?;
-        Ok(())
-    }
-
-    fn commit(&mut self) {
-        self.committed = true;
-        let _ = fs::remove_file(self.root.join("pending.json"));
-    }
-}
-
-struct CngCsrSigningKey {
-    key_name: String,
-    public_key_der: Vec<u8>,
-}
-
-impl PublicKeyData for CngCsrSigningKey {
-    fn der_bytes(&self) -> &[u8] {
-        &self.public_key_der
-    }
-
-    fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
-        &rcgen::PKCS_RSA_SHA256
-    }
-}
-
-impl SigningKey for CngCsrSigningKey {
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        sign_cng_machine_key_sha256(&self.key_name, message)
-            .map_err(|_| rcgen::Error::RemoteKeyError)
-    }
-}
-
-impl Drop for PendingDeviceIdentity {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        let _ = cleanup_pending_identity(&self.root);
-    }
+    key_pem: Zeroizing<String>,
 }
 /// The elevated Agent claims the one-time code after the protected Pipe has
 /// authenticated the GUI caller. No desktop confirmation is required.
@@ -322,10 +234,9 @@ fn register_before(
     deadline: Instant,
 ) -> Result<(), AgentError> {
     ensure_private_directory(root)?;
-    cleanup_pending_identity(root)?;
     cleanup_retired_generations(root)?;
     let (host, port, path) = claim_target(hub_address)?;
-    let mut identity = registration_identity(root)?;
+    let identity = registration_identity()?;
     let payload = claim(
         &host,
         port,
@@ -334,105 +245,36 @@ fn register_before(
         &identity.csr_pem,
         deadline,
     )?;
-    persist(root, &payload, &mut identity)?;
+    persist(root, &payload, &identity)?;
     let _ = cleanup_retired_generations(root);
     Ok(())
 }
 
-fn registration_identity(root: &Path) -> Result<PendingDeviceIdentity, AgentError> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| failed())?
-        .as_nanos();
-    let key_name = format!("FairyPam.Agent.{}.{}", std::process::id(), nonce);
-    let authorized_user_sid = current_user_sid()?;
-    write_private(
-        &root.join("pending.json"),
-        &serde_json::to_vec(&PendingEnrollmentDocument {
-            schema_version: 1,
-            key_name: key_name.clone(),
-            authorized_user_sid: authorized_user_sid.clone(),
-            certificate_sha256: None,
-            generation: None,
-        })
-        .map_err(|_| failed())?,
-    )?;
-    create_cng_machine_key(&key_name, &authorized_user_sid).map_err(|_| failed())?;
-    let result = (|| {
-        validate_cng_machine_key_policy(&key_name, &authorized_user_sid).map_err(|_| failed())?;
-        prove_cng_machine_key_signature(&key_name).map_err(|_| failed())?;
-        let signing_key = CngCsrSigningKey {
-            public_key_der: cng_machine_rsa_public_key_der(&key_name).map_err(|_| failed())?,
-            key_name: key_name.clone(),
-        };
-        let mut params = CertificateParams::default();
-        params.distinguished_name = DistinguishedName::new();
-        params
-            .distinguished_name
-            .push(DnType::CommonName, "FairyPam Agent Enrollment");
-        let csr_pem = params
-            .serialize_request(&signing_key)
-            .and_then(|csr| csr.pem())
-            .map_err(|_| failed())?;
-        if csr_pem.len() > 16 * 1024
-            || !csr_pem.starts_with("-----BEGIN CERTIFICATE REQUEST-----\n")
-            || !csr_pem.ends_with("-----END CERTIFICATE REQUEST-----\n")
-            || csr_pem.contains('\r')
-            || csr_pem.as_bytes().contains(&0)
-        {
-            return Err(failed());
-        }
-        validate_guardian_key_isolation(&key_name)?;
-        Ok(csr_pem)
-    })();
-    match result {
-        Ok(csr_pem) => Ok(PendingDeviceIdentity {
-            root: root.to_owned(),
-            key_name,
-            authorized_user_sid,
-            csr_pem,
-            committed: false,
-        }),
-        Err(error) => {
-            if delete_cng_machine_key(&key_name).is_ok() {
-                let _ = fs::remove_file(root.join("pending.json"));
-            }
-            Err(error)
-        }
-    }
-}
-
-fn validate_guardian_key_isolation(key_name: &str) -> Result<(), AgentError> {
-    let executable = std::env::current_exe().map_err(|_| failed())?;
-    let guardian = executable
-        .parent()
-        .ok_or_else(failed)?
-        .join("fairypam-agent-guardian.exe");
-    fairypam_agent_suite::windows_security::verify_trusted_install_entry(&guardian, false)
+fn registration_identity() -> Result<PendingDeviceIdentity, AgentError> {
+    let key =
+        KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048).map_err(|_| failed())?;
+    let key_pem = Zeroizing::new(key.serialize_pem());
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "FairyPam Agent Enrollment");
+    let csr_pem = params
+        .serialize_request(&key)
+        .and_then(|csr| csr.pem())
         .map_err(|_| failed())?;
-    let action = ActionId::new("enrollment.release_probe").map_err(|_| failed())?;
-    let holds = BTreeMap::from([(
-        action.clone(),
-        PhysicalHold::ScanCode {
-            action_id: action.clone(),
-            scan_code: 17,
-            extended: false,
-        },
-    )]);
-    let mut client =
-        GuardianProcessClient::spawn(&guardian, holds, Duration::from_secs(5), Some(key_name))
-            .map_err(|_| failed())?;
-    if client.isolation_status().is_none() {
+    if csr_pem.len() > 16 * 1024
+        || !csr_pem.starts_with("-----BEGIN CERTIFICATE REQUEST-----\n")
+        || !csr_pem.ends_with("-----END CERTIFICATE REQUEST-----\n")
+        || csr_pem.contains('\r')
+        || csr_pem.as_bytes().contains(&0)
+        || key_pem.len() > 16 * 1024
+        || !key_pem.starts_with(PRIVATE_KEY_BEGIN)
+        || !key_pem.ends_with(PRIVATE_KEY_END)
+    {
         return Err(failed());
     }
-    let registered = BTreeSet::from([action]);
-    client
-        .register_intent(1, &registered)
-        .map_err(|_| failed())?;
-    client.commit_holds(1, &registered).map_err(|_| failed())?;
-    client
-        .release_all(ReleaseReason::EmergencyStop)
-        .map_err(|_| failed())
+    Ok(PendingDeviceIdentity { csr_pem, key_pem })
 }
 
 fn claim_target(value: &str) -> Result<(String, u16, String), AgentError> {
@@ -592,7 +434,7 @@ fn read_response(
 fn persist(
     root: &Path,
     payload: &EnrollmentResponse,
-    identity: &mut PendingDeviceIdentity,
+    identity: &PendingDeviceIdentity,
 ) -> Result<(), AgentError> {
     if [
         payload.agent_id.as_str(),
@@ -610,13 +452,6 @@ fn persist(
         return Err(failed());
     }
     ensure_private_directory(root)?;
-    let fingerprint =
-        certificate_sha256(payload.client_cert_pem.as_bytes()).map_err(|_| failed())?;
-    let fingerprint_hex = fingerprint
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-
     let generation = format!(
         "g-{}-{}",
         std::process::id(),
@@ -626,7 +461,6 @@ fn persist(
             .as_nanos()
     );
     let directory = root.join(&generation);
-    identity.update_journal(Some(fingerprint_hex.clone()), Some(generation.clone()))?;
     create_private_directory(&directory)?;
 
     let temporary = root.join(format!("current-{generation}.tmp"));
@@ -634,13 +468,10 @@ fn persist(
         // Credentials live only in their private files; runtime.json contains no PEM material.
         let runtime = EnrollmentRuntimeDocument {
             agent_id: payload.agent_id.clone(),
-            authorized_user_sid: identity.authorized_user_sid.clone(),
-            certificate_sha256: fingerprint_hex,
             control_endpoint: payload.control_endpoint.clone(),
             expires_at: payload.expires_at.clone(),
             frame_endpoint: payload.frame_endpoint.clone(),
             hub_server_name: payload.hub_server_name.clone(),
-            key_name: identity.key_name.clone(),
             profile_root_public_key_hex: payload.profile_root_public_key_hex.clone(),
         };
         write_private(
@@ -650,14 +481,12 @@ fn persist(
         for (contents, file) in [
             (payload.ca_pem.as_str(), "ca.pem"),
             (payload.client_cert_pem.as_str(), "client-cert.pem"),
+            (identity.key_pem.as_str(), "client-key.pem"),
         ] {
             write_private(&directory.join(file), contents.as_bytes())?;
         }
 
-        crate::runtime::validate_enrollment_candidate_before_install(root, &generation)
-            .map_err(|_| failed())?;
-        identity.install_certificate(payload.client_cert_pem.as_bytes(), fingerprint)?;
-        // ponytail: validate the installed association before changing the active pointer.
+        // ponytail: validate the complete candidate before changing the active pointer.
         crate::runtime::validate_enrollment_candidate(root, &generation).map_err(|_| failed())?;
         write_private(
             &temporary,
@@ -672,92 +501,13 @@ fn persist(
             )
         }
         .map_err(|_| failed())?;
-        identity.commit();
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
-        let _ = fs::remove_dir_all(&directory);
+        fs::remove_dir_all(&directory).map_err(|_| failed())?;
     }
     result
-}
-
-pub(crate) fn cleanup_pending_identity(root: &Path) -> Result<(), AgentError> {
-    ensure_private_directory(root)?;
-    let pending_path = root.join("pending.json");
-    match pending_path.symlink_metadata() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(failed()),
-        Ok(_) => {}
-    }
-    let pending: PendingEnrollmentDocument = load_private_json(&pending_path)?;
-    validate_pending_document(&pending)?;
-
-    let active_generation = match root.join("current.json").symlink_metadata() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return Err(failed()),
-        Ok(_) => {
-            Some(load_private_json::<EnrollmentPointer>(&root.join("current.json"))?.generation)
-        }
-    };
-    if let Some(active) = active_generation.as_deref() {
-        if pending.generation.as_deref() == Some(active) {
-            let runtime: EnrollmentRuntimeDocument =
-                load_private_json(&root.join(active).join("runtime.json"))?;
-            if pending.key_name == runtime.key_name
-                && pending.certificate_sha256.as_deref()
-                    == Some(runtime.certificate_sha256.as_str())
-            {
-                fs::remove_file(&pending_path).map_err(|_| failed())?;
-                return Ok(());
-            }
-            return Err(failed());
-        }
-    }
-
-    if let Some(value) = pending.certificate_sha256.as_deref() {
-        delete_local_machine_certificate(&decode_fingerprint(value)?).map_err(|_| failed())?;
-    }
-    delete_cng_machine_key(&pending.key_name).map_err(|_| failed())?;
-    if let Some(generation) = pending.generation.as_deref() {
-        let directory = root.join(generation);
-        match directory.symlink_metadata() {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(failed()),
-            Ok(_) => {
-                verify_private_directory(&directory)?;
-                fs::remove_dir_all(&directory).map_err(|_| failed())?;
-            }
-        }
-    }
-    fs::remove_file(&pending_path).map_err(|_| failed())
-}
-
-fn validate_pending_document(document: &PendingEnrollmentDocument) -> Result<(), AgentError> {
-    let key_suffix = document
-        .key_name
-        .strip_prefix("FairyPam.Agent.")
-        .unwrap_or_default();
-    if document.schema_version != 1
-        || key_suffix.is_empty()
-        || document.key_name.len() > 128
-        || !key_suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
-        || !document.authorized_user_sid.starts_with("S-1-")
-        || document.authorized_user_sid.len() > 184
-        || document
-            .certificate_sha256
-            .as_deref()
-            .is_some_and(|value| decode_fingerprint(value).is_err())
-        || document
-            .generation
-            .as_deref()
-            .is_some_and(|value| !valid_generation(value))
-    {
-        return Err(failed());
-    }
-    Ok(())
 }
 
 pub(crate) fn cleanup_retired_generations(root: &Path) -> Result<(), AgentError> {
@@ -779,11 +529,6 @@ pub(crate) fn cleanup_retired_generations(root: &Path) -> Result<(), AgentError>
         }
         let directory = entry.path();
         verify_private_directory(&directory)?;
-        let document: EnrollmentRuntimeDocument =
-            load_private_json(&directory.join("runtime.json"))?;
-        let fingerprint = decode_fingerprint(&document.certificate_sha256)?;
-        delete_local_machine_certificate(&fingerprint).map_err(|_| failed())?;
-        delete_cng_machine_key(&document.key_name).map_err(|_| failed())?;
         fs::remove_dir_all(&directory).map_err(|_| failed())?;
     }
     Ok(())
@@ -801,21 +546,6 @@ fn load_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, A
     serde_json::from_slice(&bytes).map_err(|_| failed())
 }
 
-pub(crate) fn decode_fingerprint(value: &str) -> Result<[u8; 32], AgentError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(failed());
-    }
-    let mut fingerprint = [0_u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
-        fingerprint[index] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
-    }
-    Ok(fingerprint)
-}
-
 pub(crate) fn valid_generation(value: &str) -> bool {
     value.starts_with("g-")
         && value.len() <= 80
@@ -829,30 +559,6 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
     file.write_all(bytes).map_err(|_| failed())?;
     file.sync_all().map_err(|_| failed())?;
     verify_private_file(path)
-}
-
-fn replace_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), AgentError> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| failed())?
-        .as_nanos();
-    let temporary = path.with_extension(format!("{nonce}.tmp"));
-    write_private(
-        &temporary,
-        &serde_json::to_vec(value).map_err(|_| failed())?,
-    )?;
-    let result = unsafe {
-        MoveFileExW(
-            &HSTRING::from(temporary.to_string_lossy().as_ref()),
-            &HSTRING::from(path.to_string_lossy().as_ref()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    }
-    .map_err(|_| failed());
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
 }
 
 pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
@@ -1040,42 +746,6 @@ fn ensure_elevated() -> Result<(), AgentError> {
         .ok_or_else(|| AgentError::new("enrollment.elevation_required", "elevated Agent required"))
 }
 
-fn current_user_sid() -> Result<String, AgentError> {
-    let mut token = Default::default();
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
-        .map_err(|_| failed())?;
-    let result = (|| {
-        let mut length = 0_u32;
-        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut length) };
-        if length < std::mem::size_of::<TOKEN_USER>() as u32 {
-            return Err(failed());
-        }
-        let mut buffer = vec![0_u8; length as usize];
-        unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                Some(buffer.as_mut_ptr().cast()),
-                length,
-                &mut length,
-            )
-        }
-        .map_err(|_| failed())?;
-        let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
-        let mut text = PWSTR::null();
-        unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) }.map_err(|_| failed())?;
-        let sid = unsafe { text.to_string() };
-        let _ = unsafe { windows::Win32::Foundation::LocalFree(Some(HLOCAL(text.0.cast()))) };
-        let sid = sid.map_err(|_| failed())?;
-        if !sid.starts_with("S-1-") || sid.len() > 184 {
-            return Err(failed());
-        }
-        Ok(sid)
-    })();
-    let _ = unsafe { CloseHandle(token) };
-    result
-}
-
 fn close(handle: *mut core::ffi::c_void) {
     let _ = unsafe { WinHttpCloseHandle(handle) };
 }
@@ -1109,30 +779,18 @@ fn failed() -> AgentError {
 mod tests {
     use serde_json::Value;
 
-    use super::{
-        claim_body, decode_fingerprint, private_sddl_matches, valid_generation, EnrollmentResponse,
-    };
+    use super::{claim_body, private_sddl_matches, valid_generation, EnrollmentResponse};
 
     #[cfg(windows)]
     #[test]
-    fn cng_machine_key_policy_survives_reopen_and_can_sign() {
-        let key_name = format!(
-            "FairyPam.Agent.test.{}.{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let sid = super::current_user_sid().unwrap();
-        fairypam_agent_transport::create_cng_machine_key(&key_name, &sid).unwrap();
-        let result = (|| {
-            fairypam_agent_transport::validate_cng_machine_key_policy(&key_name, &sid)?;
-            fairypam_agent_transport::prove_cng_machine_key_signature(&key_name)
-        })();
-        let cleanup = fairypam_agent_transport::delete_cng_machine_key(&key_name);
-        result.unwrap();
-        cleanup.unwrap();
+    fn enrollment_identity_generates_local_rsa_pem() {
+        let identity = super::registration_identity().unwrap();
+
+        assert!(identity
+            .csr_pem
+            .starts_with("-----BEGIN CERTIFICATE REQUEST-----\n"));
+        assert!(identity.key_pem.starts_with(super::PRIVATE_KEY_BEGIN));
+        assert!(!identity.csr_pem.contains(identity.key_pem.as_str()));
     }
 
     #[test]
@@ -1174,7 +832,5 @@ mod tests {
         assert!(valid_generation("g-123-456"));
         assert!(!valid_generation("../g-123"));
         assert!(!valid_generation("request-123"));
-        assert!(decode_fingerprint(&"ab".repeat(32)).is_ok());
-        assert!(decode_fingerprint(&"AB".repeat(32)).is_err());
     }
 }

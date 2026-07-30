@@ -21,11 +21,9 @@ use fairypam_agent_protocol::v2::{
 use fairypam_agent_transport::CappedBackoff;
 use fairypam_agent_transport::{
     connect_control, connect_frame, control_queue, open_control_tunnel, open_frame_tunnel,
-    receive_hub_hello, ControlSender, ControlSession, IdentityKey, SessionFrameSlot,
-    TransportConfig, TransportError, VerifiedSession,
+    receive_hub_hello, validate_transport_config, ControlSender, ControlSession, IdentityKey,
+    SessionFrameSlot, TransportConfig, TransportError, VerifiedSession,
 };
-#[cfg(windows)]
-use fairypam_agent_transport::{validate_transport_candidate, validate_transport_config};
 use http::Uri;
 #[cfg(any(windows, test))]
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -63,7 +61,7 @@ impl RuntimeConfig {
     pub fn from_production() -> Result<Self, AgentError> {
         let root = PathBuf::from(crate::enrollment::STATE_ROOT);
         crate::enrollment::ensure_private_directory(&root)?;
-        crate::enrollment::cleanup_pending_identity(&root)?;
+        crate::enrollment::cleanup_retired_generations(&root)?;
         if enrollment_state_exists_at(&root) {
             match Self::from_enrollment_state_at(&root) {
                 Ok(config) => Ok(config),
@@ -173,7 +171,6 @@ impl RuntimeConfig {
     #[cfg(windows)]
     fn from_enrollment_state_at(root: &Path) -> Result<Self, AgentError> {
         crate::enrollment::ensure_private_directory(root)?;
-        crate::enrollment::cleanup_pending_identity(root)?;
         let pointer: EnrollmentPointer = load_private_json(&root.join("current.json"))?;
         let generation = pointer.generation;
         let config = Self::from_enrollment_candidate(root, generation)?;
@@ -192,7 +189,7 @@ impl RuntimeConfig {
         let directory = root.join(&generation);
         let document: crate::enrollment::EnrollmentRuntimeDocument =
             load_private_json(&directory.join("runtime.json"))?;
-        let expires_at = validate_enrollment_expiry(&document.expires_at)?;
+        validate_enrollment_expiry(&document.expires_at)?;
         let verifier =
             Ed25519SignatureVerifier::from_public_key_hex(&document.profile_root_public_key_hex)?;
         let profiles = ProfileStore::load_optional(&enrollment_profile_directory()?, &verifier)?;
@@ -214,14 +211,7 @@ impl RuntimeConfig {
                 agent_id: document.agent_id,
                 ca_pem: private_file(&directory, "ca.pem")?,
                 identity_cert_pem: private_file(&directory, "client-cert.pem")?,
-                identity_key: IdentityKey::CngMachine {
-                    key_name: document.key_name,
-                    authorized_user_sid: document.authorized_user_sid,
-                    certificate_sha256: crate::enrollment::decode_fingerprint(
-                        &document.certificate_sha256,
-                    )?,
-                    expires_at_unix_seconds: expires_at.unix_timestamp(),
-                },
+                identity_key: IdentityKey::Pem(private_file(&directory, "client-key.pem")?),
                 connect_timeout: Duration::from_secs(10),
             },
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -265,21 +255,6 @@ pub(crate) fn validate_enrollment_candidate(
         AgentError::new(
             "runtime.enrollment_invalid",
             "enrollment transport identity is invalid",
-        )
-    })
-}
-
-#[cfg(windows)]
-pub(crate) fn validate_enrollment_candidate_before_install(
-    root: &Path,
-    generation: &str,
-) -> Result<(), AgentError> {
-    crate::enrollment::ensure_private_directory(root)?;
-    let candidate = RuntimeConfig::from_enrollment_candidate(root, generation.to_owned())?;
-    validate_transport_candidate(&candidate.transport).map_err(|_| {
-        AgentError::new(
-            "runtime.enrollment_invalid",
-            "enrollment transport candidate is invalid",
         )
     })
 }
@@ -1464,15 +1439,7 @@ impl SharedRuntime {
         };
         let (awaiting_enrollment, profiles_configured, certificate_ready, games_available) = {
             let config = self.config.lock().map_err(lock_error)?;
-            let certificate_ready = regular_nonempty_file(&config.transport.ca_pem)
-                && regular_nonempty_file(&config.transport.identity_cert_pem)
-                && match &config.transport.identity_key {
-                    IdentityKey::Pem(path) => regular_nonempty_file(path),
-                    #[cfg(windows)]
-                    IdentityKey::CngMachine { .. } => {
-                        validate_transport_config(&config.transport).is_ok()
-                    }
-                };
+            let certificate_ready = validate_transport_config(&config.transport).is_ok();
             let games_available = observability::scan_installed_games(&config.profiles).is_ok();
             (
                 config.awaiting_enrollment,
