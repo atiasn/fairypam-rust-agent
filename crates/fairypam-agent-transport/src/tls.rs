@@ -1106,8 +1106,11 @@ fn cng_dacl_sids(descriptor: PSECURITY_DESCRIPTOR) -> Result<[PSID; 2], Transpor
             return Err(identity_invalid("CNG key DACL policy is invalid"));
         }
         let ace = raw.cast::<ACCESS_ALLOWED_ACE>();
-        if unsafe { (*ace).Mask } != 0x1f019b {
-            return Err(identity_invalid("CNG key DACL policy is invalid"));
+        let mask = unsafe { (*ace).Mask };
+        if mask != 0x1f019b {
+            return Err(identity_invalid(format!(
+                "CNG key DACL policy is invalid (reason=mask,index={index},value=0x{mask:08x})"
+            )));
         }
         *sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast() };
         let sid_offset = std::mem::size_of::<ACCESS_ALLOWED_ACE>() - std::mem::size_of::<u32>();
@@ -1116,7 +1119,9 @@ fn cng_dacl_sids(descriptor: PSECURITY_DESCRIPTOR) -> Result<[PSID; 2], Transpor
             || 8 + 4 * unsafe { *sid.cast::<u8>().add(1) } as usize != sid_bytes
             || unsafe { IsValidSid(*sid) } == 0
         {
-            return Err(identity_invalid("CNG key DACL policy is invalid"));
+            return Err(identity_invalid(format!(
+                "CNG key DACL policy is invalid (reason=sid_shape,index={index},bytes={sid_bytes})"
+            )));
         }
     }
     Ok(sids)
