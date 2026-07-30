@@ -918,13 +918,16 @@ fn set_cng_property(
 }
 
 #[cfg(windows)]
-const MICROSOFT_SOFTWARE_KSP_FULL_CONTROL_MASK: u32 = 0x8000_0000 | 0x4000_0000 | 0x001f_019b;
+const CNG_KEY_FULL_CONTROL_MASK: u32 = 0x001f_019b;
+#[cfg(windows)]
+const MICROSOFT_SOFTWARE_KSP_CANONICAL_FULL_CONTROL_MASK: u32 =
+    0x8000_0000 | 0x4000_0000 | CNG_KEY_FULL_CONTROL_MASK;
 
 #[cfg(windows)]
 fn cng_security_descriptor(authorized_user_sid: &str) -> Result<Vec<u8>, TransportError> {
     validate_windows_sid(authorized_user_sid)?;
     let sddl = format!(
-        "D:P(A;;0x{MICROSOFT_SOFTWARE_KSP_FULL_CONTROL_MASK:08x};;;SY)(A;;0x{MICROSOFT_SOFTWARE_KSP_FULL_CONTROL_MASK:08x};;;{authorized_user_sid})"
+        "D:P(A;;0x{CNG_KEY_FULL_CONTROL_MASK:08x};;;SY)(A;;0x{CNG_KEY_FULL_CONTROL_MASK:08x};;;{authorized_user_sid})"
     );
     let wide = sddl.encode_utf16().chain([0]).collect::<Vec<_>>();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -1069,8 +1072,8 @@ fn cng_security_descriptors_match(
     actual: PSECURITY_DESCRIPTOR,
     expected: PSECURITY_DESCRIPTOR,
 ) -> Result<bool, TransportError> {
-    let actual = cng_dacl_sids(actual)?;
-    let expected = cng_dacl_sids(expected)?;
+    let actual = cng_dacl_sids(actual, MICROSOFT_SOFTWARE_KSP_CANONICAL_FULL_CONTROL_MASK)?;
+    let expected = cng_dacl_sids(expected, CNG_KEY_FULL_CONTROL_MASK)?;
     Ok((unsafe { EqualSid(actual[0], expected[0]) } != 0
         && unsafe { EqualSid(actual[1], expected[1]) } != 0)
         || (unsafe { EqualSid(actual[0], expected[1]) } != 0
@@ -1078,7 +1081,10 @@ fn cng_security_descriptors_match(
 }
 
 #[cfg(windows)]
-fn cng_dacl_sids(descriptor: PSECURITY_DESCRIPTOR) -> Result<[PSID; 2], TransportError> {
+fn cng_dacl_sids(
+    descriptor: PSECURITY_DESCRIPTOR,
+    expected_mask: u32,
+) -> Result<[PSID; 2], TransportError> {
     let mut control = 0_u16;
     let mut revision = 0_u32;
     if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
@@ -1112,7 +1118,7 @@ fn cng_dacl_sids(descriptor: PSECURITY_DESCRIPTOR) -> Result<[PSID; 2], Transpor
         }
         let ace = raw.cast::<ACCESS_ALLOWED_ACE>();
         let mask = unsafe { (*ace).Mask };
-        if mask != MICROSOFT_SOFTWARE_KSP_FULL_CONTROL_MASK {
+        if mask != expected_mask {
             return Err(identity_invalid(format!(
                 "CNG key DACL policy is invalid (reason=mask,index={index},value=0x{mask:08x})"
             )));
