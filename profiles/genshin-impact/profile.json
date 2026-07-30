@@ -3,7 +3,7 @@
     "schema_version": 1,
     "profile": {
       "id": "genshin-impact",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "display_name": "原神",
       "target": {
         "process_names": ["YuanShen.exe"],
@@ -27,12 +27,14 @@
         }
       ],
       "actions": {
+        "combat.normal_attack": {"kind": "client_point_click", "button": "left"},
+        "environment.escape": {"kind": "pulse", "scan_code": 1},
         "gadget.quick_use": {"kind": "pulse", "scan_code": 44},
         "move.forward": {"kind": "hold", "scan_code": 17}
       }
     },
     "files": []
   },
-  "content_sha256": "fe10b449fea8c72c29c7ba180c1855d4b61b6cb2bd73878d4dd593aeb4487fb0",
-  "signature": "d4d0b91bb4a74244c9071e1213683a9159347aaa740ddd650d319c60ae3aa5359f8c5292a61a88fd1471a452f846ea6d2dcff1a5f7aaa61f5f703b1a05940000"
+  "content_sha256": "29fa8298e433c310ef3779cdc1bd817911d09216c933b782b2cebe84e50fef77",
+  "signature": "e43d7134446f96d2cd4ab9ec821a76fec5e02580b4474cc3f670da26b5dcd6e6422aa5748ff3987a8aea2864f7ec9d613fe23821bab91706b6d09d45cfb8600c"
 }
