@@ -1102,6 +1102,7 @@ dependencies = [
  "rustls",
  "rustls-cng",
  "sha2",
+ "socket2",
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
