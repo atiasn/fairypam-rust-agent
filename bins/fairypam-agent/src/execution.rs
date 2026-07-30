@@ -1929,6 +1929,47 @@ impl WindowsRuntimePlatform {
         }
         Ok(guardian)
     }
+
+    fn validate_task_input_session(&mut self, session: &SessionRef) -> Result<(), AgentError> {
+        let Some(input) = self.task_input.as_ref() else {
+            return Err(AgentError::new(
+                "input_lease_invalid",
+                "task input lease is not active",
+            ));
+        };
+        let matches = input.session.agent_id == session.agent_id
+            && input.session.session_id == session.session_id
+            && input.session.generation == session.generation;
+        if matches {
+            return Ok(());
+        }
+        let release_error = self.release_task_input().err();
+        Err(AgentError::new(
+            "input_lease_invalid",
+            match release_error {
+                Some(error) => format!(
+                    "task input lease belongs to another Control session; release failed: {error}"
+                ),
+                None => "task input lease belongs to another Control session".into(),
+            },
+        ))
+    }
+
+    fn focus_task_input_target(
+        &mut self,
+        binding: &TargetBinding,
+    ) -> Result<TargetSnapshot, AgentError> {
+        self.targets.focus(binding).map_err(|error| {
+            let release_error = self.release_task_input().err();
+            AgentError::new(
+                error.code(),
+                match release_error {
+                    Some(release) => format!("{error}; input release failed: {release}"),
+                    None => error.to_string(),
+                },
+            )
+        })
+    }
 }
 
 #[cfg(windows)]
@@ -2297,49 +2338,6 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             .input
             .execute_pulse(&action, &input.session, &permit, now)
             .map_err(|error| AgentError::new(error.code(), error.to_string()))
-    }
-
-    fn validate_task_input_session(&mut self, session: &SessionRef) -> Result<(), AgentError> {
-        let Some(input) = self.task_input.as_ref() else {
-            return Err(AgentError::new(
-                "input_lease_invalid",
-                "task input lease is not active",
-            ));
-        };
-        let matches = {
-            input.session.agent_id == session.agent_id
-                && input.session.session_id == session.session_id
-                && input.session.generation == session.generation
-        };
-        if matches {
-            return Ok(());
-        }
-        let release_error = self.release_task_input().err();
-        Err(AgentError::new(
-            "input_lease_invalid",
-            match release_error {
-                Some(error) => format!(
-                    "task input lease belongs to another Control session; release failed: {error}"
-                ),
-                None => "task input lease belongs to another Control session".into(),
-            },
-        ))
-    }
-
-    fn focus_task_input_target(
-        &mut self,
-        binding: &TargetBinding,
-    ) -> Result<TargetSnapshot, AgentError> {
-        self.targets.focus(binding).map_err(|error| {
-            let release_error = self.release_task_input().err();
-            AgentError::new(
-                error.code(),
-                match release_error {
-                    Some(release) => format!("{error}; input release failed: {release}"),
-                    None => error.to_string(),
-                },
-            )
-        })
     }
 
     fn release_task_input(&mut self) -> Result<(), AgentError> {
