@@ -52,7 +52,9 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Security::{
-    GetSecurityDescriptorLength, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    EqualSid, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    GetSecurityDescriptorLength, IsValidAcl, IsValidSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+    DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
 };
 use x509_parser::extensions::GeneralName;
 use x509_parser::pem::parse_x509_pem;
@@ -1008,12 +1010,14 @@ fn cng_key_security_matches(
             "CNG key security descriptor is unavailable",
         ));
     }
-    let value = security_descriptor_to_sddl(&mut descriptor, flags)?;
     let mut expected_descriptor = cng_security_descriptor(authorized_user_sid)?;
-    let expected = security_descriptor_to_sddl(&mut expected_descriptor, flags)?;
-    if cng_security_sddl_matches(&value, &expected) {
+    if cng_security_descriptors_match(
+        descriptor.as_mut_ptr().cast(),
+        expected_descriptor.as_mut_ptr().cast(),
+    )? {
         Ok(true)
     } else {
+        let value = security_descriptor_to_sddl(&mut descriptor, flags)?;
         Err(identity_invalid(format!(
             "CNG key DACL policy is invalid ({})",
             cng_security_sddl_summary(&value, authorized_user_sid)
@@ -1055,28 +1059,67 @@ fn security_descriptor_to_sddl(
     value
 }
 
-#[cfg(any(windows, test))]
-fn cng_security_sddl_matches(value: &str, expected: &str) -> bool {
-    let Some(mut actual_aces) = cng_security_sddl_aces(value) else {
-        return false;
-    };
-    let Some(mut expected_aces) = cng_security_sddl_aces(expected) else {
-        return false;
-    };
-    actual_aces.sort_unstable();
-    expected_aces.sort_unstable();
-    actual_aces == expected_aces
+#[cfg(windows)]
+fn cng_security_descriptors_match(
+    actual: PSECURITY_DESCRIPTOR,
+    expected: PSECURITY_DESCRIPTOR,
+) -> Result<bool, TransportError> {
+    let actual = cng_dacl_sids(actual)?;
+    let expected = cng_dacl_sids(expected)?;
+    Ok((unsafe { EqualSid(actual[0], expected[0]) } != 0
+        && unsafe { EqualSid(actual[1], expected[1]) } != 0)
+        || (unsafe { EqualSid(actual[0], expected[1]) } != 0
+            && unsafe { EqualSid(actual[1], expected[0]) } != 0))
 }
 
-#[cfg(any(windows, test))]
-fn cng_security_sddl_aces(value: &str) -> Option<Vec<&str>> {
-    let value = value.strip_prefix("D:")?;
-    let (flags, value) = value.split_once('(')?;
-    if !matches!(flags, "P" | "PAI") {
-        return None;
+#[cfg(windows)]
+fn cng_dacl_sids(descriptor: PSECURITY_DESCRIPTOR) -> Result<[PSID; 2], TransportError> {
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+        || control & SE_DACL_PROTECTED == 0
+    {
+        return Err(identity_invalid("CNG key DACL policy is invalid"));
     }
-    let aces = value.strip_suffix(')')?.split(")(").collect::<Vec<_>>();
-    (aces.len() == 2).then_some(aces)
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut acl: *mut ACL = std::ptr::null_mut();
+    if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) } == 0
+        || present == 0
+        || acl.is_null()
+        || unsafe { IsValidAcl(acl) } == 0
+        || unsafe { (*acl).AceCount } != 2
+    {
+        return Err(identity_invalid("CNG key DACL policy is invalid"));
+    }
+    let mut sids: [PSID; 2] = [std::ptr::null_mut(); 2];
+    for (index, sid) in sids.iter_mut().enumerate() {
+        let mut raw = std::ptr::null_mut();
+        if unsafe { GetAce(acl, index as u32, &mut raw) } == 0 || raw.is_null() {
+            return Err(identity_invalid("CNG key DACL policy is invalid"));
+        }
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        if header.AceType != 0
+            || header.AceFlags != 0
+            || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+        {
+            return Err(identity_invalid("CNG key DACL policy is invalid"));
+        }
+        let ace = raw.cast::<ACCESS_ALLOWED_ACE>();
+        if unsafe { (*ace).Mask } != 0x1f019b {
+            return Err(identity_invalid("CNG key DACL policy is invalid"));
+        }
+        *sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast() };
+        let sid_offset = std::mem::size_of::<ACCESS_ALLOWED_ACE>() - std::mem::size_of::<u32>();
+        let sid_bytes = usize::from(header.AceSize).saturating_sub(sid_offset);
+        if sid_bytes < 8
+            || 8 + 4 * unsafe { *sid.cast::<u8>().add(1) } as usize != sid_bytes
+            || unsafe { IsValidSid(*sid) } == 0
+        {
+            return Err(identity_invalid("CNG key DACL policy is invalid"));
+        }
+    }
+    Ok(sids)
 }
 
 #[cfg(any(windows, test))]
@@ -1490,33 +1533,6 @@ mod tests {
 
             let error = verify_agent_uri_san(cert.as_bytes(), AGENT_ID).unwrap_err();
             assert_eq!(error.code(), "transport.identity_agent_mismatch");
-        }
-    }
-
-    #[test]
-    fn cng_key_dacl_is_exactly_system_and_the_enrolling_user() {
-        const EXPECTED: &str = "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)";
-        assert!(cng_security_sddl_matches(
-            "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)",
-            EXPECTED,
-        ));
-        assert!(cng_security_sddl_matches(
-            "D:PAI(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)(A;;0x1f019b;;;SY)",
-            EXPECTED,
-        ));
-        assert!(cng_security_sddl_matches(
-            "D:PAI(A;;0x1f019b;;;AC)(A;;0x1f019b;;;SY)",
-            "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;AC)",
-        ));
-        for rejected in [
-            "D:AI(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)",
-            "D:PAI(A;ID;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)",
-            "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1001)(A;;GR;;;BU)",
-            "D:P(A;;0x1f019a;;;SY)(A;;0x1f019a;;;S-1-5-21-1-2-3-1001)",
-            "D:P(A;;0x1f019b;;;SY)(A;;0x1f019b;;;S-1-5-21-1-2-3-1002)",
-            "D:P(A;;0x1f019b;;;SY)",
-        ] {
-            assert!(!cng_security_sddl_matches(rejected, EXPECTED));
         }
     }
 
