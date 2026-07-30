@@ -19,6 +19,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::{LockedInputTarget, NativeWindows, WindowsTargetPlatform};
 
+pub(crate) fn send_foreground_activation_probe() -> u32 {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT::default(),
+        },
+    };
+    unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) }
+}
+
 #[derive(Debug)]
 struct SendInputPlatform {
     client_left: i32,
