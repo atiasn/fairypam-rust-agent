@@ -11,7 +11,8 @@ use fairypam_agent_core::target::{TargetBinding, TargetCandidate, TargetSelector
 use fairypam_agent_core::AgentError;
 use fairypam_agent_protocol::v1::{
     agent_control_event, hub_control_command, AgentControlEvent, AttemptRef, FramePacket,
-    HubControlCommand, SafetyEvent, SessionRef, TaskAttemptReceiptV1, TaskCommandOutcomeV1,
+    HubControlCommand, SafetyEvent, SessionRef, TaskAttemptReceiptV1, TaskCommandOutcomeState,
+    TaskCommandOutcomeV1,
 };
 use fairypam_agent_protocol::v2;
 use fairypam_agent_transport::{SessionFrameSlot, VerifiedSession};
