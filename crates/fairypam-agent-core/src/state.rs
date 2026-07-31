@@ -285,6 +285,24 @@ impl Machine {
         Ok(vec![Effect::OpenInputGate])
     }
 
+    pub fn renew_control_authorization(
+        &mut self,
+        authorization: &dyn LocalAuthorization,
+        now: Instant,
+        requested_expires_at: Instant,
+    ) -> Result<(), AgentError> {
+        self.require_state(&AgentState::Controlling, "renew_control_authorization")?;
+        let expires_at = authorized_expiry(authorization, now)?.min(requested_expires_at);
+        if expires_at <= now {
+            return Err(AgentError::new(
+                "authorization.expired",
+                "control authorization renewal is already expired",
+            ));
+        }
+        self.authorization_expires_at = Some(expires_at);
+        Ok(())
+    }
+
     pub fn local_reset(
         &mut self,
         authorization: &dyn LocalAuthorization,

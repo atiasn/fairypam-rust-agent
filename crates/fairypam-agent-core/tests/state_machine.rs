@@ -176,6 +176,30 @@ fn input_capability_requires_current_controlling_target_snapshot() {
 }
 
 #[test]
+fn controlling_input_authorization_can_be_renewed_per_frame() {
+    let now = Instant::now();
+    let mut state = controlling_machine(now);
+    let renewed_at = now + Duration::from_secs(31);
+    let expires_at = renewed_at + Duration::from_secs(1);
+
+    state
+        .renew_control_authorization(&TestAuthorization { expires_at }, renewed_at, expires_at)
+        .unwrap();
+    state
+        .issue_input_capability(
+            renewed_at,
+            &TargetSnapshot {
+                binding: target_binding(),
+                foreground: true,
+                minimized: false,
+                capturable: true,
+            },
+            true,
+        )
+        .unwrap();
+}
+
+#[test]
 fn disconnected_from_controlling_releases_before_transition() {
     let mut state = controlling_machine(Instant::now());
 

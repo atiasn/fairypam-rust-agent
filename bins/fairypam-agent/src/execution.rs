@@ -2356,11 +2356,13 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         use fairypam_agent_core::state::{Machine, SessionIdentity};
         use fairypam_agent_input::{ActionMap, GuardianProcessClient};
 
+        let lease_duration = expires_at.saturating_duration_since(Instant::now());
         self.check_attempt_environment()?;
         self.release_task_input()?;
-        let now = Instant::now();
         let snapshot = self.targets.focus(binding)?;
         self.check_attempt_environment()?;
+        let now = Instant::now();
+        let expires_at = now + lease_duration;
         let session = SessionIdentity {
             agent_id: session.agent_id.clone(),
             session_id: session.session_id.clone(),
@@ -2412,11 +2414,11 @@ impl RuntimePlatform for WindowsRuntimePlatform {
     ) -> Result<(), AgentError> {
         use fairypam_agent_input::InputPermit;
 
+        let lease_duration = expires_at.saturating_duration_since(Instant::now());
         self.check_attempt_environment()?;
         if self.task_input.is_none() {
-            self.start_task_input(profile, binding, session, expires_at)?;
+            self.start_task_input(profile, binding, session, Instant::now() + lease_duration)?;
         }
-        let now = Instant::now();
         self.validate_task_input_session(session)?;
         let snapshot = self.focus_task_input_target(binding)?;
         self.check_attempt_environment()?;
@@ -2438,6 +2440,12 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         let input = self.task_input.as_mut().ok_or_else(|| {
             AgentError::new("input_lease_invalid", "task input lease is not active")
         })?;
+        let now = Instant::now();
+        let expires_at = now + lease_duration;
+        let authorization = TaskAuthorization { expires_at };
+        input
+            .machine
+            .renew_control_authorization(&authorization, now, expires_at)?;
         let permit = InputPermit::from_capability(
             input.machine.issue_input_capability(now, &snapshot, true)?,
         );
