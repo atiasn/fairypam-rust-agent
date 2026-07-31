@@ -23,6 +23,8 @@ jobs:
     name: Build non-promotable Windows product installer
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v6
 
@@ -48,7 +50,7 @@ jobs:
         with:
           workspaces: |
             . -> target
-            tauri-ui/src-tauri -> target
+            tauri-ui/src-tauri -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Prepare signed candidate bootstrap
@@ -99,7 +101,7 @@ jobs:
 
             npm run tauri build -- --no-bundle
             ..\target\release\fairypam-build-suite.exe `
-              --patch-tauri-nsis src-tauri\target\release\fairypam-agent-tauri-ui.exe
+              --patch-tauri-nsis ..\target\release\fairypam-agent-tauri-ui.exe
             $suiteVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
             $builtAt = [DateTime]::UtcNow.ToString('o')
             ..\target\release\fairypam-build-suite.exe `
@@ -110,7 +112,7 @@ jobs:
               --build-origin 'github-actions/windows-candidate.yml' `
               --output ..\target\suite\BUILD-MANIFEST.json `
               --guardian ..\target\release\fairypam-agent-guardian.exe `
-              --gui src-tauri\target\release\fairypam-agent-tauri-ui.exe `
+              --gui ..\target\release\fairypam-agent-tauri-ui.exe `
               --bootstrap ..\target\suite\agent-bootstrap.json `
               --bootstrap-signature ..\target\suite\agent-bootstrap.json.sig `
               --helper ..\target\release\fairypam-agent-installer.exe `
@@ -127,7 +129,7 @@ jobs:
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $setup = @(Get-ChildItem tauri-ui/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
+          $setup = @(Get-ChildItem target/release/bundle/nsis -Filter '*-setup.exe')
           if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
           & whoami.exe /groups /fo csv /nh
           $installRoot = 'C:\Program Files\FairyPam'
@@ -250,7 +252,7 @@ jobs:
           FAIRYPAM_ENROLLMENT_BASE_URL: ${{ inputs.enrollment_base_url }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $setup = @(Get-ChildItem tauri-ui/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe')
+          $setup = @(Get-ChildItem target/release/bundle/nsis -Filter '*-setup.exe')
           if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item $setup[0] dist/fairypam-agent-setup-windows.exe
