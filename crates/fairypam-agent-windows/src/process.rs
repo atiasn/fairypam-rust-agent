@@ -81,13 +81,13 @@ pub fn matching_process_ids(
             .position(|value| *value == 0)
             .unwrap_or(entry.szExeFile.len());
         let name = String::from_utf16_lossy(&entry.szExeFile[..name_end]);
-        if entry.th32ProcessID != 0 && name.eq_ignore_ascii_case(expected_name) {
-            if query_process_path(entry.th32ProcessID)?
+        if entry.th32ProcessID != 0
+            && name.eq_ignore_ascii_case(expected_name)
+            && query_process_path(entry.th32ProcessID)?
                 .and_then(|path| normalized_process_path_sha256(&path))
                 == Some(expected)
-            {
-                matches.push(entry.th32ProcessID);
-            }
+        {
+            matches.push(entry.th32ProcessID);
         }
         if let Err(error) = unsafe { Process32NextW(snapshot.0, &mut entry) } {
             if unsafe { GetLastError() } == ERROR_NO_MORE_FILES {

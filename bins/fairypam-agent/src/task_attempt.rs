@@ -262,6 +262,7 @@ impl TaskAttemptRuntime {
         Ok(self.require_active(task)?.reference.message())
     }
 
+    #[cfg(test)]
     pub fn owned_target(
         &mut self,
         task: &TaskCommandRef,
