@@ -57,7 +57,7 @@ enum ExecutionCapability {
 
 enum CleanupPolicy {
   CLEANUP_POLICY_UNSPECIFIED = 0;
-  CLEANUP_POLICY_RELEASE_INPUT_AND_CLOSE_OWNED_TARGET = 1;
+  CLEANUP_POLICY_RELEASE_INPUT_KEEP_MANAGED_TARGET = 1;
 }
 
 message ExecutionContract {
@@ -115,12 +115,12 @@ enum CaptureState {
   CAPTURE_STATE_UNKNOWN = 4;
 }
 
-enum OwnedTargetState {
-  OWNED_TARGET_STATE_UNSPECIFIED = 0;
-  OWNED_TARGET_STATE_NOT_STARTED = 1;
-  OWNED_TARGET_STATE_RUNNING = 2;
-  OWNED_TARGET_STATE_CLOSED = 3;
-  OWNED_TARGET_STATE_UNKNOWN = 4;
+enum ManagedTargetState {
+  MANAGED_TARGET_STATE_UNSPECIFIED = 0;
+  MANAGED_TARGET_STATE_NOT_STARTED = 1;
+  MANAGED_TARGET_STATE_RUNNING = 2;
+  MANAGED_TARGET_STATE_CLOSED = 3;
+  MANAGED_TARGET_STATE_UNKNOWN = 4;
 }
 
 message AttemptReceipt {
@@ -134,7 +134,7 @@ message AttemptReceipt {
   string last_side_effect_command_id = 8;
   InputState input_state = 9;
   CaptureState capture_state = 10;
-  OwnedTargetState owned_target_state = 11;
+  ManagedTargetState managed_target_state = 11;
   optional bool cleanup_complete = 12;
   optional string error_code = 13;
 }
@@ -198,6 +198,7 @@ message HubControlCommand {
     InspectAttempt inspect_attempt = 11;
     StopSession stop_session = 12;
     CaptureFrame capture_frame = 13;
+    ClientPointClick client_point_click = 14;
   }
 }
 
@@ -309,6 +310,16 @@ message InputFrame {
   repeated MouseButton held_mouse_buttons = 5;
   sint32 wheel_delta = 6;
   optional uint64 source_frame_sequence = 7;
+}
+
+message ClientPointClick {
+  CommandIdentity reference = 1;
+  uint64 input_sequence = 2;
+  uint32 lease_ms = 3;
+  MouseButton button = 4;
+  uint32 x_ppm = 5;
+  uint32 y_ppm = 6;
+  uint64 source_frame_sequence = 7;
 }
 
 message ReleaseAll {

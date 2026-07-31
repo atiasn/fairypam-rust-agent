@@ -88,7 +88,7 @@ pub fn canonical_execution_contract(contract: &ExecutionContract) -> Result<Stri
         || contract.contract_version != 2
         || contract.deadline_unix_ms <= 0
         || contract.max_input_lease_ms == 0
-        || contract.cleanup_policy != CleanupPolicy::ReleaseInputAndCloseOwnedTarget as i32
+        || contract.cleanup_policy != CleanupPolicy::ReleaseInputKeepManagedTarget as i32
         || contract.allowed_capabilities.is_empty()
     {
         return Err(ContractError("task.contract_value_invalid"));
@@ -198,6 +198,18 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
             }
             (task(value.reference.as_ref())?, "InputFrame", payload)
         }
+        Some(Payload::ClientPointClick(value)) => (
+            task(value.reference.as_ref())?,
+            "ClientPointClick",
+            serde_json::json!({
+                "button": value.button,
+                "input_sequence": value.input_sequence,
+                "lease_ms": value.lease_ms,
+                "source_frame_sequence": value.source_frame_sequence,
+                "x_ppm": value.x_ppm,
+                "y_ppm": value.y_ppm,
+            }),
+        ),
         Some(Payload::ReleaseAll(value)) => match task_optional(value.reference.as_ref())? {
             Some(task) => (
                 task,
@@ -367,7 +379,7 @@ mod tests {
             allowed_capabilities: vec![1, 2, 3, 4],
             deadline_unix_ms: 1_785_258_000_000,
             max_input_lease_ms: 1_000,
-            cleanup_policy: CleanupPolicy::ReleaseInputAndCloseOwnedTarget as i32,
+            cleanup_policy: CleanupPolicy::ReleaseInputKeepManagedTarget as i32,
             contract_version: 2,
             contract_digest: include_str!(
                 "../../../proto/fairypam/agent/v2/testdata/execution-contract.sha256"

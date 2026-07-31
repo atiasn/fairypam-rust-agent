@@ -409,14 +409,15 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
 
     pub fn execute_client_point(
         &mut self,
-        action: &ActionId,
+        button: SemanticMouseButton,
         x_ppm: u32,
         y_ppm: u32,
         session: &SessionKey,
         permit: &InputPermit<'_>,
         now: Instant,
     ) -> Result<(), SafetyError> {
-        let result = self.execute_client_point_inner(action, x_ppm, y_ppm, session, permit, now);
+        let action = self.actions.action_for_button(button)?;
+        let result = self.execute_client_point_inner(&action, x_ppm, y_ppm, session, permit, now);
         result.map_err(|error| self.fail_closed(ReleaseReason::PlatformFailure, error))
     }
 

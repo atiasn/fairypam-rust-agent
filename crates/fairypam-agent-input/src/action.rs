@@ -144,7 +144,10 @@ impl ActionMap {
             })
     }
 
-    fn action_for_button(&self, button: SemanticMouseButton) -> Result<ActionId, SafetyError> {
+    pub(crate) fn action_for_button(
+        &self,
+        button: SemanticMouseButton,
+    ) -> Result<ActionId, SafetyError> {
         self.actions
             .iter()
             .find_map(|(id, action)| match action {

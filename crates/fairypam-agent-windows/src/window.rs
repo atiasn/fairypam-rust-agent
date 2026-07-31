@@ -5,7 +5,7 @@ use fairypam_agent_core::target::{
 };
 use fairypam_agent_core::AgentError;
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -112,18 +112,20 @@ pub struct WindowsTargetCandidate {
 pub trait WindowsApi: Send {
     fn enumerate_candidates(&mut self) -> Result<Vec<WindowsTargetCandidate>, WindowsError>;
     fn snapshot(&mut self, hwnd: isize) -> Result<WindowsTargetCandidate, WindowsError>;
+    fn check_environment(&mut self) -> Result<(), WindowsError> {
+        Ok(())
+    }
     fn focus_target(
         &mut self,
         identity: &TargetIdentity,
         allow_activation_probe: bool,
     ) -> Result<(), WindowsError>;
-    fn click_target_point(
+    fn close_target(
         &mut self,
         identity: &TargetIdentity,
-        screen_x: i32,
-        screen_y: i32,
+        timeout: Duration,
     ) -> Result<(), WindowsError>;
-    fn close_target(
+    fn terminate_target(
         &mut self,
         identity: &TargetIdentity,
         timeout: Duration,
@@ -135,7 +137,8 @@ pub struct FakeWindows {
     candidates: Vec<WindowsTargetCandidate>,
     focus_activation_probe: Vec<bool>,
     focus_failures_remaining: usize,
-    target_point_clicks: Vec<(i32, i32)>,
+    environment_checks: usize,
+    environment_failure_on_check: Option<usize>,
 }
 
 impl FakeWindows {
@@ -144,13 +147,20 @@ impl FakeWindows {
             candidates,
             focus_activation_probe: Vec::new(),
             focus_failures_remaining: 0,
-            target_point_clicks: Vec::new(),
+            environment_checks: 0,
+            environment_failure_on_check: None,
         }
     }
 
     #[cfg(test)]
     fn with_focus_failures(mut self, failures: usize) -> Self {
         self.focus_failures_remaining = failures;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_environment_failure(mut self, check: usize) -> Self {
+        self.environment_failure_on_check = Some(check);
         self
     }
 }
@@ -166,6 +176,17 @@ impl WindowsApi for FakeWindows {
             .find(|candidate| candidate.identity.hwnd == hwnd)
             .cloned()
             .ok_or_else(|| WindowsError::new("target.not_found", "target window no longer exists"))
+    }
+
+    fn check_environment(&mut self) -> Result<(), WindowsError> {
+        self.environment_checks += 1;
+        if self.environment_failure_on_check == Some(self.environment_checks) {
+            return Err(WindowsError::new(
+                "environment.local_input_detected",
+                "simulated local input",
+            ));
+        }
+        Ok(())
     }
 
     fn focus_target(
@@ -194,27 +215,6 @@ impl WindowsApi for FakeWindows {
         Ok(())
     }
 
-    fn click_target_point(
-        &mut self,
-        identity: &TargetIdentity,
-        screen_x: i32,
-        screen_y: i32,
-    ) -> Result<(), WindowsError> {
-        let current = self.snapshot(identity.hwnd)?;
-        require_same_identity(identity, &current.identity)?;
-        if !current.identity.client_rect.contains(screen_x, screen_y) {
-            return Err(WindowsError::new(
-                "target.focus_click_outside_target",
-                "foreground fallback point is outside the target client area",
-            ));
-        }
-        self.target_point_clicks.push((screen_x, screen_y));
-        for candidate in &mut self.candidates {
-            candidate.foreground = candidate.identity.hwnd == identity.hwnd;
-        }
-        Ok(())
-    }
-
     fn close_target(
         &mut self,
         identity: &TargetIdentity,
@@ -225,6 +225,14 @@ impl WindowsApi for FakeWindows {
         self.candidates
             .retain(|candidate| candidate.identity.hwnd != identity.hwnd);
         Ok(())
+    }
+
+    fn terminate_target(
+        &mut self,
+        identity: &TargetIdentity,
+        timeout: Duration,
+    ) -> Result<(), WindowsError> {
+        self.close_target(identity, timeout)
     }
 }
 
@@ -444,7 +452,9 @@ fn revalidate_or_focus_target(
 ) -> Result<WindowsTargetCandidate, AgentError> {
     let expected = binding_identity(binding)?;
     let mut current = revalidate_identity(api, &expected)?;
-    for _ in 0..2 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        api.check_environment()?;
         if current.foreground && !current.minimized {
             return Ok(current);
         }
@@ -454,18 +464,18 @@ fn revalidate_or_focus_target(
             }
         }
         current = revalidate_identity(api, &expected)?;
-    }
-    if current.foreground && !current.minimized {
-        return Ok(current);
-    }
-    api.click_target_point(&current.identity, 1, 1)?;
-    current = revalidate_identity(api, &expected)?;
-    if current.foreground && !current.minimized {
-        return Ok(current);
+        api.check_environment()?;
+        if current.foreground && !current.minimized {
+            return Ok(current);
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
     Err(WindowsError::new(
         "target.focus_failed",
-        "target did not become the foreground window after two activation attempts and one target-bound click",
+        "target did not become the foreground window within 5 seconds",
     )
     .into())
 }
@@ -489,6 +499,11 @@ fn revalidate_input_target(
 }
 
 impl<A: WindowsApi> WindowsTargetPlatform<A> {
+    pub fn validate_environment(&mut self) -> Result<(), AgentError> {
+        self.api.check_environment()?;
+        Ok(())
+    }
+
     #[cfg(any(windows, test))]
     pub fn lock_input_target(
         &mut self,
@@ -566,6 +581,16 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
     pub fn close(&mut self, binding: &TargetBinding, timeout: Duration) -> Result<(), AgentError> {
         let current = revalidate_identity(&mut self.api, &binding_identity(binding)?)?;
         self.api.close_target(&current.identity, timeout)?;
+        Ok(())
+    }
+
+    pub fn terminate(
+        &mut self,
+        binding: &TargetBinding,
+        timeout: Duration,
+    ) -> Result<(), AgentError> {
+        self.api
+            .terminate_target(&binding_identity(binding)?, timeout)?;
         Ok(())
     }
 }
@@ -710,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn input_and_capture_click_the_live_fullscreen_target_after_two_focus_rejections() {
+    fn input_and_capture_retry_without_clicking_after_focus_rejections() {
         let binding = input_binding();
         let mut fullscreen = input_candidate(false);
         fullscreen.identity.client_rect = Rect::new(0, 0, 1280, 720).unwrap();
@@ -720,16 +745,31 @@ mod tests {
 
         targets.capture_identity(&binding).unwrap();
 
-        assert_eq!(targets.api().focus_activation_probe, [true, true]);
-        assert_eq!(targets.api().target_point_clicks, [(1, 1)]);
+        assert_eq!(targets.api().focus_activation_probe, [true, true, true]);
         assert!(targets.api().candidates[0].foreground);
+    }
 
-        let mut offset = WindowsTargetPlatform::new(
-            FakeWindows::with_candidates(vec![input_candidate(false)]).with_focus_failures(2),
+    #[test]
+    fn foreground_and_recovery_paths_recheck_the_environment() {
+        let binding = input_binding();
+        let mut foreground = WindowsTargetPlatform::new(
+            FakeWindows::with_candidates(vec![input_candidate(true)]).with_environment_failure(1),
         );
-        let error = offset.capture_identity(&binding).unwrap_err();
-        assert_eq!(error.code(), "target.focus_click_outside_target");
-        assert!(offset.api().target_point_clicks.is_empty());
+        assert_eq!(
+            foreground.capture_identity(&binding).unwrap_err().code(),
+            "environment.local_input_detected"
+        );
+
+        let mut recovering = WindowsTargetPlatform::new(
+            FakeWindows::with_candidates(vec![input_candidate(false)])
+                .with_focus_failures(2)
+                .with_environment_failure(2),
+        );
+        assert_eq!(
+            recovering.capture_identity(&binding).unwrap_err().code(),
+            "environment.local_input_detected"
+        );
+        assert_eq!(recovering.api().focus_activation_probe, [true]);
     }
 
     #[test]
@@ -783,6 +823,17 @@ impl WindowsApi for NativeWindows {
         native::candidate_from_raw_hwnd(hwnd)
     }
 
+    fn check_environment(&mut self) -> Result<(), WindowsError> {
+        if native::desktop_receives_input() != Some(true) {
+            return Err(WindowsError::new(
+                "target.noninteractive_desktop",
+                "agent desktop is not receiving user input",
+            ));
+        }
+        crate::local_input::check_active()
+            .map_err(|error| WindowsError::new(error.code(), error.to_string()))
+    }
+
     fn focus_target(
         &mut self,
         identity: &TargetIdentity,
@@ -791,21 +842,20 @@ impl WindowsApi for NativeWindows {
         native::focus_target(identity, allow_activation_probe)
     }
 
-    fn click_target_point(
-        &mut self,
-        identity: &TargetIdentity,
-        screen_x: i32,
-        screen_y: i32,
-    ) -> Result<(), WindowsError> {
-        native::click_target_point(identity, screen_x, screen_y)
-    }
-
     fn close_target(
         &mut self,
         identity: &TargetIdentity,
         timeout: Duration,
     ) -> Result<(), WindowsError> {
         native::close_target(identity, timeout)
+    }
+
+    fn terminate_target(
+        &mut self,
+        identity: &TargetIdentity,
+        timeout: Duration,
+    ) -> Result<(), WindowsError> {
+        native::terminate_target(identity, timeout)
     }
 }
 
@@ -830,8 +880,8 @@ mod native {
     };
     use windows::Win32::System::Threading::{
         GetCurrentThreadId, GetProcessTimes, OpenProcess, OpenProcessToken,
-        QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -840,7 +890,7 @@ mod native {
         SetForegroundWindow, ShowWindowAsync, SW_RESTORE, WM_CLOSE,
     };
 
-    use crate::send_input::{send_foreground_activation_probe, send_foreground_fallback_click};
+    use crate::send_input::send_foreground_activation_probe;
     use crate::{normalized_process_path_sha256, validate_dpi};
 
     use super::{
@@ -963,15 +1013,15 @@ mod native {
         let current = candidate_from_raw_hwnd(identity.hwnd)?;
         require_same_identity(identity, &current.identity)?;
         let hwnd = HWND(identity.hwnd as *mut c_void);
-        if current.foreground && !current.minimized {
-            return Ok(());
-        }
         let input_desktop = desktop_receives_input();
-        if input_desktop == Some(false) {
+        if input_desktop != Some(true) {
             return Err(WindowsError::new(
                 "target.noninteractive_desktop",
                 "agent desktop is not receiving user input",
             ));
+        }
+        if current.foreground && !current.minimized {
+            return Ok(());
         }
         if current.minimized {
             let _ = unsafe { ShowWindowAsync(hwnd, SW_RESTORE) };
@@ -1023,38 +1073,7 @@ mod native {
         ))
     }
 
-    pub(super) fn click_target_point(
-        identity: &TargetIdentity,
-        screen_x: i32,
-        screen_y: i32,
-    ) -> Result<(), WindowsError> {
-        let current = candidate_from_raw_hwnd(identity.hwnd)?;
-        require_same_identity(identity, &current.identity)?;
-        if !current.identity.client_rect.contains(screen_x, screen_y) {
-            return Err(WindowsError::new(
-                "target.focus_click_outside_target",
-                "foreground fallback point is outside the target client area",
-            ));
-        }
-        let sent = send_foreground_fallback_click(screen_x, screen_y);
-        if sent != 3 {
-            return Err(WindowsError::new(
-                "target.focus_click_failed",
-                format!("SendInput sent {sent}/3 foreground fallback events"),
-            ));
-        }
-        let hwnd = HWND(identity.hwnd as *mut c_void);
-        if wait_for_foreground(hwnd, Duration::from_millis(800)) {
-            Ok(())
-        } else {
-            Err(WindowsError::new(
-                "target.focus_failed",
-                "target-bound foreground fallback click did not activate the target",
-            ))
-        }
-    }
-
-    fn desktop_receives_input() -> Option<bool> {
+    pub(super) fn desktop_receives_input() -> Option<bool> {
         let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok()?;
         let mut receives_input = BOOL::default();
         unsafe {
@@ -1114,6 +1133,51 @@ mod native {
             status => Err(WindowsError::new(
                 "target.close_failed",
                 format!("waiting for target process failed with status {status:?}"),
+            )),
+        }
+    }
+
+    pub(super) fn terminate_target(
+        identity: &TargetIdentity,
+        timeout: Duration,
+    ) -> Result<(), WindowsError> {
+        let process = OwnedHandle(
+            unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                    false,
+                    identity.pid,
+                )
+            }
+            .map_err(|error| win_error("target.permission_denied", error))?,
+        );
+        let process_path_sha256 = normalized_process_path_sha256(&process_path(process.0)?)
+            .ok_or_else(|| {
+                WindowsError::new(
+                    "target.identity_unavailable",
+                    "process path cannot be normalized",
+                )
+            })?;
+        if process_started_at(process.0)? != identity.process_started_at
+            || process_path_sha256 != identity.process_path_sha256
+        {
+            return Err(WindowsError::new(
+                "target.stale",
+                "process identity changed before force close",
+            ));
+        }
+        unsafe { TerminateProcess(process.0, 1) }
+            .map_err(|error| win_error("target.close_failed", error))?;
+        let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        match unsafe { WaitForSingleObject(process.0, timeout_ms) } {
+            WAIT_OBJECT_0 => Ok(()),
+            WAIT_TIMEOUT => Err(WindowsError::new(
+                "target.close_timeout",
+                "target process did not exit after force close",
+            )),
+            status => Err(WindowsError::new(
+                "target.close_failed",
+                format!("waiting for force-closed target failed with status {status:?}"),
             )),
         }
     }

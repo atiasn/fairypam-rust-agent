@@ -169,7 +169,11 @@ impl CaptureSession for WindowsTargetCapture {
             .capture_identity(&self.binding)
             .map_err(|error| WindowsError::new(error.code(), error.to_string()))?;
         self.capture.resize(identity.client_rect, identity.dpi)?;
-        self.capture.next_frame(deadline)
+        let frame = self.capture.next_frame(deadline)?;
+        self.targets
+            .validate_environment()
+            .map_err(|error| WindowsError::new(error.code(), error.to_string()))?;
+        Ok(frame)
     }
 
     fn resize(&mut self, client_rect: Rect, dpi: u32) -> Result<(), WindowsError> {

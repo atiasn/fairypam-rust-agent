@@ -15,7 +15,8 @@ use fairypam_agent_core::supervisor::SessionSupervisor;
 use fairypam_agent_core::supervisor::{SessionDriver, SupervisorHooks};
 use fairypam_agent_core::AgentError;
 use fairypam_agent_protocol::v2::{
-    agent_control_event, AgentControlEvent, AgentRuntimeState, AgentStatus, Heartbeat, SessionRef,
+    self as v2, agent_control_event, AgentControlEvent, AgentRuntimeState, AgentStatus, Heartbeat,
+    SessionRef,
 };
 #[cfg(any(windows, test))]
 use fairypam_agent_transport::validate_transport_config;
@@ -813,7 +814,19 @@ impl SessionDriver for GrpcSessionDriver {
                             self.execution
                                 .lock()
                                 .map_err(lock_error)?
-                                .execute_v2_input_frame(&task, &frame)
+                                .execute_v2_input_frame(&task, &frame, None)
+                        }
+                        v2_adapter::TranslatedCommand::ClientPointClick { task, value } => {
+                            self.execution.lock().map_err(lock_error)?.execute_v2_input_frame(
+                                &task,
+                                &v2::InputFrame {
+                                    input_sequence: value.input_sequence,
+                                    lease_ms: value.lease_ms,
+                                    source_frame_sequence: Some(value.source_frame_sequence),
+                                    ..v2::InputFrame::default()
+                                },
+                                Some((value.button, value.x_ppm, value.y_ppm)),
+                            )
                         }
                     };
                     if let Ok(mut state) = self.state.lock() {
@@ -939,7 +952,7 @@ impl SupervisorHooks for RuntimeSafetyHooks {
             match RuntimeConfig::from_enrollment_state_at(&root) {
                 Ok(config) => {
                     if let Ok(mut execution) = self.execution.lock() {
-                        *execution = CommandExecutor::production(config.profiles.clone());
+                        execution.reload_profiles(config.profiles.clone());
                     }
                     if let Ok(mut current) = self.config.lock() {
                         *current = config;
@@ -955,7 +968,7 @@ impl SupervisorHooks for RuntimeSafetyHooks {
             }
         }
         if let Ok(mut execution) = self.execution.lock() {
-            let _ = execution.reset();
+            let _ = execution.reset_session();
         }
         if let Ok(mut state) = self.state.lock() {
             let logs = std::mem::take(&mut state.logs);
@@ -1055,7 +1068,11 @@ impl EmbeddedRuntimeHandle {
             | LocalCommand::RegisterHub { .. } => self.runtime.execute_embedded(command),
             LocalCommand::ShutdownAgent => {
                 self.runtime.record_local_operation(command);
-                self.runtime.execution.lock().map_err(lock_error)?.reset()?;
+                self.runtime
+                    .execution
+                    .lock()
+                    .map_err(lock_error)?
+                    .shutdown()?;
                 self.runtime.gui_shutdown.cancel();
                 Ok(serde_json::json!({"state": "shutting_down"}))
             }
@@ -1414,7 +1431,7 @@ impl SharedRuntime {
         let mut execution = self.execution.lock().map_err(lock_error)?;
         let mut state = self.state.lock().map_err(lock_error)?;
         let mut current = self.config.lock().map_err(lock_error)?;
-        *execution = CommandExecutor::production(config.profiles.clone());
+        execution.reload_profiles(config.profiles.clone());
         *current = config;
         state.control_state = ConnectionState::Reconnecting;
         state.frame_state = ConnectionState::Reconnecting;
@@ -1649,11 +1666,14 @@ mod tests {
         let completion = Arc::clone(&handle.completion);
 
         assert!(handle.execute(&LocalCommand::Status).is_ok());
+        assert_eq!(
+            handle.execute(&LocalCommand::CloseTarget).unwrap()["closed"],
+            true
+        );
         for command in [
             LocalCommand::LaunchTarget {
                 profile_id: "missing-profile".into(),
             },
-            LocalCommand::CloseTarget,
             LocalCommand::CapturePreview,
             LocalCommand::InputProbe {
                 action: crate::runtime_api::InputProbeAction::MoveForward,

@@ -30,6 +30,10 @@ pub enum TranslatedCommand {
         task: internal::TaskCommandRef,
         frame: wire::InputFrame,
     },
+    ClientPointClick {
+        task: internal::TaskCommandRef,
+        value: wire::ClientPointClick,
+    },
 }
 
 impl Translator {
@@ -113,7 +117,7 @@ pub fn hello(
                 agent_id,
                 agent_version,
                 protocol_major: 2,
-                protocol_minor: 1,
+                protocol_minor: 2,
                 build_commit,
                 suite_build_id: option_env!("FAIRYPAM_BUILD_ID")
                     .unwrap_or("unknown")
@@ -242,6 +246,7 @@ pub fn identity(command: &wire::HubControlCommand) -> Option<wire::CommandIdenti
         Payload::CaptureFrame(value) => value.reference.clone(),
         Payload::StopCapture(value) => value.reference.clone(),
         Payload::InputFrame(value) => value.reference.clone(),
+        Payload::ClientPointClick(value) => value.reference.clone(),
         Payload::ReleaseAll(value) => value.reference.clone(),
         Payload::FinishAttempt(value) => value.reference.clone(),
         Payload::InspectAttempt(value) => value.reference.clone(),
@@ -374,6 +379,46 @@ fn translate(
         }
         Some(Payload::InputFrame(value)) => {
             return translator.translate_input_frame(value);
+        }
+        Some(Payload::ClientPointClick(value)) => {
+            translator.require_capability(value.reference.as_ref(), 5)?;
+            if value.input_sequence == 0
+                || value.input_sequence <= translator.last_input_sequence
+                || value.lease_ms == 0
+                || value.lease_ms
+                    > translator
+                        .active_contract
+                        .as_ref()
+                        .ok_or_else(|| {
+                            AgentError::new(
+                                "task.contract_missing",
+                                "execution contract has not been accepted",
+                            )
+                        })?
+                        .max_input_lease_ms
+                        .min(translator.hub_max_input_lease_ms)
+                || !matches!(
+                    wire::MouseButton::try_from(value.button),
+                    Ok(wire::MouseButton::Left
+                        | wire::MouseButton::Right
+                        | wire::MouseButton::Middle
+                        | wire::MouseButton::X1
+                        | wire::MouseButton::X2)
+                )
+                || value.x_ppm > 1_000_000
+                || value.y_ppm > 1_000_000
+                || value.source_frame_sequence == 0
+            {
+                return Err(AgentError::new(
+                    "input.frame_invalid",
+                    "client point click is outside the v2 fixed bounds",
+                ));
+            }
+            translator.last_input_sequence = value.input_sequence;
+            return Ok(TranslatedCommand::ClientPointClick {
+                task: internal_task(wire_task(value.reference.as_ref())?)?,
+                value: value.clone(),
+            });
         }
         Some(Payload::ReleaseAll(value)) => {
             let (command, task) = either_command(value.reference.as_ref())?;
@@ -769,7 +814,7 @@ fn map_receipt(
         last_side_effect_command_id: receipt.last_side_effect_command_id,
         input_state: receipt.input_state,
         capture_state: receipt.capture_state,
-        owned_target_state: receipt.owned_target_state,
+        managed_target_state: receipt.owned_target_state,
         cleanup_complete: receipt.cleanup_complete,
         error_code: receipt.error_code,
     }
@@ -796,7 +841,7 @@ fn empty_receipt(task: wire::TaskCommandRef, code: &str) -> wire::AttemptReceipt
         side_effect_state: wire::SideEffectState::NotApplied as i32,
         input_state: wire::InputState::Released as i32,
         capture_state: wire::CaptureState::NotStarted as i32,
-        owned_target_state: wire::OwnedTargetState::NotStarted as i32,
+        managed_target_state: wire::ManagedTargetState::NotStarted as i32,
         cleanup_complete: Some(false),
         error_code: Some(code.to_owned()),
         ..wire::AttemptReceipt::default()
@@ -857,7 +902,7 @@ mod tests {
             allowed_capabilities: capabilities,
             deadline_unix_ms: i64::MAX,
             max_input_lease_ms: 500,
-            cleanup_policy: wire::CleanupPolicy::ReleaseInputAndCloseOwnedTarget as i32,
+            cleanup_policy: wire::CleanupPolicy::ReleaseInputKeepManagedTarget as i32,
             contract_version: 2,
             contract_digest: String::new(),
         };
@@ -898,6 +943,18 @@ mod tests {
                 }
                 (value.reference.as_ref().unwrap(), "InputFrame", payload)
             }
+            hub_control_command::Payload::ClientPointClick(value) => (
+                value.reference.as_ref().unwrap(),
+                "ClientPointClick",
+                serde_json::json!({
+                    "button": value.button,
+                    "input_sequence": value.input_sequence,
+                    "lease_ms": value.lease_ms,
+                    "source_frame_sequence": value.source_frame_sequence,
+                    "x_ppm": value.x_ppm,
+                    "y_ppm": value.y_ppm,
+                }),
+            ),
             hub_control_command::Payload::StartCapture(value) => (
                 value.reference.as_ref().unwrap(),
                 "StartCapture",
@@ -940,6 +997,9 @@ mod tests {
         let identity = match command.payload.as_mut().unwrap() {
             hub_control_command::Payload::BeginAttempt(value) => value.reference.as_mut().unwrap(),
             hub_control_command::Payload::InputFrame(value) => value.reference.as_mut().unwrap(),
+            hub_control_command::Payload::ClientPointClick(value) => {
+                value.reference.as_mut().unwrap()
+            }
             hub_control_command::Payload::StartCapture(value) => value.reference.as_mut().unwrap(),
             hub_control_command::Payload::CaptureFrame(value) => value.reference.as_mut().unwrap(),
             _ => unreachable!(),
@@ -1117,6 +1177,77 @@ mod tests {
         assert_eq!(frame.held_mouse_buttons, [wire::MouseButton::Left as i32]);
         assert_eq!(frame.wheel_delta, 120);
         assert_eq!(frame.source_frame_sequence, Some(7));
+    }
+
+    #[test]
+    fn translator_preserves_the_typed_client_point_click() {
+        let contract = contract(vec![1, 2, 3, 5]);
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract);
+        let command = with_digest(wire::HubControlCommand {
+            payload: Some(hub_control_command::Payload::ClientPointClick(
+                wire::ClientPointClick {
+                    reference: Some(task_identity(&contract, 2)),
+                    input_sequence: 1,
+                    lease_ms: 250,
+                    button: wire::MouseButton::Left as i32,
+                    x_ppm: 500_000,
+                    y_ppm: 583_333,
+                    source_frame_sequence: 7,
+                },
+            )),
+        });
+
+        let TranslatedCommand::ClientPointClick { value, .. } =
+            translator.translate(&command).unwrap()
+        else {
+            panic!("ClientPointClick was not preserved");
+        };
+        assert_eq!(value.x_ppm, 500_000);
+        assert_eq!(value.source_frame_sequence, 7);
+    }
+
+    #[test]
+    fn translator_rejects_unapproved_or_unbound_client_point_click() {
+        let contract_without_mouse = contract(vec![1, 2, 3]);
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract_without_mouse);
+        let error = translator
+            .translate(&with_digest(wire::HubControlCommand {
+                payload: Some(hub_control_command::Payload::ClientPointClick(
+                    wire::ClientPointClick {
+                        reference: Some(task_identity(&contract_without_mouse, 2)),
+                        input_sequence: 1,
+                        lease_ms: 250,
+                        button: wire::MouseButton::Left as i32,
+                        x_ppm: 500_000,
+                        y_ppm: 583_333,
+                        source_frame_sequence: 7,
+                    },
+                )),
+            }))
+            .unwrap_err();
+        assert_eq!(error.code(), "task.capability_denied");
+
+        let contract = contract(vec![1, 2, 3, 5]);
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract);
+        let error = translator
+            .translate(&with_digest(wire::HubControlCommand {
+                payload: Some(hub_control_command::Payload::ClientPointClick(
+                    wire::ClientPointClick {
+                        reference: Some(task_identity(&contract, 2)),
+                        input_sequence: 1,
+                        lease_ms: 250,
+                        button: wire::MouseButton::Left as i32,
+                        x_ppm: 500_000,
+                        y_ppm: 583_333,
+                        source_frame_sequence: 0,
+                    },
+                )),
+            }))
+            .unwrap_err();
+        assert_eq!(error.code(), "input.frame_invalid");
     }
 
     #[test]

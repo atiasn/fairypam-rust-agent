@@ -19,23 +19,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::{LockedInputTarget, NativeWindows, WindowsTargetPlatform};
 
+pub(crate) const SEND_INPUT_MARKER: usize = 0x4650_414D;
+
 pub(crate) fn send_foreground_activation_probe() -> u32 {
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
-            mi: MOUSEINPUT::default(),
+            mi: MOUSEINPUT {
+                dwExtraInfo: SEND_INPUT_MARKER,
+                ..Default::default()
+            },
         },
     };
     unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) }
-}
-
-pub(crate) fn send_foreground_fallback_click(screen_x: i32, screen_y: i32) -> u32 {
-    let inputs = SendInputPlatform::screen_point_click_inputs(
-        SemanticMouseButton::Left,
-        i64::from(screen_x),
-        i64::from(screen_y),
-    );
-    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
 }
 
 #[derive(Debug)]
@@ -110,7 +106,7 @@ impl SendInputPlatform {
                     wScan: scan_code,
                     dwFlags: flags,
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: SEND_INPUT_MARKER,
                 },
             },
         }
@@ -131,7 +127,7 @@ impl SendInputPlatform {
                     mouseData: data,
                     dwFlags: flags,
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: SEND_INPUT_MARKER,
                 },
             },
         }
@@ -258,7 +254,7 @@ impl<G: GuardianClient> WindowsInput<G> {
 
     pub fn execute_client_point(
         &mut self,
-        action: &ActionId,
+        button: SemanticMouseButton,
         x_ppm: u32,
         y_ppm: u32,
         session: &SessionKey,
@@ -267,7 +263,7 @@ impl<G: GuardianClient> WindowsInput<G> {
     ) -> Result<(), SafetyError> {
         self.require_target_permit(permit, session, now)?;
         self.executor
-            .execute_client_point(action, x_ppm, y_ppm, session, permit, now)
+            .execute_client_point(button, x_ppm, y_ppm, session, permit, now)
     }
 
     pub fn tick(&mut self, now: Instant) -> Result<(), SafetyError> {

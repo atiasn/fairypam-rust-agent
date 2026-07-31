@@ -269,14 +269,6 @@ impl TaskAttemptRuntime {
         Ok(self.require_active(task)?.owned_target.clone())
     }
 
-    pub fn active_owned_target(&mut self) -> Result<Option<TargetBinding>, AgentError> {
-        self.load_active()?;
-        Ok(self
-            .active
-            .as_ref()
-            .and_then(|active| active.owned_target.clone()))
-    }
-
     pub fn refresh_owned_target(
         &mut self,
         reference: &AttemptRef,
@@ -793,15 +785,14 @@ impl TaskAttemptRuntime {
         task: &TaskCommandRef,
         input_released: bool,
         capture_stopped: bool,
-        target_closed: bool,
+        managed_target_running: bool,
         error_code: Option<&str>,
     ) -> Result<TaskCommandResult, AgentError> {
         let side_effect_resolved = !matches!(
             TaskSideEffectState::try_from(self.require_active(task)?.side_effect_state),
             Ok(TaskSideEffectState::IntentRecorded | TaskSideEffectState::Uncertain)
         );
-        let cleanup_complete =
-            input_released && capture_stopped && target_closed && side_effect_resolved;
+        let cleanup_complete = input_released && capture_stopped && side_effect_resolved;
         let derived_error = if !side_effect_resolved {
             Some("side_effect_uncertain")
         } else if !cleanup_complete {
@@ -831,15 +822,13 @@ impl TaskAttemptRuntime {
                 } else {
                     TaskCaptureState::Unknown as i32
                 };
-                state.owned_target_state = if target_closed {
-                    TaskOwnedTargetState::Closed as i32
+                state.owned_target_state = if managed_target_running {
+                    TaskOwnedTargetState::Running as i32
                 } else {
-                    TaskOwnedTargetState::Unknown as i32
+                    TaskOwnedTargetState::NotStarted as i32
                 };
                 state.cleanup_complete = cleanup_complete;
-                if target_closed {
-                    state.owned_target = None;
-                }
+                state.owned_target = None;
             },
         )
     }
@@ -848,7 +837,7 @@ impl TaskAttemptRuntime {
         &mut self,
         input_released: bool,
         capture_stopped: bool,
-        target_closed: bool,
+        managed_target_running: bool,
         error_code: Option<&str>,
     ) -> Result<Option<TaskAttemptReceiptV1>, AgentError> {
         self.load_active()?;
@@ -859,8 +848,7 @@ impl TaskAttemptRuntime {
             TaskSideEffectState::try_from(active.side_effect_state),
             Ok(TaskSideEffectState::IntentRecorded | TaskSideEffectState::Uncertain)
         );
-        let cleanup_complete =
-            input_released && capture_stopped && target_closed && side_effect_resolved;
+        let cleanup_complete = input_released && capture_stopped && side_effect_resolved;
         active.attempt_state = TaskAttemptState::Terminal as i32;
         active.input_state = if input_released {
             TaskInputState::Released as i32
@@ -872,19 +860,17 @@ impl TaskAttemptRuntime {
         } else {
             TaskCaptureState::Unknown as i32
         };
-        active.owned_target_state = if target_closed {
-            TaskOwnedTargetState::Closed as i32
+        active.owned_target_state = if managed_target_running {
+            TaskOwnedTargetState::Running as i32
         } else {
-            TaskOwnedTargetState::Unknown as i32
+            TaskOwnedTargetState::NotStarted as i32
         };
         active.cleanup_complete = cleanup_complete;
         active.error_code = error_code
             .or((!side_effect_resolved).then_some("side_effect_uncertain"))
             .or((!cleanup_complete).then_some("cleanup_incomplete"))
             .map(str::to_owned);
-        if target_closed {
-            active.owned_target = None;
-        }
+        active.owned_target = None;
         self.persist(&active)?;
         let receipt = active.receipt();
         self.active = Some(active);
@@ -1464,7 +1450,11 @@ impl AttemptState {
             )
             && matches!(
                 owned_target_state,
-                Some(TaskOwnedTargetState::NotStarted | TaskOwnedTargetState::Closed)
+                Some(
+                    TaskOwnedTargetState::NotStarted
+                        | TaskOwnedTargetState::Running
+                        | TaskOwnedTargetState::Closed
+                )
             )
             && !matches!(
                 side_effect_state,
@@ -1513,7 +1503,8 @@ impl AttemptState {
                     Some(TaskOwnedTargetState::Running | TaskOwnedTargetState::Unknown)
                 ))
             || (self.owned_target.is_none()
-                && owned_target_state == Some(TaskOwnedTargetState::Running))
+                && owned_target_state == Some(TaskOwnedTargetState::Running)
+                && attempt_state != Some(TaskAttemptState::Terminal))
         {
             return Err(ledger_invalid());
         }
@@ -1564,7 +1555,9 @@ impl StoredCommandResult {
             )
             && matches!(
                 TaskOwnedTargetState::try_from(self.owned_target_state),
-                Ok(TaskOwnedTargetState::NotStarted | TaskOwnedTargetState::Closed)
+                Ok(TaskOwnedTargetState::NotStarted
+                    | TaskOwnedTargetState::Running
+                    | TaskOwnedTargetState::Closed)
             )
             && !matches!(
                 TaskSideEffectState::try_from(self.side_effect_state),

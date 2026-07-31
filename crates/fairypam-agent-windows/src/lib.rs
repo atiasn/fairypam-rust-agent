@@ -2,6 +2,8 @@
 
 mod capture;
 mod dpi;
+#[cfg(windows)]
+mod local_input;
 mod process;
 #[cfg(windows)]
 mod send_input;
@@ -14,6 +16,8 @@ pub use capture::{
     CapturedFrame, LatestFrameSlot,
 };
 pub use dpi::{physical_to_logical, validate_dpi};
+#[cfg(windows)]
+pub use process::{matching_process_ids, process_matches_executable};
 pub use process::{normalize_process_path, normalized_process_path_sha256, process_path_is_within};
 pub use window::{
     lock_unique, revalidate_identity, FakeWindows, Rect, TargetIdentity, WindowsApi, WindowsError,
@@ -25,6 +29,8 @@ pub use window::LockedInputTarget;
 
 #[cfg(windows)]
 pub use capture::BitBltCaptureBackend;
+#[cfg(windows)]
+pub use local_input::LocalInputMonitor;
 #[cfg(windows)]
 pub use send_input::WindowsInput;
 #[cfg(windows)]

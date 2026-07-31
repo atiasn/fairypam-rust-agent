@@ -35,6 +35,149 @@ pub fn process_path_is_within(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('\\'))
 }
 
+#[cfg(windows)]
+pub fn matching_process_ids(
+    executable: &std::path::Path,
+) -> Result<Vec<u32>, fairypam_agent_core::AgentError> {
+    use windows::Win32::Foundation::{GetLastError, ERROR_NO_MORE_FILES};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let expected =
+        normalized_process_path_sha256(&executable.to_string_lossy()).ok_or_else(|| {
+            fairypam_agent_core::AgentError::new(
+                "target_invalid",
+                "trusted executable path cannot be normalized",
+            )
+        })?;
+    let expected_name = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            fairypam_agent_core::AgentError::new(
+                "target_invalid",
+                "trusted executable has no valid file name",
+            )
+        })?;
+    let snapshot = OwnedHandle(
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(|error| {
+            fairypam_agent_core::AgentError::new("target.enumeration_failed", error.to_string())
+        })?,
+    );
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    unsafe { Process32FirstW(snapshot.0, &mut entry) }.map_err(|error| {
+        fairypam_agent_core::AgentError::new("target.enumeration_failed", error.to_string())
+    })?;
+    let mut matches = Vec::new();
+    loop {
+        let name_end = entry
+            .szExeFile
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..name_end]);
+        if entry.th32ProcessID != 0 && name.eq_ignore_ascii_case(expected_name) {
+            if query_process_path(entry.th32ProcessID)?
+                .and_then(|path| normalized_process_path_sha256(&path))
+                == Some(expected)
+            {
+                matches.push(entry.th32ProcessID);
+            }
+        }
+        if let Err(error) = unsafe { Process32NextW(snapshot.0, &mut entry) } {
+            if unsafe { GetLastError() } == ERROR_NO_MORE_FILES {
+                break;
+            }
+            return Err(fairypam_agent_core::AgentError::new(
+                "target.enumeration_failed",
+                error.to_string(),
+            ));
+        }
+    }
+    matches.sort_unstable();
+    matches.dedup();
+    Ok(matches)
+}
+
+#[cfg(windows)]
+pub fn process_matches_executable(
+    process_id: u32,
+    executable: &std::path::Path,
+) -> Result<bool, fairypam_agent_core::AgentError> {
+    let expected =
+        normalized_process_path_sha256(&executable.to_string_lossy()).ok_or_else(|| {
+            fairypam_agent_core::AgentError::new(
+                "target_invalid",
+                "trusted executable path cannot be normalized",
+            )
+        })?;
+    Ok(
+        query_process_path(process_id)?.and_then(|path| normalized_process_path_sha256(&path))
+            == Some(expected),
+    )
+}
+
+#[cfg(windows)]
+fn query_process_path(process_id: u32) -> Result<Option<String>, fairypam_agent_core::AgentError> {
+    use windows::core::{HRESULT, PWSTR};
+    use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let process = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+    {
+        Ok(process) => OwnedHandle(process),
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(fairypam_agent_core::AgentError::new(
+                "target.identity_unknown",
+                error.to_string(),
+            ));
+        }
+    };
+    let mut buffer = vec![0_u16; 32_768];
+    let mut length = buffer.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            process.0,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    }
+    .map_err(|error| {
+        fairypam_agent_core::AgentError::new("target.identity_unknown", error.to_string())
+    })?;
+    String::from_utf16(&buffer[..length as usize])
+        .map(Some)
+        .map_err(|_| {
+            fairypam_agent_core::AgentError::new(
+                "target.identity_unknown",
+                "target executable path is not valid UTF-16",
+            )
+        })
+}
+
+#[cfg(windows)]
+struct OwnedHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

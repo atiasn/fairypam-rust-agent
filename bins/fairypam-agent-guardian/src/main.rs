@@ -318,7 +318,7 @@ impl ReleaseDriver for SystemReleaseDriver {
                                     Default::default()
                                 },
                             time: 0,
-                            dwExtraInfo: 0,
+                            dwExtraInfo: 0x4650_414D,
                         },
                     },
                 },
@@ -340,7 +340,7 @@ impl ReleaseDriver for SystemReleaseDriver {
                                 MouseButton::X1 | MouseButton::X2 => MOUSEEVENTF_XUP,
                             },
                             time: 0,
-                            dwExtraInfo: 0,
+                            dwExtraInfo: 0x4650_414D,
                         },
                     },
                 },

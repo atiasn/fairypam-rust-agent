@@ -39,6 +39,18 @@ fn frame_sequence_key(source_id: &str, attempt: Option<&AttemptRef>) -> String {
     )
 }
 
+fn ensure_current_source_frame(source_frame: Option<(&AtomicU64, u64)>) -> Result<(), AgentError> {
+    if source_frame.is_some_and(|(current, expected)| {
+        expected == 0 || current.load(Ordering::Acquire) != expected
+    }) {
+        return Err(AgentError::new(
+            "source_frame_stale",
+            "input frame source is not the latest task frame",
+        ));
+    }
+    Ok(())
+}
+
 fn next_frame_sequence(sequence: &AtomicU64) -> Result<u64, AgentError> {
     sequence
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -160,6 +172,16 @@ impl ExecutionSession {
 }
 
 pub trait RuntimePlatform: Send {
+    fn begin_attempt_monitor(&mut self) -> Result<bool, AgentError> {
+        Ok(false)
+    }
+
+    fn check_attempt_environment(&mut self) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    fn finish_attempt_monitor(&mut self) {}
+
     fn start_task_target(&mut self, profile: &VerifiedProfile)
         -> Result<TargetBinding, AgentError>;
 
@@ -215,6 +237,8 @@ pub trait RuntimePlatform: Send {
         keys: &[v2::PhysicalKey],
         mouse_buttons: &[i32],
         wheel_delta: i32,
+        source_frame: Option<(&AtomicU64, u64)>,
+        client_point: Option<(i32, u32, u32)>,
     ) -> Result<(), AgentError>;
 
     fn release_task_input(&mut self) -> Result<(), AgentError>;
@@ -418,10 +442,20 @@ impl CommandExecutor {
                     "Agent task contract does not match this Agent build",
                 ));
             }
+            let monitor_started = self.platform.begin_attempt_monitor()?;
+            let receipt = match self.task_attempt.begin_v2(task, contract) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    if monitor_started {
+                        self.platform.finish_attempt_monitor();
+                    }
+                    return Err(error);
+                }
+            };
             Ok(CommandOutcome::TaskAck {
                 result: "{}".into(),
                 outcome: None,
-                receipt: Box::new(self.task_attempt.begin_v2(task, contract)?),
+                receipt: Box::new(receipt),
                 local_diagnostic: None,
             })
         })();
@@ -432,26 +466,30 @@ impl CommandExecutor {
         &mut self,
         task: &fairypam_agent_protocol::v1::TaskCommandRef,
         frame: &v2::InputFrame,
+        client_point: Option<(i32, u32, u32)>,
     ) -> CommandOutcome {
         let result = (|| {
             if let Some(result) = self.task_attempt.replay(task)? {
                 return Ok(CommandOutcome::task(result));
             }
-            if let Some(source) = frame.source_frame_sequence {
+            let source_frame = if let Some(source) = frame.source_frame_sequence {
                 let attempt = self.task_attempt.attempt_ref(task)?;
                 let frame_key = frame_sequence_key("client", Some(&attempt));
                 let current = self
                     .frame_sequences
                     .get(&frame_key)
-                    .map(|sequence| sequence.load(Ordering::Acquire))
-                    .unwrap_or_default();
-                if source == 0 || source != current {
-                    return Err(AgentError::new(
-                        "source_frame_stale",
-                        "input frame source is not the latest task frame",
-                    ));
-                }
-            }
+                    .cloned()
+                    .ok_or_else(|| {
+                        AgentError::new(
+                            "source_frame_stale",
+                            "input frame source is not the latest task frame",
+                        )
+                    })?;
+                ensure_current_source_frame(Some((&current, source)))?;
+                Some((current, source))
+            } else {
+                None
+            };
             if let Some(result) = self.task_attempt.prepare(task, true)? {
                 return Ok(CommandOutcome::task(result));
             }
@@ -478,6 +516,10 @@ impl CommandExecutor {
                     &frame.held_keys,
                     &frame.held_mouse_buttons,
                     frame.wheel_delta,
+                    source_frame
+                        .as_ref()
+                        .map(|(current, expected)| (current.as_ref(), *expected)),
+                    client_point,
                 )
                 .err();
             Ok(CommandOutcome::task(
@@ -570,12 +612,6 @@ impl CommandExecutor {
             }
             LocalCommand::ListProfiles => Ok(json!({"profiles": self.profiles.ids()})),
             LocalCommand::LaunchTarget { profile_id } => {
-                if self.binding.is_some() {
-                    return Err(AgentError::new(
-                        "target.active",
-                        "launch requires no active target",
-                    ));
-                }
                 let profile = self.profiles.get(profile_id)?.clone();
                 let binding = self.platform.start_task_target(&profile)?;
                 self.active_profile = Some(profile);
@@ -585,9 +621,9 @@ impl CommandExecutor {
                 )
             }
             LocalCommand::CloseTarget => {
-                let binding = self.binding.clone().ok_or_else(|| {
-                    AgentError::new("target.not_locked", "close requires a locked target")
-                })?;
+                let Some(binding) = self.binding.clone() else {
+                    return Ok(json!({"closed": true, "state": "ConnectedIdle"}));
+                };
                 self.platform.release_task_input()?;
                 self.stop_capture(None)?;
                 self.platform.close(
@@ -751,12 +787,6 @@ impl CommandExecutor {
         }
         match payload {
             Some(Payload::LaunchTarget(value)) => {
-                if self.binding.is_some() {
-                    return Err(AgentError::new(
-                        "target.active",
-                        "launch requires no active target",
-                    ));
-                }
                 let profile = self.profiles.get(&value.profile_id)?.clone();
                 let binding = self.platform.start_task_target(&profile)?;
                 self.active_profile = Some(profile);
@@ -853,9 +883,11 @@ impl CommandExecutor {
                         "close timeout must be between 1 and 5000 ms",
                     ));
                 }
-                let binding = self.binding.clone().ok_or_else(|| {
-                    AgentError::new("target.not_locked", "close requires a locked target")
-                })?;
+                let Some(binding) = self.binding.clone() else {
+                    return Ok(CommandOutcome::Ack(
+                        json!({"closed": true, "state": "ConnectedIdle"}).to_string(),
+                    ));
+                };
                 self.platform.release_task_input()?;
                 let capture_error = self.stop_capture(None).err();
                 self.platform
@@ -1045,11 +1077,26 @@ impl CommandExecutor {
                         self.task_attempt
                             .complete_capture_frame(task, Some(sequence), None)?,
                     )),
-                    Err(error) => Ok(CommandOutcome::task_with_diagnostic(
-                        self.task_attempt
-                            .complete_capture_frame(task, None, Some(error.code()))?,
-                        &error,
-                    )),
+                    Err(error) => {
+                        let release_error = self.platform.release_task_input().err();
+                        let error = AgentError::new(
+                            error.code(),
+                            match release_error {
+                                Some(release) => {
+                                    format!("{error}; input release failed: {release}")
+                                }
+                                None => error.to_string(),
+                            },
+                        );
+                        Ok(CommandOutcome::task_with_diagnostic(
+                            self.task_attempt.complete_capture_frame(
+                                task,
+                                None,
+                                Some(error.code()),
+                            )?,
+                            &error,
+                        ))
+                    }
                 }
             }
             Some(Payload::StopCapture(value)) => {
@@ -1215,10 +1262,20 @@ impl CommandExecutor {
                         "Agent task contract does not match this Agent build",
                     ));
                 }
+                let monitor_started = self.platform.begin_attempt_monitor()?;
+                let receipt = match self.task_attempt.begin(task, contract) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        if monitor_started {
+                            self.platform.finish_attempt_monitor();
+                        }
+                        return Err(error);
+                    }
+                };
                 Ok(CommandOutcome::TaskAck {
                     result: "{}".into(),
                     outcome: None,
-                    receipt: Box::new(self.task_attempt.begin(task, contract)?),
+                    receipt: Box::new(receipt),
                     local_diagnostic: None,
                 })
             }
@@ -1261,29 +1318,14 @@ impl CommandExecutor {
                 }
                 let release_error = self.platform.release_task_input().err();
                 let capture_stopped = self.stop_capture(None).is_ok();
-                let owned_target = self.task_attempt.owned_target(task)?;
-                let close_error = owned_target.as_ref().and_then(|binding| {
-                    self.platform
-                        .close(
-                            binding,
-                            Duration::from_millis(u64::from(MAX_CLOSE_TIMEOUT_MS)),
-                        )
-                        .err()
-                });
-                let target_closed = close_error.is_none();
-                if target_closed {
-                    self.active_profile = None;
-                    self.binding = None;
-                }
-                let error_code = release_error
-                    .as_ref()
-                    .or(close_error.as_ref())
-                    .map(AgentError::code);
+                self.platform.finish_attempt_monitor();
+                let managed_target_running = self.binding.is_some();
+                let error_code = release_error.as_ref().map(AgentError::code);
                 Ok(CommandOutcome::task(self.task_attempt.complete_finish(
                     task,
                     release_error.is_none(),
                     capture_stopped,
-                    target_closed,
+                    managed_target_running,
                     error_code,
                 )?))
             }
@@ -1427,6 +1469,8 @@ impl CommandExecutor {
                 keys,
                 mouse_buttons,
                 0,
+                None,
+                None,
             )
             .and_then(|()| {
                 self.platform.apply_task_input_frame(
@@ -1438,6 +1482,8 @@ impl CommandExecutor {
                     &[],
                     &[],
                     0,
+                    None,
+                    None,
                 )
             });
         let release = self.platform.release_task_input();
@@ -1446,13 +1492,29 @@ impl CommandExecutor {
         Ok(json!({"state": "released"}))
     }
 
-    pub fn reset(&mut self) -> Result<(), AgentError> {
+    pub fn reload_profiles(&mut self, profiles: ProfileStore) {
+        self.profiles = profiles;
+    }
+
+    pub fn reset_session(&mut self) -> Result<(), AgentError> {
         if self.task_attempt.is_active()? || self.task_attempt.emergency_stopped()? {
             self.emergency_stop()?;
-            return Ok(());
         }
         self.platform.release_task_input()?;
         self.stop_capture(None)?;
+        self.platform.finish_attempt_monitor();
+        self.frame_sequences.clear();
+        Ok(())
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), AgentError> {
+        self.reset_session()?;
+        if let Some(binding) = self.binding.clone() {
+            self.platform.close(
+                &binding,
+                Duration::from_millis(u64::from(MAX_CLOSE_TIMEOUT_MS)),
+            )?;
+        }
         self.active_profile = None;
         self.binding = None;
         self.frame_sequences.clear();
@@ -1463,36 +1525,23 @@ impl CommandExecutor {
         self.task_attempt.set_emergency_stopped(true)?;
         let release_error = self.platform.release_task_input().err();
         let capture_error = self.stop_capture(None).err();
-        let owned_target = self.task_attempt.active_owned_target()?;
-        let close_error = owned_target.as_ref().and_then(|binding| {
-            self.platform
-                .close(
-                    binding,
-                    Duration::from_millis(u64::from(MAX_CLOSE_TIMEOUT_MS)),
-                )
-                .err()
-        });
-        let target_closed = close_error.is_none();
-        if target_closed {
-            self.active_profile = None;
-            self.binding = None;
-        }
+        self.platform.finish_attempt_monitor();
+        let managed_target_running = self.binding.is_some();
         self.frame_sequences.clear();
         let error_code = capture_error
             .as_ref()
             .or(release_error.as_ref())
-            .or(close_error.as_ref())
             .map(AgentError::code);
         let receipt = self.task_attempt.emergency_finish(
             release_error.is_none(),
             capture_error.is_none(),
-            target_closed,
+            managed_target_running,
             error_code,
         )?;
         let cleanup_complete = receipt
             .as_ref()
             .and_then(|value| value.cleanup_complete)
-            .unwrap_or(release_error.is_none() && capture_error.is_none() && target_closed);
+            .unwrap_or(release_error.is_none() && capture_error.is_none());
         let response_error_code = receipt
             .as_ref()
             .and_then(|value| value.error_code.as_deref())
@@ -1733,6 +1782,8 @@ impl RuntimePlatform for UnsupportedPlatform {
         _keys: &[v2::PhysicalKey],
         _mouse_buttons: &[i32],
         _wheel_delta: i32,
+        _source_frame: Option<(&AtomicU64, u64)>,
+        _client_point: Option<(i32, u32, u32)>,
     ) -> Result<(), AgentError> {
         Err(AgentError::new(
             "input.platform_unsupported",
@@ -1832,15 +1883,17 @@ impl RuntimePlatform for UnsupportedPlatform {
 #[cfg(windows)]
 struct WindowsRuntimePlatform {
     targets: fairypam_agent_windows::WindowsTargetPlatform<fairypam_agent_windows::NativeWindows>,
-    owned: Option<OwnedTaskProcess>,
+    managed: Option<ManagedGameProcess>,
     task_input: Option<WindowsTaskInput>,
+    input_monitor: Option<fairypam_agent_windows::LocalInputMonitor>,
     rediscovery_used: bool,
 }
 
 #[cfg(windows)]
-struct OwnedTaskProcess {
-    _child: std::process::Child,
-    job: usize,
+struct ManagedGameProcess {
+    _child: Option<std::process::Child>,
+    job: Option<usize>,
+    executable: std::path::PathBuf,
     binding: TargetBinding,
 }
 
@@ -1867,12 +1920,14 @@ impl Drop for OwnedJob {
 }
 
 #[cfg(windows)]
-impl Drop for OwnedTaskProcess {
+impl Drop for ManagedGameProcess {
     fn drop(&mut self) {
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
-        // SAFETY: this value owns the Job Object handle until this drop.
-        let _ = unsafe { CloseHandle(HANDLE(self.job as _)) };
+        if let Some(job) = self.job {
+            // SAFETY: this value owns the Job Object handle until this drop.
+            let _ = unsafe { CloseHandle(HANDLE(job as _)) };
+        }
     }
 }
 
@@ -1886,6 +1941,25 @@ struct WindowsTaskInput {
 #[cfg(windows)]
 struct TaskAuthorization {
     expires_at: Instant,
+}
+
+#[cfg(windows)]
+fn semantic_mouse_button(
+    button: i32,
+) -> Result<fairypam_agent_input::SemanticMouseButton, AgentError> {
+    use fairypam_agent_input::SemanticMouseButton;
+
+    match v2::MouseButton::try_from(button) {
+        Ok(v2::MouseButton::Left) => Ok(SemanticMouseButton::Left),
+        Ok(v2::MouseButton::Right) => Ok(SemanticMouseButton::Right),
+        Ok(v2::MouseButton::Middle) => Ok(SemanticMouseButton::Middle),
+        Ok(v2::MouseButton::X1) => Ok(SemanticMouseButton::X1),
+        Ok(v2::MouseButton::X2) => Ok(SemanticMouseButton::X2),
+        _ => Err(AgentError::new(
+            "input.frame_invalid",
+            "input command contains an invalid mouse button",
+        )),
+    }
 }
 
 #[cfg(windows)]
@@ -1908,8 +1982,9 @@ impl WindowsRuntimePlatform {
             targets: fairypam_agent_windows::WindowsTargetPlatform::new(
                 fairypam_agent_windows::NativeWindows,
             ),
-            owned: None,
+            managed: None,
             task_input: None,
+            input_monitor: None,
             rediscovery_used: false,
         }
     }
@@ -1970,13 +2045,48 @@ impl WindowsRuntimePlatform {
             )
         })
     }
+
+    fn wait_for_process_window(
+        &mut self,
+        profile: &VerifiedProfile,
+        process_id: u32,
+        deadline: Instant,
+    ) -> Result<TargetBinding, AgentError> {
+        use fairypam_agent_core::platform::TargetPlatform;
+
+        loop {
+            let mut candidates = self
+                .targets
+                .enumerate(profile)?
+                .into_iter()
+                .filter(|candidate| candidate.process_id == process_id);
+            if let Some(candidate) = candidates.next() {
+                if candidates.next().is_some() {
+                    return Err(AgentError::new(
+                        "target.ambiguous",
+                        "the signed Profile process exposes multiple trusted windows",
+                    ));
+                }
+                return self.targets.lock(profile, candidate.selector);
+            }
+            if Instant::now() >= deadline {
+                return Err(AgentError::new(
+                    "target.launch_failed",
+                    "trusted target window did not become ready within 120 seconds",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
 }
 
 #[cfg(windows)]
 impl Drop for WindowsRuntimePlatform {
     fn drop(&mut self) {
         let _ = <Self as RuntimePlatform>::release_task_input(self);
-        self.owned = None;
+        if let Some(binding) = self.managed.as_ref().map(|target| target.binding.clone()) {
+            let _ = <Self as RuntimePlatform>::close(self, &binding, Duration::from_secs(5));
+        }
     }
 }
 
@@ -2009,40 +2119,87 @@ fn kill_on_close_job() -> Result<OwnedJob, AgentError> {
 
 #[cfg(windows)]
 impl RuntimePlatform for WindowsRuntimePlatform {
+    fn begin_attempt_monitor(&mut self) -> Result<bool, AgentError> {
+        if self.input_monitor.is_some() {
+            return Ok(false);
+        }
+        self.input_monitor = Some(fairypam_agent_windows::LocalInputMonitor::start()?);
+        Ok(true)
+    }
+
+    fn check_attempt_environment(&mut self) -> Result<(), AgentError> {
+        let Some(monitor) = self.input_monitor.as_ref() else {
+            return Ok(());
+        };
+        if let Err(error) = monitor.check() {
+            let release_error = self.release_task_input().err();
+            return Err(AgentError::new(
+                error.code(),
+                match release_error {
+                    Some(release) => format!("{error}; input release failed: {release}"),
+                    None => error.to_string(),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_attempt_monitor(&mut self) {
+        self.input_monitor = None;
+    }
+
     fn start_task_target(
         &mut self,
         profile: &VerifiedProfile,
     ) -> Result<TargetBinding, AgentError> {
-        use fairypam_agent_core::platform::TargetPlatform;
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 
-        if let Some(owned) = self.owned.as_ref() {
-            if owned.binding.profile_id != profile.profile().id {
+        let executable = crate::observability::resolve_profile_executable(profile)?;
+        if let Some(managed) = self.managed.as_ref() {
+            if managed.binding.profile_id != profile.profile().id {
                 return Err(AgentError::new(
                     "target_invalid",
-                    "an Agent-owned target for another Profile is already active",
+                    "an Agent-managed target for another Profile is already active",
                 ));
             }
-            let process_id = owned.binding.process_id;
-            let candidate = self
-                .targets
-                .enumerate(profile)?
-                .into_iter()
-                .find(|candidate| candidate.process_id == process_id)
-                .ok_or_else(|| {
-                    AgentError::new(
-                        "target_invalid",
-                        "the Agent-owned target is no longer a signed Profile candidate",
-                    )
-                })?;
-            let binding = self.targets.lock(profile, candidate.selector)?;
-            self.owned.as_mut().expect("checked above").binding = binding.clone();
+            let process_id = managed.binding.process_id;
+            if !fairypam_agent_windows::process_matches_executable(process_id, &executable)? {
+                self.managed = None;
+            } else {
+                let binding = self.wait_for_process_window(
+                    profile,
+                    process_id,
+                    Instant::now() + Duration::from_secs(120),
+                )?;
+                self.managed.as_mut().expect("checked above").binding = binding.clone();
+                self.rediscovery_used = false;
+                return Ok(binding);
+            }
+        }
+        let existing = fairypam_agent_windows::matching_process_ids(&executable)?;
+        if existing.len() > 1 {
+            return Err(AgentError::new(
+                "target.ambiguous",
+                "multiple signed Profile processes are already running",
+            ));
+        }
+        if let Some(process_id) = existing.first().copied() {
+            let binding = self.wait_for_process_window(
+                profile,
+                process_id,
+                Instant::now() + Duration::from_secs(120),
+            )?;
+            self.managed = Some(ManagedGameProcess {
+                _child: None,
+                job: None,
+                executable,
+                binding: binding.clone(),
+            });
             self.rediscovery_used = false;
             return Ok(binding);
         }
-        let executable = crate::observability::resolve_profile_executable(profile)?;
         let working_directory = executable.parent().ok_or_else(|| {
             AgentError::new(
                 "target_invalid",
@@ -2064,46 +2221,18 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 "task target could not be assigned to its cleanup Job Object",
             ));
         }
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let binding = loop {
-            if child
-                .try_wait()
-                .map_err(|error| AgentError::new("target.launch_failed", error.to_string()))?
-                .is_some()
-            {
-                return Err(AgentError::new(
-                    "target.launch_failed",
-                    "task target exited before its trusted window was ready",
-                ));
-            }
-            if self
-                .targets
-                .enumerate(profile)?
-                .into_iter()
-                .any(|candidate| candidate.process_id == child.id())
-            {
-                std::thread::sleep(Duration::from_secs(5));
-                if let Some(stable_candidate) = self
-                    .targets
-                    .enumerate(profile)?
-                    .into_iter()
-                    .find(|candidate| candidate.process_id == child.id())
-                {
-                    break self.targets.lock(profile, stable_candidate.selector)?;
-                }
-            }
-            if Instant::now() >= deadline {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let binding = match self.wait_for_process_window(profile, child.id(), deadline) {
+            Ok(binding) => binding,
+            Err(error) => {
                 let _ = child.kill();
-                return Err(AgentError::new(
-                    "target.launch_failed",
-                    "task target window did not become ready within 60 seconds",
-                ));
+                return Err(error);
             }
-            std::thread::sleep(Duration::from_millis(250));
         };
-        self.owned = Some(OwnedTaskProcess {
-            _child: child,
-            job: job.into_raw(),
+        self.managed = Some(ManagedGameProcess {
+            _child: Some(child),
+            job: Some(job.into_raw()),
+            executable,
             binding: binding.clone(),
         });
         self.rediscovery_used = false;
@@ -2139,17 +2268,18 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         }
         self.rediscovery_used = true;
         let refreshed = self.targets.rediscover(profile, binding)?;
-        if let Some(owned) = self.owned.as_mut() {
-            if owned.binding.process_id != refreshed.process_id
-                || owned.binding.process_started_at_unix_ms != refreshed.process_started_at_unix_ms
-                || owned.binding.process_path_sha256 != refreshed.process_path_sha256
+        if let Some(managed) = self.managed.as_mut() {
+            if managed.binding.process_id != refreshed.process_id
+                || managed.binding.process_started_at_unix_ms
+                    != refreshed.process_started_at_unix_ms
+                || managed.binding.process_path_sha256 != refreshed.process_path_sha256
             {
                 return Err(AgentError::new(
                     "target.stale",
-                    "rediscovered window does not belong to the Agent-owned process",
+                    "rediscovered window does not belong to the Agent-managed process",
                 ));
             }
-            owned.binding = refreshed.clone();
+            managed.binding = refreshed.clone();
         }
         Ok(refreshed)
     }
@@ -2161,11 +2291,24 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         encoding: RuntimeCaptureEncoding,
     ) -> Result<Box<dyn RuntimeCapture>, AgentError> {
         use fairypam_agent_windows::CaptureEncoding;
+        self.check_attempt_environment()?;
         let encoding = match encoding {
             RuntimeCaptureEncoding::Jpeg { quality } => CaptureEncoding::Jpeg { quality },
             RuntimeCaptureEncoding::Png => CaptureEncoding::Png,
         };
-        let capture = self.targets.start_capture(binding, region, encoding)?;
+        let capture = self
+            .targets
+            .start_capture(binding, region, encoding)
+            .map_err(|error| {
+                let release_error = self.release_task_input().err();
+                AgentError::new(
+                    error.code(),
+                    match release_error {
+                        Some(release) => format!("{error}; input release failed: {release}"),
+                        None => error.to_string(),
+                    },
+                )
+            })?;
         Ok(Box::new(WindowsCapture { capture }))
     }
 
@@ -2173,24 +2316,33 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         self.targets.focus(binding)
     }
 
-    fn close(&mut self, binding: &TargetBinding, timeout: Duration) -> Result<(), AgentError> {
-        if let Some(owned) = self.owned.as_ref() {
-            if owned.binding.process_id != binding.process_id
-                || owned.binding.window_handle != binding.window_handle
-            {
-                return Err(AgentError::new(
-                    "target_invalid",
-                    "refusing to close a target not owned by this task",
-                ));
-            }
+    fn close(&mut self, binding: &TargetBinding, _timeout: Duration) -> Result<(), AgentError> {
+        let Some(managed) = self.managed.as_ref() else {
+            return Ok(());
+        };
+        if managed.binding.process_id != binding.process_id
+            || managed.binding.process_started_at_unix_ms != binding.process_started_at_unix_ms
+            || managed.binding.process_path_sha256 != binding.process_path_sha256
+        {
+            return Err(AgentError::new(
+                "target_invalid",
+                "refusing to close a target not managed by this Agent",
+            ));
         }
-        if let Err(error) = self.targets.close(binding, timeout) {
-            if self.owned.is_some() || !matches!(error.code(), "target.stale" | "target.not_found")
-            {
+        let executable = managed.executable.clone();
+        if let Err(error) = self.targets.close(binding, Duration::from_secs(5)) {
+            let still_running = fairypam_agent_windows::matching_process_ids(&executable)?
+                .contains(&binding.process_id);
+            if !still_running {
+                self.managed = None;
+                return Ok(());
+            }
+            if error.code() == "target.stale" {
                 return Err(error);
             }
+            self.targets.terminate(binding, Duration::from_secs(5))?;
         }
-        self.owned = None;
+        self.managed = None;
         Ok(())
     }
 
@@ -2204,9 +2356,11 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         use fairypam_agent_core::state::{Machine, SessionIdentity};
         use fairypam_agent_input::{ActionMap, GuardianProcessClient};
 
+        self.check_attempt_environment()?;
         self.release_task_input()?;
         let now = Instant::now();
         let snapshot = self.targets.focus(binding)?;
+        self.check_attempt_environment()?;
         let session = SessionIdentity {
             agent_id: session.agent_id.clone(),
             session_id: session.session_id.clone(),
@@ -2253,15 +2407,19 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         keys: &[v2::PhysicalKey],
         mouse_buttons: &[i32],
         wheel_delta: i32,
+        source_frame: Option<(&AtomicU64, u64)>,
+        client_point: Option<(i32, u32, u32)>,
     ) -> Result<(), AgentError> {
-        use fairypam_agent_input::{InputPermit, SemanticMouseButton};
+        use fairypam_agent_input::InputPermit;
 
+        self.check_attempt_environment()?;
         if self.task_input.is_none() {
             self.start_task_input(profile, binding, session, expires_at)?;
         }
         let now = Instant::now();
         self.validate_task_input_session(session)?;
         let snapshot = self.focus_task_input_target(binding)?;
+        self.check_attempt_environment()?;
         if !snapshot.foreground || snapshot.minimized || !snapshot.capturable {
             let _ = self.release_task_input();
             return Err(AgentError::new(
@@ -2271,17 +2429,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         }
         let buttons = mouse_buttons
             .iter()
-            .map(|button| match v2::MouseButton::try_from(*button) {
-                Ok(v2::MouseButton::Left) => Ok(SemanticMouseButton::Left),
-                Ok(v2::MouseButton::Right) => Ok(SemanticMouseButton::Right),
-                Ok(v2::MouseButton::Middle) => Ok(SemanticMouseButton::Middle),
-                Ok(v2::MouseButton::X1) => Ok(SemanticMouseButton::X1),
-                Ok(v2::MouseButton::X2) => Ok(SemanticMouseButton::X2),
-                _ => Err(AgentError::new(
-                    "input.frame_invalid",
-                    "input frame contains an invalid mouse button",
-                )),
-            })
+            .map(|button| semantic_mouse_button(*button))
             .collect::<Result<Vec<_>, _>>()?;
         let keys = keys
             .iter()
@@ -2293,6 +2441,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         let permit = InputPermit::from_capability(
             input.machine.issue_input_capability(now, &snapshot, true)?,
         );
+        ensure_current_source_frame(source_frame)?;
         input
             .input
             .apply_physical_frame(
@@ -2305,6 +2454,22 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 &permit,
                 now,
             )
+            .and_then(|()| {
+                let Some((button, x_ppm, y_ppm)) = client_point else {
+                    return Ok(());
+                };
+                ensure_current_source_frame(source_frame).map_err(|error| {
+                    fairypam_agent_input::SafetyError::new(error.code(), error.to_string())
+                })?;
+                input.input.execute_client_point(
+                    semantic_mouse_button(button)?,
+                    x_ppm,
+                    y_ppm,
+                    &input.session,
+                    &permit,
+                    now,
+                )
+            })
             .map_err(|error| AgentError::new(error.code(), error.to_string()))
     }
 
@@ -2317,8 +2482,10 @@ impl RuntimePlatform for WindowsRuntimePlatform {
     ) -> Result<(), AgentError> {
         use fairypam_agent_input::{ActionId, InputPermit};
 
+        self.check_attempt_environment()?;
         self.validate_task_input_session(session)?;
         let snapshot = self.focus_task_input_target(binding)?;
+        self.check_attempt_environment()?;
         if !snapshot.foreground || snapshot.minimized || !snapshot.capturable {
             let _ = self.release_task_input();
             return Err(AgentError::new(
@@ -2382,7 +2549,7 @@ mod tests {
 
     use ed25519_dalek::{Signer, SigningKey};
     use fairypam_agent_core::profile::{
-        profile_content_sha256, verify_profile, ActionDefinition, CaptureSource,
+        profile_content_sha256, verify_profile, ActionDefinition, CaptureSource, ClientPointButton,
         Ed25519SignatureVerifier, Profile, ProfileContent, ProfileEnvelope, TargetRules,
     };
     use fairypam_agent_core::target::{ClientRect, IntegrityLevel, TargetSnapshot};
@@ -2429,6 +2596,12 @@ mod tests {
                     (
                         M1_ACTION_ID.into(),
                         ActionDefinition::Pulse { scan_code: 44 },
+                    ),
+                    (
+                        "combat.normal_attack".into(),
+                        ActionDefinition::ClientPointClick {
+                            button: ClientPointButton::Left,
+                        },
                     ),
                 ]),
             },
@@ -2547,6 +2720,12 @@ mod tests {
         close_calls: Vec<(TargetBinding, Duration)>,
         input_active: bool,
         pulse_calls: Vec<String>,
+        point_clicks: usize,
+        advance_source_before_click: bool,
+        begin_monitor_calls: usize,
+        finish_monitor_calls: usize,
+        monitor_active: bool,
+        fail_begin_monitor: bool,
         fail_close: bool,
         capture_error: Option<AgentError>,
     }
@@ -2557,6 +2736,28 @@ mod tests {
     }
 
     impl RuntimePlatform for FakePlatform {
+        fn begin_attempt_monitor(&mut self) -> Result<bool, AgentError> {
+            let mut state = self.state.lock().unwrap();
+            state.begin_monitor_calls += 1;
+            if state.fail_begin_monitor {
+                return Err(AgentError::new(
+                    "environment.monitor_failed",
+                    "simulated input monitor failure",
+                ));
+            }
+            if state.monitor_active {
+                return Ok(false);
+            }
+            state.monitor_active = true;
+            Ok(true)
+        }
+
+        fn finish_attempt_monitor(&mut self) {
+            let mut state = self.state.lock().unwrap();
+            state.finish_monitor_calls += 1;
+            state.monitor_active = false;
+        }
+
         fn start_task_target(
             &mut self,
             _profile: &VerifiedProfile,
@@ -2681,8 +2882,19 @@ mod tests {
             _keys: &[v2::PhysicalKey],
             _buttons: &[i32],
             _wheel_delta: i32,
+            source_frame: Option<(&AtomicU64, u64)>,
+            client_point: Option<(i32, u32, u32)>,
         ) -> Result<(), AgentError> {
-            self.state.lock().unwrap().input_active = true;
+            let mut state = self.state.lock().unwrap();
+            ensure_current_source_frame(source_frame)?;
+            state.input_active = true;
+            if client_point.is_some() && state.advance_source_before_click {
+                if let Some((current, _)) = source_frame {
+                    current.fetch_add(1, Ordering::Release);
+                }
+            }
+            ensure_current_source_frame(source_frame)?;
+            state.point_clicks += usize::from(client_point.is_some());
             Ok(())
         }
 
@@ -2880,6 +3092,123 @@ mod tests {
         let executor = CommandExecutor::production(ProfileStore::default());
 
         assert_eq!(executor.runtime_mode, "production");
+    }
+
+    #[test]
+    fn session_reset_keeps_the_managed_target_until_agent_shutdown() {
+        let (mut executor, state) = executor_with_state();
+        executor.active_profile = Some(verified_profile());
+        executor.binding = Some(binding());
+        state.lock().unwrap().target_owned = true;
+
+        executor.reset_session().unwrap();
+        assert!(executor.binding.is_some());
+        assert!(state.lock().unwrap().close_calls.is_empty());
+
+        executor.shutdown().unwrap();
+        assert!(executor.binding.is_none());
+        assert_eq!(state.lock().unwrap().close_calls.len(), 1);
+    }
+
+    #[test]
+    fn v2_client_point_click_reaches_the_device_path() {
+        let profile = verified_profile();
+        let mut contract = v2::ExecutionContract {
+            task_run_id: "11111111-1111-4111-8111-111111111111".into(),
+            attempt_id: "22222222-2222-4222-8222-222222222222".into(),
+            agent_build_id: option_env!("FAIRYPAM_BUILD_ID").unwrap_or("unknown").into(),
+            profile_id: profile.profile().id.clone(),
+            profile_digest: profile.content_sha256().into(),
+            allowed_capabilities: vec![1, 2, 3, 5],
+            deadline_unix_ms: i64::MAX,
+            max_input_lease_ms: 1000,
+            cleanup_policy: v2::CleanupPolicy::ReleaseInputKeepManagedTarget as i32,
+            contract_version: 2,
+            contract_digest: String::new(),
+        };
+        contract.contract_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                fairypam_agent_protocol::canonical_execution_contract(&contract).unwrap()
+            )
+        );
+        let reference = AgentAttemptContractV1 {
+            task_run_id: contract.task_run_id.clone(),
+            attempt_id: contract.attempt_id.clone(),
+            agent_build_id: contract.agent_build_id.clone(),
+            profile_id: contract.profile_id.clone(),
+            profile_digest: contract.profile_digest.clone(),
+            cleanup_policy: "close_owned_target".into(),
+            contract_version: contract.contract_version,
+            contract_digest: contract.contract_digest.clone(),
+        };
+        let (mut executor, state) = executor_with_state();
+        state.lock().unwrap().fail_begin_monitor = true;
+        assert!(matches!(
+            executor.execute_v2_begin(&task_ref(&reference, "begin"), &contract),
+            CommandOutcome::Nack { ref code, .. } if code == "environment.monitor_failed"
+        ));
+        state.lock().unwrap().fail_begin_monitor = false;
+        assert!(matches!(
+            executor.execute_v2_begin(&task_ref(&reference, "begin"), &contract),
+            CommandOutcome::TaskAck { .. }
+        ));
+        assert_eq!(state.lock().unwrap().begin_monitor_calls, 2);
+        executor.binding = Some(binding());
+        let click = task_ref(&reference, "click");
+        let attempt = click.attempt.as_ref().unwrap();
+        executor.frame_sequences.insert(
+            frame_sequence_key("client", Some(attempt)),
+            Arc::new(AtomicU64::new(7)),
+        );
+
+        assert!(matches!(
+            executor.execute_v2_input_frame(
+                &click,
+                &v2::InputFrame {
+                    input_sequence: 1,
+                    lease_ms: 500,
+                    source_frame_sequence: Some(7),
+                    ..v2::InputFrame::default()
+                },
+                Some((v2::MouseButton::Left as i32, 500_000, 583_333)),
+            ),
+            CommandOutcome::TaskAck { .. }
+        ));
+        assert_eq!(state.lock().unwrap().point_clicks, 1);
+
+        let (mut stale_executor, stale_state) = executor_with_state();
+        assert!(matches!(
+            stale_executor.execute_v2_begin(&task_ref(&reference, "stale-begin"), &contract),
+            CommandOutcome::TaskAck { .. }
+        ));
+        stale_executor.binding = Some(binding());
+        let stale_click = task_ref(&reference, "stale-click");
+        let stale_attempt = stale_click.attempt.as_ref().unwrap();
+        stale_executor.frame_sequences.insert(
+            frame_sequence_key("client", Some(stale_attempt)),
+            Arc::new(AtomicU64::new(7)),
+        );
+        stale_state.lock().unwrap().advance_source_before_click = true;
+        let outcome = stale_executor.execute_v2_input_frame(
+            &stale_click,
+            &v2::InputFrame {
+                input_sequence: 1,
+                lease_ms: 500,
+                source_frame_sequence: Some(7),
+                ..v2::InputFrame::default()
+            },
+            Some((v2::MouseButton::Left as i32, 500_000, 583_333)),
+        );
+
+        assert!(matches!(
+            outcome,
+            CommandOutcome::TaskAck {
+                receipt,
+                ..
+            } if receipt.error_code.as_deref() == Some("source_frame_stale")
+        ));
+        assert_eq!(stale_state.lock().unwrap().point_clicks, 0);
     }
 
     #[test]
@@ -3252,7 +3581,7 @@ mod tests {
             contract.attempt_id
         );
         assert_eq!(state.lock().unwrap().launch_calls, 1);
-        assert_eq!(state.lock().unwrap().close_calls.len(), 1);
+        assert!(state.lock().unwrap().close_calls.is_empty());
     }
 
     #[test]
@@ -3337,7 +3666,7 @@ mod tests {
         assert_eq!(stopped["state"], "EmergencyStopped");
         assert_eq!(stopped["cleanup_complete"], true);
         assert!(!state.lock().unwrap().input_active);
-        assert_eq!(state.lock().unwrap().close_calls.len(), 1);
+        assert!(state.lock().unwrap().close_calls.is_empty());
         assert_eq!(
             executor.execute_local(&LocalCommand::Status).unwrap()["state"],
             "EmergencyStopped"
@@ -3371,7 +3700,7 @@ mod tests {
         );
         assert_eq!(
             executor.execute_local(&LocalCommand::Status).unwrap()["state"],
-            "ConnectedIdle"
+            "TargetLocked"
         );
         assert_eq!(
             executor.execute_local(&LocalCommand::Status).unwrap()["task_active"],
@@ -3514,10 +3843,14 @@ mod tests {
                     && receipt.error_code.as_deref() == Some("transport.frame_paused")
         ));
 
-        state.lock().unwrap().capture_error = Some(AgentError::new(
-            "target.focus_failed",
-            "target did not become the foreground window; request_accepted=false, foreground_pid=42, target_pid=84",
-        ));
+        {
+            let mut state = state.lock().unwrap();
+            state.input_active = true;
+            state.capture_error = Some(AgentError::new(
+                "target.focus_failed",
+                "target did not become the foreground window; request_accepted=false, foreground_pid=42, target_pid=84",
+            ));
+        }
         let focus_failed = HubControlCommand {
             payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {
                 source_id: "client".into(),
@@ -3541,6 +3874,7 @@ mod tests {
                 && diagnostic.contains("foreground_pid=42")
                 && diagnostic.contains("target_pid=84")
         ));
+        assert!(!state.lock().unwrap().input_active);
     }
 
     #[test]
