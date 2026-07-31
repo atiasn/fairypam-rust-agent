@@ -139,10 +139,10 @@ impl GuardianProcessClient {
                 }
             })?;
         receiver
-            .recv_timeout(Duration::from_millis(250))
+            .recv_timeout(Duration::from_secs(1))
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => {
-                    SafetyError::new("guardian.deadline", "guardian response exceeded 250 ms")
+                    SafetyError::new("guardian.deadline", "guardian response exceeded 1 second")
                 }
                 mpsc::RecvTimeoutError::Disconnected => {
                     SafetyError::new("guardian.disconnected", "guardian I/O worker disconnected")

@@ -731,24 +731,20 @@ impl TaskAttemptRuntime {
         &mut self,
         task: &TaskCommandRef,
         source_frame_sequence: Option<u64>,
-        applied: bool,
+        outcome: TaskCommandOutcomeState,
         holds_active: bool,
         error_code: Option<&str>,
     ) -> Result<TaskCommandResult, AgentError> {
         self.complete(
             task,
-            if applied {
-                TaskCommandOutcomeState::Applied
-            } else {
-                TaskCommandOutcomeState::Uncertain
-            },
+            outcome,
             source_frame_sequence,
             error_code,
             true,
             |state| {
-                state.input_state = if applied && holds_active {
+                state.input_state = if outcome == TaskCommandOutcomeState::Applied && holds_active {
                     TaskInputState::Active as i32
-                } else if applied {
+                } else if outcome != TaskCommandOutcomeState::Uncertain {
                     TaskInputState::Released as i32
                 } else {
                     TaskInputState::Unknown as i32
@@ -2023,6 +2019,43 @@ mod tests {
             TaskSideEffectState::Uncertain as i32
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn definitely_not_applied_input_allows_cleanup() {
+        let contract = contract();
+        let begin = task(&contract, "begin-1", 'a');
+        let input = task(&contract, "input-1", 'b');
+        let finish = task(&contract, "finish-1", 'c');
+        let mut runtime = TaskAttemptRuntime::memory();
+        runtime.begin(&begin, &contract).unwrap();
+        assert!(runtime.prepare(&input, true).unwrap().is_none());
+
+        let rejected = runtime
+            .complete_input_frame(
+                &input,
+                None,
+                TaskCommandOutcomeState::NotApplied,
+                false,
+                Some("guardian.unavailable"),
+            )
+            .unwrap();
+        assert_eq!(
+            rejected.receipt.side_effect_state,
+            TaskSideEffectState::NotApplied as i32
+        );
+        assert_eq!(
+            rejected.receipt.input_state,
+            TaskInputState::Released as i32
+        );
+
+        assert!(runtime.prepare_finish(&finish).unwrap().is_none());
+        assert!(runtime
+            .complete_finish(&finish, true, true, false, None)
+            .unwrap()
+            .receipt
+            .cleanup_complete
+            .unwrap());
     }
 
     #[test]

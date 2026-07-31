@@ -522,11 +522,12 @@ impl CommandExecutor {
                     client_point,
                 )
                 .err();
+            let outcome = input_frame_outcome(error.as_ref());
             Ok(CommandOutcome::task(
                 self.task_attempt.complete_input_frame(
                     task,
                     frame.source_frame_sequence,
-                    error.is_none(),
+                    outcome,
                     !frame.held_keys.is_empty() || !frame.held_mouse_buttons.is_empty(),
                     error.as_ref().map(AgentError::code),
                 )?,
@@ -1566,6 +1567,14 @@ fn task_reference_invalid() -> AgentError {
     )
 }
 
+fn input_frame_outcome(error: Option<&AgentError>) -> TaskCommandOutcomeState {
+    match error.map(AgentError::code) {
+        None => TaskCommandOutcomeState::Applied,
+        Some("guardian.unavailable") => TaskCommandOutcomeState::NotApplied,
+        Some(_) => TaskCommandOutcomeState::Uncertain,
+    }
+}
+
 fn task_payload_allowed(payload: Option<&hub_control_command::Payload>) -> bool {
     use hub_control_command::Payload;
     match payload {
@@ -2383,7 +2392,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         let guardian = GuardianProcessClient::spawn(
             &Self::task_guardian_path()?,
             action_map.physical_holds(),
-            Duration::from_millis(300),
+            Duration::from_millis(1_500),
             None,
         )
         .map_err(|error| AgentError::new("guardian.unavailable", error.to_string()))?;
@@ -4044,6 +4053,22 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.close_calls.len(), 1);
         assert_eq!(state.close_calls[0].1, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn guardian_start_failure_is_definitely_not_applied() {
+        let guardian = AgentError::new("guardian.unavailable", "guardian did not start");
+        let other = AgentError::new("input.failed", "input result is unknown");
+
+        assert_eq!(input_frame_outcome(None), TaskCommandOutcomeState::Applied);
+        assert_eq!(
+            input_frame_outcome(Some(&guardian)),
+            TaskCommandOutcomeState::NotApplied
+        );
+        assert_eq!(
+            input_frame_outcome(Some(&other)),
+            TaskCommandOutcomeState::Uncertain
+        );
     }
 
     #[cfg(not(windows))]
