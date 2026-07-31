@@ -105,9 +105,16 @@ for (const forbidden of ['CngMachine', 'rustls-cng', 'rustls_cng', 'Microsoft So
 if (!transport.includes('identity_key_pem')) fail('transport must use the protected PEM identity');
 
 const windowsTarget = readAgent('crates/fairypam-agent-windows/src/window.rs');
-for (const required of ['for _ in 0..2', 'api.focus_target(&current.identity, true)', 'api.click_target_point(&current.identity, 1, 1)']) {
+for (const required of [
+  'fn revalidate_or_focus_target(',
+  'Duration::from_secs(5)',
+  'api.check_environment()?',
+  'api.focus_target(&current.identity, true)',
+  'Duration::from_millis(200)',
+]) {
   if (!windowsTarget.includes(required)) fail(`missing shared foreground recovery ${required}`);
 }
+if (windowsTarget.includes('click_target_point')) fail('foreground recovery must not click');
 const execution = readAgent('bins/fairypam-agent/src/execution.rs');
 if ((execution.match(/self\.focus_task_input_target\(binding\)\?/g) ?? []).length !== 2
     || (execution.match(/self\.validate_task_input_session\(session\)\?/g) ?? []).length !== 2
