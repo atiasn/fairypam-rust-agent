@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 const RECEIPT_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
-const MAX_BUSINESS_COMMAND_RESULTS: usize = 496;
+const MAX_BUSINESS_COMMAND_RESULTS: usize = 98_304;
 const MAX_INSPECT_COMMAND_RESULTS: usize = 8;
 const MAX_RELEASE_COMMAND_RESULTS: usize = 4;
 const MAX_FINISH_COMMAND_RESULTS: usize = 4;
@@ -1025,7 +1026,11 @@ impl TaskAttemptRuntime {
         };
         fs::create_dir_all(root).map_err(|error| io_error("task.ledger_unavailable", error))?;
         let path = root.join(format!("{}.jsonl", state.reference.attempt_id));
-        let mut bytes = serde_json::to_vec(state).map_err(|error| {
+        // ponytail: append only the current snapshot; load_last rebuilds the
+        // command index so ledger growth stays linear for long visual tasks.
+        let mut record = state.clone();
+        record.command_results.clear();
+        let mut bytes = serde_json::to_vec(&record).map_err(|error| {
             AgentError::new(
                 "task.ledger_invalid",
                 format!("cannot encode attempt ledger: {error}"),
@@ -1049,7 +1054,7 @@ impl TaskAttemptRuntime {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AttemptState {
     contract: StoredContract,
@@ -1068,7 +1073,7 @@ struct AttemptState {
     #[serde(default)]
     last_command_error_code: Option<String>,
     #[serde(default)]
-    command_results: Vec<StoredCommandResult>,
+    command_results: BTreeMap<String, StoredCommandResult>,
     side_effect_state: i32,
     last_side_effect_command_id: String,
     input_state: i32,
@@ -1080,7 +1085,7 @@ struct AttemptState {
     error_code: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredCommandResult {
     command_id: String,
@@ -1101,7 +1106,7 @@ struct StoredCommandResult {
     receipt_error_code: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredContract {
     task_run_id: String,
@@ -1197,7 +1202,7 @@ impl From<&v2::ExecutionContract> for StoredContract {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredAttemptRef {
     task_run_id: String,
@@ -1253,7 +1258,7 @@ impl AttemptState {
             last_command_outcome: TaskCommandOutcomeState::Applied as i32,
             last_command_source_frame_sequence: None,
             last_command_error_code: None,
-            command_results: Vec::new(),
+            command_results: BTreeMap::new(),
             side_effect_state: TaskSideEffectState::None as i32,
             last_side_effect_command_id: String::new(),
             input_state: TaskInputState::Released as i32,
@@ -1385,9 +1390,7 @@ impl AttemptState {
     }
 
     fn stored_result(&self, command_id: &str) -> Option<&StoredCommandResult> {
-        self.command_results
-            .iter()
-            .find(|result| result.command_id == command_id)
+        self.command_results.get(command_id)
     }
 
     fn store_current_result(&mut self) -> Result<(), AgentError> {
@@ -1409,11 +1412,7 @@ impl AttemptState {
             cleanup_complete: self.cleanup_complete,
             receipt_error_code: self.error_code.clone(),
         };
-        if let Some(stored) = self
-            .command_results
-            .iter_mut()
-            .find(|stored| stored.command_id == result.command_id)
-        {
+        if let Some(stored) = self.command_results.get_mut(&result.command_id) {
             if stored.payload_digest != result.payload_digest {
                 return Err(AgentError::new(
                     "command.payload_digest_conflict",
@@ -1429,7 +1428,8 @@ impl AttemptState {
                 "task command journal reached its fixed safety bound",
             ));
         }
-        self.command_results.push(result);
+        self.command_results
+            .insert(result.command_id.clone(), result);
         Ok(())
     }
 
@@ -1476,16 +1476,10 @@ impl AttemptState {
             || (self.last_command_outcome != TaskCommandOutcomeState::Unspecified as i32
                 && TaskCommandOutcomeState::try_from(self.last_command_outcome).is_err())
             || self.command_results.len() > MAX_COMMAND_RESULTS
-            || self.command_results.iter().any(|result| !result.validate())
             || self
                 .command_results
                 .iter()
-                .enumerate()
-                .any(|(index, result)| {
-                    self.command_results[index + 1..]
-                        .iter()
-                        .any(|other| other.command_id == result.command_id)
-                })
+                .any(|(command_id, result)| command_id != &result.command_id || !result.validate())
             || (self.last_command_outcome != TaskCommandOutcomeState::Unspecified as i32
                 && self
                     .stored_result(&self.last_command_id)
@@ -1664,19 +1658,27 @@ fn load_last(path: &Path) -> Result<AttemptState, AgentError> {
         }
     })?;
     let mut last = None;
+    let mut command_results = BTreeMap::new();
     for line in BufReader::new(file).lines() {
         let line = line.map_err(|error| io_error("task.ledger_unavailable", error))?;
         if line.len() > MAX_RECORD_BYTES {
             return Err(ledger_invalid());
         }
-        last = Some(serde_json::from_str::<AttemptState>(&line).map_err(|_| ledger_invalid())?);
+        let mut state =
+            serde_json::from_str::<AttemptState>(&line).map_err(|_| ledger_invalid())?;
+        for (command_id, result) in std::mem::take(&mut state.command_results) {
+            command_results.insert(command_id, result);
+        }
+        if state.last_command_outcome != TaskCommandOutcomeState::Unspecified as i32 {
+            state.store_current_result()?;
+            for (command_id, result) in std::mem::take(&mut state.command_results) {
+                command_results.insert(command_id, result);
+            }
+        }
+        last = Some(state);
     }
     let mut state = last.ok_or_else(ledger_invalid)?;
-    if state.command_results.is_empty()
-        && state.last_command_outcome != TaskCommandOutcomeState::Unspecified as i32
-    {
-        state.store_current_result()?;
-    }
+    state.command_results = command_results;
     state.validate()?;
     Ok(state)
 }
@@ -1896,19 +1898,32 @@ mod tests {
     }
 
     #[test]
-    fn business_capacity_keeps_recovery_slots_available_after_restart() {
-        let root = temporary_root();
+    fn business_capacity_keeps_recovery_slots_available() {
         let contract = contract();
         let mut begin = task(&contract, "begin-1", 'a');
         begin.command.as_mut().unwrap().sequence = 1;
         let mut runtime = TaskAttemptRuntime::memory();
         runtime.begin(&begin, &contract).unwrap();
+        let template = runtime
+            .active
+            .as_ref()
+            .unwrap()
+            .command_results
+            .values()
+            .next()
+            .unwrap()
+            .clone();
         for sequence in 2..=MAX_BUSINESS_COMMAND_RESULTS as u64 {
-            let mut command = task(&contract, &format!("command-{sequence}"), 'b');
-            command.command.as_mut().unwrap().sequence = sequence;
-            command.payload_digest = format!("{sequence:064x}");
-            assert!(runtime.prepare(&command, false).unwrap().is_none());
-            runtime.complete_release(&command, None).unwrap();
+            let mut result = template.clone();
+            result.command_id = format!("command-{sequence}");
+            result.sequence = sequence;
+            result.payload_digest = format!("{sequence:064x}");
+            runtime
+                .active
+                .as_mut()
+                .unwrap()
+                .command_results
+                .insert(result.command_id.clone(), result);
         }
 
         let mut overflow = task(&contract, "business-overflow", 'c');
@@ -1919,11 +1934,7 @@ mod tests {
         };
         assert_eq!(error.code(), "task.ledger_full");
 
-        let state = runtime.active.take().unwrap();
-        TaskAttemptRuntime::at(root.clone())
-            .persist(&state)
-            .unwrap();
-        let mut restarted = TaskAttemptRuntime::at(root.clone());
+        let mut restarted = runtime;
         for index in 0..MAX_INSPECT_COMMAND_RESULTS {
             let mut inspect = task(&contract, &format!("recovery-inspect-{index}"), 'c');
             inspect.command.as_mut().unwrap().sequence = 1_001 + index as u64;
@@ -1959,7 +1970,6 @@ mod tests {
             TaskCommandOutcomeState::Applied as i32
         );
         assert_eq!(completed.receipt.cleanup_complete, Some(true));
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

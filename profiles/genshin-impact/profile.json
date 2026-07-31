@@ -3,7 +3,7 @@
     "schema_version": 1,
     "profile": {
       "id": "genshin-impact",
-      "version": "1.2.0",
+      "version": "1.4.0",
       "display_name": "原神",
       "target": {
         "process_names": ["YuanShen.exe"],
@@ -28,13 +28,18 @@
       ],
       "actions": {
         "combat.normal_attack": {"kind": "client_point_click", "button": "left"},
-        "environment.escape": {"kind": "pulse", "scan_code": 1},
         "gadget.quick_use": {"kind": "pulse", "scan_code": 44},
-        "move.forward": {"kind": "hold", "scan_code": 17}
+        "inventory.open": {"kind": "pulse", "scan_code": 48},
+        "inventory.scroll": {"kind": "wheel", "maximum_delta": 1200},
+        "menu.open": {"kind": "pulse", "scan_code": 1},
+        "move.backward": {"kind": "hold", "scan_code": 31},
+        "move.forward": {"kind": "hold", "scan_code": 17},
+        "move.left": {"kind": "hold", "scan_code": 30},
+        "move.right": {"kind": "hold", "scan_code": 32}
       }
     },
     "files": []
   },
-  "content_sha256": "29fa8298e433c310ef3779cdc1bd817911d09216c933b782b2cebe84e50fef77",
-  "signature": "e43d7134446f96d2cd4ab9ec821a76fec5e02580b4474cc3f670da26b5dcd6e6422aa5748ff3987a8aea2864f7ec9d613fe23821bab91706b6d09d45cfb8600c"
+  "content_sha256": "ceeb9501957a6694ef9c4e57995bd90c4ca0808edf660beaef50811739f9f3d6",
+  "signature": "c300a7dac0b143560c15ee8300b7561aa7367aa8231b33b9b7e53972b32a7464b4d5a54f9cf3d5c8720d6cf10be5b017685dd5471b32d756a9fe977494faac07"
 }

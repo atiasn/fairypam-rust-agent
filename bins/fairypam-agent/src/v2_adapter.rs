@@ -1163,7 +1163,7 @@ mod tests {
                     extended: false,
                 }],
                 held_mouse_buttons: vec![wire::MouseButton::Left as i32],
-                wheel_delta: 120,
+                wheel_delta: 1200,
                 source_frame_sequence: Some(7),
             })),
         });
@@ -1175,7 +1175,7 @@ mod tests {
         assert_eq!(frame.input_sequence, 1);
         assert_eq!(frame.held_keys[0].scan_code, 17);
         assert_eq!(frame.held_mouse_buttons, [wire::MouseButton::Left as i32]);
-        assert_eq!(frame.wheel_delta, 120);
+        assert_eq!(frame.wheel_delta, 1200);
         assert_eq!(frame.source_frame_sequence, Some(7));
     }
 
