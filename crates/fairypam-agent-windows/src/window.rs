@@ -57,15 +57,6 @@ impl Rect {
             height,
         })
     }
-
-    fn contains(&self, x: i32, y: i32) -> bool {
-        let right = i64::from(self.left) + i64::from(self.width);
-        let bottom = i64::from(self.top) + i64::from(self.height);
-        i64::from(x) >= i64::from(self.left)
-            && i64::from(x) < right
-            && i64::from(y) >= i64::from(self.top)
-            && i64::from(y) < bottom
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

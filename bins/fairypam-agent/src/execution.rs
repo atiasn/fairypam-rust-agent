@@ -2462,7 +2462,9 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                     fairypam_agent_input::SafetyError::new(error.code(), error.to_string())
                 })?;
                 input.input.execute_client_point(
-                    semantic_mouse_button(button)?,
+                    semantic_mouse_button(button).map_err(|error| {
+                        fairypam_agent_input::SafetyError::new(error.code(), error.to_string())
+                    })?,
                     x_ppm,
                     y_ppm,
                     &input.session,
