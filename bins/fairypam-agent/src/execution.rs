@@ -1757,6 +1757,26 @@ fn now_unix_us() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+#[cfg(any(windows, test))]
+fn retry_startup_identity<T>(
+    deadline: Instant,
+    retry_interval: Duration,
+    mut operation: impl FnMut() -> Result<T, AgentError>,
+) -> Result<T, AgentError> {
+    loop {
+        match operation() {
+            Err(error) if error.code() == "target.identity_unknown" => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(retry_interval.min(remaining));
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(windows)]
 fn production_platform() -> Box<dyn RuntimePlatform> {
     Box::new(WindowsRuntimePlatform::new())
@@ -2175,7 +2195,12 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 ));
             }
             let process_id = managed.binding.process_id;
-            if !fairypam_agent_windows::process_matches_executable(process_id, &executable)? {
+            let matches = retry_startup_identity(
+                Instant::now() + Duration::from_secs(30),
+                Duration::from_millis(500),
+                || fairypam_agent_windows::process_matches_executable(process_id, &executable),
+            )?;
+            if !matches {
                 self.managed = None;
             } else {
                 let binding = self.wait_for_process_window(
@@ -2188,7 +2213,11 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 return Ok(binding);
             }
         }
-        let existing = fairypam_agent_windows::matching_process_ids(&executable)?;
+        let existing = retry_startup_identity(
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_millis(500),
+            || fairypam_agent_windows::matching_process_ids(&executable),
+        )?;
         if existing.len() > 1 {
             return Err(AgentError::new(
                 "target.ambiguous",
@@ -2583,6 +2612,45 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    #[test]
+    fn startup_identity_retry_recovers_without_masking_other_errors() {
+        let mut attempts = 0;
+        let recovered = retry_startup_identity(
+            Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(AgentError::new(
+                        "target.identity_unknown",
+                        "process path is temporarily unavailable",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(recovered.is_ok());
+        assert_eq!(attempts, 2);
+
+        let error = retry_startup_identity(
+            Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+            || Err::<(), _>(AgentError::new("target.stale", "process identity changed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "target.stale");
+
+        let error = retry_startup_identity(Instant::now(), Duration::ZERO, || {
+            Err::<(), _>(AgentError::new(
+                "target.identity_unknown",
+                "process identity remained unavailable",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), "target.identity_unknown");
+    }
 
     fn verified_profile() -> VerifiedProfile {
         let signing = SigningKey::from_bytes(&[5_u8; 32]);
