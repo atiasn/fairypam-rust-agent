@@ -263,7 +263,8 @@ impl TaskAttemptRuntime {
     }
 
     pub fn recovery_blocked(&mut self) -> Result<bool, AgentError> {
-        Ok(self.recovered_active && self.is_active()?)
+        let active = self.is_active()?;
+        Ok(self.recovered_active && active)
     }
 
     pub fn profile_id(&mut self, task: &TaskCommandRef) -> Result<String, AgentError> {
