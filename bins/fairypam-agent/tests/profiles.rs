@@ -1,8 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use fairypam_agent::profile_store::ProfileStore;
-use fairypam_agent_core::profile::Ed25519SignatureVerifier;
+use fairypam_agent_core::profile::{verify_profile, Ed25519SignatureVerifier, VerifiedProfile};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -11,17 +10,24 @@ fn workspace_root() -> PathBuf {
 #[test]
 fn installed_testbed_and_genshin_profiles_verify_and_do_not_share_actions() {
     let root = workspace_root();
-    let public_key = fs::read_to_string(root.join("test-profile-root-public-key.hex")).unwrap();
-    let verifier = Ed25519SignatureVerifier::from_public_key_hex(public_key.trim()).unwrap();
-    let store = ProfileStore::load(&root.join("profiles"), &verifier).unwrap();
+    let test_root = fs::read_to_string(root.join("test-profile-root-public-key.hex")).unwrap();
+    let testbed = load_profile(&root, "fairypam-test-window", test_root.trim());
+    let genshin = load_profile(
+        &root,
+        "genshin-impact",
+        "a1fe01b263727eddd401ce276ac34ce085df8b917b4eca6d6cd7bbfb8d0fbfaa",
+    );
 
-    assert_eq!(store.ids(), vec!["fairypam-test-window", "genshin-impact"]);
-    let testbed = store.get("fairypam-test-window").unwrap();
-    let genshin = store.get("genshin-impact").unwrap();
     assert!(testbed.profile().actions.contains_key("input.pulse"));
     assert!(!genshin.profile().actions.contains_key("input.pulse"));
     assert!(genshin.profile().actions.contains_key("gadget.quick_use"));
     assert!(!testbed.profile().actions.contains_key("gadget.quick_use"));
+}
+
+fn load_profile(root: &std::path::Path, id: &str, public_key: &str) -> VerifiedProfile {
+    let bytes = fs::read(root.join("profiles").join(id).join("profile.json")).unwrap();
+    let verifier = Ed25519SignatureVerifier::from_public_key_hex(public_key).unwrap();
+    verify_profile(&bytes, &verifier).unwrap()
 }
 
 #[test]
