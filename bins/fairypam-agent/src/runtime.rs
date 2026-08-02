@@ -668,8 +668,9 @@ impl SessionDriver for GrpcSessionDriver {
         };
         let session = control.verified_session().clone();
         let frames = session.frame_slot();
+        let runtime_state = self.execution.lock().map_err(lock_error)?.runtime_state()?;
         sender
-            .try_send(status_event(&session, AgentRuntimeState::ConnectedIdle))
+            .try_send(status_event(&session, runtime_state))
             .map_err(map_transport)?;
         sender
             .try_send(v2_adapter::discovery_snapshot(
@@ -743,6 +744,8 @@ impl SessionDriver for GrpcSessionDriver {
                 }
                 _ = heartbeat.tick() => {
                     sender.try_send(heartbeat_event(&session)).map_err(map_transport)?;
+                    let runtime_state = self.execution.lock().map_err(lock_error)?.runtime_state()?;
+                    sender.try_send(status_event(&session, runtime_state)).map_err(map_transport)?;
                 }
                 _ = capture_health.tick() => {
                     let event = self

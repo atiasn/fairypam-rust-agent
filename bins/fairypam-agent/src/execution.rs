@@ -558,6 +558,19 @@ impl CommandExecutor {
             .unwrap_or_else(CommandOutcome::from_error)
     }
 
+    pub fn runtime_state(&mut self) -> Result<v2::AgentRuntimeState, AgentError> {
+        if self.task_attempt.emergency_stopped()? {
+            return Ok(v2::AgentRuntimeState::EmergencyStopped);
+        }
+        if self.task_attempt.recovery_blocked()? {
+            return Ok(v2::AgentRuntimeState::RecoveryBlocked);
+        }
+        if self.task_attempt.is_active()? {
+            return Ok(v2::AgentRuntimeState::Executing);
+        }
+        Ok(v2::AgentRuntimeState::ConnectedIdle)
+    }
+
     pub fn execute_local(
         &mut self,
         command: &LocalCommand,
@@ -3704,6 +3717,10 @@ mod tests {
             executor.execute_local(&LocalCommand::Status).unwrap()["task_active"],
             true
         );
+        assert_eq!(
+            executor.runtime_state().unwrap(),
+            v2::AgentRuntimeState::Executing
+        );
 
         for command in [
             HubControlCommand {
@@ -3764,6 +3781,10 @@ mod tests {
             false
         );
         assert_eq!(
+            executor.runtime_state().unwrap(),
+            v2::AgentRuntimeState::EmergencyStopped
+        );
+        assert_eq!(
             executor.execute_local(&LocalCommand::Doctor).unwrap()["runtime"],
             "dry_run"
         );
@@ -3793,6 +3814,10 @@ mod tests {
         assert_eq!(
             executor.execute_local(&LocalCommand::Status).unwrap()["task_active"],
             false
+        );
+        assert_eq!(
+            executor.runtime_state().unwrap(),
+            v2::AgentRuntimeState::ConnectedIdle
         );
     }
 

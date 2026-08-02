@@ -29,6 +29,7 @@ pub struct TaskAttemptRuntime {
     root: Option<PathBuf>,
     active: Option<AttemptState>,
     loaded: bool,
+    recovered_active: bool,
     emergency_stopped: bool,
 }
 
@@ -43,6 +44,7 @@ impl TaskAttemptRuntime {
             root: production_root(),
             active: None,
             loaded: false,
+            recovered_active: false,
             emergency_stopped: false,
         }
     }
@@ -52,6 +54,7 @@ impl TaskAttemptRuntime {
             root: None,
             active: None,
             loaded: true,
+            recovered_active: false,
             emergency_stopped: false,
         }
     }
@@ -62,6 +65,7 @@ impl TaskAttemptRuntime {
             root: Some(root),
             active: None,
             loaded: false,
+            recovered_active: false,
             emergency_stopped: false,
         }
     }
@@ -87,6 +91,7 @@ impl TaskAttemptRuntime {
             active.attempt_state == TaskAttemptState::Terminal as i32 && active.cleanup_complete
         }) {
             self.active = None;
+            self.recovered_active = false;
         }
 
         if let Some(active) = self.active.as_ref() {
@@ -110,6 +115,7 @@ impl TaskAttemptRuntime {
         self.persist(&state)?;
         let receipt = state.receipt();
         self.active = Some(state);
+        self.recovered_active = false;
         Ok(receipt)
     }
 
@@ -142,6 +148,7 @@ impl TaskAttemptRuntime {
             active.attempt_state == TaskAttemptState::Terminal as i32 && active.cleanup_complete
         }) {
             self.active = None;
+            self.recovered_active = false;
         }
         if let Some(active) = self.active.as_ref() {
             active.require_reference(reference)?;
@@ -162,6 +169,7 @@ impl TaskAttemptRuntime {
         self.persist(&state)?;
         let receipt = state.receipt();
         self.active = Some(state);
+        self.recovered_active = false;
         Ok(receipt)
     }
 
@@ -252,6 +260,10 @@ impl TaskAttemptRuntime {
         Ok(self.active.as_ref().is_some_and(|active| {
             active.attempt_state != TaskAttemptState::Terminal as i32 || !active.cleanup_complete
         }))
+    }
+
+    pub fn recovery_blocked(&mut self) -> Result<bool, AgentError> {
+        Ok(self.recovered_active && self.is_active()?)
     }
 
     pub fn profile_id(&mut self, task: &TaskCommandRef) -> Result<String, AgentError> {
@@ -1011,6 +1023,7 @@ impl TaskAttemptRuntime {
                     "multiple non-terminal task attempts are persisted",
                 ));
             }
+            self.recovered_active = true;
         }
         self.loaded = true;
         Ok(())
@@ -2004,12 +2017,12 @@ mod tests {
         let effect = task(&contract, "pulse-1", 'd');
         let mut runtime = TaskAttemptRuntime::at(root.clone());
         runtime.begin(&begin, &contract).unwrap();
+        assert!(!runtime.recovery_blocked().unwrap());
         assert!(runtime.prepare(&effect, true).unwrap().is_none());
 
-        let replay = TaskAttemptRuntime::at(root.clone())
-            .replay(&effect)
-            .unwrap()
-            .unwrap();
+        let mut restarted = TaskAttemptRuntime::at(root.clone());
+        assert!(restarted.recovery_blocked().unwrap());
+        let replay = restarted.replay(&effect).unwrap().unwrap();
         assert_eq!(
             replay.outcome.outcome,
             TaskCommandOutcomeState::Uncertain as i32
@@ -2161,6 +2174,7 @@ mod tests {
         );
         let retry = task(&contract, "finish-2", 'd');
         let mut restarted = TaskAttemptRuntime::at(root.clone());
+        assert!(restarted.recovery_blocked().unwrap());
         assert!(restarted.prepare_finish(&retry).unwrap().is_none());
         let complete = restarted
             .complete_finish(&retry, true, true, true, None)
@@ -2170,6 +2184,7 @@ mod tests {
             TaskCommandOutcomeState::Applied as i32
         );
         assert_eq!(complete.receipt.cleanup_complete, Some(true));
+        assert!(!restarted.recovery_blocked().unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 }
