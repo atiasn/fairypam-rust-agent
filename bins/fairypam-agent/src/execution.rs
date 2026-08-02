@@ -1790,6 +1790,17 @@ fn retry_startup_identity<T>(
     }
 }
 
+#[cfg(any(windows, test))]
+fn managed_child_exited(child: Option<&mut std::process::Child>) -> Result<bool, AgentError> {
+    let Some(child) = child else {
+        return Ok(false);
+    };
+    child
+        .try_wait()
+        .map(|status| status.is_some())
+        .map_err(|error| AgentError::new("target.identity_unknown", error.to_string()))
+}
+
 #[cfg(windows)]
 fn production_platform() -> Box<dyn RuntimePlatform> {
     Box::new(WindowsRuntimePlatform::new())
@@ -1934,7 +1945,7 @@ struct WindowsRuntimePlatform {
 
 #[cfg(windows)]
 struct ManagedGameProcess {
-    _child: Option<std::process::Child>,
+    child: Option<std::process::Child>,
     job: Option<usize>,
     executable: std::path::PathBuf,
     binding: TargetBinding,
@@ -2200,6 +2211,13 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 
         let executable = crate::observability::resolve_profile_executable(profile)?;
+        if managed_child_exited(
+            self.managed
+                .as_mut()
+                .and_then(|managed| managed.child.as_mut()),
+        )? {
+            self.managed = None;
+        }
         if let Some(managed) = self.managed.as_ref() {
             if managed.binding.profile_id != profile.profile().id {
                 return Err(AgentError::new(
@@ -2244,7 +2262,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 Instant::now() + Duration::from_secs(120),
             )?;
             self.managed = Some(ManagedGameProcess {
-                _child: None,
+                child: None,
                 job: None,
                 executable,
                 binding: binding.clone(),
@@ -2282,7 +2300,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             }
         };
         self.managed = Some(ManagedGameProcess {
-            _child: Some(child),
+            child: Some(child),
             job: Some(job.into_raw()),
             executable,
             binding: binding.clone(),
@@ -2663,6 +2681,20 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.code(), "target.identity_unknown");
+    }
+
+    #[test]
+    fn completed_managed_child_is_stale_before_pid_identity_check() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+
+        assert!(managed_child_exited(Some(&mut child)).unwrap());
+        assert!(!managed_child_exited(None).unwrap());
     }
 
     fn verified_profile() -> VerifiedProfile {
