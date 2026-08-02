@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use fairypam_agent_core::profile::{
     profile_content_sha256, verify_profile, ActionDefinition, CaptureRegion, CaptureSource,
-    ClientPointButton, Profile, ProfileContent, ProfileEnvelope, ProfileFile, SignatureVerifier,
-    TargetRules,
+    ClientPointButton, Ed25519SignatureVerifier, Profile, ProfileContent, ProfileEnvelope,
+    ProfileFile, SignatureVerifier, TargetRules,
 };
 
 struct TestRoot;
@@ -63,6 +63,33 @@ fn valid_content() -> ProfileContent {
             sha256: "b".repeat(64),
         }],
     }
+}
+
+#[test]
+fn production_genshin_profile_matches_the_formal_root_and_target() {
+    let verifier = Ed25519SignatureVerifier::from_public_key_hex(
+        "a1fe01b263727eddd401ce276ac34ce085df8b917b4eca6d6cd7bbfb8d0fbfaa",
+    )
+    .unwrap();
+    let profile = verify_profile(
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../profiles/genshin-impact/profile.json"
+        )),
+        &verifier,
+    )
+    .unwrap();
+
+    assert_eq!(profile.profile().id, "genshin-impact");
+    assert_eq!(profile.profile().version, "1.5.0");
+    assert!(profile
+        .profile()
+        .target
+        .process_path_sha256
+        .iter()
+        .any(|hash| {
+            hash == "a07b065bda33f8cc9f1b9f56eae1bab0fada986cb2699c19d793fba8a5ab4276"
+        }));
 }
 
 fn envelope(content: ProfileContent, signature: Option<String>) -> Vec<u8> {
