@@ -7,13 +7,11 @@ use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use fairypam_agent_core::AgentError;
 use http::Uri;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, RsaKeySize, PKCS_RSA_SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::Digest;
 use windows::core::{HSTRING, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HLOCAL};
 use windows::Win32::Networking::WinHttp::{
@@ -47,6 +45,9 @@ pub(crate) const STATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\enroll
 pub(crate) const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\audit";
 pub(crate) const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
 pub(crate) const UPDATE_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\updates";
+pub(crate) const PROFILE_CATALOG_ROOT: &str =
+    r"C:\ProgramData\FairyPam.Agent\Agent\profile-catalog";
+const ENROLLMENT_BASE_URL: &str = "https://enroll.fp.atiasn.com";
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 const PRIVATE_KEY_BEGIN: &str = concat!("-----BEGIN ", "PRIVATE KEY-----\n");
 const PRIVATE_KEY_END: &str = concat!("-----END ", "PRIVATE KEY-----\n");
@@ -83,13 +84,6 @@ struct EnrollmentPointer {
     generation: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct BootstrapDocument {
-    enrollment_base_url: String,
-    schema_version: u32,
-}
-
 struct PendingDeviceIdentity {
     csr_pem: String,
     key_pem: Zeroizing<String>,
@@ -101,8 +95,7 @@ pub fn register(registration_code: &str) -> Result<(), AgentError> {
 }
 
 pub(crate) fn register_at_signed(root: &Path, registration_code: &str) -> Result<(), AgentError> {
-    let hub_address = bootstrap_enrollment_base_url()?;
-    register_at(root, &hub_address, registration_code)
+    register_at(root, ENROLLMENT_BASE_URL, registration_code)
 }
 
 pub(crate) fn register_at(
@@ -146,73 +139,6 @@ fn valid_hub_address(hub_address: &str) -> bool {
                 })
                 && uri.query().is_none()
         })
-}
-
-pub(crate) fn bootstrap_enrollment_base_url() -> Result<String, AgentError> {
-    let executable = std::env::current_exe().map_err(|_| bootstrap_invalid())?;
-    let directory = executable.parent().ok_or_else(bootstrap_invalid)?;
-    let document_path = directory.join("agent-bootstrap.json");
-    let signature_path = directory.join("agent-bootstrap.json.sig");
-    fairypam_agent_suite::windows_security::verify_trusted_install_entry(&document_path, false)
-        .map_err(|_| bootstrap_invalid())?;
-    fairypam_agent_suite::windows_security::verify_trusted_install_entry(&signature_path, false)
-        .map_err(|_| bootstrap_invalid())?;
-    let document_bytes = fs::read(&document_path).map_err(|_| bootstrap_invalid())?;
-    if document_bytes.len() > 16 * 1024
-        || document_bytes.last() != Some(&b'\n')
-        || document_bytes[..document_bytes.len().saturating_sub(1)]
-            .iter()
-            .any(|byte| matches!(byte, b'\n' | b'\r'))
-    {
-        return Err(bootstrap_invalid());
-    }
-    let document: BootstrapDocument =
-        serde_json::from_slice(&document_bytes[..document_bytes.len() - 1])
-            .map_err(|_| bootstrap_invalid())?;
-    let canonical = serde_json::to_vec(&document).map_err(|_| bootstrap_invalid())?;
-    if canonical != document_bytes[..document_bytes.len() - 1]
-        || document.schema_version != 1
-        || !valid_hub_address(&document.enrollment_base_url)
-    {
-        return Err(bootstrap_invalid());
-    }
-    let signature_bytes = fs::read(&signature_path).map_err(|_| bootstrap_invalid())?;
-    if signature_bytes.len() != 129 || signature_bytes.last() != Some(&b'\n') {
-        return Err(bootstrap_invalid());
-    }
-    let signature = decode_lower_hex::<64>(&signature_bytes[..128])?;
-    let public_key = decode_lower_hex::<32>(
-        option_env!("FAIRYPAM_BOOTSTRAP_PUBLIC_KEY_HEX")
-            .ok_or_else(bootstrap_invalid)?
-            .as_bytes(),
-    )?;
-    let verifier = VerifyingKey::from_bytes(&public_key).map_err(|_| bootstrap_invalid())?;
-    verifier
-        .verify(
-            &sha2::Sha256::digest(&canonical),
-            &Signature::from_bytes(&signature),
-        )
-        .map_err(|_| bootstrap_invalid())?;
-    Ok(document.enrollment_base_url)
-}
-
-fn decode_lower_hex<const N: usize>(value: &[u8]) -> Result<[u8; N], AgentError> {
-    if value.len() != N * 2
-        || !value
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
-        return Err(bootstrap_invalid());
-    }
-    let mut decoded = [0_u8; N];
-    for (index, chunk) in value.chunks_exact(2).enumerate() {
-        decoded[index] = u8::from_str_radix(
-            std::str::from_utf8(chunk).map_err(|_| bootstrap_invalid())?,
-            16,
-        )
-        .map_err(|_| bootstrap_invalid())?;
-    }
-    Ok(decoded)
 }
 
 fn has_unparseable_explicit_port(authority: &http::uri::Authority) -> bool {
@@ -555,7 +481,7 @@ pub(crate) fn valid_generation(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
     let mut file = open_private_file(path, GENERIC_WRITE.0, CREATE_NEW)?;
     file.write_all(bytes).map_err(|_| failed())?;
     file.sync_all().map_err(|_| failed())?;
@@ -581,7 +507,13 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), AgentError> {
     let audit = Path::new(AUDIT_ROOT);
     let logs = Path::new(LOG_ROOT);
     let updates = Path::new(UPDATE_ROOT);
-    if path != enrollment && path != audit && path != logs && path != updates {
+    let profile_catalog = Path::new(PROFILE_CATALOG_ROOT);
+    if path != enrollment
+        && path != audit
+        && path != logs
+        && path != updates
+        && path != profile_catalog
+    {
         return Err(failed());
     }
 
@@ -603,7 +535,7 @@ fn verify_nonreparse_directory(path: &Path) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn verify_private_directory(path: &Path) -> Result<(), AgentError> {
+pub(crate) fn verify_private_directory(path: &Path) -> Result<(), AgentError> {
     verify_nonreparse_directory(path)?;
     private_security(path).then_some(()).ok_or_else(failed)
 }
@@ -668,7 +600,7 @@ fn private_sddl_matches(value: &str) -> bool {
     )
 }
 
-fn create_private_directory(path: &Path) -> Result<(), AgentError> {
+pub(crate) fn create_private_directory(path: &Path) -> Result<(), AgentError> {
     with_private_security_attributes(|attributes| unsafe {
         CreateDirectoryW(
             &HSTRING::from(path.to_string_lossy().as_ref()),
@@ -725,6 +657,17 @@ fn with_private_security_attributes<T>(
     result
 }
 
+pub(crate) fn replace_private(source: &Path, destination: &Path) -> Result<(), AgentError> {
+    unsafe {
+        MoveFileExW(
+            &HSTRING::from(source.to_string_lossy().as_ref()),
+            &HSTRING::from(destination.to_string_lossy().as_ref()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|_| failed())
+}
+
 fn ensure_elevated() -> Result<(), AgentError> {
     let mut token = Default::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
@@ -755,13 +698,6 @@ fn invalid() -> AgentError {
     AgentError::new(
         "enrollment.request_invalid",
         "registration request is invalid",
-    )
-}
-
-fn bootstrap_invalid() -> AgentError {
-    AgentError::new(
-        "enrollment.bootstrap_invalid",
-        "signed enrollment bootstrap is unavailable or invalid",
     )
 }
 

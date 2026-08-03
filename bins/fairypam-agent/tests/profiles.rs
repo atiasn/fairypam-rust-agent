@@ -10,13 +10,9 @@ fn workspace_root() -> PathBuf {
 #[test]
 fn installed_testbed_and_genshin_profiles_verify_and_do_not_share_actions() {
     let root = workspace_root();
-    let test_root = fs::read_to_string(root.join("test-profile-root-public-key.hex")).unwrap();
-    let testbed = load_profile(&root, "fairypam-test-window", test_root.trim());
-    let genshin = load_profile(
-        &root,
-        "genshin-impact",
-        "a1fe01b263727eddd401ce276ac34ce085df8b917b4eca6d6cd7bbfb8d0fbfaa",
-    );
+    let root_key = "a1fe01b263727eddd401ce276ac34ce085df8b917b4eca6d6cd7bbfb8d0fbfaa";
+    let testbed = load_profile(&root, "fairypam-test-window", root_key);
+    let genshin = load_profile(&root, "genshin-impact", root_key);
 
     assert!(testbed.profile().actions.contains_key("input.pulse"));
     assert!(!genshin.profile().actions.contains_key("input.pulse"));

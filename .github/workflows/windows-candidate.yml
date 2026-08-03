@@ -53,25 +53,17 @@ jobs:
             tauri-ui/src-tauri -> ../../target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Prepare signed candidate bootstrap
-        shell: pwsh
-        env:
-          FAIRYPAM_ENROLLMENT_BASE_URL: ${{ inputs.enrollment_base_url }}
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          $publicKey = node dotnet/scripts/write-live-test-bootstrap.mjs `
-            $env:FAIRYPAM_ENROLLMENT_BASE_URL `
-            target/suite
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "FAIRYPAM_BOOTSTRAP_PUBLIC_KEY_HEX=$publicKey" >> $env:GITHUB_ENV
-
       - name: Test and build the product installer
         shell: pwsh
         env:
           FAIRYPAM_ALLOW_UNSIGNED_CANDIDATE_REPAIR: '1'
           FAIRYPAM_BUILD_ID: product-installer-${{ github.run_id }}-${{ github.run_attempt }}
+          FAIRYPAM_ENROLLMENT_BASE_URL: ${{ inputs.enrollment_base_url }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
+          if ($env:FAIRYPAM_ENROLLMENT_BASE_URL -cne 'https://enroll.fp.atiasn.com') {
+            throw 'candidate enrollment URL must match the product-fixed logical endpoint'
+          }
           $env:FAIRYPAM_BUILD_COMMIT = (Get-Content SOURCE_COMMIT -Raw).Trim()
           cargo fmt --all -- --check
           cargo test --workspace --locked
@@ -102,10 +94,6 @@ jobs:
             npm run tauri build -- --no-bundle
             ..\target\release\fairypam-build-suite.exe `
               --patch-tauri-nsis ..\target\release\fairypam-agent-tauri-ui.exe
-            $productProfiles = '..\target\product-profiles'
-            Remove-Item -LiteralPath $productProfiles -Recurse -Force -ErrorAction SilentlyContinue
-            New-Item -ItemType Directory -Force "$productProfiles\genshin-impact" | Out-Null
-            Copy-Item '..\profiles\genshin-impact\profile.json' "$productProfiles\genshin-impact\profile.json"
             $suiteVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
             $builtAt = [DateTime]::UtcNow.ToString('o')
             ..\target\release\fairypam-build-suite.exe `
@@ -117,10 +105,7 @@ jobs:
               --output ..\target\suite\BUILD-MANIFEST.json `
               --guardian ..\target\release\fairypam-agent-guardian.exe `
               --gui ..\target\release\fairypam-agent-tauri-ui.exe `
-              --bootstrap ..\target\suite\agent-bootstrap.json `
-              --bootstrap-signature ..\target\suite\agent-bootstrap.json.sig `
-              --helper ..\target\release\fairypam-agent-installer.exe `
-              --profiles $productProfiles
+              --helper ..\target\release\fairypam-agent-installer.exe
             npm run tauri bundle -- --bundles nsis
             npm run check:command-surface
             git diff --exit-code -- src-tauri/Cargo.lock
@@ -218,19 +203,15 @@ jobs:
             (Join-Path $versionRoot 'BUILD-MANIFEST.json'),
             (Join-Path $versionRoot 'fairypam-agent-tauri-ui.exe'),
             (Join-Path $versionRoot 'fairypam-agent-guardian.exe'),
-            (Join-Path $versionRoot 'agent-bootstrap.json'),
-            (Join-Path $versionRoot 'agent-bootstrap.json.sig'),
             (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'),
             (Join-Path $installRoot 'uninstall.exe')
           )) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "missing installed product file: $path" }
           }
-          $profiles = Join-Path $versionRoot 'profiles'
-          if (-not (Test-Path -LiteralPath $profiles -PathType Container)) { throw "missing installed profiles directory: $profiles" }
-          $installedProfiles = @(Get-ChildItem -LiteralPath $profiles -Recurse -File -Filter 'profile.json')
-          if ($installedProfiles.Count -ne 1) { throw "expected exactly one production Profile, found $($installedProfiles.Count)" }
-          $installedProfile = Get-Content $installedProfiles[0].FullName -Raw | ConvertFrom-Json
-          if ($installedProfile.content.profile.id -ne 'genshin-impact') { throw 'installed Profile is not genshin-impact' }
+          $profileCatalogRoot = 'C:\ProgramData\FairyPam.Agent\Agent\profile-catalog'
+          if (-not (Test-Path -LiteralPath $profileCatalogRoot -PathType Container)) {
+            throw "missing protected Profile Catalog root: $profileCatalogRoot"
+          }
           $allowedProductExecutables = @(
             (Join-Path $versionRoot 'fairypam-agent-tauri-ui.exe'),
             (Join-Path $versionRoot 'fairypam-agent-guardian.exe'),
@@ -289,7 +270,7 @@ jobs:
             suite_manifest_size = $manifest.Length
             install_mode = 'perMachine'
             state_root = 'C:\ProgramData\FairyPam.Agent\Agent'
-            layout = @('current.json', 'versions/<build-id>/BUILD-MANIFEST.json', 'versions/<build-id>/fairypam-agent-tauri-ui.exe', 'versions/<build-id>/fairypam-agent-guardian.exe', 'versions/<build-id>/agent-bootstrap.json', 'versions/<build-id>/agent-bootstrap.json.sig', 'versions/<build-id>/profiles/', 'resources/runtime/fairypam-agent-installer.exe')
+            layout = @('current.json', 'versions/<build-id>/BUILD-MANIFEST.json', 'versions/<build-id>/fairypam-agent-tauri-ui.exe', 'versions/<build-id>/fairypam-agent-guardian.exe', 'resources/runtime/fairypam-agent-installer.exe')
           } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 dist/product-installer-receipt.json
 
       - name: Attest product setup provenance
