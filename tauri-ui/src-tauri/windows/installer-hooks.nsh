@@ -324,7 +324,6 @@ fairypam_open_existing_install:
 !macro NSIS_HOOK_ACTIVATE
   IfFileExists "$FairyPamInstallDir\resources\runtime\fairypam-agent-installer.exe" 0 fairypam_install_validation_failed
   IfFileExists "$FairyPamInstallDir\fairypam-agent-guardian.exe" 0 fairypam_install_validation_failed
-  IfFileExists "$FairyPamInstallDir\profiles\*.*" 0 fairypam_install_validation_failed
   IfFileExists "$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources\runtime\fairypam-agent-installer.exe" 0 fairypam_install_validation_failed
   ExecWait '"$FairyPamInstallDir\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources\runtime\fairypam-agent-installer.exe" --provision "$FairyPamInstallDir"' $0
   IfErrors fairypam_install_validation_failed 0
