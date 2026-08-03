@@ -39,6 +39,7 @@ use crate::managed_game::close_event_id;
 #[cfg(any(windows, test))]
 use crate::observability;
 use crate::observability::AgentLogRecord;
+use crate::profile_catalog::ProfileCatalogStore;
 use crate::profile_store::ProfileStore;
 use crate::v2_adapter;
 const REGISTRATION_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -53,6 +54,7 @@ pub struct RuntimeConfig {
     pub agent_version: String,
     pub build_commit: String,
     pub profiles: ProfileStore,
+    profile_catalog: Option<ProfileCatalogStore>,
     enrollment_root: Option<PathBuf>,
     enrollment_generation: Option<String>,
     awaiting_enrollment: bool,
@@ -104,7 +106,7 @@ impl RuntimeConfig {
         Self::from_env()
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, feature = "test-support"))]
     fn unregistered() -> Self {
         Self {
             transport: TransportConfig {
@@ -126,6 +128,7 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles: ProfileStore::default(),
+            profile_catalog: None,
             #[cfg(windows)]
             enrollment_root: Some(PathBuf::from(crate::enrollment::STATE_ROOT)),
             #[cfg(not(windows))]
@@ -160,6 +163,7 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles,
+            profile_catalog: None,
             enrollment_root: None,
             enrollment_generation: None,
             awaiting_enrollment: false,
@@ -196,7 +200,13 @@ impl RuntimeConfig {
         validate_enrollment_expiry(&document.expires_at)?;
         let verifier =
             Ed25519SignatureVerifier::from_public_key_hex(&document.profile_root_public_key_hex)?;
-        let profiles = ProfileStore::load_optional(&enrollment_profile_directory()?, &verifier)?;
+        let profile_catalog = ProfileCatalogStore::open(
+            PathBuf::from(crate::enrollment::PROFILE_CATALOG_ROOT),
+            verifier,
+        );
+        let profiles = profile_catalog
+            .active()
+            .map_or_else(ProfileStore::default, |active| active.profiles.clone());
         Ok(Self {
             transport: TransportConfig {
                 control_endpoint: document.control_endpoint.parse().map_err(|error| {
@@ -223,6 +233,7 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles,
+            profile_catalog: Some(profile_catalog),
             enrollment_root: Some(root.to_path_buf()),
             enrollment_generation: Some(generation),
             awaiting_enrollment: false,
@@ -272,26 +283,6 @@ fn enrollment_state_exists() -> bool {
 fn enrollment_state_exists_at(root: &Path) -> bool {
     crate::enrollment::ensure_private_directory(root).is_ok()
         && crate::enrollment::verify_private_file(&root.join("current.json")).is_ok()
-}
-
-#[cfg(windows)]
-fn enrollment_profile_directory() -> Result<PathBuf, AgentError> {
-    if let Some(path) = env::var_os("FAIRYPAM_PROFILE_DIR").filter(|path| !path.is_empty()) {
-        return Ok(PathBuf::from(path));
-    }
-    let executable = env::current_exe().map_err(|_| {
-        AgentError::new(
-            "runtime.profile_directory_unavailable",
-            "cannot determine the enrolled Agent directory",
-        )
-    })?;
-    let directory = executable.parent().ok_or_else(|| {
-        AgentError::new(
-            "runtime.profile_directory_unavailable",
-            "the enrolled Agent executable has no parent directory",
-        )
-    })?;
-    Ok(directory.join("profiles"))
 }
 
 #[cfg(windows)]
@@ -512,7 +503,14 @@ pub struct GrpcSessionDriver {
 
 impl GrpcSessionDriver {
     pub fn new(config: RuntimeConfig) -> Self {
-        let execution = CommandExecutor::production(config.profiles.clone());
+        let mut execution = CommandExecutor::production(config.profiles.clone());
+        execution.set_profile_update_blocked(
+            !config.awaiting_enrollment
+                && config
+                    .profile_catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.active().is_none()),
+        );
         let mut state = if config.awaiting_enrollment {
             let mut state = RuntimeState {
                 last_error_code: "runtime.not_registered".to_owned(),
@@ -627,6 +625,167 @@ impl GrpcSessionDriver {
         #[cfg(not(windows))]
         Ok(false)
     }
+
+    fn receive_profile_catalog(
+        &self,
+        catalog: &v2::ProfileCatalog,
+        sender: &ControlSender,
+        session: &VerifiedSession,
+    ) -> Result<(), AgentError> {
+        self.execution
+            .lock()
+            .map_err(lock_error)?
+            .set_profile_update_blocked(true);
+        let staged = {
+            let mut config = self.config.lock().map_err(lock_error)?;
+            let store = config.profile_catalog.as_mut().ok_or_else(|| {
+                AgentError::new(
+                    "profile_catalog.unavailable",
+                    "Profile Catalog storage is unavailable",
+                )
+            })?;
+            store.stage(catalog)
+        };
+        match staged {
+            Ok(true) => {
+                sender
+                    .try_send(self.profile_catalog_event(
+                        session,
+                        catalog.catalog_version,
+                        &catalog.catalog_digest,
+                        v2::ProfileCatalogApplyState::Pending,
+                        None,
+                    )?)
+                    .map_err(map_transport)?;
+                self.activate_profile_catalog_if_ready(sender, session)
+            }
+            Ok(false) => {
+                self.execution
+                    .lock()
+                    .map_err(lock_error)?
+                    .set_profile_update_blocked(false);
+                sender
+                    .try_send(self.profile_catalog_event(
+                        session,
+                        catalog.catalog_version,
+                        &catalog.catalog_digest,
+                        v2::ProfileCatalogApplyState::Applied,
+                        None,
+                    )?)
+                    .map_err(map_transport)
+            }
+            Err(error) => sender
+                .try_send(self.profile_catalog_event(
+                    session,
+                    catalog.catalog_version,
+                    &catalog.catalog_digest,
+                    v2::ProfileCatalogApplyState::Rejected,
+                    Some(error.code().to_owned()),
+                )?)
+                .map_err(map_transport),
+        }
+    }
+
+    fn activate_profile_catalog_if_ready(
+        &self,
+        sender: &ControlSender,
+        session: &VerifiedSession,
+    ) -> Result<(), AgentError> {
+        if self.execution.lock().map_err(lock_error)?.task_active()? {
+            return Ok(());
+        }
+        let pending = self
+            .config
+            .lock()
+            .map_err(lock_error)?
+            .profile_catalog
+            .as_ref()
+            .and_then(ProfileCatalogStore::pending_identity)
+            .map(|(version, digest)| (version, digest.to_owned()));
+        let Some((version, digest)) = pending else {
+            return Ok(());
+        };
+        let activated = {
+            let mut config = self.config.lock().map_err(lock_error)?;
+            let result = config
+                .profile_catalog
+                .as_mut()
+                .ok_or_else(|| {
+                    AgentError::new(
+                        "profile_catalog.unavailable",
+                        "Profile Catalog storage is unavailable",
+                    )
+                })?
+                .activate();
+            if let Ok(active) = &result {
+                config.profiles = active.profiles.clone();
+            }
+            result
+        };
+        match activated {
+            Ok(active) => {
+                let mut execution = self.execution.lock().map_err(lock_error)?;
+                execution.reload_profiles(active.profiles.clone());
+                execution.set_profile_update_blocked(false);
+                drop(execution);
+                sender
+                    .try_send(self.profile_catalog_event(
+                        session,
+                        active.version,
+                        &active.digest,
+                        v2::ProfileCatalogApplyState::Applied,
+                        None,
+                    )?)
+                    .map_err(map_transport)?;
+                sender
+                    .try_send(v2_adapter::discovery_snapshot(
+                        session_ref(session),
+                        &active.profiles,
+                    )?)
+                    .map_err(map_transport)
+            }
+            Err(error) => sender
+                .try_send(self.profile_catalog_event(
+                    session,
+                    version,
+                    &digest,
+                    v2::ProfileCatalogApplyState::Rejected,
+                    Some(error.code().to_owned()),
+                )?)
+                .map_err(map_transport),
+        }
+    }
+
+    fn profile_catalog_event(
+        &self,
+        session: &VerifiedSession,
+        desired_version: u64,
+        desired_digest: &str,
+        state: v2::ProfileCatalogApplyState,
+        error_code: Option<String>,
+    ) -> Result<AgentControlEvent, AgentError> {
+        let active = self
+            .config
+            .lock()
+            .map_err(lock_error)?
+            .profile_catalog
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .active()
+                    .map(|active| (active.version, active.digest.clone()))
+            });
+        Ok(v2_adapter::profile_catalog_status(
+            session_ref(session),
+            desired_version,
+            desired_digest.to_owned(),
+            state,
+            active
+                .as_ref()
+                .map(|(version, digest)| (*version, digest.as_str())),
+            error_code,
+        ))
+    }
 }
 
 impl SessionDriver for GrpcSessionDriver {
@@ -656,6 +815,11 @@ impl SessionDriver for GrpcSessionDriver {
                 config.agent_version.clone(),
                 config.build_commit.clone(),
                 &config.profiles,
+                config.profile_catalog.as_ref().and_then(|catalog| {
+                    catalog
+                        .active()
+                        .map(|active| (active.version, active.digest.as_str()))
+                }),
             ))
             .await
             .map_err(map_transport)?;
@@ -675,11 +839,7 @@ impl SessionDriver for GrpcSessionDriver {
             .map_err(map_transport)?;
         sender
             .try_send(v2_adapter::discovery_snapshot(
-                fairypam_agent_protocol::v2::SessionRef {
-                    agent_id: session.agent_id().to_owned(),
-                    session_id: session.session_id().to_owned(),
-                    generation: session.generation(),
-                },
+                session_ref(&session),
                 &config.profiles,
             )?)
             .map_err(map_transport)?;
@@ -749,6 +909,7 @@ impl SessionDriver for GrpcSessionDriver {
                     }
                 }
                 _ = heartbeat.tick() => {
+                    self.activate_profile_catalog_if_ready(&sender, &session)?;
                     sender.try_send(heartbeat_event(&session)).map_err(map_transport)?;
                     let mut execution = self.execution.lock().map_err(lock_error)?;
                     let runtime_state = execution.runtime_state()?;
@@ -775,6 +936,12 @@ impl SessionDriver for GrpcSessionDriver {
                             .lock()
                             .map_err(lock_error)?
                             .acknowledge_managed_game_close(value)?;
+                        continue;
+                    }
+                    if let Some(v2::hub_control_command::Payload::ProfileCatalog(value)) =
+                        command.payload.as_ref()
+                    {
+                        self.receive_profile_catalog(value, &sender, &session)?;
                         continue;
                     }
                     let identity = v2_adapter::identity(&command).ok_or_else(|| {
@@ -879,6 +1046,7 @@ impl SessionDriver for GrpcSessionDriver {
                     }
                     let event = v2_adapter::result(identity, outcome);
                     sender.try_send(event).map_err(map_transport)?;
+                    self.activate_profile_catalog_if_ready(&sender, &session)?;
                 }
             }
         }
@@ -1048,6 +1216,12 @@ impl SupervisorHooks for RuntimeSafetyHooks {
                 Ok(config) => {
                     if let Ok(mut execution) = self.execution.lock() {
                         execution.reload_profiles(config.profiles.clone());
+                        execution.set_profile_update_blocked(
+                            config
+                                .profile_catalog
+                                .as_ref()
+                                .is_some_and(|catalog| catalog.active().is_none()),
+                        );
                     }
                     if let Ok(mut current) = self.config.lock() {
                         *current = config;
@@ -1537,6 +1711,12 @@ impl SharedRuntime {
         let mut state = self.state.lock().map_err(lock_error)?;
         let mut current = self.config.lock().map_err(lock_error)?;
         execution.reload_profiles(config.profiles.clone());
+        execution.set_profile_update_blocked(
+            config
+                .profile_catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.active().is_none()),
+        );
         *current = config;
         state.control_state = ConnectionState::Reconnecting;
         state.frame_state = ConnectionState::Reconnecting;
@@ -1589,10 +1769,6 @@ impl SharedRuntime {
                 regular_nonempty_file(&directory.join("fairypam-agent-guardian.exe"))
             })
         });
-        #[cfg(windows)]
-        let bootstrap_ready = crate::enrollment::bootstrap_enrollment_base_url().is_ok();
-        #[cfg(all(test, not(windows)))]
-        let bootstrap_ready = true;
         let (game_status, game_code) = if games_available {
             ("available", "game.discovery_ready")
         } else {
@@ -1606,7 +1782,7 @@ impl SharedRuntime {
                 "recovery": "请检查本地服务注册状态和服务连接是否可用。",
             })
         };
-        let registration_ready = binary_ready && guardian_ready && bootstrap_ready;
+        let registration_ready = binary_ready && guardian_ready;
         let enrollment_check = |id: &str, status: ConnectionState| {
             if awaiting_enrollment {
                 serde_json::json!({"id": id, "status": "pending", "code": "enrollment.required", "recovery": "请先完成本地服务注册，再检查服务连接。"})
@@ -1622,8 +1798,7 @@ impl SharedRuntime {
                 enrollment_check("control", control_state),
                 enrollment_check("frame", frame_state),
                 {"id": "guardian", "status": if guardian_ready { "available" } else { "unavailable" }, "code": if guardian_ready { "guardian.binary_available" } else { "guardian.binary_unavailable" }, "recovery": "本地服务组件不完整，请重新安装 FairyPam。"},
-                {"id": "bootstrap", "status": if bootstrap_ready { "available" } else { "unavailable" }, "code": if bootstrap_ready { "enrollment.bootstrap_available" } else { "enrollment.bootstrap_invalid" }, "recovery": "注册配置无效，请重新安装 FairyPam。"},
-                {"id": "profiles", "status": if profiles_configured { "available" } else { "unavailable" }, "code": if profiles_configured { "profile.available" } else { "profile.unavailable" }, "recovery": "请安装已签名配置文件后再选择游戏。"},
+                {"id": "profiles", "status": if profiles_configured { "available" } else { "unavailable" }, "code": if profiles_configured { "profile.available" } else { "profile.unavailable" }, "recovery": "请保持服务连接，等待 Hub 自动下发已签名 Profile Catalog。"},
                 {"id": "game_discovery", "status": game_status, "code": game_code, "recovery": "启动器更新后，请重新扫描已安装游戏。"}
             ]}),
         )

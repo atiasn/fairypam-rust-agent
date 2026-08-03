@@ -116,6 +116,7 @@ pub fn hello(
     agent_version: String,
     build_commit: String,
     profiles: &ProfileStore,
+    active_catalog: Option<(u64, &str)>,
 ) -> wire::AgentControlEvent {
     wire::AgentControlEvent {
         payload: Some(wire::agent_control_event::Payload::Hello(
@@ -136,6 +137,31 @@ pub fn hello(
                         content_digest: profile.content_sha256().to_owned(),
                     })
                     .collect(),
+                active_profile_catalog_version: active_catalog.map(|catalog| catalog.0),
+                active_profile_catalog_digest: active_catalog.map(|catalog| catalog.1.to_owned()),
+            },
+        )),
+    }
+}
+
+pub fn profile_catalog_status(
+    session: wire::SessionRef,
+    desired_version: u64,
+    desired_digest: String,
+    state: wire::ProfileCatalogApplyState,
+    active_catalog: Option<(u64, &str)>,
+    error_code: Option<String>,
+) -> wire::AgentControlEvent {
+    wire::AgentControlEvent {
+        payload: Some(wire::agent_control_event::Payload::ProfileCatalogStatus(
+            wire::ProfileCatalogStatus {
+                session: Some(session),
+                desired_catalog_version: desired_version,
+                desired_catalog_digest: desired_digest,
+                state: state as i32,
+                active_catalog_version: active_catalog.map(|catalog| catalog.0),
+                active_catalog_digest: active_catalog.map(|catalog| catalog.1.to_owned()),
+                error_code,
             },
         )),
     }
@@ -247,7 +273,7 @@ pub fn identity(command: &wire::HubControlCommand) -> Option<wire::CommandIdenti
         Payload::LaunchTarget(value) => value.reference.clone(),
         Payload::CloseTarget(value) => value.reference.clone(),
         Payload::ConfigureIdleClose(value) => value.reference.clone(),
-        Payload::AcknowledgeManagedGameClose(_) => None,
+        Payload::AcknowledgeManagedGameClose(_) | Payload::ProfileCatalog(_) => None,
         Payload::BeginAttempt(value) => value.reference.clone(),
         Payload::StartAttemptTarget(value) => value.reference.clone(),
         Payload::StartCapture(value) => value.reference.clone(),
@@ -460,7 +486,10 @@ fn translate(
                 reason: value.reason_code.clone(),
             })
         }
-        Some(Payload::AcknowledgeManagedGameClose(_)) | Some(Payload::Hello(_)) | None => {
+        Some(Payload::AcknowledgeManagedGameClose(_))
+        | Some(Payload::ProfileCatalog(_))
+        | Some(Payload::Hello(_))
+        | None => {
             return Err(reference_invalid());
         }
     };

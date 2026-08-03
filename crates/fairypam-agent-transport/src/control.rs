@@ -221,7 +221,10 @@ pub(crate) fn verify_control_command(
 ) -> Result<VerifiedControlCommand, TransportError> {
     if matches!(
         command.payload.as_ref(),
-        Some(hub_control_command::Payload::AcknowledgeManagedGameClose(_))
+        Some(
+            hub_control_command::Payload::AcknowledgeManagedGameClose(_)
+                | hub_control_command::Payload::ProfileCatalog(_)
+        )
     ) {
         return Ok(VerifiedControlCommand(command));
     }
@@ -258,7 +261,7 @@ fn command_ref(command: &HubControlCommand) -> Option<&CommandRef> {
         Payload::LaunchTarget(value) => session_ref(value.reference.as_ref()),
         Payload::CloseTarget(value) => session_ref(value.reference.as_ref()),
         Payload::ConfigureIdleClose(value) => session_ref(value.reference.as_ref()),
-        Payload::AcknowledgeManagedGameClose(_) => None,
+        Payload::AcknowledgeManagedGameClose(_) | Payload::ProfileCatalog(_) => None,
         Payload::BeginAttempt(value) => task_ref(value.reference.as_ref()),
         Payload::StartAttemptTarget(value) => task_ref(value.reference.as_ref()),
         Payload::StartCapture(value) => task_ref(value.reference.as_ref()),

@@ -549,10 +549,9 @@ Section Install
   ; already-protected root. It examines any existing product tree before the
   ; normal payload below can overwrite or execute files in that tree.
   SetOutPath "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload"
-  ; Tauri emits resource ancestors child-first. Establish the two declared
-  ; top-level resource parents explicitly so every later CreateDirectoryW call
+  ; Tauri emits resource ancestors child-first. Establish the declared
+  ; top-level resource parent explicitly so every later CreateDirectoryW call
   ; has a protected direct parent and cannot create an inherited intermediate.
-  !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\profiles" fairypam_install_untrusted_security
   !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\resources" fairypam_install_untrusted_security
   {{#each resources_ancestors}}
     !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\payload\\{{this}}" fairypam_install_untrusted_security
@@ -571,7 +570,6 @@ Section Install
   File "${MAINBINARYSRCPATH}"
 
   ; Copy resources
-  !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\profiles" fairypam_install_untrusted_security
   !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\resources" fairypam_install_untrusted_security
   {{#each resources_ancestors}}
     !insertmacro FAIRYPAM_CREATE_OR_VERIFY_PROTECTED_DIRECTORY "$INSTDIR\\{{this}}" fairypam_install_untrusted_security
