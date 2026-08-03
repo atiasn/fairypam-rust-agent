@@ -657,6 +657,7 @@ fn with_private_security_attributes<T>(
     result
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn replace_private(source: &Path, destination: &Path) -> Result<(), AgentError> {
     unsafe {
         MoveFileExW(
