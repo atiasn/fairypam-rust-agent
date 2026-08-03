@@ -47,11 +47,23 @@ fn run() -> Result<(), Box<dyn Error>> {
             MemberScope::Versioned,
         )?,
         identity(
+            required_path(&options, "--bootstrap")?,
+            "agent-bootstrap.json",
+            MemberScope::Versioned,
+        )?,
+        identity(
+            required_path(&options, "--bootstrap-signature")?,
+            "agent-bootstrap.json.sig",
+            MemberScope::Versioned,
+        )?,
+        identity(
             required_path(&options, "--helper")?,
             "resources/runtime/fairypam-agent-installer.exe",
             MemberScope::Stable,
         )?,
     ];
+    let profiles = required_path(&options, "--profiles")?;
+    collect_profiles(profiles, profiles, &mut members)?;
     members.sort_by(|left, right| left.path.cmp(&right.path));
 
     let manifest = SuiteManifest {
@@ -156,6 +168,35 @@ fn identity(path: &Path, logical: &str, scope: MemberScope) -> Result<SuiteMembe
         sha256: sha256_file(path)?,
         size_bytes: metadata.len(),
     })
+}
+
+fn collect_profiles(
+    root: &Path,
+    directory: &Path,
+    members: &mut Vec<SuiteMember>,
+) -> Result<(), Box<dyn Error>> {
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            collect_profiles(root, &path, members)?;
+        } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+            let relative = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            members.push(identity(
+                &path,
+                &format!("profiles/{relative}"),
+                MemberScope::Versioned,
+            )?);
+        } else {
+            return Err(format!("profiles contain a non-file entry: {}", path.display()).into());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -447,7 +447,6 @@ dependencies = [
  "fairypam-agent-windows",
  "http",
  "rcgen",
- "semver",
  "serde",
  "serde_json",
  "sha2",

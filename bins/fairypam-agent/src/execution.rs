@@ -453,7 +453,6 @@ pub struct CommandExecutor {
     task_attempt: TaskAttemptRuntime,
     managed_game: ManagedGameLifecycle,
     last_local_input_token: Option<u32>,
-    profile_update_blocked: bool,
 }
 
 impl CommandExecutor {
@@ -507,34 +506,13 @@ impl CommandExecutor {
             task_attempt,
             managed_game: ManagedGameLifecycle::memory(),
             last_local_input_token: None,
-            profile_update_blocked: false,
         }
-    }
-
-    pub fn set_profile_update_blocked(&mut self, blocked: bool) {
-        self.profile_update_blocked = blocked;
-    }
-
-    pub fn task_active(&mut self) -> Result<bool, AgentError> {
-        self.task_attempt.is_active()
     }
 
     pub fn execute_v2_configure_idle_close(
         &mut self,
         value: &v2::ConfigureIdleClose,
     ) -> CommandOutcome {
-        if self.profile_update_blocked {
-            match self.task_attempt.is_active() {
-                Ok(true) => {}
-                Ok(false) => {
-                    return CommandOutcome::from_error(AgentError::new(
-                        "profile_update_blocked",
-                        "Profile Catalog must be applied before accepting commands",
-                    ));
-                }
-                Err(error) => return CommandOutcome::from_error(error),
-            }
-        }
         self.managed_game
             .configure(value, Instant::now(), current_unix_ms())
             .map(|_| CommandOutcome::Ack("{}".into()))
@@ -749,12 +727,6 @@ impl CommandExecutor {
         contract: &v2::ExecutionContract,
     ) -> CommandOutcome {
         let result = (|| {
-            if self.profile_update_blocked {
-                return Err(AgentError::new(
-                    "profile_update_blocked",
-                    "Profile Catalog must be applied before accepting tasks",
-                ));
-            }
             if self.managed_game.is_closing() {
                 return Err(AgentError::new(
                     "target.closing",
@@ -911,9 +883,6 @@ impl CommandExecutor {
         if self.task_attempt.is_active()? {
             return Ok(v2::AgentRuntimeState::Executing);
         }
-        if self.profile_update_blocked {
-            return Ok(v2::AgentRuntimeState::ProfileUpdateBlocked);
-        }
         Ok(v2::AgentRuntimeState::ConnectedIdle)
     }
 
@@ -927,30 +896,6 @@ impl CommandExecutor {
         );
         let emergency_stopped = self.task_attempt.emergency_stopped()?;
         let task_active = self.task_attempt.is_active()?;
-        if self.profile_update_blocked
-            && !matches!(
-                command,
-                LocalCommand::Status
-                    | LocalCommand::Doctor
-                    | LocalCommand::ListProfiles
-                    | LocalCommand::StopCapture { .. }
-                    | LocalCommand::ReleaseAll
-                    | LocalCommand::UpdateStatus
-                    | LocalCommand::StartupStatus
-                    | LocalCommand::GetConnectionStatus
-                    | LocalCommand::RunEnvironmentCheck
-                    | LocalCommand::GetLogTail { .. }
-                    | LocalCommand::ScanInstalledGames
-                    | LocalCommand::CloseTarget
-                    | LocalCommand::ShutdownAgent
-                    | LocalCommand::RegisterHub { .. }
-            )
-        {
-            return Err(AgentError::new(
-                "profile_update_blocked",
-                "Profile Catalog must be applied before accepting commands",
-            ));
-        }
         if emergency_stopped
             && !read_only
             && !matches!(
@@ -1198,24 +1143,6 @@ impl CommandExecutor {
     ) -> Result<CommandOutcome, AgentError> {
         use hub_control_command::Payload;
         let payload = command.payload.as_ref();
-        let task_active = self.task_attempt.is_active()?;
-        if self.profile_update_blocked
-            && !task_active
-            && !matches!(
-                payload,
-                Some(
-                    Payload::CloseTarget(_)
-                        | Payload::StopCapture(_)
-                        | Payload::ReleaseAll(_)
-                        | Payload::InspectTaskAttempt(_)
-                )
-            )
-        {
-            return Err(AgentError::new(
-                "profile_update_blocked",
-                "Profile Catalog must be applied before accepting commands",
-            ));
-        }
         if self.task_attempt.emergency_stopped()?
             && !matches!(payload, Some(Payload::InspectTaskAttempt(_)))
         {
@@ -1230,7 +1157,7 @@ impl CommandExecutor {
                 "managed target remains in the closing gate",
             ));
         }
-        if task_active && !task_payload_allowed(payload) {
+        if self.task_attempt.is_active()? && !task_payload_allowed(payload) {
             return Err(AgentError::new(
                 "task_command_not_allowed",
                 "active M1 task attempt rejects this command kind",
@@ -1757,6 +1684,11 @@ impl CommandExecutor {
                     Ok(binding) => {
                         self.active_profile = Some(profile);
                         self.binding = Some(binding.clone());
+                        self.managed_game.bind_target(
+                            &binding.profile_id,
+                            Instant::now(),
+                            current_unix_ms(),
+                        );
                         Ok(CommandOutcome::task(
                             self.task_attempt
                                 .complete_target_start(task, Some(binding), None)?,
@@ -4051,6 +3983,18 @@ mod tests {
             }),
         );
         let sink = Arc::new(CollectFrames::default());
+        assert!(matches!(
+            executor.execute_v2_configure_idle_close(&v2::ConfigureIdleClose {
+                game_session_id: "game-session-1".into(),
+                profile_id: "testbed".into(),
+                state_version: 1,
+                enabled: true,
+                idle_timeout_ms: 300_000,
+                occupied: true,
+                ..v2::ConfigureIdleClose::default()
+            }),
+            CommandOutcome::Ack(_)
+        ));
         let begin = HubControlCommand {
             payload: Some(hub_control_command::Payload::BeginTaskAttempt(
                 BeginTaskAttempt {
@@ -4076,6 +4020,10 @@ mod tests {
             CommandOutcome::TaskAck { ref outcome, .. }
                 if outcome.as_ref().unwrap().outcome == TaskCommandOutcomeState::Applied as i32
         ));
+        assert_eq!(
+            executor.managed_game.current_identity(),
+            Some(("game-session-1", 1))
+        );
 
         let start_capture = HubControlCommand {
             payload: Some(hub_control_command::Payload::StartCapture(StartCapture {

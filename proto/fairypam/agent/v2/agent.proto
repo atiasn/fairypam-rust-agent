@@ -153,8 +153,6 @@ message AgentHello {
   string build_commit = 5;
   string suite_build_id = 6;
   repeated InstalledProfile installed_profiles = 7;
-  optional uint64 active_profile_catalog_version = 8;
-  optional string active_profile_catalog_digest = 9;
 }
 
 message HubHello {
@@ -172,38 +170,6 @@ enum AgentRuntimeState {
   AGENT_RUNTIME_STATE_EMERGENCY_STOPPED = 3;
   AGENT_RUNTIME_STATE_RECOVERY_BLOCKED = 4;
   AGENT_RUNTIME_STATE_STOPPING = 5;
-  AGENT_RUNTIME_STATE_PROFILE_UPDATE_BLOCKED = 6;
-}
-
-message ProfileCatalogProfile {
-  string profile_id = 1;
-  string profile_version = 2;
-  string content_digest = 3;
-  bytes profile_json = 4;
-}
-
-message ProfileCatalog {
-  uint64 catalog_version = 1;
-  string catalog_digest = 2;
-  string source_commit = 3;
-  repeated ProfileCatalogProfile profiles = 4;
-}
-
-enum ProfileCatalogApplyState {
-  PROFILE_CATALOG_APPLY_STATE_UNSPECIFIED = 0;
-  PROFILE_CATALOG_APPLY_STATE_PENDING = 1;
-  PROFILE_CATALOG_APPLY_STATE_APPLIED = 2;
-  PROFILE_CATALOG_APPLY_STATE_REJECTED = 3;
-}
-
-message ProfileCatalogStatus {
-  SessionRef session = 1;
-  uint64 desired_catalog_version = 2;
-  string desired_catalog_digest = 3;
-  ProfileCatalogApplyState state = 4;
-  optional uint64 active_catalog_version = 5;
-  optional string active_catalog_digest = 6;
-  optional string error_code = 7;
 }
 
 message AgentControlEvent {
@@ -217,7 +183,6 @@ message AgentControlEvent {
     ManagedGameIdleStatus managed_game_idle_status = 7;
     ManagedGameCloseEvent managed_game_close_event = 8;
     ManagedGameCloseProgress managed_game_close_progress = 9;
-    ProfileCatalogStatus profile_catalog_status = 10;
   }
 }
 
@@ -239,7 +204,6 @@ message HubControlCommand {
     ClientPointClick client_point_click = 14;
     ConfigureIdleClose configure_idle_close = 15;
     AcknowledgeManagedGameClose acknowledge_managed_game_close = 16;
-    ProfileCatalog profile_catalog = 17;
   }
 }
 

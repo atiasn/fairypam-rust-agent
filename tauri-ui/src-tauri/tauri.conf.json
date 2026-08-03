@@ -30,7 +30,10 @@
     "resources": {
       "../../target/release/fairypam-agent-guardian.exe": "fairypam-agent-guardian.exe",
       "../../target/release/fairypam-agent-installer.exe": "resources/runtime/fairypam-agent-installer.exe",
-      "../../target/suite/BUILD-MANIFEST.json": "BUILD-MANIFEST.json"
+      "../../target/suite/BUILD-MANIFEST.json": "BUILD-MANIFEST.json",
+      "../../target/suite/agent-bootstrap.json": "agent-bootstrap.json",
+      "../../target/suite/agent-bootstrap.json.sig": "agent-bootstrap.json.sig",
+      "../../profiles": "profiles"
     },
     "windows": {
       "webviewInstallMode": {

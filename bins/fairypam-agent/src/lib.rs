@@ -7,7 +7,6 @@ pub mod enrollment;
 pub mod execution;
 mod managed_game;
 mod observability;
-mod profile_catalog;
 pub mod profile_store;
 pub mod runtime;
 pub mod runtime_api;

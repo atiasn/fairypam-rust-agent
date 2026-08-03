@@ -338,7 +338,9 @@ fn product_installer_uses_one_fixed_protected_root() {
         "uninstall must validate through the installed runtime helper"
     );
     for required in [
+        "$INSTDIR\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\\payload\\profiles",
         "$INSTDIR\\${FAIRYPAM_INSTALL_BOOTSTRAP_DIRECTORY}\\payload\\resources",
+        "$INSTDIR\\profiles",
         "$INSTDIR\\resources",
     ] {
         assert!(

@@ -19,6 +19,7 @@ pub const MAX_MEMBER_BYTES: u64 = 256 * 1024 * 1024;
 
 const REQUIRED_VERSIONED_EXECUTABLES: [&str; 2] =
     ["fairypam-agent-guardian.exe", "fairypam-agent-tauri-ui.exe"];
+const REQUIRED_VERSIONED_DATA: [&str; 2] = ["agent-bootstrap.json", "agent-bootstrap.json.sig"];
 const REQUIRED_STABLE_EXECUTABLE: &str = "resources/runtime/fairypam-agent-installer.exe";
 const INSTALLER_OWNED_EXECUTABLES: [&str; 2] = [
     "uninstall.exe",
@@ -274,6 +275,7 @@ pub fn validate_manifest(manifest: &SuiteManifest) -> Result<(), SuiteError> {
 
     let mut paths = BTreeSet::new();
     let mut required_versioned = BTreeSet::new();
+    let mut required_versioned_data = BTreeSet::new();
     let mut stable_helper = false;
     for member in &manifest.members {
         validate_member_path(&member.path)?;
@@ -297,6 +299,14 @@ pub fn validate_manifest(manifest: &SuiteManifest) -> Result<(), SuiteError> {
             }
             required_versioned.insert(folded.clone());
         }
+        if REQUIRED_VERSIONED_DATA.contains(&folded.as_str()) {
+            if member.scope != MemberScope::Versioned {
+                return Err(invalid_manifest(
+                    "bootstrap data has the wrong installation scope",
+                ));
+            }
+            required_versioned_data.insert(folded.clone());
+        }
         if folded == REQUIRED_STABLE_EXECUTABLE {
             if member.scope != MemberScope::Stable {
                 return Err(invalid_manifest("installer helper must be stable"));
@@ -308,13 +318,18 @@ pub fn validate_manifest(manifest: &SuiteManifest) -> Result<(), SuiteError> {
                     "executable member is outside the exact product allowlist",
                 ));
             }
-        } else {
+        } else if !REQUIRED_VERSIONED_DATA.contains(&folded.as_str())
+            && !valid_profile_member_path(&folded)
+        {
             return Err(invalid_manifest(
-                "suite members must be exact product executables",
+                "data member is outside the exact profile layout",
             ));
         }
     }
-    if required_versioned.len() != REQUIRED_VERSIONED_EXECUTABLES.len() || !stable_helper {
+    if required_versioned.len() != REQUIRED_VERSIONED_EXECUTABLES.len()
+        || required_versioned_data.len() != REQUIRED_VERSIONED_DATA.len()
+        || !stable_helper
+    {
         return Err(invalid_manifest(
             "required production executables are incomplete",
         ));
@@ -645,6 +660,16 @@ fn allowed_product_executable(value: &str) -> bool {
         || folded == REQUIRED_STABLE_EXECUTABLE
 }
 
+fn valid_profile_member_path(value: &str) -> bool {
+    let mut parts = value.split('/');
+    matches!(parts.next(), Some("profiles"))
+        && parts
+            .next()
+            .is_some_and(|game_id| safe_identifier(game_id, 128))
+        && matches!(parts.next(), Some("profile.json"))
+        && parts.next().is_none()
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -709,6 +734,17 @@ mod tests {
                     MemberScope::Versioned,
                     b"gui",
                 ),
+                member("agent-bootstrap.json", MemberScope::Versioned, b"bootstrap"),
+                member(
+                    "agent-bootstrap.json.sig",
+                    MemberScope::Versioned,
+                    b"signature",
+                ),
+                member(
+                    "profiles/default/profile.json",
+                    MemberScope::Versioned,
+                    b"profile",
+                ),
             ],
         }
     }
@@ -756,7 +792,7 @@ mod tests {
                 .as_nanos()
         ));
         let version_root = directory.join("versions").join(&manifest.build_id);
-        fs::create_dir_all(&version_root).unwrap();
+        fs::create_dir_all(version_root.join("profiles").join("default")).unwrap();
         fs::create_dir_all(directory.join("resources").join("runtime")).unwrap();
         for (path, contents) in [
             (
@@ -773,6 +809,21 @@ mod tests {
             (
                 version_root.join("fairypam-agent-tauri-ui.exe"),
                 b"gui".as_slice(),
+            ),
+            (
+                version_root.join("agent-bootstrap.json"),
+                b"bootstrap".as_slice(),
+            ),
+            (
+                version_root.join("agent-bootstrap.json.sig"),
+                b"signature".as_slice(),
+            ),
+            (
+                version_root
+                    .join("profiles")
+                    .join("default")
+                    .join("profile.json"),
+                b"profile".as_slice(),
             ),
         ] {
             fs::write(path, contents).unwrap();
@@ -836,6 +887,18 @@ mod tests {
             (
                 directory.join("fairypam-agent-tauri-ui.exe"),
                 b"gui".as_slice(),
+            ),
+            (
+                directory.join("agent-bootstrap.json"),
+                b"bootstrap".as_slice(),
+            ),
+            (
+                directory.join("agent-bootstrap.json.sig"),
+                b"signature".as_slice(),
+            ),
+            (
+                directory.join("profiles/default/profile.json"),
+                b"profile".as_slice(),
             ),
         ] {
             fs::create_dir_all(path.parent().unwrap()).unwrap();

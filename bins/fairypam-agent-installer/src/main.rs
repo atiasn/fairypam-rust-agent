@@ -47,8 +47,6 @@ const ENROLLMENT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\enrollment";
 const AUDIT_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\audit";
 #[cfg(windows)]
 const LOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\logs";
-#[cfg(windows)]
-const PROFILE_CATALOG_ROOT: &str = r"C:\ProgramData\FairyPam.Agent\Agent\profile-catalog";
 #[cfg(any(windows, test))]
 const PRIVATE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 #[cfg(any(windows, test))]
@@ -78,7 +76,6 @@ enum ProvisionFailure {
     Logs = 9,
     Rollback = 10,
     Launch = 11,
-    ProfileCatalog = 12,
     Transaction = 16,
 }
 
@@ -233,7 +230,6 @@ fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
             (ENROLLMENT_ROOT, ProvisionFailure::Enrollment),
             (AUDIT_ROOT, ProvisionFailure::Audit),
             (LOG_ROOT, ProvisionFailure::Logs),
-            (PROFILE_CATALOG_ROOT, ProvisionFailure::ProfileCatalog),
         ] {
             match create_or_verify_private_directory(std::path::Path::new(path)) {
                 Ok(change) => changes.push((path, change)),
@@ -528,7 +524,6 @@ fn verify_existing_state_for_install() -> Result<(), ProvisionFailure> {
         (ENROLLMENT_ROOT, ProvisionFailure::Enrollment),
         (AUDIT_ROOT, ProvisionFailure::Audit),
         (LOG_ROOT, ProvisionFailure::Logs),
-        (PROFILE_CATALOG_ROOT, ProvisionFailure::ProfileCatalog),
     ] {
         let path = std::path::Path::new(path);
         match path.symlink_metadata() {

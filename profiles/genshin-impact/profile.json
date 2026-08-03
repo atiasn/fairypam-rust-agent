@@ -1,1 +1,46 @@
-{"content":{"schema_version":1,"profile":{"id":"genshin-impact","version":"1.5.0","display_name":"原神","target":{"process_names":["YuanShen.exe"],"process_path_sha256":["a07b065bda33f8cc9f1b9f56eae1bab0fada986cb2699c19d793fba8a5ab4276","aa42c410fe42d3de8b20121fa6f2520cc2c4c12a225e35b03c4f1a00a73a45fe","cd2516e4359c1c1166adf8d025dcd027073a8293d197eec494675ec750baf762"],"window_classes":["UnityWndClass"],"title_patterns":["原神*"],"require_elevated":true,"minimum_client_width":1280,"minimum_client_height":720,"minimum_dpi":96},"capture_sources":[{"id":"client","region":{"kind":"full_client"},"maximum_fps":10,"encodings":["jpeg","png"]}],"actions":{"combat.normal_attack":{"kind":"client_point_click","button":"left"},"gadget.quick_use":{"kind":"pulse","scan_code":44},"inventory.open":{"kind":"pulse","scan_code":48},"inventory.scroll":{"kind":"wheel","maximum_delta":1200},"menu.open":{"kind":"pulse","scan_code":1},"move.backward":{"kind":"hold","scan_code":31},"move.forward":{"kind":"hold","scan_code":17},"move.left":{"kind":"hold","scan_code":30},"move.right":{"kind":"hold","scan_code":32}}},"files":[]},"content_sha256":"d80bfb4da8bee9667cdc18c7d0dc6b5ac43e2730e06d3cb81b5c95620fd0adea","signature":"407fedd89fc901af576cc79917e5c1eca7639a8b98f58d9c40dc872f6c594ac9ce4affc59ec22bc04560d07dfe0b446ff0c057e5e15f3aed6f8cf1d74316ac01"}
+{
+  "content": {
+    "schema_version": 1,
+    "profile": {
+      "id": "genshin-impact",
+      "version": "1.5.0",
+      "display_name": "原神",
+      "target": {
+        "process_names": ["YuanShen.exe"],
+        "process_path_sha256": [
+          "a07b065bda33f8cc9f1b9f56eae1bab0fada986cb2699c19d793fba8a5ab4276",
+          "aa42c410fe42d3de8b20121fa6f2520cc2c4c12a225e35b03c4f1a00a73a45fe",
+          "cd2516e4359c1c1166adf8d025dcd027073a8293d197eec494675ec750baf762"
+        ],
+        "window_classes": ["UnityWndClass"],
+        "title_patterns": ["原神*"],
+        "require_elevated": true,
+        "minimum_client_width": 1280,
+        "minimum_client_height": 720,
+        "minimum_dpi": 96
+      },
+      "capture_sources": [
+        {
+          "id": "client",
+          "region": {"kind": "full_client"},
+          "maximum_fps": 10,
+          "encodings": ["jpeg", "png"]
+        }
+      ],
+      "actions": {
+        "combat.normal_attack": {"kind": "client_point_click", "button": "left"},
+        "gadget.quick_use": {"kind": "pulse", "scan_code": 44},
+        "inventory.open": {"kind": "pulse", "scan_code": 48},
+        "inventory.scroll": {"kind": "wheel", "maximum_delta": 1200},
+        "menu.open": {"kind": "pulse", "scan_code": 1},
+        "move.backward": {"kind": "hold", "scan_code": 31},
+        "move.forward": {"kind": "hold", "scan_code": 17},
+        "move.left": {"kind": "hold", "scan_code": 30},
+        "move.right": {"kind": "hold", "scan_code": 32}
+      }
+    },
+    "files": []
+  },
+  "content_sha256": "d80bfb4da8bee9667cdc18c7d0dc6b5ac43e2730e06d3cb81b5c95620fd0adea",
+  "signature": "eb3e9dece77ea2f8e4d0a1a96c1dab30536fbf1010ac2ac5d4612a06153a5968a8f7b0de5a502e13291f9d9d67ba2516ded97cf9e33ebb54d93b09502bb40700"
+}
