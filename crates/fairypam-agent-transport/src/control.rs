@@ -138,7 +138,9 @@ impl ControlSession {
             return Ok(None);
         };
         let verified = verify_control_command(&self.session, command)?;
-        let reference = command_ref(&verified.0).expect("verified command has CommandRef");
+        let Some(reference) = command_ref(&verified.0) else {
+            return Ok(Some(verified));
+        };
         let now_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -217,6 +219,12 @@ pub(crate) fn verify_control_command(
     session: &VerifiedSession,
     command: HubControlCommand,
 ) -> Result<VerifiedControlCommand, TransportError> {
+    if matches!(
+        command.payload.as_ref(),
+        Some(hub_control_command::Payload::AcknowledgeManagedGameClose(_))
+    ) {
+        return Ok(VerifiedControlCommand(command));
+    }
     let reference = command_ref(&command).ok_or_else(|| {
         TransportError::new(
             "transport.command_session_invalid",
@@ -333,8 +341,8 @@ fn verify_command_freshness(
 #[cfg(test)]
 mod v2_tests {
     use fairypam_agent_protocol::v2::{
-        command_identity, hub_control_command, CommandIdentity, CommandRef, HubControlCommand,
-        HubHello, InputFrame, SessionRef, TaskCommandRef,
+        command_identity, hub_control_command, AcknowledgeManagedGameClose, CommandIdentity,
+        CommandRef, HubControlCommand, HubHello, InputFrame, SessionRef, TaskCommandRef,
     };
 
     use super::*;
@@ -434,6 +442,21 @@ mod v2_tests {
                 .code(),
             "transport.command_session_invalid"
         );
+    }
+
+    #[test]
+    fn managed_game_close_ack_uses_receipt_identity_without_command_ref() {
+        let ack = HubControlCommand {
+            payload: Some(hub_control_command::Payload::AcknowledgeManagedGameClose(
+                AcknowledgeManagedGameClose {
+                    event_id: "event-1".into(),
+                    game_session_id: "session-1".into(),
+                    state_version: 4,
+                },
+            )),
+        };
+
+        assert!(verify_control_command(&session(2), ack).is_ok());
     }
 
     #[test]
