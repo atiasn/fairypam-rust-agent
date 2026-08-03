@@ -20,6 +20,12 @@ pub struct Translator {
 #[derive(Debug)]
 pub enum TranslatedCommand {
     Internal(internal::HubControlCommand),
+    CloseTarget {
+        value: wire::CloseTarget,
+    },
+    ConfigureIdleClose {
+        value: wire::ConfigureIdleClose,
+    },
     BeginAttempt {
         task: internal::TaskCommandRef,
         contract: wire::ExecutionContract,
@@ -240,6 +246,8 @@ pub fn identity(command: &wire::HubControlCommand) -> Option<wire::CommandIdenti
         Payload::Hello(_) => None,
         Payload::LaunchTarget(value) => value.reference.clone(),
         Payload::CloseTarget(value) => value.reference.clone(),
+        Payload::ConfigureIdleClose(value) => value.reference.clone(),
+        Payload::AcknowledgeManagedGameClose(_) => None,
         Payload::BeginAttempt(value) => value.reference.clone(),
         Payload::StartAttemptTarget(value) => value.reference.clone(),
         Payload::StartCapture(value) => value.reference.clone(),
@@ -275,10 +283,16 @@ fn translate(
             })
         }
         Some(Payload::CloseTarget(value)) => {
-            internal::hub_control_command::Payload::CloseTarget(internal::CloseTarget {
-                command: session_command(value.reference.as_ref())?,
-                timeout_ms: value.timeout_ms,
-            })
+            session_command(value.reference.as_ref())?;
+            return Ok(TranslatedCommand::CloseTarget {
+                value: value.clone(),
+            });
+        }
+        Some(Payload::ConfigureIdleClose(value)) => {
+            session_command(value.reference.as_ref())?;
+            return Ok(TranslatedCommand::ConfigureIdleClose {
+                value: value.clone(),
+            });
         }
         Some(Payload::BeginAttempt(value)) => {
             let contract = value.contract.as_ref().ok_or_else(reference_invalid)?;
@@ -446,7 +460,9 @@ fn translate(
                 reason: value.reason_code.clone(),
             })
         }
-        Some(Payload::Hello(_)) | None => return Err(reference_invalid()),
+        Some(Payload::AcknowledgeManagedGameClose(_)) | Some(Payload::Hello(_)) | None => {
+            return Err(reference_invalid());
+        }
     };
     Ok(TranslatedCommand::Internal(internal::HubControlCommand {
         payload: Some(payload),
@@ -678,6 +694,17 @@ pub fn result(
             outcome: wire::CommandOutcome::Applied as i32,
             ..wire::CommandResult::default()
         },
+        CommandOutcome::CloseAck(receipt) => wire::CommandResult {
+            reference: Some(reference),
+            outcome: wire::CommandOutcome::Applied as i32,
+            close_receipt: Some(receipt),
+            ..wire::CommandResult::default()
+        },
+        CommandOutcome::CloseNack { receipt, code, .. } => {
+            let mut result = error_result(reference, &code);
+            result.close_receipt = Some(receipt);
+            result
+        }
         CommandOutcome::Nack { code, .. } => error_result(reference, &code),
         CommandOutcome::TaskAck {
             outcome, receipt, ..
@@ -769,6 +796,7 @@ fn task_result(
             source_frame_sequence,
         )),
         error_code,
+        close_receipt: None,
     }
 }
 
@@ -867,6 +895,53 @@ fn now_unix_ms() -> i64 {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn manual_close_failure_keeps_typed_receipt_on_not_applied_result() {
+        let identity = wire::CommandIdentity {
+            value: Some(command_identity::Value::Command(wire::CommandRef {
+                session: Some(wire::SessionRef {
+                    agent_id: "11111111-1111-4111-8111-111111111111".into(),
+                    session_id: "session-1".into(),
+                    generation: 1,
+                }),
+                command_id: "close-1".into(),
+                sequence: 1,
+                expires_at_unix_ms: 1_700_000_000_000,
+            })),
+        };
+        let receipt = wire::ManagedGameCloseReceipt {
+            game_session_id: "33333333-3333-4333-8333-333333333333".into(),
+            state_version: 4,
+            trigger: wire::ManagedGameCloseTrigger::Manual as i32,
+            result: wire::ManagedGameCloseResult::Failed as i32,
+            occurred_at_unix_ms: 1_700_000_000_000,
+            error_code: Some("target.close_failed".into()),
+        };
+
+        let event = result(
+            identity,
+            CommandOutcome::CloseNack {
+                receipt: receipt.clone(),
+                code: "target.close_failed".into(),
+                message: "close failed".into(),
+            },
+        );
+        let command_result = match event.payload.unwrap() {
+            wire::agent_control_event::Payload::CommandResult(value) => value,
+            other => panic!("unexpected payload: {other:?}"),
+        };
+
+        assert_eq!(
+            command_result.outcome,
+            wire::CommandOutcome::NotApplied as i32
+        );
+        assert_eq!(
+            command_result.error_code.as_deref(),
+            Some("target.close_failed")
+        );
+        assert_eq!(command_result.close_receipt, Some(receipt));
+    }
 
     fn task_identity(contract: &wire::ExecutionContract, sequence: u64) -> wire::CommandIdentity {
         wire::CommandIdentity {

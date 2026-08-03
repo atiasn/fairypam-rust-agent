@@ -180,6 +180,9 @@ message AgentControlEvent {
     CommandResult command_result = 4;
     DiscoverySnapshot discovery_snapshot = 5;
     SafetyEvent safety_event = 6;
+    ManagedGameIdleStatus managed_game_idle_status = 7;
+    ManagedGameCloseEvent managed_game_close_event = 8;
+    ManagedGameCloseProgress managed_game_close_progress = 9;
   }
 }
 
@@ -199,6 +202,8 @@ message HubControlCommand {
     StopSession stop_session = 12;
     CaptureFrame capture_frame = 13;
     ClientPointClick client_point_click = 14;
+    ConfigureIdleClose configure_idle_close = 15;
+    AcknowledgeManagedGameClose acknowledge_managed_game_close = 16;
   }
 }
 
@@ -220,6 +225,7 @@ message CommandResult {
   optional uint64 source_frame_sequence = 3;
   AttemptReceipt attempt_receipt = 4;
   optional string error_code = 5;
+  ManagedGameCloseReceipt close_receipt = 6;
 }
 
 message DiscoveredGame {
@@ -257,6 +263,88 @@ message LaunchTarget {
 message CloseTarget {
   CommandIdentity reference = 1;
   uint32 timeout_ms = 2;
+  string game_session_id = 3;
+  uint64 state_version = 4;
+}
+
+message ConfigureIdleClose {
+  CommandIdentity reference = 1;
+  string game_session_id = 2;
+  string profile_id = 3;
+  uint64 state_version = 4;
+  bool enabled = 5;
+  uint64 idle_timeout_ms = 6;
+  bool occupied = 7;
+}
+
+enum ManagedGameIdleState {
+  MANAGED_GAME_IDLE_STATE_UNSPECIFIED = 0;
+  MANAGED_GAME_IDLE_STATE_DISABLED = 1;
+  MANAGED_GAME_IDLE_STATE_COUNTING = 2;
+  MANAGED_GAME_IDLE_STATE_OCCUPIED = 3;
+  MANAGED_GAME_IDLE_STATE_PAUSED = 4;
+  MANAGED_GAME_IDLE_STATE_CLOSE_FAILED = 5;
+}
+
+message ManagedGameIdleStatus {
+  SessionRef session = 1;
+  string game_session_id = 2;
+  uint64 state_version = 3;
+  uint64 status_sequence = 4;
+  ManagedGameIdleState state = 5;
+  int64 last_activity_at_unix_ms = 6;
+  optional int64 expected_close_at_unix_ms = 7;
+  optional string reason_code = 8;
+}
+
+enum ManagedGameCloseTrigger {
+  MANAGED_GAME_CLOSE_TRIGGER_UNSPECIFIED = 0;
+  MANAGED_GAME_CLOSE_TRIGGER_MANUAL = 1;
+  MANAGED_GAME_CLOSE_TRIGGER_IDLE = 2;
+}
+
+enum ManagedGameCloseResult {
+  MANAGED_GAME_CLOSE_RESULT_UNSPECIFIED = 0;
+  MANAGED_GAME_CLOSE_RESULT_GRACEFUL = 1;
+  MANAGED_GAME_CLOSE_RESULT_FORCED = 2;
+  MANAGED_GAME_CLOSE_RESULT_FAILED = 3;
+}
+
+message ManagedGameCloseReceipt {
+  string game_session_id = 1;
+  uint64 state_version = 2;
+  ManagedGameCloseTrigger trigger = 3;
+  ManagedGameCloseResult result = 4;
+  int64 occurred_at_unix_ms = 5;
+  optional string error_code = 6;
+}
+
+message ManagedGameCloseEvent {
+  SessionRef session = 1;
+  string event_id = 2;
+  ManagedGameCloseReceipt receipt = 3;
+}
+
+enum ManagedGameClosePhase {
+  MANAGED_GAME_CLOSE_PHASE_UNSPECIFIED = 0;
+  MANAGED_GAME_CLOSE_PHASE_STOPPING_TASKS = 1;
+  MANAGED_GAME_CLOSE_PHASE_RELEASING_INPUT_CAPTURE = 2;
+  MANAGED_GAME_CLOSE_PHASE_NORMAL_CLOSE = 3;
+  MANAGED_GAME_CLOSE_PHASE_FORCE_CLOSE = 4;
+}
+
+message ManagedGameCloseProgress {
+  SessionRef session = 1;
+  string game_session_id = 2;
+  uint64 state_version = 3;
+  ManagedGameClosePhase phase = 4;
+  int64 occurred_at_unix_ms = 5;
+}
+
+message AcknowledgeManagedGameClose {
+  string event_id = 1;
+  string game_session_id = 2;
+  uint64 state_version = 3;
 }
 
 message BeginAttempt {

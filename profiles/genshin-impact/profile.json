@@ -3,12 +3,11 @@
     "schema_version": 1,
     "profile": {
       "id": "genshin-impact",
-      "version": "1.5.0",
+      "version": "1.4.0",
       "display_name": "原神",
       "target": {
         "process_names": ["YuanShen.exe"],
         "process_path_sha256": [
-          "a07b065bda33f8cc9f1b9f56eae1bab0fada986cb2699c19d793fba8a5ab4276",
           "aa42c410fe42d3de8b20121fa6f2520cc2c4c12a225e35b03c4f1a00a73a45fe",
           "cd2516e4359c1c1166adf8d025dcd027073a8293d197eec494675ec750baf762"
         ],
@@ -41,6 +40,6 @@
     },
     "files": []
   },
-  "content_sha256": "d80bfb4da8bee9667cdc18c7d0dc6b5ac43e2730e06d3cb81b5c95620fd0adea",
-  "signature": "eb3e9dece77ea2f8e4d0a1a96c1dab30536fbf1010ac2ac5d4612a06153a5968a8f7b0de5a502e13291f9d9d67ba2516ded97cf9e33ebb54d93b09502bb40700"
+  "content_sha256": "ceeb9501957a6694ef9c4e57995bd90c4ca0808edf660beaef50811739f9f3d6",
+  "signature": "c300a7dac0b143560c15ee8300b7561aa7367aa8231b33b9b7e53972b32a7464b4d5a54f9cf3d5c8720d6cf10be5b017685dd5471b32d756a9fe977494faac07"
 }

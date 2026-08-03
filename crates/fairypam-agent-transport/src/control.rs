@@ -249,6 +249,8 @@ fn command_ref(command: &HubControlCommand) -> Option<&CommandRef> {
         Payload::Hello(_) => None,
         Payload::LaunchTarget(value) => session_ref(value.reference.as_ref()),
         Payload::CloseTarget(value) => session_ref(value.reference.as_ref()),
+        Payload::ConfigureIdleClose(value) => session_ref(value.reference.as_ref()),
+        Payload::AcknowledgeManagedGameClose(_) => None,
         Payload::BeginAttempt(value) => task_ref(value.reference.as_ref()),
         Payload::StartAttemptTarget(value) => task_ref(value.reference.as_ref()),
         Payload::StartCapture(value) => task_ref(value.reference.as_ref()),

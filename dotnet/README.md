@@ -1,7 +1,7 @@
 # C# Windows Agent 开发入口
 
-本目录承载 C# Windows Agent 的 WPF GUI/Core、Guardian、严格本机状态与 Windows preliminary build。
-Slice 2A 已加入生成的 `fairypam.agent.v2` client contract、session/command identity、共享 canonical
+本目录承载 .NET Windows Agent 的 WPF GUI/Core、Guardian、严格本机状态与 Windows preliminary build。
+当前实现已加入生成的 `fairypam.agent.v2` client contract、session/command identity、共享 canonical
 payload digest/重放校验和 CSR-only enrollment response/certificate 校验；尚未创建 CNG key、安装证书
 或连接 Hub、游戏、截图和输入。
 preliminary 生成物的 `promotable` 固定为 `false`。
@@ -48,11 +48,11 @@ Release build 不接受默认或环境运行时覆盖；public key 必须作为 
 
 ## 正式证据与失败恢复
 
-`.github/workflows/csharp-windows-candidate.yml` 当前只产出 Slice 2 preliminary compile evidence：两个
+`.github/workflows/dotnet-windows-candidate.yml` 当前只产出 preliminary compile evidence：两个
 self-contained ZIP、逐文件 manifest 与绑定 source commit/run/build ID 的 receipt。receipt 固定
 `evidence_kind=csharp-windows-slice2-preliminary`、`formal_gate_status=blocked` 和
-`promotable=false`，不能关闭 `CSHARP-WINDOWS-BUILD`。正式 Gate 仍须等 Slice 5 的 NSIS
+`promotable=false`，不能关闭 `CSHARP-WINDOWS-BUILD`。正式 Gate 仍须由 NSIS
 candidate/receipt；不得用 preliminary、Docker、本地或 Rust receipt 替代。
 
 启动发现 ledger 截断、非法或未安全终结 attempt 时进入恢复阻断；不得删除 ledger、重写最后
-一行或清空目录来恢复。Slice 4 提供真实 cleanup 前，只能保留证据并停止输入能力。
+一行或清空目录来恢复。具备真实 cleanup 证据前，只能保留证据并停止输入能力。

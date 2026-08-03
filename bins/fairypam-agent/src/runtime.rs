@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::execution::{CommandExecutor, CommandOutcome, ExecutionSession, FrameSink};
+use crate::managed_game::close_event_id;
 #[cfg(any(windows, test))]
 use crate::observability;
 use crate::observability::AgentLogRecord;
@@ -700,6 +701,11 @@ impl SessionDriver for GrpcSessionDriver {
             LogLevel::Info,
             RuntimeLogMessage::ControlConnectionEstablished,
         );
+        drop(state);
+        self.execution
+            .lock()
+            .map_err(lock_error)?
+            .prepare_managed_game_close_replay();
         Ok(())
     }
 
@@ -744,15 +750,16 @@ impl SessionDriver for GrpcSessionDriver {
                 }
                 _ = heartbeat.tick() => {
                     sender.try_send(heartbeat_event(&session)).map_err(map_transport)?;
-                    let runtime_state = self.execution.lock().map_err(lock_error)?.runtime_state()?;
+                    let mut execution = self.execution.lock().map_err(lock_error)?;
+                    let runtime_state = execution.runtime_state()?;
                     sender.try_send(status_event(&session, runtime_state)).map_err(map_transport)?;
+                    if let Some(status) = execution.managed_game_status() {
+                        sender.try_send(managed_game_idle_event(&session, status)).map_err(map_transport)?;
+                    }
                 }
                 _ = capture_health.tick() => {
-                    let event = self
-                        .execution
-                        .lock()
-                        .map_err(lock_error)?
-                        .capture_failure_event(&ExecutionSession::from_verified(&session))?;
+                    let mut execution = self.execution.lock().map_err(lock_error)?;
+                    let event = execution.capture_failure_event(&ExecutionSession::from_verified(&session))?;
                     if let Some(event) = event {
                         sender.try_send(v2_adapter::safety_event(event)?).map_err(map_transport)?;
                     }
@@ -761,6 +768,15 @@ impl SessionDriver for GrpcSessionDriver {
                     let command = command.map_err(map_transport)?.ok_or_else(|| {
                         AgentError::new("runtime.control_closed", "Hub closed the Control stream")
                     })?.into_inner();
+                    if let Some(v2::hub_control_command::Payload::AcknowledgeManagedGameClose(value)) =
+                        command.payload.as_ref()
+                    {
+                        self.execution
+                            .lock()
+                            .map_err(lock_error)?
+                            .acknowledge_managed_game_close(value)?;
+                        continue;
+                    }
                     let identity = v2_adapter::identity(&command).ok_or_else(|| {
                         AgentError::new(
                             "runtime.command_invalid",
@@ -797,6 +813,32 @@ impl SessionDriver for GrpcSessionDriver {
                                 &ExecutionSession::from_verified(&session),
                                 Arc::new(frames) as Arc<dyn FrameSink>,
                             )
+                        }
+                        v2_adapter::TranslatedCommand::CloseTarget { value } => {
+                            let mut report = |phase| {
+                                let event = managed_game_close_progress_event(
+                                    &session,
+                                    &value.game_session_id,
+                                    value.state_version,
+                                    phase,
+                                );
+                                if let Err(error) = sender.try_send(event) {
+                                    tracing::warn!(
+                                        code = error.code(),
+                                        "managed game close progress event was not sent"
+                                    );
+                                }
+                            };
+                            self.execution.lock().map_err(lock_error)?.execute_v2_close_target_with_progress(
+                                &value,
+                                &mut report,
+                            )
+                        }
+                        v2_adapter::TranslatedCommand::ConfigureIdleClose { value } => {
+                            self.execution
+                                .lock()
+                                .map_err(lock_error)?
+                                .execute_v2_configure_idle_close(&value)
                         }
                         v2_adapter::TranslatedCommand::BeginAttempt {
                             task,
@@ -876,6 +918,56 @@ impl SessionDriver for GrpcSessionDriver {
                 }
             }
         }
+    }
+}
+
+impl GrpcSessionDriver {
+    fn tick_managed_game_close(&self) -> Result<(), AgentError> {
+        let connection = {
+            let state = self.state.lock().map_err(lock_error)?;
+            state.sender.clone().zip(state.session.clone())
+        };
+        let receipt = {
+            let mut execution = self.execution.lock().map_err(lock_error)?;
+            let mut report = |game_session_id: &str, state_version, phase| {
+                let Some((sender, session)) = connection.as_ref() else {
+                    return;
+                };
+                let event = managed_game_close_progress_event(
+                    session,
+                    game_session_id,
+                    state_version,
+                    phase,
+                );
+                if let Err(error) = sender.try_send(event) {
+                    tracing::warn!(
+                        code = error.code(),
+                        "managed game close progress event was not sent"
+                    );
+                }
+            };
+            let _ = execution.close_idle_game_if_due_with_progress(&mut report)?;
+            execution.pending_managed_game_close()
+        };
+        let Some(receipt) = receipt else {
+            return Ok(());
+        };
+        let (sender, session) = {
+            let state = self.state.lock().map_err(lock_error)?;
+            let (Some(sender), Some(session)) = (state.sender.clone(), state.session.clone())
+            else {
+                return Ok(());
+            };
+            (sender, session)
+        };
+        sender
+            .try_send(managed_game_close_event(&session, receipt))
+            .map_err(map_transport)?;
+        self.execution
+            .lock()
+            .map_err(lock_error)?
+            .mark_managed_game_close_reported();
+        Ok(())
     }
 }
 
@@ -1148,14 +1240,24 @@ async fn run_embedded_driver(driver: GrpcSessionDriver) -> Result<(), AgentError
         }
     }
     let mut supervisor_run = Box::pin(supervisor.run(&driver));
-    tokio::select! {
-        result = &mut supervisor_run => match result {
-            Ok(never) => match never {},
-            Err(error) => Err(error),
-        },
-        _ = driver.gui_shutdown.cancelled() => {
-            drop(supervisor_run);
-            shutdown_embedded(&driver, &mut supervisor)
+    let mut idle_close = tokio::time::interval(Duration::from_millis(250));
+    idle_close.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    idle_close.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut supervisor_run => return match result {
+                Ok(never) => match never {},
+                Err(error) => Err(error),
+            },
+            _ = idle_close.tick() => {
+                if let Err(error) = driver.tick_managed_game_close() {
+                    tracing::warn!(code = error.code(), "managed game idle-close tick paused");
+                }
+            },
+            _ = driver.gui_shutdown.cancelled() => {
+                drop(supervisor_run);
+                return shutdown_embedded(&driver, &mut supervisor);
+            }
         }
     }
 }
@@ -1621,6 +1723,51 @@ fn status_event(session: &VerifiedSession, state: AgentRuntimeState) -> AgentCon
             profile_id: String::new(),
             attempt: None,
         })),
+    }
+}
+
+fn managed_game_idle_event(
+    session: &VerifiedSession,
+    mut status: v2::ManagedGameIdleStatus,
+) -> AgentControlEvent {
+    status.session = Some(session_ref(session));
+    AgentControlEvent {
+        payload: Some(agent_control_event::Payload::ManagedGameIdleStatus(status)),
+    }
+}
+
+fn managed_game_close_event(
+    session: &VerifiedSession,
+    receipt: v2::ManagedGameCloseReceipt,
+) -> AgentControlEvent {
+    let event_id = close_event_id(&receipt);
+    AgentControlEvent {
+        payload: Some(agent_control_event::Payload::ManagedGameCloseEvent(
+            v2::ManagedGameCloseEvent {
+                session: Some(session_ref(session)),
+                event_id,
+                receipt: Some(receipt),
+            },
+        )),
+    }
+}
+
+fn managed_game_close_progress_event(
+    session: &VerifiedSession,
+    game_session_id: &str,
+    state_version: u64,
+    phase: v2::ManagedGameClosePhase,
+) -> AgentControlEvent {
+    AgentControlEvent {
+        payload: Some(agent_control_event::Payload::ManagedGameCloseProgress(
+            v2::ManagedGameCloseProgress {
+                session: Some(session_ref(session)),
+                game_session_id: game_session_id.to_owned(),
+                state_version,
+                phase: phase as i32,
+                occurred_at_unix_ms: now_unix_ms(),
+            },
+        )),
     }
 }
 

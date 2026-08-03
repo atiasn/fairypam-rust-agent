@@ -102,10 +102,6 @@ jobs:
             npm run tauri build -- --no-bundle
             ..\target\release\fairypam-build-suite.exe `
               --patch-tauri-nsis ..\target\release\fairypam-agent-tauri-ui.exe
-            $productProfiles = '..\target\product-profiles'
-            Remove-Item -LiteralPath $productProfiles -Recurse -Force -ErrorAction SilentlyContinue
-            New-Item -ItemType Directory -Force "$productProfiles\genshin-impact" | Out-Null
-            Copy-Item '..\profiles\genshin-impact\profile.json' "$productProfiles\genshin-impact\profile.json"
             $suiteVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
             $builtAt = [DateTime]::UtcNow.ToString('o')
             ..\target\release\fairypam-build-suite.exe `
@@ -120,7 +116,7 @@ jobs:
               --bootstrap ..\target\suite\agent-bootstrap.json `
               --bootstrap-signature ..\target\suite\agent-bootstrap.json.sig `
               --helper ..\target\release\fairypam-agent-installer.exe `
-              --profiles $productProfiles
+              --profiles ..\profiles
             npm run tauri bundle -- --bundles nsis
             npm run check:command-surface
             git diff --exit-code -- src-tauri/Cargo.lock
@@ -227,10 +223,6 @@ jobs:
           }
           $profiles = Join-Path $versionRoot 'profiles'
           if (-not (Test-Path -LiteralPath $profiles -PathType Container)) { throw "missing installed profiles directory: $profiles" }
-          $installedProfiles = @(Get-ChildItem -LiteralPath $profiles -Recurse -File -Filter 'profile.json')
-          if ($installedProfiles.Count -ne 1) { throw "expected exactly one production Profile, found $($installedProfiles.Count)" }
-          $installedProfile = Get-Content $installedProfiles[0].FullName -Raw | ConvertFrom-Json
-          if ($installedProfile.content.profile.id -ne 'genshin-impact') { throw 'installed Profile is not genshin-impact' }
           $allowedProductExecutables = @(
             (Join-Path $versionRoot 'fairypam-agent-tauri-ui.exe'),
             (Join-Path $versionRoot 'fairypam-agent-guardian.exe'),

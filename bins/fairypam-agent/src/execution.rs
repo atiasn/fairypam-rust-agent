@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::managed_game::ManagedGameLifecycle;
 use crate::runtime_api::{InputProbeAction, RuntimeCommand as LocalCommand};
 use fairypam_agent_core::profile::{CaptureRegion, VerifiedProfile};
 use fairypam_agent_core::target::{TargetBinding, TargetCandidate, TargetSelector, TargetSnapshot};
@@ -50,6 +51,56 @@ fn ensure_current_source_frame(source_frame: Option<(&AtomicU64, u64)>) -> Resul
         ));
     }
     Ok(())
+}
+
+fn command_refreshes_managed_activity(command: &HubControlCommand) -> bool {
+    use hub_control_command::Payload;
+    matches!(
+        command.payload.as_ref(),
+        Some(
+            Payload::LaunchTarget(_)
+                | Payload::FocusTarget(_)
+                | Payload::StartTaskTarget(_)
+                | Payload::StartCapture(_)
+                | Payload::CaptureFrame(_)
+                | Payload::InputLease(_)
+                | Payload::PulseAction(_)
+                | Payload::MouseDeltaAction(_)
+                | Payload::WindowPointClickAction(_)
+        )
+    )
+}
+
+fn command_targets_managed_game(command: &HubControlCommand) -> bool {
+    use hub_control_command::Payload;
+    matches!(
+        command.payload.as_ref(),
+        Some(
+            Payload::LaunchTarget(_)
+                | Payload::EnumerateTargets(_)
+                | Payload::LockTarget(_)
+                | Payload::FocusTarget(_)
+                | Payload::StartTaskTarget(_)
+                | Payload::StartCapture(_)
+                | Payload::CaptureFrame(_)
+                | Payload::InputLease(_)
+                | Payload::PulseAction(_)
+                | Payload::MouseDeltaAction(_)
+                | Payload::WindowPointClickAction(_)
+        )
+    )
+}
+
+fn outcome_applied(outcome: &CommandOutcome) -> bool {
+    match outcome {
+        CommandOutcome::Ack(_) | CommandOutcome::CloseAck(_) => true,
+        CommandOutcome::TaskAck { outcome: None, .. } => true,
+        CommandOutcome::TaskAck {
+            outcome: Some(value),
+            ..
+        } => value.outcome == TaskCommandOutcomeState::Applied as i32,
+        CommandOutcome::CloseNack { .. } | CommandOutcome::Nack { .. } => false,
+    }
 }
 
 fn next_frame_sequence(sequence: &AtomicU64) -> Result<u64, AgentError> {
@@ -209,7 +260,32 @@ pub trait RuntimePlatform: Send {
 
     fn focus(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError>;
 
+    fn local_foreground_input_token(
+        &mut self,
+        _binding: &TargetBinding,
+    ) -> Result<Option<u32>, AgentError> {
+        Ok(None)
+    }
+
     fn close(&mut self, binding: &TargetBinding, timeout: Duration) -> Result<(), AgentError>;
+
+    fn close_with_result(
+        &mut self,
+        binding: &TargetBinding,
+        timeout: Duration,
+    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
+        self.close(binding, timeout)?;
+        Ok(v2::ManagedGameCloseResult::Graceful)
+    }
+
+    fn close_with_progress(
+        &mut self,
+        binding: &TargetBinding,
+        timeout: Duration,
+        _on_force: &mut dyn FnMut(),
+    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
+        self.close_with_result(binding, timeout)
+    }
 
     fn start_task_input(
         &mut self,
@@ -248,6 +324,12 @@ pub trait RuntimePlatform: Send {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandOutcome {
     Ack(String),
+    CloseAck(v2::ManagedGameCloseReceipt),
+    CloseNack {
+        receipt: v2::ManagedGameCloseReceipt,
+        code: String,
+        message: String,
+    },
     TaskAck {
         result: String,
         outcome: Option<TaskCommandOutcomeV1>,
@@ -369,16 +451,28 @@ pub struct CommandExecutor {
     capture: Option<CaptureWorker>,
     frame_sequences: BTreeMap<String, Arc<AtomicU64>>,
     task_attempt: TaskAttemptRuntime,
+    managed_game: ManagedGameLifecycle,
+    last_local_input_token: Option<u32>,
 }
 
 impl CommandExecutor {
     pub fn production(profiles: ProfileStore) -> Self {
-        Self::with_platform_and_attempts(
+        let executor = Self::with_platform_and_attempts(
             profiles,
             production_platform(),
             TaskAttemptRuntime::production(),
             "production",
-        )
+        );
+        #[cfg(windows)]
+        let mut executor = executor;
+        #[cfg(windows)]
+        {
+            executor.managed_game = ManagedGameLifecycle::persistent(
+                std::path::PathBuf::from(crate::enrollment::STATE_ROOT)
+                    .join("managed-game-lifecycle.json"),
+            );
+        }
+        executor
     }
 
     pub fn with_platform(profiles: ProfileStore, platform: Box<dyn RuntimePlatform>) -> Self {
@@ -410,7 +504,205 @@ impl CommandExecutor {
             capture: None,
             frame_sequences: BTreeMap::new(),
             task_attempt,
+            managed_game: ManagedGameLifecycle::memory(),
+            last_local_input_token: None,
         }
+    }
+
+    pub fn execute_v2_configure_idle_close(
+        &mut self,
+        value: &v2::ConfigureIdleClose,
+    ) -> CommandOutcome {
+        self.managed_game
+            .configure(value, Instant::now(), current_unix_ms())
+            .map(|_| CommandOutcome::Ack("{}".into()))
+            .unwrap_or_else(CommandOutcome::from_error)
+    }
+
+    pub fn execute_v2_close_target(&mut self, value: &v2::CloseTarget) -> CommandOutcome {
+        self.execute_v2_close_target_with_progress(value, &mut |_| {})
+    }
+
+    pub fn execute_v2_close_target_with_progress(
+        &mut self,
+        value: &v2::CloseTarget,
+        on_progress: &mut dyn FnMut(v2::ManagedGameClosePhase),
+    ) -> CommandOutcome {
+        let result = (|| {
+            if self.task_attempt.is_active()? {
+                return Err(AgentError::new(
+                    "task_command_not_allowed",
+                    "active task must finish safe cleanup before the game can close",
+                ));
+            }
+            if !(1..=MAX_CLOSE_TIMEOUT_MS).contains(&value.timeout_ms) {
+                return Err(AgentError::new(
+                    "target.close_timeout_invalid",
+                    "close timeout must be between 1 and 5000 ms",
+                ));
+            }
+            let Some((game_session_id, state_version)) = self.managed_game.current_identity()
+            else {
+                return Err(AgentError::new(
+                    "target.identity_unavailable",
+                    "managed game identity has not been confirmed",
+                ));
+            };
+            if value.game_session_id != game_session_id || value.state_version != state_version {
+                return Err(AgentError::new(
+                    "target.identity_mismatch",
+                    "close request does not match the managed game identity",
+                ));
+            }
+            self.managed_game.begin_close()?;
+            let close_result =
+                match self.close_current_target_with_progress(value.timeout_ms, on_progress) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let receipt = self
+                            .managed_game
+                            .manual_close_failed(error.code(), current_unix_ms())
+                            .ok_or_else(|| {
+                                AgentError::new(
+                                    "target.identity_unavailable",
+                                    "managed game identity disappeared during close",
+                                )
+                            })?;
+                        return Ok(CommandOutcome::CloseNack {
+                            receipt,
+                            code: error.code().to_owned(),
+                            message: error.to_string(),
+                        });
+                    }
+                };
+            self.managed_game
+                .manual_close_receipt(close_result, current_unix_ms())
+                .map(CommandOutcome::CloseAck)
+                .ok_or_else(|| {
+                    AgentError::new(
+                        "target.identity_unavailable",
+                        "managed game identity disappeared during close",
+                    )
+                })
+        })();
+        result.unwrap_or_else(CommandOutcome::from_error)
+    }
+
+    pub fn managed_game_status(&self) -> Option<v2::ManagedGameIdleStatus> {
+        self.managed_game.status(Instant::now(), current_unix_ms())
+    }
+
+    pub fn prepare_managed_game_close_replay(&mut self) {
+        self.managed_game.prepare_close_replay();
+    }
+
+    pub fn pending_managed_game_close(&self) -> Option<v2::ManagedGameCloseReceipt> {
+        self.managed_game.pending_close_receipt()
+    }
+
+    pub fn mark_managed_game_close_reported(&mut self) {
+        self.managed_game.mark_close_reported();
+    }
+
+    pub fn acknowledge_managed_game_close(
+        &mut self,
+        value: &v2::AcknowledgeManagedGameClose,
+    ) -> Result<(), AgentError> {
+        self.managed_game.acknowledge_close(
+            &value.event_id,
+            &value.game_session_id,
+            value.state_version,
+        )
+    }
+
+    pub fn close_idle_game_if_due(
+        &mut self,
+    ) -> Result<Option<v2::ManagedGameCloseReceipt>, AgentError> {
+        self.close_idle_game_if_due_with_progress(&mut |_, _, _| {})
+    }
+
+    pub fn close_idle_game_if_due_with_progress(
+        &mut self,
+        on_progress: &mut dyn FnMut(&str, u64, v2::ManagedGameClosePhase),
+    ) -> Result<Option<v2::ManagedGameCloseReceipt>, AgentError> {
+        self.observe_local_foreground_activity()?;
+        if !self.managed_game.due(Instant::now()) {
+            return Ok(None);
+        }
+        let Some((game_session_id, state_version)) = self
+            .managed_game
+            .current_identity()
+            .map(|(game_session_id, state_version)| (game_session_id.to_owned(), state_version))
+        else {
+            return Ok(None);
+        };
+        self.managed_game.begin_close()?;
+        let mut report = |phase| on_progress(&game_session_id, state_version, phase);
+        Ok(
+            match self.close_current_target_with_progress(MAX_CLOSE_TIMEOUT_MS, &mut report) {
+                Ok(result) => self.managed_game.close_receipt(
+                    v2::ManagedGameCloseTrigger::Idle,
+                    result,
+                    current_unix_ms(),
+                    None,
+                ),
+                Err(error) => self.managed_game.close_receipt(
+                    v2::ManagedGameCloseTrigger::Idle,
+                    v2::ManagedGameCloseResult::Failed,
+                    current_unix_ms(),
+                    Some(error.code().to_owned()),
+                ),
+            },
+        )
+    }
+
+    fn observe_local_foreground_activity(&mut self) -> Result<(), AgentError> {
+        let Some(binding) = self.binding.as_ref() else {
+            self.last_local_input_token = None;
+            return Ok(());
+        };
+        let Some(token) = self.platform.local_foreground_input_token(binding)? else {
+            return Ok(());
+        };
+        if self
+            .last_local_input_token
+            .replace(token)
+            .is_some_and(|previous| previous != token)
+        {
+            self.managed_game
+                .mark_activity(Instant::now(), current_unix_ms());
+        }
+        Ok(())
+    }
+
+    fn close_current_target(
+        &mut self,
+        timeout_ms: u32,
+    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
+        self.close_current_target_with_progress(timeout_ms, &mut |_| {})
+    }
+
+    fn close_current_target_with_progress(
+        &mut self,
+        timeout_ms: u32,
+        on_progress: &mut dyn FnMut(v2::ManagedGameClosePhase),
+    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
+        on_progress(v2::ManagedGameClosePhase::ReleasingInputCapture);
+        self.platform.release_task_input()?;
+        self.stop_capture(None)?;
+        on_progress(v2::ManagedGameClosePhase::NormalClose);
+        let result = match self.binding.clone() {
+            Some(binding) => self.platform.close_with_progress(
+                &binding,
+                Duration::from_millis(u64::from(timeout_ms)),
+                &mut || on_progress(v2::ManagedGameClosePhase::ForceClose),
+            )?,
+            None => v2::ManagedGameCloseResult::Graceful,
+        };
+        self.active_profile = None;
+        self.binding = None;
+        self.last_local_input_token = None;
+        Ok(result)
     }
 
     pub fn execute(
@@ -419,8 +711,14 @@ impl CommandExecutor {
         session: &ExecutionSession,
         frames: Arc<dyn FrameSink>,
     ) -> CommandOutcome {
-        self.execute_inner(command, session, frames)
-            .unwrap_or_else(CommandOutcome::from_error)
+        let outcome = self
+            .execute_inner(command, session, frames)
+            .unwrap_or_else(CommandOutcome::from_error);
+        if command_refreshes_managed_activity(command) && outcome_applied(&outcome) {
+            self.managed_game
+                .mark_activity(Instant::now(), current_unix_ms());
+        }
+        outcome
     }
 
     pub fn execute_v2_begin(
@@ -429,6 +727,12 @@ impl CommandExecutor {
         contract: &v2::ExecutionContract,
     ) -> CommandOutcome {
         let result = (|| {
+            if self.managed_game.is_closing() {
+                return Err(AgentError::new(
+                    "target.closing",
+                    "managed target remains in the closing gate",
+                ));
+            }
             let profile = self.profiles.get(&contract.profile_id)?;
             if profile.content_sha256() != contract.profile_digest {
                 return Err(AgentError::new(
@@ -470,6 +774,12 @@ impl CommandExecutor {
         client_point: Option<(i32, u32, u32)>,
     ) -> CommandOutcome {
         let result = (|| {
+            if self.managed_game.is_closing() {
+                return Err(AgentError::new(
+                    "target.closing",
+                    "managed target remains in the closing gate",
+                ));
+            }
             if let Some(result) = self.task_attempt.replay(task)? {
                 return Ok(CommandOutcome::task(result));
             }
@@ -534,7 +844,12 @@ impl CommandExecutor {
                 )?,
             ))
         })();
-        result.unwrap_or_else(CommandOutcome::from_error)
+        let outcome = result.unwrap_or_else(CommandOutcome::from_error);
+        if outcome_applied(&outcome) {
+            self.managed_game
+                .mark_activity(Instant::now(), current_unix_ms());
+        }
+        outcome
     }
 
     pub fn v2_payload_digest_conflict(
@@ -599,6 +914,21 @@ impl CommandExecutor {
                 "active M1 task attempt rejects this local command",
             ));
         }
+        if self.managed_game.is_closing()
+            && !read_only
+            && !matches!(
+                command,
+                LocalCommand::CloseTarget
+                    | LocalCommand::StopCapture { .. }
+                    | LocalCommand::ReleaseAll
+                    | LocalCommand::ResetEmergencyStop
+            )
+        {
+            return Err(AgentError::new(
+                "target.closing",
+                "managed game is closing and rejects new target actions",
+            ));
+        }
         match command {
             LocalCommand::Status => Ok(json!({
                 "state": if emergency_stopped {
@@ -636,6 +966,33 @@ impl CommandExecutor {
                 )
             }
             LocalCommand::CloseTarget => {
+                if self.managed_game.current_identity().is_some() {
+                    self.managed_game.begin_close()?;
+                    let close_result = match self.close_current_target(MAX_CLOSE_TIMEOUT_MS) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            self.managed_game
+                                .manual_close_failed(error.code(), current_unix_ms());
+                            return Err(error);
+                        }
+                    };
+                    let receipt = self
+                        .managed_game
+                        .manual_close_receipt(close_result, current_unix_ms())
+                        .ok_or_else(|| {
+                            AgentError::new(
+                                "target.identity_unavailable",
+                                "managed game identity disappeared during close",
+                            )
+                        })?;
+                    return Ok(json!({
+                        "closed": true,
+                        "close_result": v2::ManagedGameCloseResult::try_from(receipt.result)
+                            .unwrap_or(v2::ManagedGameCloseResult::Failed)
+                            .as_str_name(),
+                        "state": "ConnectedIdle",
+                    }));
+                }
                 let Some(binding) = self.binding.clone() else {
                     return Ok(json!({"closed": true, "state": "ConnectedIdle"}));
                 };
@@ -794,6 +1151,12 @@ impl CommandExecutor {
                 "remote commands cannot reset a local emergency stop",
             ));
         }
+        if self.managed_game.is_closing() && command_targets_managed_game(command) {
+            return Err(AgentError::new(
+                "target.closing",
+                "managed target remains in the closing gate",
+            ));
+        }
         if self.task_attempt.is_active()? && !task_payload_allowed(payload) {
             return Err(AgentError::new(
                 "task_command_not_allowed",
@@ -806,6 +1169,12 @@ impl CommandExecutor {
                 let binding = self.platform.start_task_target(&profile)?;
                 self.active_profile = Some(profile);
                 self.binding = Some(binding.clone());
+                self.last_local_input_token = None;
+                self.managed_game.bind_target(
+                    &binding.profile_id,
+                    Instant::now(),
+                    current_unix_ms(),
+                );
                 Ok(CommandOutcome::Ack(
                     json!({
                         "profile_id": binding.profile_id,
@@ -1770,6 +2139,10 @@ fn now_unix_us() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+fn current_unix_ms() -> i64 {
+    now_unix_us() / 1_000
+}
+
 #[cfg(any(windows, test))]
 fn retry_startup_identity<T>(
     deadline: Instant,
@@ -2386,9 +2759,49 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         self.targets.focus(binding)
     }
 
-    fn close(&mut self, binding: &TargetBinding, _timeout: Duration) -> Result<(), AgentError> {
+    fn local_foreground_input_token(
+        &mut self,
+        binding: &TargetBinding,
+    ) -> Result<Option<u32>, AgentError> {
+        use fairypam_agent_core::platform::TargetPlatform;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+        if !self.targets.revalidate(binding)?.foreground {
+            return Ok(None);
+        }
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+            return Err(AgentError::new(
+                "idle_close.local_input_unavailable",
+                windows::core::Error::from_win32().to_string(),
+            ));
+        }
+        Ok(Some(info.dwTime))
+    }
+
+    fn close(&mut self, binding: &TargetBinding, timeout: Duration) -> Result<(), AgentError> {
+        self.close_with_result(binding, timeout).map(|_| ())
+    }
+
+    fn close_with_result(
+        &mut self,
+        binding: &TargetBinding,
+        timeout: Duration,
+    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
+        self.close_with_progress(binding, timeout, &mut || {})
+    }
+
+    fn close_with_progress(
+        &mut self,
+        binding: &TargetBinding,
+        _timeout: Duration,
+        on_force: &mut dyn FnMut(),
+    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
         let Some(managed) = self.managed.as_ref() else {
-            return Ok(());
+            return Ok(v2::ManagedGameCloseResult::Graceful);
         };
         if managed.binding.process_id != binding.process_id
             || managed.binding.process_started_at_unix_ms != binding.process_started_at_unix_ms
@@ -2405,15 +2818,18 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 .contains(&binding.process_id);
             if !still_running {
                 self.managed = None;
-                return Ok(());
+                return Ok(v2::ManagedGameCloseResult::Graceful);
             }
             if error.code() == "target.stale" {
                 return Err(error);
             }
+            on_force();
             self.targets.terminate(binding, Duration::from_secs(5))?;
+            self.managed = None;
+            return Ok(v2::ManagedGameCloseResult::Forced);
         }
         self.managed = None;
-        Ok(())
+        Ok(v2::ManagedGameCloseResult::Graceful)
     }
 
     fn start_task_input(
@@ -4137,6 +4553,107 @@ mod tests {
         assert!(executor.binding.is_some());
         assert!(executor.active_profile.is_some());
         assert_eq!(state.lock().unwrap().close_calls.len(), 1);
+    }
+
+    #[test]
+    fn manual_close_failure_is_persisted_and_stops_idle_retry() {
+        let (mut executor, state) = executor_with_state();
+        state.lock().unwrap().fail_close = true;
+        assert!(matches!(
+            executor.execute(
+                &HubControlCommand {
+                    payload: Some(hub_control_command::Payload::LaunchTarget(LaunchTarget {
+                        profile_id: "testbed".into(),
+                        ..LaunchTarget::default()
+                    })),
+                },
+                &ExecutionSession::test(),
+                Arc::new(CollectFrames::default()),
+            ),
+            CommandOutcome::Ack(_)
+        ));
+        let profile_id = executor
+            .active_profile
+            .as_ref()
+            .unwrap()
+            .profile()
+            .id
+            .clone();
+        let config = v2::ConfigureIdleClose {
+            game_session_id: "33333333-3333-4333-8333-333333333333".into(),
+            profile_id,
+            state_version: 1,
+            enabled: true,
+            idle_timeout_ms: 5 * 60 * 1_000,
+            occupied: false,
+            ..v2::ConfigureIdleClose::default()
+        };
+        assert!(matches!(
+            executor.execute_v2_configure_idle_close(&config),
+            CommandOutcome::Ack(_)
+        ));
+
+        let mut phases = Vec::new();
+        let outcome = executor.execute_v2_close_target_with_progress(
+            &v2::CloseTarget {
+                game_session_id: config.game_session_id.clone(),
+                state_version: config.state_version,
+                timeout_ms: 5_000,
+                ..v2::CloseTarget::default()
+            },
+            &mut |phase| phases.push(phase),
+        );
+        assert!(
+            matches!(
+                outcome,
+                CommandOutcome::CloseNack { ref code, ref receipt, .. }
+                    if code == "target.close_failed"
+                        && receipt.result == v2::ManagedGameCloseResult::Failed as i32
+                        && receipt.error_code.as_deref() == Some("target.close_failed")
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert_eq!(
+            phases,
+            [
+                v2::ManagedGameClosePhase::ReleasingInputCapture,
+                v2::ManagedGameClosePhase::NormalClose,
+            ]
+        );
+
+        assert!(executor.pending_managed_game_close().is_none());
+        assert_eq!(
+            executor.managed_game_status().unwrap().state,
+            v2::ManagedGameIdleState::CloseFailed as i32
+        );
+        assert!(executor.close_idle_game_if_due().unwrap().is_none());
+        assert!(matches!(
+            executor.execute(
+                &lock_command(),
+                &ExecutionSession::test(),
+                Arc::new(CollectFrames::default()),
+            ),
+            CommandOutcome::Nack { ref code, .. } if code == "target.closing"
+        ));
+        assert!(matches!(
+            executor.execute_local(&LocalCommand::EnumerateTargets {
+                profile_id: "testbed".into(),
+            }),
+            Err(ref error) if error.code() == "target.closing"
+        ));
+        state.lock().unwrap().fail_close = false;
+        assert!(
+            executor.execute_local(&LocalCommand::CloseTarget).unwrap()["closed"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(!executor.managed_game.is_closing());
+        assert!(executor
+            .execute_local(&LocalCommand::EnumerateTargets {
+                profile_id: "testbed".into(),
+            })
+            .is_ok());
+        assert_eq!(state.lock().unwrap().close_calls.len(), 2);
     }
 
     #[test]

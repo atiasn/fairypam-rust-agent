@@ -5,6 +5,7 @@ use fairypam_agent_core::platform::{AuthorizationState, DenyAllAuthorization, Lo
 #[cfg(windows)]
 pub mod enrollment;
 pub mod execution;
+mod managed_game;
 mod observability;
 pub mod profile_store;
 pub mod runtime;
