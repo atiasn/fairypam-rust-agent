@@ -401,7 +401,7 @@ fn persistence_error(error: impl std::fmt::Display) -> AgentError {
     AgentError::new("profile_catalog.persistence_failed", error.to_string())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn ensure_root(root: &Path) -> Result<(), AgentError> {
     crate::enrollment::ensure_private_directory(root)?;
     let generations = generations_root(root);
@@ -412,39 +412,39 @@ fn ensure_root(root: &Path) -> Result<(), AgentError> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn ensure_root(root: &Path) -> Result<(), AgentError> {
     fs::create_dir_all(generations_root(root)).map_err(persistence_error)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn create_private_directory(path: &Path) -> Result<(), AgentError> {
     crate::enrollment::create_private_directory(path)
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn create_private_directory(path: &Path) -> Result<(), AgentError> {
     fs::create_dir(path).map_err(persistence_error)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn verify_private_directory(path: &Path) -> Result<(), AgentError> {
     crate::enrollment::verify_private_directory(path)
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn verify_private_directory(path: &Path) -> Result<(), AgentError> {
     path.is_dir()
         .then_some(())
         .ok_or_else(|| persistence_error("directory is unavailable"))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
     crate::enrollment::write_private(path, bytes)
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
     use std::io::Write;
     let mut file = fs::OpenOptions::new()
@@ -456,20 +456,20 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
     file.sync_all().map_err(persistence_error)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn replace_private(source: &Path, destination: &Path) -> Result<(), AgentError> {
     crate::enrollment::replace_private(source, destination)
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn replace_private(source: &Path, destination: &Path) -> Result<(), AgentError> {
     fs::rename(source, destination).map_err(persistence_error)
 }
 
 fn read_private(path: &Path, maximum: usize) -> Result<Vec<u8>, AgentError> {
-    #[cfg(windows)]
+    #[cfg(all(windows, not(test)))]
     let mut file = crate::enrollment::open_private_read(path)?;
-    #[cfg(not(windows))]
+    #[cfg(any(not(windows), test))]
     let mut file = fs::File::open(path).map_err(persistence_error)?;
     let mut bytes = Vec::new();
     file.by_ref()
@@ -479,18 +479,18 @@ fn read_private(path: &Path, maximum: usize) -> Result<Vec<u8>, AgentError> {
     if bytes.len() > maximum {
         return Err(invalid("profile_catalog.size_exceeded"));
     }
-    #[cfg(windows)]
+    #[cfg(all(windows, not(test)))]
     crate::enrollment::verify_private_file(path)?;
     Ok(bytes)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn remove_private_file(path: &Path) -> Result<(), AgentError> {
     crate::enrollment::verify_private_file(path)?;
     fs::remove_file(path).map_err(persistence_error)
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn remove_private_file(path: &Path) -> Result<(), AgentError> {
     fs::remove_file(path).map_err(persistence_error)
 }
