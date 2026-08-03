@@ -2776,7 +2776,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
             return Err(AgentError::new(
                 "idle_close.local_input_unavailable",
-                windows::core::Error::from_win32().to_string(),
+                windows::core::Error::from_thread().to_string(),
             ));
         }
         Ok(Some(info.dwTime))
