@@ -21,6 +21,7 @@ struct FakeInput {
     events: Option<Arc<Mutex<Vec<&'static str>>>>,
     fail_pulse: bool,
     emergency_releases: Vec<Vec<u16>>,
+    wheel_events: Vec<(Option<(u32, u32)>, i32)>,
 }
 
 impl InputPlatform for FakeInput {
@@ -52,6 +53,21 @@ impl InputPlatform for FakeInput {
             self.pressed.remove(scan_code);
             self.released.push(*scan_code);
         }
+        Ok(())
+    }
+
+    fn wheel(&mut self, delta: i32) -> Result<(), SafetyError> {
+        self.wheel_events.push((None, delta));
+        Ok(())
+    }
+
+    fn wheel_at_client_point(
+        &mut self,
+        x_ppm: u32,
+        y_ppm: u32,
+        delta: i32,
+    ) -> Result<(), SafetyError> {
+        self.wheel_events.push((Some((x_ppm, y_ppm)), delta));
         Ok(())
     }
 }
@@ -586,6 +602,7 @@ fn physical_frame_applies_and_releases_profile_declared_key() {
             &[(17, false)],
             &[],
             0,
+            None,
             &authority.permit(now),
             now,
         )
@@ -600,6 +617,7 @@ fn physical_frame_applies_and_releases_profile_declared_key() {
             &[],
             &[],
             0,
+            None,
             &authority.permit(now),
             now,
         )
@@ -626,6 +644,7 @@ fn invalid_wheel_rejects_the_entire_physical_frame_before_side_effects() {
             &[(17, false)],
             &[],
             360,
+            None,
             &authority.permit(now),
             now,
         )
@@ -634,5 +653,96 @@ fn invalid_wheel_rejects_the_entire_physical_frame_before_side_effects() {
     assert_eq!(error.code(), "input.wheel_not_allowed");
     assert!(executor.platform().pressed.is_empty());
     assert!(executor.platform().emergency_releases.is_empty());
+    assert!(executor.guardian().calls.is_empty());
+}
+
+#[test]
+fn physical_frame_positions_the_pointer_before_wheel_without_button_holds() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let mut executor = LeaseExecutor::new(
+        &verified_profile(),
+        FakeInput::default(),
+        FakeGuardian::default(),
+    )
+    .unwrap();
+
+    executor
+        .apply_physical_frame(
+            session(1),
+            1,
+            now + Duration::from_secs(1),
+            &[],
+            &[],
+            -120,
+            Some((500_000, 500_000)),
+            &authority.permit(now),
+            now,
+        )
+        .unwrap();
+
+    assert_eq!(
+        executor.platform().wheel_events,
+        vec![(Some((500_000, 500_000)), -120)]
+    );
+    assert!(executor.held_actions().is_empty());
+}
+
+#[test]
+fn physical_frame_without_a_wheel_point_keeps_legacy_wheel_behavior() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let mut executor = LeaseExecutor::new(
+        &verified_profile(),
+        FakeInput::default(),
+        FakeGuardian::default(),
+    )
+    .unwrap();
+
+    executor
+        .apply_physical_frame(
+            session(1),
+            1,
+            now + Duration::from_secs(1),
+            &[],
+            &[],
+            -120,
+            None,
+            &authority.permit(now),
+            now,
+        )
+        .unwrap();
+
+    assert_eq!(executor.platform().wheel_events, vec![(None, -120)]);
+}
+
+#[test]
+fn invalid_wheel_point_rejects_the_entire_frame_before_side_effects() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let mut executor = LeaseExecutor::new(
+        &verified_profile(),
+        FakeInput::default(),
+        FakeGuardian::default(),
+    )
+    .unwrap();
+
+    let error = executor
+        .apply_physical_frame(
+            session(1),
+            1,
+            now + Duration::from_secs(1),
+            &[(17, false)],
+            &[],
+            -120,
+            Some((1_000_001, 500_000)),
+            &authority.permit(now),
+            now,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code(), "input.wheel_point_invalid");
+    assert!(executor.platform().pressed.is_empty());
+    assert!(executor.platform().wheel_events.is_empty());
     assert!(executor.guardian().calls.is_empty());
 }

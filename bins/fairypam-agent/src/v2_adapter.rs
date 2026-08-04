@@ -124,7 +124,7 @@ pub fn hello(
                 agent_id,
                 agent_version,
                 protocol_major: 2,
-                protocol_minor: 3,
+                protocol_minor: 4,
                 build_commit,
                 suite_build_id: option_env!("FAIRYPAM_BUILD_ID")
                     .unwrap_or("unknown")
@@ -555,6 +555,10 @@ impl Translator {
             || value
                 .source_frame_sequence
                 .is_some_and(|sequence| sequence == 0)
+            || value.wheel_x_ppm.is_some() != value.wheel_y_ppm.is_some()
+            || value.wheel_x_ppm.is_some_and(|value| value > 1_000_000)
+            || value.wheel_y_ppm.is_some_and(|value| value > 1_000_000)
+            || (value.wheel_x_ppm.is_some() && value.wheel_delta == 0)
             || dangerous_keys(&value.held_keys)
         {
             return Err(AgentError::new(
@@ -1045,6 +1049,12 @@ mod tests {
                 if let Some(sequence) = value.source_frame_sequence {
                     payload["source_frame_sequence"] = sequence.into();
                 }
+                if let Some(x_ppm) = value.wheel_x_ppm {
+                    payload["wheel_x_ppm"] = x_ppm.into();
+                }
+                if let Some(y_ppm) = value.wheel_y_ppm {
+                    payload["wheel_y_ppm"] = y_ppm.into();
+                }
                 (value.reference.as_ref().unwrap(), "InputFrame", payload)
             }
             hub_control_command::Payload::ClientPointClick(value) => (
@@ -1269,6 +1279,8 @@ mod tests {
                 held_mouse_buttons: vec![wire::MouseButton::Left as i32],
                 wheel_delta: 1200,
                 source_frame_sequence: Some(7),
+                wheel_x_ppm: Some(500_000),
+                wheel_y_ppm: Some(500_000),
             })),
         });
 
@@ -1281,6 +1293,39 @@ mod tests {
         assert_eq!(frame.held_mouse_buttons, [wire::MouseButton::Left as i32]);
         assert_eq!(frame.wheel_delta, 1200);
         assert_eq!(frame.source_frame_sequence, Some(7));
+        assert_eq!(frame.wheel_x_ppm, Some(500_000));
+        assert_eq!(frame.wheel_y_ppm, Some(500_000));
+    }
+
+    #[test]
+    fn translator_rejects_invalid_wheel_points() {
+        for (wheel_delta, wheel_x_ppm, wheel_y_ppm) in [
+            (-1200, Some(500_000), None),
+            (0, Some(500_000), Some(500_000)),
+            (-1200, Some(1_000_001), Some(500_000)),
+            (-1200, Some(500_000), Some(1_000_001)),
+        ] {
+            let contract = contract(vec![1, 2, 3, 6]);
+            let mut translator = Translator::new(500);
+            accept_begin(&mut translator, &contract);
+            let command = with_digest(wire::HubControlCommand {
+                payload: Some(hub_control_command::Payload::InputFrame(wire::InputFrame {
+                    reference: Some(task_identity(&contract, 2)),
+                    input_sequence: 1,
+                    lease_ms: 250,
+                    wheel_delta,
+                    source_frame_sequence: Some(7),
+                    wheel_x_ppm,
+                    wheel_y_ppm,
+                    ..wire::InputFrame::default()
+                })),
+            });
+
+            assert_eq!(
+                translator.translate(&command).unwrap_err().code(),
+                "input.frame_invalid"
+            );
+        }
     }
 
     #[test]

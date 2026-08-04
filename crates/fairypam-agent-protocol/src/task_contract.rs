@@ -196,6 +196,12 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
             if let Some(source) = value.source_frame_sequence {
                 payload["source_frame_sequence"] = serde_json::json!(source);
             }
+            if let Some(x_ppm) = value.wheel_x_ppm {
+                payload["wheel_x_ppm"] = serde_json::json!(x_ppm);
+            }
+            if let Some(y_ppm) = value.wheel_y_ppm {
+                payload["wheel_y_ppm"] = serde_json::json!(y_ppm);
+            }
             (task(value.reference.as_ref())?, "InputFrame", payload)
         }
         Some(Payload::ClientPointClick(value)) => (

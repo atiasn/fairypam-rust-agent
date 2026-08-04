@@ -161,6 +161,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
         keys: &[(u16, bool)],
         buttons: &[SemanticMouseButton],
         wheel_delta: i32,
+        wheel_point: Option<(u32, u32)>,
         permit: &InputPermit<'_>,
         now: Instant,
     ) -> Result<(), SafetyError> {
@@ -173,6 +174,14 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
             return Err(SafetyError::new(
                 "input.wheel_not_allowed",
                 "wheel delta is outside the verified Profile policy",
+            ));
+        }
+        if wheel_point.is_some_and(|(x_ppm, y_ppm)| {
+            wheel_delta == 0 || x_ppm > 1_000_000 || y_ppm > 1_000_000
+        }) {
+            return Err(SafetyError::new(
+                "input.wheel_point_invalid",
+                "wheel point must be normalized and accompany a wheel delta",
             ));
         }
         self.apply_lease(
@@ -188,9 +197,13 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
         if wheel_delta == 0 {
             return Ok(());
         }
-        self.platform
-            .wheel(wheel_delta)
-            .map_err(|error| self.fail_closed(ReleaseReason::PlatformFailure, error))
+        match wheel_point {
+            Some((x_ppm, y_ppm)) => self
+                .platform
+                .wheel_at_client_point(x_ppm, y_ppm, wheel_delta),
+            None => self.platform.wheel(wheel_delta),
+        }
+        .map_err(|error| self.fail_closed(ReleaseReason::PlatformFailure, error))
     }
 
     fn apply_lease_inner(

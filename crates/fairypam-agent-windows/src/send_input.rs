@@ -133,34 +133,74 @@ impl SendInputPlatform {
         }
     }
 
+    fn screen_point_move_input(screen_x: i64, screen_y: i64) -> INPUT {
+        let virtual_left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let virtual_top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let virtual_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+        let virtual_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+        let (absolute_x, absolute_y) = virtual_desktop_coordinates(
+            screen_x,
+            screen_y,
+            virtual_left,
+            virtual_top,
+            virtual_width,
+            virtual_height,
+        );
+        Self::mouse(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            absolute_x,
+            absolute_y,
+            0,
+        )
+    }
+
     fn screen_point_click_inputs(
         button: SemanticMouseButton,
         screen_x: i64,
         screen_y: i64,
     ) -> [INPUT; 3] {
-        let virtual_left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-        let virtual_top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-        let virtual_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
-        let virtual_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
-        let relative_x =
-            (screen_x - i64::from(virtual_left)).clamp(0, i64::from(virtual_width - 1));
-        let relative_y =
-            (screen_y - i64::from(virtual_top)).clamp(0, i64::from(virtual_height - 1));
-        let absolute_x = (relative_x * 65_535 / i64::from((virtual_width - 1).max(1))) as i32;
-        let absolute_y = (relative_y * 65_535 / i64::from((virtual_height - 1).max(1))) as i32;
         let (down, down_data) = mouse_button_event(button, false);
         let (up, up_data) = mouse_button_event(button, true);
         [
-            Self::mouse(
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                absolute_x,
-                absolute_y,
-                0,
-            ),
+            Self::screen_point_move_input(screen_x, screen_y),
             Self::mouse(down, 0, 0, down_data),
             Self::mouse(up, 0, 0, up_data),
         ]
     }
+
+    fn screen_point_wheel_inputs(screen_x: i64, screen_y: i64, delta: i32) -> [INPUT; 2] {
+        [
+            Self::screen_point_move_input(screen_x, screen_y),
+            Self::mouse(MOUSEEVENTF_WHEEL, 0, 0, delta as u32),
+        ]
+    }
+
+    fn client_screen_point(&self, x_ppm: u32, y_ppm: u32) -> (i64, i64) {
+        (
+            i64::from(self.client_left)
+                + i64::from(self.client_width.saturating_sub(1)) * i64::from(x_ppm) / 1_000_000,
+            i64::from(self.client_top)
+                + i64::from(self.client_height.saturating_sub(1)) * i64::from(y_ppm) / 1_000_000,
+        )
+    }
+}
+
+fn virtual_desktop_coordinates(
+    screen_x: i64,
+    screen_y: i64,
+    virtual_left: i32,
+    virtual_top: i32,
+    virtual_width: i32,
+    virtual_height: i32,
+) -> (i32, i32) {
+    let width = virtual_width.max(1);
+    let height = virtual_height.max(1);
+    let relative_x = (screen_x - i64::from(virtual_left)).clamp(0, i64::from(width - 1));
+    let relative_y = (screen_y - i64::from(virtual_top)).clamp(0, i64::from(height - 1));
+    (
+        (relative_x * 65_535 / i64::from((width - 1).max(1))) as i32,
+        (relative_y * 65_535 / i64::from((height - 1).max(1))) as i32,
+    )
 }
 
 pub struct WindowsInput<G> {
@@ -211,6 +251,7 @@ impl<G: GuardianClient> WindowsInput<G> {
         keys: &[(u16, bool)],
         buttons: &[SemanticMouseButton],
         wheel_delta: i32,
+        wheel_point: Option<(u32, u32)>,
         permit: &InputPermit<'_>,
         now: Instant,
     ) -> Result<(), SafetyError> {
@@ -222,6 +263,7 @@ impl<G: GuardianClient> WindowsInput<G> {
             keys,
             buttons,
             wheel_delta,
+            wheel_point,
             permit,
             now,
         )
@@ -344,6 +386,16 @@ impl InputPlatform for RevalidatingInputPlatform {
         self.sender.wheel(delta)
     }
 
+    fn wheel_at_client_point(
+        &mut self,
+        x_ppm: u32,
+        y_ppm: u32,
+        delta: i32,
+    ) -> Result<(), SafetyError> {
+        self.refresh()?;
+        self.sender.wheel_at_client_point(x_ppm, y_ppm, delta)
+    }
+
     fn pulse_scan_code(&mut self, scan_code: u16) -> Result<(), SafetyError> {
         self.refresh()?;
         self.sender.pulse_scan_code(scan_code)
@@ -429,6 +481,16 @@ impl InputPlatform for SendInputPlatform {
         self.send(&[Self::mouse(MOUSEEVENTF_WHEEL, 0, 0, delta as u32)])
     }
 
+    fn wheel_at_client_point(
+        &mut self,
+        x_ppm: u32,
+        y_ppm: u32,
+        delta: i32,
+    ) -> Result<(), SafetyError> {
+        let (x, y) = self.client_screen_point(x_ppm, y_ppm);
+        self.send(&Self::screen_point_wheel_inputs(x, y, delta))
+    }
+
     fn relative_mouse(&mut self, delta_x: i32, delta_y: i32) -> Result<(), SafetyError> {
         self.send(&[Self::mouse(MOUSEEVENTF_MOVE, delta_x, delta_y, 0)])
     }
@@ -439,10 +501,7 @@ impl InputPlatform for SendInputPlatform {
         x_ppm: u32,
         y_ppm: u32,
     ) -> Result<(), SafetyError> {
-        let x = i64::from(self.client_left)
-            + i64::from(self.client_width.saturating_sub(1)) * i64::from(x_ppm) / 1_000_000;
-        let y = i64::from(self.client_top)
-            + i64::from(self.client_height.saturating_sub(1)) * i64::from(y_ppm) / 1_000_000;
+        let (x, y) = self.client_screen_point(x_ppm, y_ppm);
         self.send(&Self::screen_point_click_inputs(button, x, y))
     }
 }
@@ -596,5 +655,31 @@ mod tests {
         };
 
         assert_eq!(error.code(), "input.profile_binding_mismatch");
+    }
+
+    #[test]
+    fn positioned_wheel_moves_then_wheels_without_mouse_buttons() {
+        let inputs = SendInputPlatform::screen_point_wheel_inputs(0, 0, -120);
+        let move_input = unsafe { inputs[0].Anonymous.mi };
+        let wheel_input = unsafe { inputs[1].Anonymous.mi };
+
+        assert_eq!(
+            move_input.dwFlags,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+        );
+        assert_eq!(wheel_input.dwFlags, MOUSEEVENTF_WHEEL);
+        assert_eq!(wheel_input.mouseData, (-120_i32) as u32);
+    }
+
+    #[test]
+    fn virtual_desktop_coordinates_include_negative_origins() {
+        assert_eq!(
+            virtual_desktop_coordinates(0, 0, -1920, -1080, 3840, 2160),
+            (32_776, 32_782)
+        );
+        assert_eq!(
+            virtual_desktop_coordinates(-3_000, 3_000, -1920, -1080, 3840, 2160),
+            (0, 65_535)
+        );
     }
 }

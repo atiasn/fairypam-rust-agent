@@ -314,6 +314,7 @@ pub trait RuntimePlatform: Send {
         keys: &[v2::PhysicalKey],
         mouse_buttons: &[i32],
         wheel_delta: i32,
+        wheel_point: Option<(u32, u32)>,
         source_frame: Option<(&AtomicU64, u64)>,
         client_point: Option<(i32, u32, u32)>,
     ) -> Result<(), AgentError>;
@@ -855,6 +856,7 @@ impl CommandExecutor {
                     &frame.held_keys,
                     &frame.held_mouse_buttons,
                     frame.wheel_delta,
+                    frame.wheel_x_ppm.zip(frame.wheel_y_ppm),
                     source_frame
                         .as_ref()
                         .map(|(current, expected)| (current.as_ref(), *expected)),
@@ -1933,6 +1935,7 @@ impl CommandExecutor {
                 0,
                 None,
                 None,
+                None,
             )
             .and_then(|()| {
                 self.platform.apply_task_input_frame(
@@ -1944,6 +1947,7 @@ impl CommandExecutor {
                     &[],
                     &[],
                     0,
+                    None,
                     None,
                     None,
                 )
@@ -2287,6 +2291,7 @@ impl RuntimePlatform for UnsupportedPlatform {
         _keys: &[v2::PhysicalKey],
         _mouse_buttons: &[i32],
         _wheel_delta: i32,
+        _wheel_point: Option<(u32, u32)>,
         _source_frame: Option<(&AtomicU64, u64)>,
         _client_point: Option<(i32, u32, u32)>,
     ) -> Result<(), AgentError> {
@@ -2973,6 +2978,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         keys: &[v2::PhysicalKey],
         mouse_buttons: &[i32],
         wheel_delta: i32,
+        wheel_point: Option<(u32, u32)>,
         source_frame: Option<(&AtomicU64, u64)>,
         client_point: Option<(i32, u32, u32)>,
     ) -> Result<(), AgentError> {
@@ -3023,6 +3029,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 &keys,
                 &buttons,
                 wheel_delta,
+                wheel_point,
                 &permit,
                 now,
             )
@@ -3509,6 +3516,7 @@ mod tests {
             _keys: &[v2::PhysicalKey],
             _buttons: &[i32],
             _wheel_delta: i32,
+            _wheel_point: Option<(u32, u32)>,
             source_frame: Option<(&AtomicU64, u64)>,
             client_point: Option<(i32, u32, u32)>,
         ) -> Result<(), AgentError> {

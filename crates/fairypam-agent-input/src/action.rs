@@ -298,6 +298,18 @@ pub trait InputPlatform: Send {
         ))
     }
 
+    fn wheel_at_client_point(
+        &mut self,
+        _x_ppm: u32,
+        _y_ppm: u32,
+        _delta: i32,
+    ) -> Result<(), SafetyError> {
+        Err(SafetyError::new(
+            "input.platform_unsupported",
+            "positioned mouse wheel input is unsupported by this platform",
+        ))
+    }
+
     fn emergency_release(&mut self, scan_codes: &[u16]) -> Result<(), SafetyError> {
         let mut first_error = None;
         for scan_code in scan_codes {
