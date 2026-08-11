@@ -187,7 +187,7 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
             "StartMusicAutoplay",
             serde_json::json!({
                 "maximum_duration_ms": value.maximum_duration_ms,
-                "supervision_lease_ms": value.supervision_lease_ms,
+                "supervision_lease_ms": value.supervision_lease_ms.ok_or(ContractError("command.payload_invalid"))?,
             }),
         ),
         Some(Payload::StopMusicAutoplay(value)) => (
@@ -419,6 +419,28 @@ mod tests {
         assert_eq!(
             verify_execution_contract(&contract).unwrap_err().code(),
             "task.contract_value_invalid"
+        );
+    }
+
+    #[test]
+    fn shared_music_autoplay_vector_freezes_explicit_autonomous_mode() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../proto/fairypam/agent/v2/testdata/task-command-vectors.json"
+        ))
+        .unwrap();
+        let vector = vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|vector| vector["kind"] == "StartMusicAutoplay")
+            .unwrap();
+        let canonical = vector["canonical_json"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(canonical).unwrap();
+
+        assert_eq!(payload["payload"]["supervision_lease_ms"], 0);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(canonical.as_bytes())),
+            vector["sha256"].as_str().unwrap()
         );
     }
 }

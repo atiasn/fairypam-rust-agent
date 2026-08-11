@@ -226,7 +226,7 @@ mod tests {
                 heartbeat_interval_ms: 1_000,
                 max_input_lease_ms: 500,
                 max_frame_bytes: 4,
-                accepted_protocol_minor: 5,
+                accepted_protocol_minor: 6,
             },
             "agent-a",
         )

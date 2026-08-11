@@ -36,9 +36,9 @@ const MUSIC_INPUT_LEASE: Duration = Duration::from_millis(1_000);
 const MUSIC_INPUT_RENEW: Duration = Duration::from_millis(500);
 #[cfg(any(windows, test))]
 const MUSIC_TARGET_REVALIDATE: Duration = Duration::from_millis(250);
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const MUSIC_SUPERVISION_LEASE_MIN: Duration = Duration::from_millis(500);
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const MUSIC_SUPERVISION_LEASE_MAX: Duration = Duration::from_millis(5_000);
 #[cfg(any(windows, test))]
 const MUSIC_BLUE_THRESHOLD: u8 = 220;
@@ -77,6 +77,42 @@ fn music_lane_keys(profile: &VerifiedProfile) -> Result<Vec<(u16, bool)>, AgentE
 #[cfg(any(windows, test))]
 fn music_held_state(blue: [u8; 6]) -> [bool; 6] {
     blue.map(|value| value < MUSIC_BLUE_THRESHOLD)
+}
+
+#[cfg(any(windows, test))]
+fn music_supervision_window(
+    maximum_duration: Duration,
+    supervision_lease: Duration,
+) -> Result<Duration, AgentError> {
+    if !(Duration::from_secs(1)..=Duration::from_secs(600)).contains(&maximum_duration)
+        || (!supervision_lease.is_zero()
+            && !(MUSIC_SUPERVISION_LEASE_MIN..=MUSIC_SUPERVISION_LEASE_MAX)
+                .contains(&supervision_lease))
+    {
+        return Err(AgentError::new(
+            "music.autoplay_command_invalid",
+            "music autoplay has an invalid duration or supervision mode",
+        ));
+    }
+    Ok(if supervision_lease.is_zero() {
+        maximum_duration
+    } else {
+        supervision_lease
+    })
+}
+
+#[cfg(any(windows, test))]
+fn music_autoplay_can_renew(
+    active_maximum_duration: Duration,
+    active_autonomous: bool,
+    finished: bool,
+    requested_maximum_duration: Duration,
+    requested_autonomous: bool,
+) -> bool {
+    active_maximum_duration == requested_maximum_duration
+        && !active_autonomous
+        && !requested_autonomous
+        && !finished
 }
 
 #[cfg(any(windows, test))]
@@ -136,13 +172,13 @@ where
     let mut next_revalidate = started_at;
     while !stop() {
         let loop_now = now();
-        music_input_expiry(supervision_deadline()?, loop_now)?;
         if loop_now >= deadline {
             return Err(AgentError::new(
                 "music.autoplay_timeout",
                 "local music autoplay exceeded its bounded duration",
             ));
         }
+        music_input_expiry(supervision_deadline()?, loop_now)?;
         io.check_monitor()?;
         if loop_now >= next_revalidate {
             io.validate_target()?;
@@ -2751,6 +2787,7 @@ struct WindowsTaskInput {
 struct WindowsMusicAutoplayWorker {
     stop: Arc<AtomicBool>,
     maximum_duration: Duration,
+    autonomous: bool,
     supervision_deadline: Arc<Mutex<Instant>>,
     thread: JoinHandle<(WindowsTaskInput, Option<AgentError>, Result<(), AgentError>)>,
 }
@@ -3615,18 +3652,22 @@ impl RuntimePlatform for WindowsRuntimePlatform {
     ) -> Result<(), AgentError> {
         use fairypam_agent_core::platform::TargetPlatform;
 
-        if !(Duration::from_secs(1)..=Duration::from_secs(600)).contains(&maximum_duration)
-            || !(MUSIC_SUPERVISION_LEASE_MIN..=MUSIC_SUPERVISION_LEASE_MAX)
-                .contains(&supervision_lease)
-            || self.music_release_uncertain
-        {
+        let supervision_window = music_supervision_window(maximum_duration, supervision_lease)?;
+        let autonomous = supervision_lease.is_zero();
+        if self.music_release_uncertain {
             return Err(AgentError::new(
                 "music.autoplay_command_invalid",
-                "music autoplay has an invalid duration, supervision lease, or release state",
+                "music autoplay has an invalid release state",
             ));
         }
         if let Some(worker) = self.music_autoplay.as_ref() {
-            if worker.maximum_duration != maximum_duration || worker.thread.is_finished() {
+            if !music_autoplay_can_renew(
+                worker.maximum_duration,
+                worker.autonomous,
+                worker.thread.is_finished(),
+                maximum_duration,
+                autonomous,
+            ) {
                 return Err(AgentError::new(
                     "music.autoplay_command_invalid",
                     "music autoplay renewal does not match an active worker",
@@ -3657,7 +3698,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         })?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        let supervision_deadline = Arc::new(Mutex::new(Instant::now() + supervision_lease));
+        let supervision_deadline = Arc::new(Mutex::new(Instant::now() + supervision_window));
         let worker_supervision_deadline = Arc::clone(&supervision_deadline);
         let worker_binding = binding.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -3708,6 +3749,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         self.music_autoplay = Some(WindowsMusicAutoplayWorker {
             stop,
             maximum_duration,
+            autonomous,
             supervision_deadline,
             thread,
         });
@@ -3955,6 +3997,22 @@ mod tests {
         let start = Instant::now();
         let deadline = start + Duration::from_secs(2);
         assert_eq!(
+            music_supervision_window(Duration::from_secs(600), Duration::ZERO).unwrap(),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            music_supervision_window(Duration::from_secs(600), Duration::from_secs(2)).unwrap(),
+            Duration::from_secs(2)
+        );
+        for lease in [Duration::from_millis(1), Duration::from_millis(5_001)] {
+            assert_eq!(
+                music_supervision_window(Duration::from_secs(600), lease)
+                    .unwrap_err()
+                    .code(),
+                "music.autoplay_command_invalid"
+            );
+        }
+        assert_eq!(
             music_input_expiry(deadline, start + Duration::from_millis(1_900)).unwrap(),
             deadline
         );
@@ -3970,6 +4028,20 @@ mod tests {
             music_input_expiry_if_running(deadline, deadline, true).unwrap(),
             None
         );
+        assert!(!music_autoplay_can_renew(
+            Duration::from_secs(600),
+            true,
+            false,
+            Duration::from_secs(600),
+            true,
+        ));
+        assert!(music_autoplay_can_renew(
+            Duration::from_secs(600),
+            false,
+            false,
+            Duration::from_secs(600),
+            false,
+        ));
     }
 
     struct FakeMusicIo {
@@ -4154,6 +4226,35 @@ mod tests {
             "input.release_failed"
         );
         assert_eq!(retry, Some(7));
+    }
+
+    #[test]
+    fn music_autonomous_timeout_still_releases_input() {
+        let start = Instant::now();
+        let mut times = VecDeque::from([start, start + Duration::from_secs(600)]);
+        let input = (FakeMusicIo::new(start), true);
+        let (input, operation_error, release) = finish_music_autoplay_worker(
+            input,
+            |input| {
+                run_music_autoplay_loop(
+                    &mut input.0,
+                    Duration::from_secs(600),
+                    || Ok(start + Duration::from_secs(600)),
+                    || times.pop_front().unwrap(),
+                    |_| {},
+                    || false,
+                )
+            },
+            |input| {
+                input.1 = false;
+                Ok(())
+            },
+        );
+
+        assert_eq!(operation_error.unwrap().code(), "music.autoplay_timeout");
+        assert!(input.0.applications.is_empty());
+        assert!(!input.1);
+        assert!(release.is_ok());
     }
 
     fn candidate() -> TargetCandidate {

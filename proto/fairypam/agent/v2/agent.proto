@@ -417,7 +417,7 @@ message StopCapture {
 message StartMusicAutoplay {
   CommandIdentity reference = 1;
   uint32 maximum_duration_ms = 2;
-  uint32 supervision_lease_ms = 3;
+  optional uint32 supervision_lease_ms = 3;
 }
 
 message StopMusicAutoplay {
