@@ -100,24 +100,67 @@ fn music_metric_summary(values: &[u64]) -> [u64; 4] {
 }
 
 #[cfg(any(windows, test))]
-impl Drop for MusicAutoplayMetrics {
-    fn drop(&mut self) {
-        let sample = music_metric_summary(&self.sample_intervals_us);
-        let input = music_metric_summary(&self.input_latency_us);
-        tracing::info!(
-            sample_count = self.sample_count,
-            sample_interval_p50_us = sample[0],
-            sample_interval_p95_us = sample[1],
-            sample_interval_p99_us = sample[2],
-            sample_interval_max_us = sample[3],
-            input_count = self.input_latency_us.len(),
-            input_latency_p50_us = input[0],
-            input_latency_p95_us = input[1],
-            input_latency_p99_us = input[2],
-            input_latency_max_us = input[3],
-            missed_sample_deadlines = self.missed_sample_deadlines,
-            "music autoplay timing summary"
-        );
+fn music_metric_log_line(metrics: &MusicAutoplayMetrics, attempt: &AttemptRef) -> String {
+    let sample = music_metric_summary(&metrics.sample_intervals_us);
+    let input = music_metric_summary(&metrics.input_latency_us);
+    format!(
+        "music autoplay timing summary task_run_id={} attempt_id={} sample_count={} sample_interval_p50_us={} sample_interval_p95_us={} sample_interval_p99_us={} sample_interval_max_us={} input_count={} input_latency_p50_us={} input_latency_p95_us={} input_latency_p99_us={} input_latency_max_us={} missed_sample_deadlines={}",
+        attempt.task_run_id,
+        attempt.attempt_id,
+        metrics.sample_count,
+        sample[0],
+        sample[1],
+        sample[2],
+        sample[3],
+        metrics.input_latency_us.len(),
+        input[0],
+        input[1],
+        input[2],
+        input[3],
+        metrics.missed_sample_deadlines,
+    )
+}
+
+#[cfg(any(windows, test))]
+fn persist_music_metric_summary_with<Write>(
+    metrics: &MusicAutoplayMetrics,
+    attempt: &AttemptRef,
+    write: Write,
+) -> Result<(), AgentError>
+where
+    Write: FnOnce(&str) -> Result<(), AgentError>,
+{
+    write(&music_metric_log_line(metrics, attempt)).map_err(|error| {
+        AgentError::new(
+            "music.autoplay_metrics_unavailable",
+            format!("music autoplay timing metrics cannot be persisted: {error}"),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn persist_music_metric_summary(
+    metrics: &MusicAutoplayMetrics,
+    attempt: &AttemptRef,
+) -> Result<(), AgentError> {
+    persist_music_metric_summary_with(metrics, attempt, |message| {
+        crate::observability::production_log()
+            .and_then(|log| log.append(crate::runtime_api::LogLevel::Info, message))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn merge_music_autoplay_errors(
+    operation_error: Option<AgentError>,
+    metrics_error: Option<AgentError>,
+) -> Option<AgentError> {
+    match (operation_error, metrics_error) {
+        (Some(operation), Some(metrics)) => Some(AgentError::new(
+            "music.autoplay_metrics_unavailable",
+            format!("{metrics}; worker result: {operation}"),
+        )),
+        (operation, None) => operation,
+        (None, metrics) => metrics,
     }
 }
 
@@ -195,6 +238,7 @@ trait MusicAutoplayIo {
 fn run_music_autoplay_loop<I, Supervision, Now, Sleep, Stop>(
     io: &mut I,
     maximum_duration: Duration,
+    metrics: &mut MusicAutoplayMetrics,
     mut supervision_deadline: Supervision,
     mut now: Now,
     mut sleep: Sleep,
@@ -215,7 +259,6 @@ where
     let mut next_revalidate = started_at;
     let mut next_sample = started_at;
     let mut previous_sample = None;
-    let mut metrics = MusicAutoplayMetrics::default();
     while !stop() {
         let loop_now = now();
         if loop_now >= deadline {
@@ -621,6 +664,7 @@ pub trait RuntimePlatform: Send {
         _profile: &VerifiedProfile,
         _binding: &TargetBinding,
         _session: &SessionRef,
+        _attempt: &AttemptRef,
         _maximum_duration: Duration,
         _supervision_lease: Duration,
     ) -> Result<(), AgentError> {
@@ -1225,12 +1269,14 @@ impl CommandExecutor {
                 .as_ref()
                 .and_then(|command| command.session.as_ref())
                 .ok_or_else(task_reference_invalid)?;
+            let attempt = task.attempt.as_ref().ok_or_else(task_reference_invalid)?;
             let error = self
                 .platform
                 .start_music_autoplay(
                     &profile,
                     &binding,
                     session,
+                    attempt,
                     Duration::from_millis(u64::from(maximum_duration_ms)),
                     Duration::from_millis(u64::from(supervision_lease_ms)),
                 )
@@ -2791,6 +2837,7 @@ impl RuntimePlatform for UnsupportedPlatform {
         _profile: &VerifiedProfile,
         _binding: &TargetBinding,
         _session: &SessionRef,
+        _attempt: &AttemptRef,
         _maximum_duration: Duration,
         _supervision_lease: Duration,
     ) -> Result<(), AgentError> {
@@ -3241,6 +3288,7 @@ fn run_music_autoplay(
     input: WindowsTaskInput,
     binding: TargetBinding,
     lane_keys: Vec<(u16, bool)>,
+    attempt: AttemptRef,
     maximum_duration: Duration,
     supervision_deadline: Arc<Mutex<Instant>>,
     stop: &AtomicBool,
@@ -3248,7 +3296,8 @@ fn run_music_autoplay(
     use fairypam_agent_input::ReleaseReason;
 
     let loop_deadline = Arc::clone(&supervision_deadline);
-    finish_music_autoplay_worker(
+    let mut metrics = MusicAutoplayMetrics::default();
+    let (input, operation_error, release) = finish_music_autoplay_worker(
         input,
         |input| {
             let mut io = WindowsMusicAutoplayIo {
@@ -3266,6 +3315,7 @@ fn run_music_autoplay(
             run_music_autoplay_loop(
                 &mut io,
                 maximum_duration,
+                &mut metrics,
                 || {
                     loop_deadline.lock().map(|value| *value).map_err(|_| {
                         AgentError::new(
@@ -3285,7 +3335,10 @@ fn run_music_autoplay(
                 .release_all(ReleaseReason::SessionChanged)
                 .map_err(|error| AgentError::new(error.code(), error.to_string()))
         },
-    )
+    );
+    let metrics_error = persist_music_metric_summary(&metrics, &attempt).err();
+    let operation_error = merge_music_autoplay_errors(operation_error, metrics_error);
+    (input, operation_error, release)
 }
 
 #[cfg(windows)]
@@ -3805,6 +3858,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         profile: &VerifiedProfile,
         binding: &TargetBinding,
         session: &SessionRef,
+        attempt: &AttemptRef,
         maximum_duration: Duration,
         supervision_lease: Duration,
     ) -> Result<(), AgentError> {
@@ -3859,6 +3913,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         let supervision_deadline = Arc::new(Mutex::new(Instant::now() + supervision_window));
         let worker_supervision_deadline = Arc::clone(&supervision_deadline);
         let worker_binding = binding.clone();
+        let worker_attempt = attempt.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let thread = match std::thread::Builder::new()
             .name("fairypam-music-autoplay".into())
@@ -3870,6 +3925,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                     input,
                     worker_binding,
                     lane_keys,
+                    worker_attempt,
                     maximum_duration,
                     worker_supervision_deadline,
                     &worker_stop,
@@ -4152,6 +4208,56 @@ mod tests {
             music_metric_summary(&(1..=100).collect::<Vec<_>>()),
             [50, 95, 99, 100]
         );
+        let attempt = AttemptRef {
+            task_run_id: "task-1".into(),
+            attempt_id: "attempt-1".into(),
+            contract_version: 2,
+            contract_digest: "11".repeat(32),
+        };
+        let metrics = MusicAutoplayMetrics {
+            sample_count: 3,
+            sample_intervals_us: vec![4_900, 5_000],
+            input_latency_us: vec![100, 300],
+            missed_sample_deadlines: 1,
+        };
+        let line = music_metric_log_line(&metrics, &attempt);
+        assert_eq!(
+            line,
+            "music autoplay timing summary task_run_id=task-1 attempt_id=attempt-1 sample_count=3 sample_interval_p50_us=4900 sample_interval_p95_us=4900 sample_interval_p99_us=4900 sample_interval_max_us=5000 input_count=2 input_latency_p50_us=100 input_latency_p95_us=100 input_latency_p99_us=100 input_latency_max_us=300 missed_sample_deadlines=1"
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-music-metrics-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = crate::observability::FixedLog::open(&root).unwrap();
+        persist_music_metric_summary_with(&metrics, &attempt, |message| {
+            log.append(crate::runtime_api::LogLevel::Info, message)
+        })
+        .unwrap();
+        assert_eq!(
+            log.tail(1, &crate::runtime_api::LogLevel::Info).unwrap()["entries"][0]["message"],
+            line
+        );
+        std::fs::remove_dir_all(root).unwrap();
+
+        let write_error = persist_music_metric_summary_with(&metrics, &attempt, |_| {
+            Err(AgentError::new("local.log_write_failed", "test failure"))
+        })
+        .unwrap_err();
+        assert_eq!(write_error.code(), "music.autoplay_metrics_unavailable");
+        let combined = merge_music_autoplay_errors(
+            Some(AgentError::new("target_invalid", "test target failure")),
+            Some(write_error),
+        )
+        .unwrap();
+        assert_eq!(combined.code(), "music.autoplay_metrics_unavailable");
+        assert!(combined.to_string().contains("target_invalid"));
     }
 
     #[test]
@@ -4289,6 +4395,7 @@ mod tests {
         run_music_autoplay_loop(
             &mut io,
             Duration::from_secs(10),
+            &mut MusicAutoplayMetrics::default(),
             || Ok(start + Duration::from_secs(2)),
             || times.pop_front().unwrap(),
             |_| {},
@@ -4313,6 +4420,7 @@ mod tests {
         run_music_autoplay_loop(
             &mut io,
             Duration::from_secs(10),
+            &mut MusicAutoplayMetrics::default(),
             || Ok(start + Duration::from_secs(2)),
             || times.pop_front().unwrap(),
             |duration| sleeps.push(duration),
@@ -4331,6 +4439,7 @@ mod tests {
         let error = run_music_autoplay_loop(
             &mut io,
             Duration::from_secs(10),
+            &mut MusicAutoplayMetrics::default(),
             || Ok(start + Duration::from_secs(2)),
             || times.pop_front().unwrap(),
             |_| {},
@@ -4352,6 +4461,7 @@ mod tests {
         run_music_autoplay_loop(
             &mut io,
             Duration::from_secs(10),
+            &mut MusicAutoplayMetrics::default(),
             || Ok(start + Duration::from_secs(2)),
             || times.pop_front().unwrap(),
             |_| {},
@@ -4374,6 +4484,7 @@ mod tests {
             assert!(run_music_autoplay_loop(
                 &mut io,
                 Duration::from_secs(10),
+                &mut MusicAutoplayMetrics::default(),
                 || Ok(start + Duration::from_secs(2)),
                 || times.pop_front().unwrap(),
                 |_| {},
@@ -4433,6 +4544,7 @@ mod tests {
                 run_music_autoplay_loop(
                     &mut input.0,
                     Duration::from_secs(600),
+                    &mut MusicAutoplayMetrics::default(),
                     || Ok(start + Duration::from_secs(600)),
                     || times.pop_front().unwrap(),
                     |_| {},
@@ -4726,6 +4838,7 @@ mod tests {
             _profile: &VerifiedProfile,
             _binding: &TargetBinding,
             _session: &SessionRef,
+            _attempt: &AttemptRef,
             maximum_duration: Duration,
             supervision_lease: Duration,
         ) -> Result<(), AgentError> {
