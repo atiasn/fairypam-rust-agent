@@ -3116,7 +3116,7 @@ struct WindowsMusicAutoplayIo<'a> {
     snapshot: Option<TargetSnapshot>,
     lane_keys: Vec<(u16, bool)>,
     targets: fairypam_agent_windows::WindowsTargetPlatform<fairypam_agent_windows::NativeWindows>,
-    sampler: fairypam_agent_windows::ClientPixelSampler,
+    sampler: fairypam_agent_windows::ClientPixelSampler<6>,
     supervision_deadline: Arc<Mutex<Instant>>,
     stop: &'a AtomicBool,
 }
@@ -3205,8 +3205,7 @@ impl MusicAutoplayIo for WindowsMusicAutoplayIo<'_> {
     }
 
     fn sample_blue(&mut self) -> Result<[u8; 6], AgentError> {
-        let points = MUSIC_LANES.map(|(_, x, y)| (x, y));
-        self.sampler.sample_blue(&points).map_err(AgentError::from)
+        self.sampler.sample_blue().map_err(AgentError::from)
     }
 
     fn arm_guard(&mut self, sequence: u64) -> Result<bool, AgentError> {
@@ -3300,6 +3299,7 @@ fn run_music_autoplay(
     let (input, operation_error, release) = finish_music_autoplay_worker(
         input,
         |input| {
+            let points = MUSIC_LANES.map(|(_, x, y)| (x, y));
             let mut io = WindowsMusicAutoplayIo {
                 input,
                 binding: binding.clone(),
@@ -3308,7 +3308,7 @@ fn run_music_autoplay(
                 targets: fairypam_agent_windows::WindowsTargetPlatform::new(
                     fairypam_agent_windows::NativeWindows,
                 ),
-                sampler: fairypam_agent_windows::ClientPixelSampler::new(&binding),
+                sampler: fairypam_agent_windows::ClientPixelSampler::new(&binding, &points)?,
                 supervision_deadline,
                 stop,
             };
