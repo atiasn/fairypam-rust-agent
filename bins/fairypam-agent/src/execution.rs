@@ -3649,7 +3649,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             session,
             Instant::now() + MUSIC_INPUT_LEASE,
         )?;
-        let mut input = self.task_input.take().ok_or_else(|| {
+        let input = self.task_input.take().ok_or_else(|| {
             AgentError::new(
                 "music.autoplay_start_failed",
                 "music autoplay input lease was not created",
