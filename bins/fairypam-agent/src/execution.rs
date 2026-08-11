@@ -334,7 +334,7 @@ where
                 .min(u128::from(u64::MAX)) as u64,
         );
         let supervised_until =
-            timed_music_stage(&mut metrics.supervision_check_us, || supervision_deadline())?;
+            timed_music_stage(&mut metrics.supervision_check_us, &mut supervision_deadline)?;
         music_input_expiry(supervised_until, loop_now)?;
         timed_music_stage(&mut metrics.monitor_check_us, || io.check_monitor())?;
         if loop_now >= next_revalidate {
