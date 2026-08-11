@@ -269,6 +269,45 @@ impl<G: GuardianClient> WindowsInput<G> {
         )
     }
 
+    pub fn arm_guarded_physical_frame(
+        &mut self,
+        session: SessionKey,
+        sequence: u64,
+        expires_at: Instant,
+        keys: &[(u16, bool)],
+        permit: &InputPermit<'_>,
+        now: Instant,
+    ) -> Result<(), SafetyError> {
+        self.require_target_permit(permit, &session, now)?;
+        self.executor
+            .arm_guarded_physical_frame(session, sequence, expires_at, keys, permit, now)
+    }
+
+    pub fn renew_guarded_physical_frame(
+        &mut self,
+        session: &SessionKey,
+        sequence: u64,
+        expires_at: Instant,
+        permit: &InputPermit<'_>,
+        now: Instant,
+    ) -> Result<(), SafetyError> {
+        self.require_target_permit(permit, session, now)?;
+        self.executor
+            .renew_guarded_physical_frame(session, sequence, expires_at, permit, now)
+    }
+
+    pub fn apply_guarded_physical_frame(
+        &mut self,
+        session: &SessionKey,
+        keys: &[(u16, bool)],
+        permit: &InputPermit<'_>,
+        now: Instant,
+    ) -> Result<(), SafetyError> {
+        self.require_target_permit(permit, session, now)?;
+        self.executor
+            .apply_guarded_physical_frame(session, keys, permit, now)
+    }
+
     pub fn execute_pulse(
         &mut self,
         action: &ActionId,
@@ -367,6 +406,13 @@ impl InputPlatform for RevalidatingInputPlatform {
         self.sender.release_key(scan_code, extended)
     }
 
+    fn apply_guarded_key_transitions(
+        &mut self,
+        transitions: &[(u16, bool, bool)],
+    ) -> Result<(), SafetyError> {
+        self.sender.apply_guarded_key_transitions(transitions)
+    }
+
     fn pulse_key(&mut self, scan_code: u16, extended: bool) -> Result<(), SafetyError> {
         self.refresh()?;
         self.sender.pulse_key(scan_code, extended)
@@ -443,6 +489,17 @@ impl InputPlatform for SendInputPlatform {
 
     fn release_key(&mut self, scan_code: u16, extended: bool) -> Result<(), SafetyError> {
         self.send(&[Self::keyboard(scan_code, extended, true)])
+    }
+
+    fn apply_guarded_key_transitions(
+        &mut self,
+        transitions: &[(u16, bool, bool)],
+    ) -> Result<(), SafetyError> {
+        let inputs = transitions
+            .iter()
+            .map(|&(scan_code, extended, pressed)| Self::keyboard(scan_code, extended, !pressed))
+            .collect::<Vec<_>>();
+        self.send(&inputs)
     }
 
     fn pulse_key(&mut self, scan_code: u16, extended: bool) -> Result<(), SafetyError> {

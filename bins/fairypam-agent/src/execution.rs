@@ -80,6 +80,48 @@ fn music_held_state(blue: [u8; 6]) -> [bool; 6] {
 }
 
 #[cfg(any(windows, test))]
+#[derive(Default)]
+struct MusicAutoplayMetrics {
+    sample_count: u64,
+    sample_intervals_us: Vec<u64>,
+    input_latency_us: Vec<u64>,
+    missed_sample_deadlines: u64,
+}
+
+#[cfg(any(windows, test))]
+fn music_metric_summary(values: &[u64]) -> [u64; 4] {
+    if values.is_empty() {
+        return [0; 4];
+    }
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    let at = |percentile: usize| values[(values.len() - 1) * percentile / 100];
+    [at(50), at(95), at(99), *values.last().unwrap()]
+}
+
+#[cfg(any(windows, test))]
+impl Drop for MusicAutoplayMetrics {
+    fn drop(&mut self) {
+        let sample = music_metric_summary(&self.sample_intervals_us);
+        let input = music_metric_summary(&self.input_latency_us);
+        tracing::info!(
+            sample_count = self.sample_count,
+            sample_interval_p50_us = sample[0],
+            sample_interval_p95_us = sample[1],
+            sample_interval_p99_us = sample[2],
+            sample_interval_max_us = sample[3],
+            input_count = self.input_latency_us.len(),
+            input_latency_p50_us = input[0],
+            input_latency_p95_us = input[1],
+            input_latency_p99_us = input[2],
+            input_latency_max_us = input[3],
+            missed_sample_deadlines = self.missed_sample_deadlines,
+            "music autoplay timing summary"
+        );
+    }
+}
+
+#[cfg(any(windows, test))]
 fn music_supervision_window(
     maximum_duration: Duration,
     supervision_lease: Duration,
@@ -144,8 +186,9 @@ trait MusicAutoplayIo {
     fn check_monitor(&mut self) -> Result<(), AgentError>;
     fn validate_target(&mut self) -> Result<(), AgentError>;
     fn sample_blue(&mut self) -> Result<[u8; 6], AgentError>;
-    fn apply_held(&mut self, held: [bool; 6], sequence: u64)
-        -> Result<Option<Instant>, AgentError>;
+    fn arm_guard(&mut self, sequence: u64) -> Result<bool, AgentError>;
+    fn renew_guard(&mut self, sequence: u64) -> Result<bool, AgentError>;
+    fn apply_held(&mut self, held: [bool; 6]) -> Result<Option<Duration>, AgentError>;
 }
 
 #[cfg(any(windows, test))]
@@ -170,6 +213,9 @@ where
     let mut sequence = 0_u64;
     let mut next_renew = started_at;
     let mut next_revalidate = started_at;
+    let mut next_sample = started_at;
+    let mut previous_sample = None;
+    let mut metrics = MusicAutoplayMetrics::default();
     while !stop() {
         let loop_now = now();
         if loop_now >= deadline {
@@ -184,8 +230,16 @@ where
             io.validate_target()?;
             next_revalidate = loop_now + MUSIC_TARGET_REVALIDATE;
         }
-        let desired = music_held_state(io.sample_blue()?);
-        if desired != held || loop_now >= next_renew {
+        if sequence == 0 {
+            if stop() {
+                break;
+            }
+            sequence = 1;
+            if !io.arm_guard(sequence)? {
+                break;
+            }
+            next_renew = loop_now + MUSIC_INPUT_RENEW;
+        } else if loop_now >= next_renew {
             if stop() {
                 break;
             }
@@ -195,13 +249,41 @@ where
                     "local music input sequence exhausted",
                 )
             })?;
-            let Some(applied_at) = io.apply_held(desired, sequence)? else {
+            if !io.renew_guard(sequence)? {
+                break;
+            }
+            next_renew = loop_now + MUSIC_INPUT_RENEW;
+        }
+        metrics.sample_count += 1;
+        if let Some(previous) = previous_sample.replace(loop_now) {
+            if let Some(interval) = loop_now.checked_duration_since(previous) {
+                metrics
+                    .sample_intervals_us
+                    .push(interval.as_micros().min(u128::from(u64::MAX)) as u64);
+            }
+        }
+        let desired = music_held_state(io.sample_blue()?);
+        if desired != held {
+            if stop() {
+                break;
+            }
+            let Some(latency) = io.apply_held(desired)? else {
                 break;
             };
+            metrics
+                .input_latency_us
+                .push(latency.as_micros().min(u128::from(u64::MAX)) as u64);
             held = desired;
-            next_renew = applied_at + MUSIC_INPUT_RENEW;
         }
-        sleep(MUSIC_SAMPLE_INTERVAL);
+        next_sample += MUSIC_SAMPLE_INTERVAL;
+        let after_work = now();
+        while next_sample < after_work {
+            next_sample += MUSIC_SAMPLE_INTERVAL;
+            metrics.missed_sample_deadlines += 1;
+        }
+        if next_sample > after_work {
+            sleep(next_sample - after_work);
+        }
     }
     Ok(())
 }
@@ -2984,6 +3066,7 @@ fn validate_music_target(snapshot: &TargetSnapshot) -> Result<(), AgentError> {
 struct WindowsMusicAutoplayIo<'a> {
     input: &'a mut WindowsTaskInput,
     binding: TargetBinding,
+    snapshot: Option<TargetSnapshot>,
     lane_keys: Vec<(u16, bool)>,
     targets: fairypam_agent_windows::WindowsTargetPlatform<fairypam_agent_windows::NativeWindows>,
     sampler: fairypam_agent_windows::ClientPixelSampler,
@@ -3004,6 +3087,59 @@ impl WindowsMusicAutoplayIo<'_> {
                 )
             })
     }
+
+    fn renewal_context(
+        &mut self,
+    ) -> Result<Option<(TargetSnapshot, Instant, Instant)>, AgentError> {
+        let snapshot = self.snapshot.clone().ok_or_else(|| {
+            AgentError::new(
+                "music.autoplay_target_invalid",
+                "music autoplay target has not been revalidated",
+            )
+        })?;
+        let authorization_now = Instant::now();
+        let expires_at = music_input_expiry(self.supervised_until()?, authorization_now)?;
+        let authorization = TaskAuthorization { expires_at };
+        self.input.machine.renew_control_authorization(
+            &authorization,
+            authorization_now,
+            expires_at,
+        )?;
+        let input_now = Instant::now();
+        let Some(final_expiry) = music_input_expiry_if_running(
+            self.supervised_until()?,
+            input_now,
+            self.stop.load(Ordering::Acquire),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            snapshot,
+            input_now,
+            std::cmp::min(expires_at, final_expiry),
+        )))
+    }
+
+    fn input_context(&self) -> Result<Option<(TargetSnapshot, Instant)>, AgentError> {
+        let snapshot = self.snapshot.clone().ok_or_else(|| {
+            AgentError::new(
+                "music.autoplay_target_invalid",
+                "music autoplay target has not been revalidated",
+            )
+        })?;
+        let input_now = Instant::now();
+        if music_input_expiry_if_running(
+            self.supervised_until()?,
+            input_now,
+            self.stop.load(Ordering::Acquire),
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some((snapshot, input_now)))
+    }
 }
 
 #[cfg(windows)]
@@ -3015,7 +3151,10 @@ impl MusicAutoplayIo for WindowsMusicAutoplayIo<'_> {
     fn validate_target(&mut self) -> Result<(), AgentError> {
         use fairypam_agent_core::platform::TargetPlatform;
 
-        validate_music_target(&self.targets.revalidate(&self.binding)?)
+        let snapshot = self.targets.revalidate(&self.binding)?;
+        validate_music_target(&snapshot)?;
+        self.snapshot = Some(snapshot);
+        Ok(())
     }
 
     fn sample_blue(&mut self) -> Result<[u8; 6], AgentError> {
@@ -3023,59 +3162,77 @@ impl MusicAutoplayIo for WindowsMusicAutoplayIo<'_> {
         self.sampler.sample_blue(&points).map_err(AgentError::from)
     }
 
-    fn apply_held(
-        &mut self,
-        held: [bool; 6],
-        sequence: u64,
-    ) -> Result<Option<Instant>, AgentError> {
-        use fairypam_agent_core::platform::TargetPlatform;
+    fn arm_guard(&mut self, sequence: u64) -> Result<bool, AgentError> {
         use fairypam_agent_input::InputPermit;
 
-        let snapshot = self.targets.revalidate(&self.binding)?;
-        validate_music_target(&snapshot)?;
+        let Some((snapshot, input_now, expires_at)) = self.renewal_context()? else {
+            return Ok(false);
+        };
+        let permit = InputPermit::from_capability(
+            self.input
+                .machine
+                .issue_input_capability(input_now, &snapshot, true)?,
+        );
+        self.input
+            .input
+            .arm_guarded_physical_frame(
+                self.input.session.clone(),
+                sequence,
+                expires_at,
+                &self.lane_keys,
+                &permit,
+                input_now,
+            )
+            .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+        Ok(true)
+    }
+
+    fn renew_guard(&mut self, sequence: u64) -> Result<bool, AgentError> {
+        use fairypam_agent_input::InputPermit;
+
+        let Some((snapshot, input_now, expires_at)) = self.renewal_context()? else {
+            return Ok(false);
+        };
+        let permit = InputPermit::from_capability(
+            self.input
+                .machine
+                .issue_input_capability(input_now, &snapshot, true)?,
+        );
+        self.input
+            .input
+            .renew_guarded_physical_frame(
+                &self.input.session,
+                sequence,
+                expires_at,
+                &permit,
+                input_now,
+            )
+            .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+        Ok(true)
+    }
+
+    fn apply_held(&mut self, held: [bool; 6]) -> Result<Option<Duration>, AgentError> {
+        use fairypam_agent_input::InputPermit;
+
+        let Some((snapshot, input_now)) = self.input_context()? else {
+            return Ok(None);
+        };
         let keys = held
             .iter()
             .zip(&self.lane_keys)
             .filter_map(|(active, key)| active.then_some(*key))
             .collect::<Vec<_>>();
-        let authorization_now = Instant::now();
-        let expires_at = music_input_expiry(self.supervised_until()?, authorization_now)?;
-        let authorization = TaskAuthorization { expires_at };
-        self.input.machine.renew_control_authorization(
-            &authorization,
-            authorization_now,
-            expires_at,
-        )?;
-        let permit = InputPermit::from_capability(self.input.machine.issue_input_capability(
-            authorization_now,
-            &snapshot,
-            true,
-        )?);
-        let input_now = Instant::now();
-        let Some(final_expiry) = music_input_expiry_if_running(
-            self.supervised_until()?,
-            input_now,
-            self.stop.load(Ordering::Acquire),
-        )?
-        else {
-            return Ok(None);
-        };
-        let expires_at = std::cmp::min(expires_at, final_expiry);
+        let permit = InputPermit::from_capability(
+            self.input
+                .machine
+                .issue_input_capability(input_now, &snapshot, true)?,
+        );
+        let started_at = Instant::now();
         self.input
             .input
-            .apply_physical_frame(
-                self.input.session.clone(),
-                sequence,
-                expires_at,
-                &keys,
-                &[],
-                0,
-                None,
-                &permit,
-                input_now,
-            )
+            .apply_guarded_physical_frame(&self.input.session, &keys, &permit, input_now)
             .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
-        Ok(Some(input_now))
+        Ok(Some(started_at.elapsed()))
     }
 }
 
@@ -3097,6 +3254,7 @@ fn run_music_autoplay(
             let mut io = WindowsMusicAutoplayIo {
                 input,
                 binding: binding.clone(),
+                snapshot: None,
                 lane_keys,
                 targets: fairypam_agent_windows::WindowsTargetPlatform::new(
                     fairypam_agent_windows::NativeWindows,
@@ -3990,6 +4148,10 @@ mod tests {
             music_held_state([219, 220, 0, 255, 221, 218]),
             [true, false, true, false, false, true]
         );
+        assert_eq!(
+            music_metric_summary(&(1..=100).collect::<Vec<_>>()),
+            [50, 95, 99, 100]
+        );
     }
 
     #[test]
@@ -4047,22 +4209,22 @@ mod tests {
     struct FakeMusicIo {
         monitor_error: bool,
         target_error: bool,
+        target_checks: usize,
         samples: VecDeque<[u8; 6]>,
-        apply_times: VecDeque<Instant>,
-        applications: Vec<([bool; 6], u64)>,
+        arms: Vec<u64>,
+        renewals: Vec<u64>,
+        applications: Vec<[bool; 6]>,
     }
 
     impl FakeMusicIo {
-        fn new(start: Instant) -> Self {
+        fn new(_start: Instant) -> Self {
             Self {
                 monitor_error: false,
                 target_error: false,
+                target_checks: 0,
                 samples: VecDeque::from([[219, 255, 255, 255, 255, 255]; 3]),
-                apply_times: VecDeque::from([
-                    start,
-                    start + MUSIC_INPUT_RENEW,
-                    start + MUSIC_INPUT_RENEW * 2,
-                ]),
+                arms: Vec::new(),
+                renewals: Vec::new(),
                 applications: Vec::new(),
             }
         }
@@ -4081,6 +4243,7 @@ mod tests {
         }
 
         fn validate_target(&mut self) -> Result<(), AgentError> {
+            self.target_checks += 1;
             if self.target_error {
                 Err(AgentError::new("target_invalid", "test target failure"))
             } else {
@@ -4092,13 +4255,19 @@ mod tests {
             Ok(self.samples.pop_front().unwrap_or([255; 6]))
         }
 
-        fn apply_held(
-            &mut self,
-            held: [bool; 6],
-            sequence: u64,
-        ) -> Result<Option<Instant>, AgentError> {
-            self.applications.push((held, sequence));
-            Ok(Some(self.apply_times.pop_front().unwrap()))
+        fn arm_guard(&mut self, sequence: u64) -> Result<bool, AgentError> {
+            self.arms.push(sequence);
+            Ok(true)
+        }
+
+        fn renew_guard(&mut self, sequence: u64) -> Result<bool, AgentError> {
+            self.renewals.push(sequence);
+            Ok(true)
+        }
+
+        fn apply_held(&mut self, held: [bool; 6]) -> Result<Option<Duration>, AgentError> {
+            self.applications.push(held);
+            Ok(Some(Duration::from_micros(100)))
         }
     }
 
@@ -4109,10 +4278,13 @@ mod tests {
         let mut times = VecDeque::from([
             start,
             start,
+            start,
+            start + Duration::from_millis(100),
             start + Duration::from_millis(100),
             start + MUSIC_INPUT_RENEW,
+            start + MUSIC_INPUT_RENEW,
         ]);
-        let mut stops = VecDeque::from([false, false, false, false, false, true]);
+        let mut stops = VecDeque::from([false, false, false, false, false, false, true]);
 
         run_music_autoplay_loop(
             &mut io,
@@ -4124,9 +4296,31 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(io.applications.len(), 2);
-        assert_eq!(io.applications[0].1, 1);
-        assert_eq!(io.applications[1].1, 2);
+        assert_eq!(io.arms, [1]);
+        assert_eq!(io.renewals, [2]);
+        assert_eq!(io.applications, [[true, false, false, false, false, false]]);
+        assert_eq!(io.target_checks, 2);
+    }
+
+    #[test]
+    fn music_loop_sleeps_to_the_absolute_five_millisecond_deadline() {
+        let start = Instant::now();
+        let mut io = FakeMusicIo::new(start);
+        let mut times = VecDeque::from([start, start, start + Duration::from_millis(2)]);
+        let mut stops = VecDeque::from([false, false, false, true]);
+        let mut sleeps = Vec::new();
+
+        run_music_autoplay_loop(
+            &mut io,
+            Duration::from_secs(10),
+            || Ok(start + Duration::from_secs(2)),
+            || times.pop_front().unwrap(),
+            |duration| sleeps.push(duration),
+            || stops.pop_front().unwrap_or(true),
+        )
+        .unwrap();
+
+        assert_eq!(sleeps, [Duration::from_millis(3)]);
     }
 
     #[test]

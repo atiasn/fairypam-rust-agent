@@ -47,6 +47,24 @@ impl InputPlatform for FakeInput {
         self.release_scan_code(scan_code)
     }
 
+    fn apply_guarded_key_transitions(
+        &mut self,
+        transitions: &[(u16, bool, bool)],
+    ) -> Result<(), SafetyError> {
+        if let Some(events) = &self.events {
+            events.lock().unwrap().push("local_batch");
+        }
+        for &(scan_code, _extended, pressed) in transitions {
+            if pressed {
+                self.pressed.insert(scan_code);
+            } else {
+                self.pressed.remove(&scan_code);
+                self.released.push(scan_code);
+            }
+        }
+        Ok(())
+    }
+
     fn emergency_release(&mut self, scan_codes: &[u16]) -> Result<(), SafetyError> {
         self.emergency_releases.push(scan_codes.to_vec());
         for scan_code in scan_codes {
@@ -106,6 +124,9 @@ impl GuardianClient for FakeGuardian {
 
     fn heartbeat(&mut self, _sequence: u64) -> Result<(), SafetyError> {
         self.calls.push("heartbeat");
+        if let Some(events) = &self.events {
+            events.lock().unwrap().push("heartbeat");
+        }
         Ok(())
     }
 
@@ -248,6 +269,51 @@ fn target_binding() -> TargetBinding {
         dpi: 96,
         integrity: IntegrityLevel::Medium,
     }
+}
+
+#[test]
+fn guarded_music_frame_arms_once_then_batches_without_reauthorizing() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut executor = LeaseExecutor::new(
+        &verified_profile(),
+        FakeInput {
+            events: Some(Arc::clone(&events)),
+            ..Default::default()
+        },
+        FakeGuardian {
+            events: Some(Arc::clone(&events)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let permit = authority.permit(now);
+    let expires_at = now + Duration::from_secs(1);
+
+    executor
+        .arm_guarded_physical_frame(session(1), 1, expires_at, &[(17, false)], &permit, now)
+        .unwrap();
+    executor
+        .apply_guarded_physical_frame(&session(1), &[(17, false)], &permit, now)
+        .unwrap();
+    executor
+        .apply_guarded_physical_frame(&session(1), &[], &permit, now)
+        .unwrap();
+    executor
+        .renew_guarded_physical_frame(&session(1), 2, expires_at, &permit, now)
+        .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "register_intent",
+            "commit_holds",
+            "local_batch",
+            "local_batch",
+            "heartbeat",
+        ]
+    );
 }
 
 #[test]

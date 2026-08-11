@@ -99,6 +99,7 @@ pub struct LeaseExecutor<P, G> {
     sequence: u64,
     expires_at: Option<Instant>,
     held_actions: BTreeSet<ActionId>,
+    guarded_actions: BTreeSet<ActionId>,
     input_gate_open: bool,
     last_release_reason: Option<ReleaseReason>,
 }
@@ -121,6 +122,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
             sequence: 0,
             expires_at: None,
             held_actions: BTreeSet::new(),
+            guarded_actions: BTreeSet::new(),
             input_gate_open: false,
             last_release_reason: None,
         }
@@ -206,6 +208,145 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
         .map_err(|error| self.fail_closed(ReleaseReason::PlatformFailure, error))
     }
 
+    pub fn arm_guarded_physical_frame(
+        &mut self,
+        session: SessionKey,
+        sequence: u64,
+        expires_at: Instant,
+        keys: &[(u16, bool)],
+        permit: &InputPermit<'_>,
+        now: Instant,
+    ) -> Result<(), SafetyError> {
+        let result =
+            self.arm_guarded_physical_frame_inner(session, sequence, expires_at, keys, permit, now);
+        result.map_err(|error| self.fail_closed(ReleaseReason::EmergencyStop, error))
+    }
+
+    fn arm_guarded_physical_frame_inner(
+        &mut self,
+        session: SessionKey,
+        sequence: u64,
+        expires_at: Instant,
+        keys: &[(u16, bool)],
+        permit: &InputPermit<'_>,
+        now: Instant,
+    ) -> Result<(), SafetyError> {
+        if !permit.is_valid_for(now, &session) || expires_at <= now {
+            return Err(SafetyError::new(
+                "input.permit_invalid",
+                "guarded input requires a current permit and lease",
+            ));
+        }
+        if self
+            .active_session
+            .as_ref()
+            .is_some_and(|active| active != &session)
+        {
+            self.release_all(ReleaseReason::SessionChanged)?;
+            self.sequence = 0;
+        }
+        if sequence == 0
+            || sequence <= self.sequence
+            || self.input_gate_open
+            || !self.held_actions.is_empty()
+            || !self.guarded_actions.is_empty()
+        {
+            return Err(SafetyError::new(
+                "input.sequence_invalid",
+                "guarded input must arm once with a new sequence",
+            ));
+        }
+        let guarded_actions = self.actions.physical_actions(keys, &[])?;
+        if guarded_actions.is_empty()
+            || guarded_actions.iter().any(|action| {
+                !matches!(self.hold_action(action), Ok(ResolvedAction::HoldKey { .. }))
+            })
+        {
+            return Err(SafetyError::new(
+                "input.action_kind_invalid",
+                "guarded input accepts physical hold keys only",
+            ));
+        }
+        self.platform.validate_before_input()?;
+        self.guardian.register_intent(sequence, &guarded_actions)?;
+        self.guardian.commit_holds(sequence, &guarded_actions)?;
+        self.active_session = Some(session);
+        self.sequence = sequence;
+        self.expires_at = Some(expires_at);
+        self.held_actions.clear();
+        self.guarded_actions = guarded_actions;
+        self.input_gate_open = true;
+        Ok(())
+    }
+
+    pub fn renew_guarded_physical_frame(
+        &mut self,
+        session: &SessionKey,
+        sequence: u64,
+        expires_at: Instant,
+        permit: &InputPermit<'_>,
+        now: Instant,
+    ) -> Result<(), SafetyError> {
+        let result = (|| {
+            self.require_guarded_gate(session, permit, now)?;
+            if sequence <= self.sequence || expires_at <= now {
+                return Err(SafetyError::new(
+                    "input.sequence_invalid",
+                    "guarded input renewal must advance its sequence and lease",
+                ));
+            }
+            self.guardian.heartbeat(sequence)?;
+            self.sequence = sequence;
+            self.expires_at = Some(expires_at);
+            Ok(())
+        })();
+        result.map_err(|error| self.fail_closed(ReleaseReason::GuardianFailure, error))
+    }
+
+    pub fn apply_guarded_physical_frame(
+        &mut self,
+        session: &SessionKey,
+        keys: &[(u16, bool)],
+        permit: &InputPermit<'_>,
+        now: Instant,
+    ) -> Result<(), SafetyError> {
+        let result = (|| {
+            self.require_guarded_gate(session, permit, now)?;
+            let desired = self.actions.physical_actions(keys, &[])?;
+            if !desired.is_subset(&self.guarded_actions) {
+                return Err(SafetyError::new(
+                    "input.action_not_guarded",
+                    "physical key is outside the committed Guardian release set",
+                ));
+            }
+            let mut transitions = Vec::new();
+            for action in self.held_actions.difference(&desired) {
+                match self.hold_action(action)? {
+                    ResolvedAction::HoldKey {
+                        scan_code,
+                        extended,
+                    } => transitions.push((scan_code, extended, false)),
+                    _ => unreachable!("guarded actions are physical hold keys"),
+                }
+            }
+            for action in desired.difference(&self.held_actions) {
+                match self.hold_action(action)? {
+                    ResolvedAction::HoldKey {
+                        scan_code,
+                        extended,
+                    } => transitions.push((scan_code, extended, true)),
+                    _ => unreachable!("guarded actions are physical hold keys"),
+                }
+            }
+            if !transitions.is_empty() {
+                self.platform.apply_guarded_key_transitions(&transitions)?;
+            }
+            self.held_actions = desired;
+            Ok(())
+        })();
+        result.map_err(|error| self.fail_closed(ReleaseReason::PlatformFailure, error))
+    }
+
     fn apply_lease_inner(
         &mut self,
         lease: InputLease,
@@ -249,6 +390,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
         self.held_actions.extend(lease.desired_holds.clone());
         self.apply_hold_difference(&previous, &lease.desired_holds)?;
         self.held_actions = lease.desired_holds.clone();
+        self.guarded_actions.clear();
         self.guardian
             .commit_holds(lease.sequence, &lease.desired_holds)?;
         self.active_session = Some(lease.session);
@@ -341,6 +483,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
         }
         if first_error.is_none() {
             self.held_actions.clear();
+            self.guarded_actions.clear();
         }
         self.expires_at = None;
         self.last_release_reason = Some(reason);
@@ -475,6 +618,25 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
                 "input gate is closed",
             ))
         }
+    }
+
+    fn require_guarded_gate(
+        &self,
+        session: &SessionKey,
+        permit: &InputPermit<'_>,
+        now: Instant,
+    ) -> Result<(), SafetyError> {
+        if self.guarded_actions.is_empty()
+            || self.active_session.as_ref() != Some(session)
+            || self.expires_at.is_none()
+            || self.expires_at.is_some_and(|expires_at| expires_at <= now)
+        {
+            return Err(SafetyError::new(
+                "input.gate_closed",
+                "guarded input gate is closed",
+            ));
+        }
+        self.require_open_gate(session, permit, now)
     }
 
     fn fail_closed(&mut self, reason: ReleaseReason, original: SafetyError) -> SafetyError {

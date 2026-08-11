@@ -267,6 +267,20 @@ pub trait InputPlatform: Send {
         self.release_scan_code(scan_code)
     }
 
+    fn apply_guarded_key_transitions(
+        &mut self,
+        transitions: &[(u16, bool, bool)],
+    ) -> Result<(), SafetyError> {
+        for &(scan_code, extended, pressed) in transitions {
+            if pressed {
+                self.press_key(scan_code, extended)?;
+            } else {
+                self.release_key(scan_code, extended)?;
+            }
+        }
+        Ok(())
+    }
+
     fn pulse_key(&mut self, scan_code: u16, extended: bool) -> Result<(), SafetyError> {
         if extended {
             return Err(SafetyError::new(
