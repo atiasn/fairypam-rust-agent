@@ -1040,6 +1040,24 @@ impl SessionDriver for GrpcSessionDriver {
                                 Some((value.button, value.x_ppm, value.y_ppm)),
                             )
                         }
+                v2_adapter::TranslatedCommand::StartMusicAutoplay {
+                    task,
+                    maximum_duration_ms,
+                    supervision_lease_ms,
+                } => self
+                    .execution
+                    .lock()
+                    .map_err(lock_error)?
+                    .execute_v2_start_music_autoplay(
+                        &task,
+                        maximum_duration_ms,
+                        supervision_lease_ms,
+                    ),
+                        v2_adapter::TranslatedCommand::StopMusicAutoplay { task } => self
+                            .execution
+                            .lock()
+                            .map_err(lock_error)?
+                            .execute_v2_stop_music_autoplay(&task),
                     };
                     if let Ok(mut state) = self.state.lock() {
                         state.record_command_diagnostic(&outcome);

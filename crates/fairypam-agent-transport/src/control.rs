@@ -198,7 +198,7 @@ pub(crate) fn verify_hub_hello(
         || hello.heartbeat_interval_ms == 0
         || hello.max_input_lease_ms == 0
         || hello.max_frame_bytes == 0
-        || hello.accepted_protocol_minor != 4
+        || hello.accepted_protocol_minor != 5
     {
         return Err(TransportError::new(
             "transport.session_invalid",
@@ -267,6 +267,8 @@ fn command_ref(command: &HubControlCommand) -> Option<&CommandRef> {
         Payload::StartCapture(value) => task_ref(value.reference.as_ref()),
         Payload::CaptureFrame(value) => task_ref(value.reference.as_ref()),
         Payload::StopCapture(value) => task_ref(value.reference.as_ref()),
+        Payload::StartMusicAutoplay(value) => task_ref(value.reference.as_ref()),
+        Payload::StopMusicAutoplay(value) => task_ref(value.reference.as_ref()),
         Payload::InputFrame(value) => task_ref(value.reference.as_ref()),
         Payload::ClientPointClick(value) => task_ref(value.reference.as_ref()),
         Payload::ReleaseAll(value) => identity_ref(value.reference.as_ref()),
@@ -305,6 +307,8 @@ fn task_identity(command: &HubControlCommand) -> bool {
         Some(Payload::StartCapture(value)) => value.reference.as_ref(),
         Some(Payload::CaptureFrame(value)) => value.reference.as_ref(),
         Some(Payload::StopCapture(value)) => value.reference.as_ref(),
+        Some(Payload::StartMusicAutoplay(value)) => value.reference.as_ref(),
+        Some(Payload::StopMusicAutoplay(value)) => value.reference.as_ref(),
         Some(Payload::InputFrame(value)) => value.reference.as_ref(),
         Some(Payload::ClientPointClick(value)) => value.reference.as_ref(),
         Some(Payload::ReleaseAll(value)) => value.reference.as_ref(),
@@ -361,7 +365,7 @@ mod v2_tests {
                 heartbeat_interval_ms: 1_000,
                 max_input_lease_ms: 500,
                 max_frame_bytes: 1_024,
-                accepted_protocol_minor: 4,
+                accepted_protocol_minor: 5,
             },
             "agent-a",
         )

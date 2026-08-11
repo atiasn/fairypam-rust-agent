@@ -240,6 +240,8 @@ message HubControlCommand {
     ConfigureIdleClose configure_idle_close = 15;
     AcknowledgeManagedGameClose acknowledge_managed_game_close = 16;
     ProfileCatalog profile_catalog = 17;
+    StartMusicAutoplay start_music_autoplay = 18;
+    StopMusicAutoplay stop_music_autoplay = 19;
   }
 }
 
@@ -410,6 +412,16 @@ message CaptureFrame {
 message StopCapture {
   CommandIdentity reference = 1;
   string capture_source_id = 2;
+}
+
+message StartMusicAutoplay {
+  CommandIdentity reference = 1;
+  uint32 maximum_duration_ms = 2;
+  uint32 supervision_lease_ms = 3;
+}
+
+message StopMusicAutoplay {
+  CommandIdentity reference = 1;
 }
 
 message PhysicalKey {

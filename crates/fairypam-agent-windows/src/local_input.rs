@@ -136,6 +136,16 @@ pub(crate) fn check_active() -> Result<(), AgentError> {
     active_state().map_or(Ok(()), |state| check_state(&state))
 }
 
+pub fn require_local_input_monitor() -> Result<(), AgentError> {
+    let state = active_state().ok_or_else(|| {
+        AgentError::new(
+            "environment.monitor_failed",
+            "input monitor is not active during local music autoplay",
+        )
+    })?;
+    check_state(&state)
+}
+
 fn check_state(state: &MonitorState) -> Result<(), AgentError> {
     if !state.interfered.swap(false, Ordering::AcqRel) {
         return Ok(());
@@ -217,5 +227,15 @@ mod tests {
 
         record_motion(&state, POINT { x: 4, y: 4 });
         assert!(state.interfered.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn optional_and_required_checks_differ_without_a_monitor() {
+        clear_active();
+        assert!(check_active().is_ok());
+        assert_eq!(
+            require_local_input_monitor().unwrap_err().code(),
+            "environment.monitor_failed"
+        );
     }
 }

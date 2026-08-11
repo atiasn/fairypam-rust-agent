@@ -182,6 +182,19 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
             "StopCapture",
             serde_json::json!({"capture_source_id": value.capture_source_id}),
         ),
+        Some(Payload::StartMusicAutoplay(value)) => (
+            task(value.reference.as_ref())?,
+            "StartMusicAutoplay",
+            serde_json::json!({
+                "maximum_duration_ms": value.maximum_duration_ms,
+                "supervision_lease_ms": value.supervision_lease_ms,
+            }),
+        ),
+        Some(Payload::StopMusicAutoplay(value)) => (
+            task(value.reference.as_ref())?,
+            "StopMusicAutoplay",
+            serde_json::json!({}),
+        ),
         Some(Payload::InputFrame(value)) => {
             let mut payload = serde_json::json!({
                 "held_keys": value.held_keys.iter().map(|key| serde_json::json!({

@@ -4,6 +4,7 @@ mod capture;
 mod dpi;
 #[cfg(windows)]
 mod local_input;
+mod pixel;
 mod process;
 #[cfg(windows)]
 mod send_input;
@@ -30,7 +31,9 @@ pub use window::LockedInputTarget;
 #[cfg(windows)]
 pub use capture::BitBltCaptureBackend;
 #[cfg(windows)]
-pub use local_input::LocalInputMonitor;
+pub use local_input::{require_local_input_monitor, LocalInputMonitor};
+#[cfg(windows)]
+pub use pixel::ClientPixelSampler;
 #[cfg(windows)]
 pub use send_input::WindowsInput;
 #[cfg(windows)]

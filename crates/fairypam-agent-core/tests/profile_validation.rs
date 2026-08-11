@@ -81,7 +81,7 @@ fn production_genshin_profile_matches_the_formal_root_and_target() {
     .unwrap();
 
     assert_eq!(profile.profile().id, "genshin-impact");
-    assert_eq!(profile.profile().version, "1.5.0");
+    assert_eq!(profile.profile().version, "1.6.0");
     assert!(profile
         .profile()
         .target

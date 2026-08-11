@@ -770,6 +770,7 @@ impl TaskAttemptRuntime {
         &mut self,
         task: &TaskCommandRef,
         error_code: Option<&str>,
+        released: bool,
     ) -> Result<TaskCommandResult, AgentError> {
         self.complete(
             task,
@@ -782,7 +783,7 @@ impl TaskAttemptRuntime {
             error_code,
             false,
             |state| {
-                state.input_state = if error_code.is_none() {
+                state.input_state = if released {
                     TaskInputState::Released as i32
                 } else {
                     TaskInputState::Unknown as i32
@@ -1863,7 +1864,7 @@ mod tests {
             assert!(runtime.prepare(command, false).unwrap().is_none());
             assert_eq!(
                 runtime
-                    .complete_release(command, None)
+                    .complete_release(command, None, true)
                     .unwrap()
                     .outcome
                     .outcome,
@@ -1959,7 +1960,7 @@ mod tests {
             let mut release = task(&contract, &format!("recovery-release-{index}"), 'd');
             release.command.as_mut().unwrap().sequence = 1_101 + index as u64;
             assert!(restarted.prepare_recovery(&release).unwrap().is_none());
-            restarted.complete_release(&release, None).unwrap();
+            restarted.complete_release(&release, None, true).unwrap();
         }
         let mut release_overflow = task(&contract, "recovery-release-overflow", 'd');
         release_overflow.command.as_mut().unwrap().sequence = 1_200;

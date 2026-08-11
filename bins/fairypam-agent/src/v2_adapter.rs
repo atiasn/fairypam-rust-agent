@@ -40,6 +40,14 @@ pub enum TranslatedCommand {
         task: internal::TaskCommandRef,
         value: wire::ClientPointClick,
     },
+    StartMusicAutoplay {
+        task: internal::TaskCommandRef,
+        maximum_duration_ms: u32,
+        supervision_lease_ms: u32,
+    },
+    StopMusicAutoplay {
+        task: internal::TaskCommandRef,
+    },
 }
 
 impl Translator {
@@ -124,7 +132,7 @@ pub fn hello(
                 agent_id,
                 agent_version,
                 protocol_major: 2,
-                protocol_minor: 4,
+                protocol_minor: 5,
                 build_commit,
                 suite_build_id: option_env!("FAIRYPAM_BUILD_ID")
                     .unwrap_or("unknown")
@@ -279,6 +287,8 @@ pub fn identity(command: &wire::HubControlCommand) -> Option<wire::CommandIdenti
         Payload::StartCapture(value) => value.reference.clone(),
         Payload::CaptureFrame(value) => value.reference.clone(),
         Payload::StopCapture(value) => value.reference.clone(),
+        Payload::StartMusicAutoplay(value) => value.reference.clone(),
+        Payload::StopMusicAutoplay(value) => value.reference.clone(),
         Payload::InputFrame(value) => value.reference.clone(),
         Payload::ClientPointClick(value) => value.reference.clone(),
         Payload::ReleaseAll(value) => value.reference.clone(),
@@ -416,6 +426,32 @@ fn translate(
                 task: task_command(value.reference.as_ref())?,
                 ..internal::StopCapture::default()
             })
+        }
+        Some(Payload::StartMusicAutoplay(value)) => {
+            translator.require_capability(value.reference.as_ref(), 4)?;
+            if !(1_000..=600_000).contains(&value.maximum_duration_ms) {
+                return Err(AgentError::new(
+                    "music.autoplay_command_invalid",
+                    "music autoplay duration must be between 1 and 600 seconds",
+                ));
+            }
+            if !(500..=5_000).contains(&value.supervision_lease_ms) {
+                return Err(AgentError::new(
+                    "music.autoplay_command_invalid",
+                    "music autoplay supervision lease must be between 500 and 5000 milliseconds",
+                ));
+            }
+            return Ok(TranslatedCommand::StartMusicAutoplay {
+                task: internal_task(wire_task(value.reference.as_ref())?)?,
+                maximum_duration_ms: value.maximum_duration_ms,
+                supervision_lease_ms: value.supervision_lease_ms,
+            });
+        }
+        Some(Payload::StopMusicAutoplay(value)) => {
+            translator.require_capability(value.reference.as_ref(), 4)?;
+            return Ok(TranslatedCommand::StopMusicAutoplay {
+                task: internal_task(wire_task(value.reference.as_ref())?)?,
+            });
         }
         Some(Payload::InputFrame(value)) => {
             return translator.translate_input_frame(value);
@@ -1088,6 +1124,19 @@ mod tests {
                     "quality": value.quality,
                 }),
             ),
+            hub_control_command::Payload::StartMusicAutoplay(value) => (
+                value.reference.as_ref().unwrap(),
+                "StartMusicAutoplay",
+                serde_json::json!({
+                    "maximum_duration_ms": value.maximum_duration_ms,
+                    "supervision_lease_ms": value.supervision_lease_ms,
+                }),
+            ),
+            hub_control_command::Payload::StopMusicAutoplay(value) => (
+                value.reference.as_ref().unwrap(),
+                "StopMusicAutoplay",
+                serde_json::json!({}),
+            ),
             _ => unreachable!(),
         };
         let task = wire_task(Some(identity)).unwrap();
@@ -1116,6 +1165,12 @@ mod tests {
             }
             hub_control_command::Payload::StartCapture(value) => value.reference.as_mut().unwrap(),
             hub_control_command::Payload::CaptureFrame(value) => value.reference.as_mut().unwrap(),
+            hub_control_command::Payload::StartMusicAutoplay(value) => {
+                value.reference.as_mut().unwrap()
+            }
+            hub_control_command::Payload::StopMusicAutoplay(value) => {
+                value.reference.as_mut().unwrap()
+            }
             _ => unreachable!(),
         };
         match identity.value.as_mut().unwrap() {
@@ -1260,6 +1315,98 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code(), "input.frame_invalid");
+    }
+
+    #[test]
+    fn translator_accepts_bounded_attempt_music_autoplay_commands() {
+        let contract = contract(vec![1, 4]);
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract);
+        let start = translator
+            .translate(&with_digest(wire::HubControlCommand {
+                payload: Some(hub_control_command::Payload::StartMusicAutoplay(
+                    wire::StartMusicAutoplay {
+                        reference: Some(task_identity(&contract, 2)),
+                        maximum_duration_ms: 600_000,
+                        supervision_lease_ms: 2_000,
+                    },
+                )),
+            }))
+            .unwrap();
+        assert!(matches!(
+            start,
+            TranslatedCommand::StartMusicAutoplay {
+                maximum_duration_ms: 600_000,
+                supervision_lease_ms: 2_000,
+                ..
+            }
+        ));
+
+        let stop = translator
+            .translate(&with_digest(wire::HubControlCommand {
+                payload: Some(hub_control_command::Payload::StopMusicAutoplay(
+                    wire::StopMusicAutoplay {
+                        reference: Some(task_identity(&contract, 3)),
+                    },
+                )),
+            }))
+            .unwrap();
+        assert!(matches!(stop, TranslatedCommand::StopMusicAutoplay { .. }));
+    }
+
+    #[test]
+    fn translator_rejects_unbounded_or_unapproved_music_autoplay() {
+        for maximum_duration_ms in [999, 600_001] {
+            let contract = contract(vec![1, 4]);
+            let mut translator = Translator::new(500);
+            accept_begin(&mut translator, &contract);
+            let error = translator
+                .translate(&with_digest(wire::HubControlCommand {
+                    payload: Some(hub_control_command::Payload::StartMusicAutoplay(
+                        wire::StartMusicAutoplay {
+                            reference: Some(task_identity(&contract, 2)),
+                            maximum_duration_ms,
+                            supervision_lease_ms: 2_000,
+                        },
+                    )),
+                }))
+                .unwrap_err();
+            assert_eq!(error.code(), "music.autoplay_command_invalid");
+        }
+
+        let keyboard_only_contract = contract(vec![1, 3]);
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &keyboard_only_contract);
+        let error = translator
+            .translate(&with_digest(wire::HubControlCommand {
+                payload: Some(hub_control_command::Payload::StartMusicAutoplay(
+                    wire::StartMusicAutoplay {
+                        reference: Some(task_identity(&keyboard_only_contract, 2)),
+                        maximum_duration_ms: 600_000,
+                        supervision_lease_ms: 2_000,
+                    },
+                )),
+            }))
+            .unwrap_err();
+        assert_eq!(error.code(), "task.capability_denied");
+
+        for supervision_lease_ms in [499, 5_001] {
+            let contract = contract(vec![1, 4]);
+            let mut translator = Translator::new(500);
+            accept_begin(&mut translator, &contract);
+            let error = translator
+                .translate(&with_digest(wire::HubControlCommand {
+                    payload: Some(hub_control_command::Payload::StartMusicAutoplay(
+                        wire::StartMusicAutoplay {
+                            reference: Some(task_identity(&contract, 2)),
+                            maximum_duration_ms: 600_000,
+                            supervision_lease_ms,
+                        },
+                    )),
+                }))
+                .unwrap_err();
+            assert_eq!(error.code(), "music.autoplay_command_invalid");
+        }
     }
 
     #[test]
