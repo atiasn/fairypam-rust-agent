@@ -84,7 +84,14 @@ fn music_held_state(blue: [u8; 6]) -> [bool; 6] {
 struct MusicAutoplayMetrics {
     sample_count: u64,
     sample_intervals_us: Vec<u64>,
+    scheduler_lateness_us: Vec<u64>,
     input_latency_us: Vec<u64>,
+    supervision_check_us: Vec<u64>,
+    monitor_check_us: Vec<u64>,
+    target_revalidate_us: Vec<u64>,
+    guardian_us: Vec<u64>,
+    pixel_sample_us: Vec<u64>,
+    input_pipeline_us: Vec<u64>,
     missed_sample_deadlines: u64,
 }
 
@@ -97,6 +104,30 @@ fn music_metric_summary(values: &[u64]) -> [u64; 4] {
     values.sort_unstable();
     let at = |percentile: usize| values[(values.len() - 1) * percentile / 100];
     [at(50), at(95), at(99), *values.last().unwrap()]
+}
+
+#[cfg(any(windows, test))]
+fn timed_music_stage<T>(
+    values: &mut Vec<u64>,
+    operation: impl FnOnce() -> Result<T, AgentError>,
+) -> Result<T, AgentError> {
+    let started_at = Instant::now();
+    let result = operation();
+    values.push(started_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+    result
+}
+
+#[cfg(any(windows, test))]
+fn music_metric_fragment(name: &str, values: &[u64]) -> String {
+    let summary = music_metric_summary(values);
+    format!(
+        " {name}_count={} {name}_p50_us={} {name}_p95_us={} {name}_p99_us={} {name}_max_us={}",
+        values.len(),
+        summary[0],
+        summary[1],
+        summary[2],
+        summary[3],
+    )
 }
 
 #[cfg(any(windows, test))]
@@ -122,20 +153,48 @@ fn music_metric_log_line(metrics: &MusicAutoplayMetrics, attempt: &AttemptRef) -
 }
 
 #[cfg(any(windows, test))]
+fn music_stage_metric_log_lines(
+    metrics: &MusicAutoplayMetrics,
+    attempt: &AttemptRef,
+) -> [String; 7] {
+    [
+        ("scheduler_lateness", &metrics.scheduler_lateness_us),
+        ("supervision_check", &metrics.supervision_check_us),
+        ("monitor_check", &metrics.monitor_check_us),
+        ("target_revalidate", &metrics.target_revalidate_us),
+        ("guardian", &metrics.guardian_us),
+        ("pixel_sample", &metrics.pixel_sample_us),
+        ("input_pipeline", &metrics.input_pipeline_us),
+    ]
+    .map(|(name, values)| {
+        format!(
+            "music autoplay stage timing task_run_id={} attempt_id={}{}",
+            attempt.task_run_id,
+            attempt.attempt_id,
+            music_metric_fragment(name, values),
+        )
+    })
+}
+
+#[cfg(any(windows, test))]
 fn persist_music_metric_summary_with<Write>(
     metrics: &MusicAutoplayMetrics,
     attempt: &AttemptRef,
-    write: Write,
+    mut write: Write,
 ) -> Result<(), AgentError>
 where
-    Write: FnOnce(&str) -> Result<(), AgentError>,
+    Write: FnMut(&str) -> Result<(), AgentError>,
 {
-    write(&music_metric_log_line(metrics, attempt)).map_err(|error| {
-        AgentError::new(
-            "music.autoplay_metrics_unavailable",
-            format!("music autoplay timing metrics cannot be persisted: {error}"),
-        )
-    })
+    let lines = music_stage_metric_log_lines(metrics, attempt);
+    for line in std::iter::once(music_metric_log_line(metrics, attempt)).chain(lines) {
+        write(&line).map_err(|error| {
+            AgentError::new(
+                "music.autoplay_metrics_unavailable",
+                format!("music autoplay timing metrics cannot be persisted: {error}"),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -267,10 +326,19 @@ where
                 "local music autoplay exceeded its bounded duration",
             ));
         }
-        music_input_expiry(supervision_deadline()?, loop_now)?;
-        io.check_monitor()?;
+        metrics.scheduler_lateness_us.push(
+            loop_now
+                .checked_duration_since(next_sample)
+                .unwrap_or_default()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        let supervised_until =
+            timed_music_stage(&mut metrics.supervision_check_us, || supervision_deadline())?;
+        music_input_expiry(supervised_until, loop_now)?;
+        timed_music_stage(&mut metrics.monitor_check_us, || io.check_monitor())?;
         if loop_now >= next_revalidate {
-            io.validate_target()?;
+            timed_music_stage(&mut metrics.target_revalidate_us, || io.validate_target())?;
             next_revalidate = loop_now + MUSIC_TARGET_REVALIDATE;
         }
         if sequence == 0 {
@@ -278,7 +346,7 @@ where
                 break;
             }
             sequence = 1;
-            if !io.arm_guard(sequence)? {
+            if !timed_music_stage(&mut metrics.guardian_us, || io.arm_guard(sequence))? {
                 break;
             }
             next_renew = loop_now + MUSIC_INPUT_RENEW;
@@ -292,7 +360,7 @@ where
                     "local music input sequence exhausted",
                 )
             })?;
-            if !io.renew_guard(sequence)? {
+            if !timed_music_stage(&mut metrics.guardian_us, || io.renew_guard(sequence))? {
                 break;
             }
             next_renew = loop_now + MUSIC_INPUT_RENEW;
@@ -305,12 +373,15 @@ where
                     .push(interval.as_micros().min(u128::from(u64::MAX)) as u64);
             }
         }
-        let desired = music_held_state(io.sample_blue()?);
+        let blue = timed_music_stage(&mut metrics.pixel_sample_us, || io.sample_blue())?;
+        let desired = music_held_state(blue);
         if desired != held {
             if stop() {
                 break;
             }
-            let Some(latency) = io.apply_held(desired)? else {
+            let Some(latency) =
+                timed_music_stage(&mut metrics.input_pipeline_us, || io.apply_held(desired))?
+            else {
                 break;
             };
             metrics
@@ -4217,13 +4288,33 @@ mod tests {
         let metrics = MusicAutoplayMetrics {
             sample_count: 3,
             sample_intervals_us: vec![4_900, 5_000],
+            scheduler_lateness_us: vec![1_000, 2_000],
             input_latency_us: vec![100, 300],
+            supervision_check_us: vec![10, 20],
+            monitor_check_us: vec![30, 40],
+            target_revalidate_us: vec![50],
+            guardian_us: vec![60],
+            pixel_sample_us: vec![70, 80],
+            input_pipeline_us: vec![90, 100],
             missed_sample_deadlines: 1,
         };
         let line = music_metric_log_line(&metrics, &attempt);
         assert_eq!(
             line,
             "music autoplay timing summary task_run_id=task-1 attempt_id=attempt-1 sample_count=3 sample_interval_p50_us=4900 sample_interval_p95_us=4900 sample_interval_p99_us=4900 sample_interval_max_us=5000 input_count=2 input_latency_p50_us=100 input_latency_p95_us=100 input_latency_p99_us=100 input_latency_max_us=300 missed_sample_deadlines=1"
+        );
+        let stage_lines = music_stage_metric_log_lines(&metrics, &attempt);
+        assert_eq!(
+            stage_lines[0],
+            "music autoplay stage timing task_run_id=task-1 attempt_id=attempt-1 scheduler_lateness_count=2 scheduler_lateness_p50_us=1000 scheduler_lateness_p95_us=1000 scheduler_lateness_p99_us=1000 scheduler_lateness_max_us=2000"
+        );
+        assert_eq!(
+            stage_lines[1],
+            "music autoplay stage timing task_run_id=task-1 attempt_id=attempt-1 supervision_check_count=2 supervision_check_p50_us=10 supervision_check_p95_us=10 supervision_check_p99_us=10 supervision_check_max_us=20"
+        );
+        assert_eq!(
+            stage_lines[6],
+            "music autoplay stage timing task_run_id=task-1 attempt_id=attempt-1 input_pipeline_count=2 input_pipeline_p50_us=90 input_pipeline_p95_us=90 input_pipeline_p99_us=90 input_pipeline_max_us=100"
         );
 
         let root = std::env::temp_dir().join(format!(
@@ -4240,10 +4331,12 @@ mod tests {
             log.append(crate::runtime_api::LogLevel::Info, message)
         })
         .unwrap();
-        assert_eq!(
-            log.tail(1, &crate::runtime_api::LogLevel::Info).unwrap()["entries"][0]["message"],
-            line
-        );
+        let entries = log.tail(8, &crate::runtime_api::LogLevel::Info).unwrap();
+        let entries = entries["entries"].as_array().unwrap();
+        for (entry, stage) in entries.iter().take(7).zip(stage_lines.iter().rev()) {
+            assert_eq!(entry["message"], *stage);
+        }
+        assert_eq!(entries[7]["message"], line);
         std::fs::remove_dir_all(root).unwrap();
 
         let write_error = persist_music_metric_summary_with(&metrics, &attempt, |_| {
@@ -4429,6 +4522,60 @@ mod tests {
         .unwrap();
 
         assert_eq!(sleeps, [Duration::from_millis(3)]);
+    }
+
+    #[test]
+    fn music_loop_records_scheduler_lateness_against_the_absolute_deadline() {
+        let start = Instant::now();
+        let mut io = FakeMusicIo::new(start);
+        let mut times = VecDeque::from([
+            start,
+            start + Duration::from_millis(12),
+            start + Duration::from_millis(12),
+        ]);
+        let mut stops = VecDeque::from([false, false, false, true]);
+        let mut metrics = MusicAutoplayMetrics::default();
+
+        run_music_autoplay_loop(
+            &mut io,
+            Duration::from_secs(10),
+            &mut metrics,
+            || Ok(start + Duration::from_secs(2)),
+            || times.pop_front().unwrap(),
+            |_| {},
+            || stops.pop_front().unwrap_or(true),
+        )
+        .unwrap();
+
+        assert_eq!(metrics.scheduler_lateness_us, [12_000]);
+    }
+
+    #[test]
+    fn music_loop_attributes_each_hot_path_stage_without_changing_scheduling() {
+        let start = Instant::now();
+        let mut io = FakeMusicIo::new(start);
+        let mut times = VecDeque::from([start, start, start + Duration::from_millis(2)]);
+        let mut stops = VecDeque::from([false, false, false, true]);
+        let mut metrics = MusicAutoplayMetrics::default();
+
+        run_music_autoplay_loop(
+            &mut io,
+            Duration::from_secs(10),
+            &mut metrics,
+            || Ok(start + Duration::from_secs(2)),
+            || times.pop_front().unwrap(),
+            |_| {},
+            || stops.pop_front().unwrap_or(true),
+        )
+        .unwrap();
+
+        assert_eq!(metrics.supervision_check_us.len(), 1);
+        assert_eq!(metrics.monitor_check_us.len(), 1);
+        assert_eq!(metrics.target_revalidate_us.len(), 1);
+        assert_eq!(metrics.guardian_us.len(), 1);
+        assert_eq!(metrics.pixel_sample_us.len(), 1);
+        assert_eq!(metrics.input_pipeline_us.len(), 1);
+        assert_eq!(metrics.sample_count, 1);
     }
 
     #[test]
