@@ -3899,7 +3899,9 @@ fn run_music_autoplay(
                     if let Err(error) = &result {
                         sender_state.fail(error.clone());
                     }
-                    let release = sender.release_all();
+                    let release = sender
+                        .release_all()
+                        .map_err(|error| AgentError::new(error.code(), error.to_string()));
                     (sender_metrics, result, release)
                 })
                 .map_err(|error| AgentError::new("music.autoplay_start_failed", error.to_string()));
