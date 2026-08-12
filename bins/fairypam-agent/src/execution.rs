@@ -3859,7 +3859,8 @@ fn run_music_autoplay(
 
             let sender_state = state.clone();
             let sender_input_deadline = Arc::clone(&input_deadline);
-            let (sender_start, sender_receive) = std::sync::mpsc::sync_channel(1);
+            let (sender_start, sender_receive) =
+                std::sync::mpsc::sync_channel::<fairypam_agent_windows::MusicLaneSender>(1);
             let sender_thread = std::thread::Builder::new()
                 .name("fairypam-music-sender".into())
                 .spawn(move || {
