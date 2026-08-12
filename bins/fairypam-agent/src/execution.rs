@@ -3802,9 +3802,9 @@ fn run_music_autoplay(
 
             let (sampler_ready_sender, sampler_ready_receiver) =
                 std::sync::mpsc::sync_channel(MUSIC_LANES.len());
-            let mut sampler_threads: Vec<
-                JoinHandle<(usize, MusicAutoplayMetrics, Result<(), AgentError>)>,
-            > = Vec::with_capacity(MUSIC_LANES.len());
+            type MusicSamplerThreadResult = (usize, MusicAutoplayMetrics, Result<(), AgentError>);
+            let mut sampler_threads: Vec<JoinHandle<MusicSamplerThreadResult>> =
+                Vec::with_capacity(MUSIC_LANES.len());
             let mut sampler_start_senders = Vec::with_capacity(MUSIC_LANES.len());
             for (lane, point) in points.into_iter().enumerate() {
                 let sampler_state = state.clone();
