@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn music_send_boundary_rejects_exact_freshness_and_lease_deadlines() {
         let start = Instant::now();
-        let freshness_deadline = start + Duration::from_millis(20);
+        let freshness_deadline = start + Duration::from_millis(80);
         let input_deadline = start + Duration::from_secs(1);
 
         validate_music_send_boundary(

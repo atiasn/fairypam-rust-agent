@@ -31,7 +31,7 @@ const M1_ACTION_ID: &str = "gadget.quick_use";
 #[cfg(any(windows, test))]
 const MUSIC_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(any(windows, test))]
-const MUSIC_EVENT_FRESHNESS: Duration = Duration::from_millis(20);
+const MUSIC_EVENT_FRESHNESS: Duration = Duration::from_millis(80);
 #[cfg(any(windows, test))]
 const MUSIC_EVENT_QUEUE_CAPACITY: usize = 32;
 #[cfg(any(windows, test))]
@@ -79,8 +79,8 @@ fn music_lane_keys(profile: &VerifiedProfile) -> Result<Vec<(u16, bool)>, AgentE
 }
 
 #[cfg(any(windows, test))]
-fn music_lane_held(blue: u8) -> bool {
-    blue < MUSIC_BLUE_THRESHOLD
+fn music_held_state(blue: [u8; 6]) -> [bool; 6] {
+    blue.map(|value| value < MUSIC_BLUE_THRESHOLD)
 }
 
 #[cfg(any(windows, test))]
@@ -152,24 +152,20 @@ struct MusicAutoplayMetrics {
     guardian_us: Vec<u64>,
     pixel_sample_us: Vec<u64>,
     pixel_foreground_us: Vec<u64>,
-    pixel_get_pixel_us: Vec<u64>,
+    pixel_bitblt_us: Vec<u64>,
+    pixel_gdi_flush_us: Vec<u64>,
+    pixel_buffer_read_us: Vec<u64>,
     input_pipeline_us: Vec<u64>,
     missed_sample_deadlines: u64,
     stale_event_count: u64,
     queue_overflow_count: u64,
-    lane_sample_count: [u64; 6],
-    lane_sample_intervals_us: [Vec<u64>; 6],
-    lane_missed_sample_deadlines: [u64; 6],
 }
 
 #[cfg(any(windows, test))]
 impl MusicAutoplayMetrics {
-    fn sample_capacity(maximum_duration: Duration) -> usize {
-        (maximum_duration.as_millis() / MUSIC_SAMPLE_INTERVAL.as_millis() + 1).min(120_001) as usize
-    }
-
     fn with_capacity(maximum_duration: Duration) -> Self {
-        let samples = Self::sample_capacity(maximum_duration);
+        let samples = (maximum_duration.as_millis() / MUSIC_SAMPLE_INTERVAL.as_millis() + 1)
+            .min(120_001) as usize;
         let target_checks = (maximum_duration.as_millis() / MUSIC_TARGET_REVALIDATE.as_millis() + 1)
             .min(2_401) as usize;
         let guardian_checks =
@@ -184,21 +180,10 @@ impl MusicAutoplayMetrics {
             guardian_us: Vec::with_capacity(guardian_checks),
             pixel_sample_us: Vec::with_capacity(samples),
             pixel_foreground_us: Vec::with_capacity(samples),
-            pixel_get_pixel_us: Vec::with_capacity(samples),
+            pixel_bitblt_us: Vec::with_capacity(samples),
+            pixel_gdi_flush_us: Vec::with_capacity(samples),
+            pixel_buffer_read_us: Vec::with_capacity(samples),
             input_pipeline_us: Vec::with_capacity(samples),
-            lane_sample_intervals_us: std::array::from_fn(|_| Vec::with_capacity(samples)),
-            ..Self::default()
-        }
-    }
-
-    fn with_lane_capacity(maximum_duration: Duration) -> Self {
-        let samples = Self::sample_capacity(maximum_duration);
-        Self {
-            sample_intervals_us: Vec::with_capacity(samples),
-            scheduler_lateness_us: Vec::with_capacity(samples),
-            pixel_sample_us: Vec::with_capacity(samples),
-            pixel_foreground_us: Vec::with_capacity(samples),
-            pixel_get_pixel_us: Vec::with_capacity(samples),
             ..Self::default()
         }
     }
@@ -219,48 +204,37 @@ impl MusicAutoplayMetrics {
         self.pixel_sample_us.append(&mut other.pixel_sample_us);
         self.pixel_foreground_us
             .append(&mut other.pixel_foreground_us);
-        self.pixel_get_pixel_us
-            .append(&mut other.pixel_get_pixel_us);
+        self.pixel_bitblt_us.append(&mut other.pixel_bitblt_us);
+        self.pixel_gdi_flush_us
+            .append(&mut other.pixel_gdi_flush_us);
+        self.pixel_buffer_read_us
+            .append(&mut other.pixel_buffer_read_us);
         self.input_pipeline_us.append(&mut other.input_pipeline_us);
         self.missed_sample_deadlines += other.missed_sample_deadlines;
         self.stale_event_count += other.stale_event_count;
         self.queue_overflow_count += other.queue_overflow_count;
-        for lane in 0..MUSIC_LANES.len() {
-            self.lane_sample_count[lane] += other.lane_sample_count[lane];
-            self.lane_sample_intervals_us[lane].append(&mut other.lane_sample_intervals_us[lane]);
-            self.lane_missed_sample_deadlines[lane] += other.lane_missed_sample_deadlines[lane];
-        }
-    }
-
-    fn merge_lane(&mut self, lane: usize, mut other: Self) {
-        self.lane_sample_count[lane] += other.sample_count;
-        self.lane_sample_intervals_us[lane].clone_from(&other.sample_intervals_us);
-        self.lane_missed_sample_deadlines[lane] += other.missed_sample_deadlines;
-        other.lane_sample_count = [0; 6];
-        other.lane_sample_intervals_us = std::array::from_fn(|_| Vec::new());
-        other.lane_missed_sample_deadlines = [0; 6];
-        self.merge(other);
     }
 }
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Default)]
-struct MusicLaneSample {
-    blue: u8,
+struct MusicRowSample {
+    blue: [u8; 6],
     foreground: Duration,
-    get_pixel: Duration,
+    bitblt: Duration,
+    gdi_flush: Duration,
+    buffer_read: Duration,
 }
 
 #[cfg(any(windows, test))]
-trait MusicLaneSamplerIo {
-    fn sample(&mut self) -> Result<MusicLaneSample, AgentError>;
+trait MusicRowSamplerIo {
+    fn sample(&mut self) -> Result<MusicRowSample, AgentError>;
 }
 
 #[cfg(any(windows, test))]
 #[allow(clippy::too_many_arguments)]
-fn run_music_lane_sampler_loop<I, Now, Sleep, Send>(
+fn run_music_row_sampler_loop<I, Now, Sleep, Send>(
     io: &mut I,
-    lane: usize,
     start_at: Instant,
     deadline: Instant,
     generation: u64,
@@ -271,24 +245,18 @@ fn run_music_lane_sampler_loop<I, Now, Sleep, Send>(
     mut send: Send,
 ) -> Result<(), AgentError>
 where
-    I: MusicLaneSamplerIo,
+    I: MusicRowSamplerIo,
     Now: FnMut() -> Instant,
     Sleep: FnMut(Duration),
     Send: FnMut(MusicLaneEvent) -> Result<(), AgentError>,
 {
-    if lane >= MUSIC_LANES.len() {
-        return Err(AgentError::new(
-            "music.autoplay_event_invalid",
-            "music autoplay lane is outside the frozen range",
-        ));
-    }
     let before_start = now();
     if before_start < start_at {
         sleep(start_at - before_start);
     }
     let mut next_sample = start_at;
     let mut previous_sample = None;
-    let mut held = false;
+    let mut held = [false; 6];
     while !stop.load(Ordering::Acquire) {
         let loop_now = now();
         if loop_now >= deadline {
@@ -317,22 +285,28 @@ where
         metrics
             .pixel_sample_us
             .push(sampled_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
-        metrics
-            .pixel_foreground_us
-            .push(sample.foreground.as_micros().min(u128::from(u64::MAX)) as u64);
-        metrics
-            .pixel_get_pixel_us
-            .push(sample.get_pixel.as_micros().min(u128::from(u64::MAX)) as u64);
-        let desired = music_lane_held(sample.blue);
+        for (values, duration) in [
+            (&mut metrics.pixel_foreground_us, sample.foreground),
+            (&mut metrics.pixel_bitblt_us, sample.bitblt),
+            (&mut metrics.pixel_gdi_flush_us, sample.gdi_flush),
+            (&mut metrics.pixel_buffer_read_us, sample.buffer_read),
+        ] {
+            values.push(duration.as_micros().min(u128::from(u64::MAX)) as u64);
+        }
+        let desired = music_held_state(sample.blue);
         let detected_at = now();
-        if !stop.load(Ordering::Acquire) && desired != held {
-            send(MusicLaneEvent {
-                generation,
-                lane,
-                detected_at,
-                pressed: desired,
-            })?;
-            held = desired;
+        if !stop.load(Ordering::Acquire) {
+            for lane in 0..MUSIC_LANES.len() {
+                if desired[lane] != held[lane] {
+                    send(MusicLaneEvent {
+                        generation,
+                        lane,
+                        detected_at,
+                        pressed: desired[lane],
+                    })?;
+                    held[lane] = desired[lane];
+                }
+            }
         }
         next_sample += MUSIC_SAMPLE_INTERVAL;
         let after_work = now();
@@ -342,25 +316,6 @@ where
         }
         if next_sample > after_work {
             sleep(next_sample - after_work);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(windows, test))]
-fn validate_music_sampler_handles(handles: &[isize; 6]) -> Result<(), AgentError> {
-    if handles.contains(&0) {
-        return Err(AgentError::new(
-            "music.autoplay_start_failed",
-            "music sampler returned an invalid HDC",
-        ));
-    }
-    for lane in 0..handles.len() {
-        if handles[..lane].contains(&handles[lane]) {
-            return Err(AgentError::new(
-                "music.autoplay_start_failed",
-                "music sampler HDCs must be pairwise distinct",
-            ));
         }
     }
     Ok(())
@@ -643,8 +598,8 @@ fn music_metric_log_line(metrics: &MusicAutoplayMetrics, attempt: &AttemptRef) -
 fn music_stage_metric_log_lines(
     metrics: &MusicAutoplayMetrics,
     attempt: &AttemptRef,
-) -> Vec<String> {
-    let mut lines = [
+) -> [String; 11] {
+    [
         ("scheduler_lateness", &metrics.scheduler_lateness_us),
         ("supervision_check", &metrics.supervision_check_us),
         ("monitor_check", &metrics.monitor_check_us),
@@ -652,10 +607,11 @@ fn music_stage_metric_log_lines(
         ("guardian", &metrics.guardian_us),
         ("pixel_sample", &metrics.pixel_sample_us),
         ("pixel_foreground", &metrics.pixel_foreground_us),
-        ("pixel_get_pixel", &metrics.pixel_get_pixel_us),
+        ("pixel_bitblt", &metrics.pixel_bitblt_us),
+        ("pixel_gdi_flush", &metrics.pixel_gdi_flush_us),
+        ("pixel_buffer_read", &metrics.pixel_buffer_read_us),
         ("input_pipeline", &metrics.input_pipeline_us),
     ]
-    .into_iter()
     .map(|(name, values)| {
         format!(
             "music autoplay stage timing task_run_id={} attempt_id={}{}",
@@ -664,23 +620,6 @@ fn music_stage_metric_log_lines(
             music_metric_fragment(name, values),
         )
     })
-    .collect::<Vec<_>>();
-    for lane in 0..MUSIC_LANES.len() {
-        let sample = music_metric_summary(&metrics.lane_sample_intervals_us[lane]);
-        lines.push(format!(
-            "music autoplay lane timing task_run_id={} attempt_id={} lane={} sample_count={} sample_interval_p50_us={} sample_interval_p95_us={} sample_interval_p99_us={} sample_interval_max_us={} missed_sample_deadlines={}",
-            attempt.task_run_id,
-            attempt.attempt_id,
-            lane,
-            metrics.lane_sample_count[lane],
-            sample[0],
-            sample[1],
-            sample[2],
-            sample[3],
-            metrics.lane_missed_sample_deadlines[lane],
-        ));
-    }
-    lines
 }
 
 #[cfg(any(windows, test))]
@@ -3581,18 +3520,20 @@ struct WindowsMusicSafetyIo<'a> {
 }
 
 #[cfg(windows)]
-struct WindowsMusicLaneSampler {
-    sampler: fairypam_agent_windows::ClientPointSampler,
+struct WindowsMusicRowSampler {
+    sampler: fairypam_agent_windows::ClientPixelSampler<6>,
 }
 
 #[cfg(windows)]
-impl MusicLaneSamplerIo for WindowsMusicLaneSampler {
-    fn sample(&mut self) -> Result<MusicLaneSample, AgentError> {
+impl MusicRowSamplerIo for WindowsMusicRowSampler {
+    fn sample(&mut self) -> Result<MusicRowSample, AgentError> {
         let (blue, timing) = self.sampler.sample_blue_timed().map_err(AgentError::from)?;
-        Ok(MusicLaneSample {
+        Ok(MusicRowSample {
             blue,
             foreground: timing.foreground,
-            get_pixel: timing.get_pixel,
+            bitblt: timing.bitblt,
+            gdi_flush: timing.gdi_flush,
+            buffer_read: timing.buffer_read,
         })
     }
 }
@@ -3800,156 +3741,111 @@ fn run_music_autoplay(
             let (event_sender, event_receiver) =
                 std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
 
-            let (sampler_ready_sender, sampler_ready_receiver) =
-                std::sync::mpsc::sync_channel(MUSIC_LANES.len());
-            type MusicSamplerThreadResult = (usize, MusicAutoplayMetrics, Result<(), AgentError>);
-            let mut sampler_threads: Vec<JoinHandle<MusicSamplerThreadResult>> =
-                Vec::with_capacity(MUSIC_LANES.len());
-            let mut sampler_start_senders = Vec::with_capacity(MUSIC_LANES.len());
-            for (lane, point) in points.into_iter().enumerate() {
-                let sampler_state = state.clone();
-                let sampler_binding = binding.clone();
-                let sampler_ready_sender = sampler_ready_sender.clone();
-                let event_sender = event_sender.clone();
-                let (start_sender, start_receiver) = std::sync::mpsc::sync_channel(1);
-                let thread = match std::thread::Builder::new()
-                    .name(format!("fairypam-music-lane-{lane}"))
-                    .spawn(move || {
-                        let mut sampler_metrics =
-                            MusicAutoplayMetrics::with_lane_capacity(maximum_duration);
-                        let mut queue_overflows = 0_u64;
-                        let sampler = match fairypam_agent_windows::ClientPointSampler::new(
-                            &sampler_binding,
-                            point,
-                        ) {
-                            Ok(sampler) => sampler,
-                            Err(error) => {
-                                let error = AgentError::from(error);
-                                let _ = sampler_ready_sender.send((lane, Err(error.clone())));
-                                sampler_state.fail(error.clone());
-                                return (lane, sampler_metrics, Err(error));
-                            }
-                        };
-                        let source_dc = sampler.source_dc();
-                        if sampler_ready_sender.send((lane, Ok(source_dc))).is_err() {
+            let sampler_state = state.clone();
+            let sampler_binding = binding.clone();
+            let (sampler_ready_sender, sampler_ready_receiver) = std::sync::mpsc::sync_channel(1);
+            let (sampler_start_sender, sampler_start_receiver) = std::sync::mpsc::sync_channel(1);
+            let sampler_thread = match std::thread::Builder::new()
+                .name("fairypam-music-row-sampler".into())
+                .spawn(move || {
+                    let mut sampler_metrics = MusicAutoplayMetrics::with_capacity(maximum_duration);
+                    let mut queue_overflows = 0_u64;
+                    let sampler = match fairypam_agent_windows::ClientPixelSampler::new(
+                        &sampler_binding,
+                        &points,
+                    ) {
+                        Ok(sampler) => sampler,
+                        Err(error) => {
+                            let error = AgentError::from(error);
+                            let _ = sampler_ready_sender.send(Err(error.clone()));
+                            sampler_state.fail(error.clone());
+                            return (sampler_metrics, Err(error));
+                        }
+                    };
+                    if sampler_ready_sender.send(Ok(())).is_err() {
+                        let error = AgentError::new(
+                            "music.autoplay_start_failed",
+                            "music sampler startup receiver is unavailable",
+                        );
+                        sampler_state.fail(error.clone());
+                        return (sampler_metrics, Err(error));
+                    }
+                    let (start_at, deadline) = match sampler_start_receiver.recv() {
+                        Ok(value) => value,
+                        Err(_) => {
                             let error = AgentError::new(
                                 "music.autoplay_start_failed",
-                                "music sampler startup receiver is unavailable",
+                                "music sampler did not receive the shared start deadline",
                             );
                             sampler_state.fail(error.clone());
-                            return (lane, sampler_metrics, Err(error));
+                            return (sampler_metrics, Err(error));
                         }
-                        drop(sampler_ready_sender);
-                        let (start_at, deadline) = match start_receiver.recv() {
-                            Ok(value) => value,
-                            Err(_) => {
-                                let error = AgentError::new(
-                                    "music.autoplay_start_failed",
-                                    "music sampler did not receive the shared start deadline",
-                                );
-                                sampler_state.fail(error.clone());
-                                return (lane, sampler_metrics, Err(error));
-                            }
-                        };
-                        let mut io = WindowsMusicLaneSampler { sampler };
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            run_music_lane_sampler_loop(
-                                &mut io,
-                                lane,
-                                start_at,
-                                deadline,
-                                1,
-                                &sampler_state.stopped,
-                                &mut sampler_metrics,
-                                Instant::now,
-                                std::thread::sleep,
-                                |event| match event_sender.try_send(event) {
-                                    Ok(()) => Ok(()),
-                                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                                        queue_overflows += 1;
-                                        Err(AgentError::new(
-                                            "music.autoplay_queue_overflow",
-                                            "music autoplay event queue is full",
-                                        ))
-                                    }
-                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                        Err(AgentError::new(
-                                            "music.autoplay_sender_failed",
-                                            "music autoplay sender is unavailable",
-                                        ))
-                                    }
-                                },
-                            )
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err(AgentError::new(
-                                "music.autoplay_worker_failed",
-                                "music lane sampler panicked",
-                            ))
-                        });
-                        if let Err(error) = &result {
-                            sampler_state.fail(error.clone());
-                        }
-                        sampler_metrics.queue_overflow_count = queue_overflows;
-                        (lane, sampler_metrics, result)
-                    }) {
-                    Ok(thread) => thread,
-                    Err(error) => {
-                        let error =
-                            AgentError::new("music.autoplay_start_failed", error.to_string());
-                        state.fail(error.clone());
-                        drop(sampler_start_senders);
-                        for thread in sampler_threads {
-                            let _ = thread.join();
-                        }
-                        let _ = lane_sender.release_all();
-                        return Err(error);
+                    };
+                    let mut io = WindowsMusicRowSampler { sampler };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_music_row_sampler_loop(
+                            &mut io,
+                            start_at,
+                            deadline,
+                            1,
+                            &sampler_state.stopped,
+                            &mut sampler_metrics,
+                            Instant::now,
+                            std::thread::sleep,
+                            |event| match event_sender.try_send(event) {
+                                Ok(()) => Ok(()),
+                                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                    queue_overflows += 1;
+                                    Err(AgentError::new(
+                                        "music.autoplay_queue_overflow",
+                                        "music autoplay event queue is full",
+                                    ))
+                                }
+                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                    Err(AgentError::new(
+                                        "music.autoplay_sender_failed",
+                                        "music autoplay sender is unavailable",
+                                    ))
+                                }
+                            },
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(AgentError::new(
+                            "music.autoplay_worker_failed",
+                            "music row sampler panicked",
+                        ))
+                    });
+                    if let Err(error) = &result {
+                        sampler_state.fail(error.clone());
                     }
-                };
-                sampler_start_senders.push(start_sender);
-                sampler_threads.push(thread);
-            }
-            drop(sampler_ready_sender);
-            drop(event_sender);
-
-            let mut sampler_handles = [0_isize; 6];
-            let mut sampler_start_error = None;
-            for _ in 0..MUSIC_LANES.len() {
-                match sampler_ready_receiver.recv() {
-                    Ok((lane, Ok(handle))) if lane < MUSIC_LANES.len() => {
-                        sampler_handles[lane] = handle;
-                    }
-                    Ok((_, Ok(_))) => {
-                        sampler_start_error = Some(AgentError::new(
-                            "music.autoplay_start_failed",
-                            "music sampler returned an invalid lane",
-                        ));
-                    }
-                    Ok((_, Err(error))) => {
-                        sampler_start_error.get_or_insert(error);
-                    }
-                    Err(_) => {
-                        sampler_start_error.get_or_insert_with(|| {
-                            AgentError::new(
-                                "music.autoplay_start_failed",
-                                "music sampler stopped during startup",
-                            )
-                        });
-                        break;
-                    }
-                };
-            }
-            if sampler_start_error.is_none() {
-                sampler_start_error = validate_music_sampler_handles(&sampler_handles).err();
-            }
-            if let Some(error) = sampler_start_error {
-                state.fail(error.clone());
-                drop(sampler_start_senders);
-                for thread in sampler_threads {
-                    let _ = thread.join();
+                    sampler_metrics.queue_overflow_count = queue_overflows;
+                    (sampler_metrics, result)
+                }) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    let _ = lane_sender.release_all();
+                    return Err(AgentError::new(
+                        "music.autoplay_start_failed",
+                        error.to_string(),
+                    ));
                 }
-                let _ = lane_sender.release_all();
-                return Err(error);
+            };
+            match sampler_ready_receiver.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let _ = lane_sender.release_all();
+                    let _ = sampler_thread.join();
+                    return Err(error);
+                }
+                Err(_) => {
+                    let _ = lane_sender.release_all();
+                    let _ = sampler_thread.join();
+                    return Err(AgentError::new(
+                        "music.autoplay_start_failed",
+                        "music sampler stopped during startup",
+                    ));
+                }
             }
 
             let start_at = Instant::now() + MUSIC_SAMPLE_INTERVAL;
@@ -4007,13 +3903,9 @@ fn run_music_autoplay(
                 Ok(thread) => thread,
                 Err(error) => {
                     state.fail(error.clone());
-                    for start in &sampler_start_senders {
-                        let _ = start.send((start_at, deadline));
-                    }
+                    let _ = sampler_start_sender.send((start_at, deadline));
                     let _ = lane_sender.release_all();
-                    for thread in sampler_threads {
-                        let _ = thread.join();
-                    }
+                    let _ = sampler_thread.join();
                     return Err(error);
                 }
             };
@@ -4024,31 +3916,21 @@ fn run_music_autoplay(
                     "music.autoplay_start_failed",
                     "music sender stopped during startup",
                 ));
-                for start in &sampler_start_senders {
-                    let _ = start.send((start_at, deadline));
-                }
+                let _ = sampler_start_sender.send((start_at, deadline));
                 let _ = sender_thread.join();
-                for thread in sampler_threads {
-                    let _ = thread.join();
-                }
+                let _ = sampler_thread.join();
                 return Err(AgentError::new(
                     "music.autoplay_start_failed",
                     "music sender stopped during startup",
                 ));
             }
-            let mut start_failed = false;
-            for start in sampler_start_senders {
-                start_failed |= start.send((start_at, deadline)).is_err();
-            }
-            if start_failed {
+            if sampler_start_sender.send((start_at, deadline)).is_err() {
                 let error = AgentError::new(
                     "music.autoplay_start_failed",
                     "music sampler stopped during startup",
                 );
                 state.fail(error.clone());
-                for thread in sampler_threads {
-                    let _ = thread.join();
-                }
+                let _ = sampler_thread.join();
                 let (_, _, sender_release) = sender_thread.join().map_err(|_| {
                     AgentError::new("music.autoplay_worker_failed", "music sender panicked")
                 })?;
@@ -4070,20 +3952,17 @@ fn run_music_autoplay(
             }
             stop.store(true, Ordering::Release);
 
-            for sampler_thread in sampler_threads {
-                match sampler_thread.join() {
-                    Ok((lane, sampler_metrics, sampler_result)) => {
-                        metrics.merge_lane(lane, sampler_metrics);
-                        if let Err(error) = sampler_result {
-                            state.fail(error);
-                        }
-                    }
-                    Err(_) => state.fail(AgentError::new(
+            let (sampler_metrics, sampler_result) = match sampler_thread.join() {
+                Ok(value) => value,
+                Err(_) => {
+                    state.fail(AgentError::new(
                         "music.autoplay_worker_failed",
-                        "music lane sampler panicked",
-                    )),
+                        "music row sampler panicked",
+                    ));
+                    (MusicAutoplayMetrics::default(), Ok(()))
                 }
-            }
+            };
+            metrics.merge(sampler_metrics);
             let (sender_metrics, sender_result, sender_release) = match sender_thread.join() {
                 Ok(value) => value,
                 Err(_) => {
@@ -4095,7 +3974,7 @@ fn run_music_autoplay(
                 }
             };
             metrics.merge(sender_metrics);
-            for result in [sender_release, safety_result, sender_result] {
+            for result in [sender_release, safety_result, sampler_result, sender_result] {
                 if let Err(error) = result {
                     state.fail(error);
                 }
@@ -4977,8 +4856,10 @@ mod tests {
                 (38, false),
             ]
         );
-        assert!(music_lane_held(219));
-        assert!(!music_lane_held(220));
+        assert_eq!(
+            music_held_state([219, 220, 0, 255, 221, 218]),
+            [true, false, true, false, false, true]
+        );
         assert_eq!(
             music_metric_summary(&(1..=100).collect::<Vec<_>>()),
             [50, 95, 99, 100]
@@ -5000,14 +4881,13 @@ mod tests {
             guardian_us: vec![60],
             pixel_sample_us: vec![70, 80],
             pixel_foreground_us: vec![11],
-            pixel_get_pixel_us: vec![23],
+            pixel_bitblt_us: vec![22],
+            pixel_gdi_flush_us: vec![33],
+            pixel_buffer_read_us: vec![44],
             input_pipeline_us: vec![90, 100],
             missed_sample_deadlines: 1,
             stale_event_count: 0,
             queue_overflow_count: 0,
-            lane_sample_count: [3, 0, 0, 0, 0, 0],
-            lane_sample_intervals_us: [vec![4_900, 5_000], vec![], vec![], vec![], vec![], vec![]],
-            lane_missed_sample_deadlines: [1, 0, 0, 0, 0, 0],
         };
         let line = music_metric_log_line(&metrics, &attempt);
         assert_eq!(
@@ -5024,12 +4904,8 @@ mod tests {
             "music autoplay stage timing task_run_id=task-1 attempt_id=attempt-1 supervision_check_count=2 supervision_check_p50_us=10 supervision_check_p95_us=10 supervision_check_p99_us=10 supervision_check_max_us=20"
         );
         assert_eq!(
-            stage_lines[8],
+            stage_lines[10],
             "music autoplay stage timing task_run_id=task-1 attempt_id=attempt-1 input_pipeline_count=2 input_pipeline_p50_us=90 input_pipeline_p95_us=90 input_pipeline_p99_us=90 input_pipeline_max_us=100"
-        );
-        assert_eq!(
-            stage_lines[9],
-            "music autoplay lane timing task_run_id=task-1 attempt_id=attempt-1 lane=0 sample_count=3 sample_interval_p50_us=4900 sample_interval_p95_us=4900 sample_interval_p99_us=4900 sample_interval_max_us=5000 missed_sample_deadlines=1"
         );
 
         let root = std::env::temp_dir().join(format!(
@@ -5046,12 +4922,12 @@ mod tests {
             log.append(crate::runtime_api::LogLevel::Info, message)
         })
         .unwrap();
-        let entries = log.tail(16, &crate::runtime_api::LogLevel::Info).unwrap();
+        let entries = log.tail(12, &crate::runtime_api::LogLevel::Info).unwrap();
         let entries = entries["entries"].as_array().unwrap();
-        for (entry, stage) in entries.iter().take(15).zip(stage_lines.iter().rev()) {
+        for (entry, stage) in entries.iter().take(11).zip(stage_lines.iter().rev()) {
             assert_eq!(entry["message"], *stage);
         }
-        assert_eq!(entries[15]["message"], line);
+        assert_eq!(entries[11]["message"], line);
         std::fs::remove_dir_all(root).unwrap();
 
         let write_error = persist_music_metric_summary_with(&metrics, &attempt, |_| {
@@ -5162,6 +5038,7 @@ mod tests {
     #[test]
     fn music_event_batch_rejects_stale_or_wrong_generation_and_stop_discards() {
         let now = Instant::now();
+        assert_eq!(MUSIC_EVENT_FRESHNESS, Duration::from_millis(80));
         let event = MusicLaneEvent {
             generation: 4,
             lane: 1,
@@ -5277,7 +5154,7 @@ mod tests {
     }
 
     #[test]
-    fn music_sender_rechecks_freshness_at_the_sendinput_boundary() {
+    fn music_sender_tolerates_observed_windows_pipeline_stall() {
         let now = Instant::now();
         let stopped = Arc::new(AtomicBool::new(false));
         let state = MusicStopState::new(Arc::clone(&stopped));
@@ -5285,18 +5162,18 @@ mod tests {
         send.send(MusicLaneEvent {
             generation: 1,
             lane: 0,
-            detected_at: now - Duration::from_millis(19),
+            detected_at: now,
             pressed: true,
         })
         .unwrap();
         let mut sender = FakeMusicSender {
             stop: stopped,
-            send_at: now + Duration::from_millis(2),
+            send_at: now + Duration::from_millis(50),
             batches: Vec::new(),
         };
         let mut metrics = MusicAutoplayMetrics::default();
 
-        let error = run_music_sender_loop(
+        run_music_sender_loop(
             &mut sender,
             &receive,
             1,
@@ -5306,47 +5183,39 @@ mod tests {
             || now,
             || Ok(now + Duration::from_secs(1)),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.code(), "music.autoplay_event_stale");
-        assert!(sender.batches.is_empty());
-        assert_eq!(metrics.stale_event_count, 1);
+        assert_eq!(sender.batches, [vec![(0, true)]]);
+        assert_eq!(metrics.stale_event_count, 0);
     }
 
-    struct FakeMusicLaneSampler;
+    struct FakeMusicRowSampler;
 
-    impl MusicLaneSamplerIo for FakeMusicLaneSampler {
-        fn sample(&mut self) -> Result<MusicLaneSample, AgentError> {
-            Ok(MusicLaneSample {
-                blue: 219,
-                ..MusicLaneSample::default()
+    impl MusicRowSamplerIo for FakeMusicRowSampler {
+        fn sample(&mut self) -> Result<MusicRowSample, AgentError> {
+            Ok(MusicRowSample {
+                blue: [219, 255, 255, 255, 255, 255],
+                ..MusicRowSample::default()
             })
         }
     }
 
     #[test]
-    fn music_lane_sampler_waits_for_shared_start_and_emits_its_edge() {
-        let now = Instant::now();
-        let start = now + MUSIC_SAMPLE_INTERVAL;
-        let clock = Cell::new(now);
+    fn music_row_sampler_emits_only_detected_edges() {
+        let start = Instant::now();
         let stop = Arc::new(AtomicBool::new(false));
         let mut events = Vec::new();
-        let mut sleeps = Vec::new();
         let mut metrics = MusicAutoplayMetrics::default();
 
-        run_music_lane_sampler_loop(
-            &mut FakeMusicLaneSampler,
-            4,
+        run_music_row_sampler_loop(
+            &mut FakeMusicRowSampler,
             start,
             start + Duration::from_secs(1),
-            7,
+            3,
             &stop,
             &mut metrics,
-            || clock.get(),
-            |duration| {
-                sleeps.push(duration);
-                clock.set(clock.get() + duration);
-            },
+            || start,
+            |_| {},
             |event| {
                 events.push(event);
                 stop.store(true, Ordering::Release);
@@ -5355,30 +5224,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(sleeps.first(), Some(&MUSIC_SAMPLE_INTERVAL));
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].generation, 7);
-        assert_eq!(events[0].lane, 4);
-        assert_eq!(events[0].detected_at, start);
+        assert_eq!(events[0].generation, 3);
+        assert_eq!(events[0].lane, 0);
         assert!(events[0].pressed);
         assert_eq!(metrics.sample_count, 1);
-    }
-
-    #[test]
-    fn music_sampler_requires_six_nonzero_distinct_hdcs() {
-        validate_music_sampler_handles(&[1, 2, 3, 4, 5, 6]).unwrap();
-        assert_eq!(
-            validate_music_sampler_handles(&[1, 2, 0, 4, 5, 6])
-                .unwrap_err()
-                .code(),
-            "music.autoplay_start_failed"
-        );
-        assert_eq!(
-            validate_music_sampler_handles(&[1, 2, 3, 4, 5, 1])
-                .unwrap_err()
-                .code(),
-            "music.autoplay_start_failed"
-        );
     }
 
     struct FakeMusicSafety {
@@ -5450,19 +5300,10 @@ mod tests {
         assert!(metrics.input_latency_us.capacity() >= 201 * MUSIC_LANES.len());
         let other = MusicAutoplayMetrics {
             sample_count: 1,
-            sample_intervals_us: vec![5_000],
-            missed_sample_deadlines: 2,
             ..MusicAutoplayMetrics::default()
         };
-        metrics.merge_lane(2, other);
+        metrics.merge(other);
         assert_eq!(metrics.sample_count, 1);
-        assert_eq!(metrics.lane_sample_count[2], 1);
-        assert_eq!(metrics.lane_sample_intervals_us[2], [5_000]);
-        assert_eq!(metrics.lane_missed_sample_deadlines[2], 2);
-
-        let lane_metrics = MusicAutoplayMetrics::with_lane_capacity(Duration::from_secs(1));
-        assert!(lane_metrics.pixel_get_pixel_us.capacity() >= 201);
-        assert_eq!(lane_metrics.input_latency_us.capacity(), 0);
     }
 
     #[test]
