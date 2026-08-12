@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fairypam_agent_core::profile::VerifiedProfile;
 use fairypam_agent_core::target::TargetBinding;
@@ -14,7 +14,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetForegroundWindow, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 use crate::{LockedInputTarget, NativeWindows, WindowsTargetPlatform};
@@ -46,6 +47,166 @@ struct RevalidatingInputPlatform {
     targets: WindowsTargetPlatform<NativeWindows>,
     binding: TargetBinding,
     sender: SendInputPlatform,
+}
+
+pub struct MusicLaneSender {
+    hwnd: isize,
+    lane_keys: [(u16, bool); 6],
+    held: [bool; 6],
+    sender: SendInputPlatform,
+}
+
+pub struct PreparedMusicLaneInput {
+    inputs: Vec<INPUT>,
+    next: [bool; 6],
+}
+
+fn validate_music_send_boundary(
+    latest_detected_at: Instant,
+    freshness_deadline: Instant,
+    input_deadline: Instant,
+    send_at: Instant,
+) -> Result<(), SafetyError> {
+    if latest_detected_at > send_at {
+        return Err(SafetyError::new(
+            "music.autoplay_event_invalid",
+            "music autoplay event timestamp is in the future",
+        ));
+    }
+    if input_deadline <= send_at {
+        return Err(SafetyError::new(
+            "input.lease_expired",
+            "music autoplay input lease expired before SendInput",
+        ));
+    }
+    if freshness_deadline <= send_at {
+        return Err(SafetyError::new(
+            "music.autoplay_event_stale",
+            "music autoplay event exceeded the frozen freshness window",
+        ));
+    }
+    Ok(())
+}
+
+impl MusicLaneSender {
+    fn new(binding: &TargetBinding, lane_keys: &[(u16, bool)]) -> Result<Self, SafetyError> {
+        let lane_keys: [(u16, bool); 6] = lane_keys.try_into().map_err(|_| {
+            SafetyError::new(
+                "music.autoplay_profile_invalid",
+                "music autoplay requires exactly six signed lane keys",
+            )
+        })?;
+        Ok(Self {
+            hwnd: binding.window_handle as isize,
+            lane_keys,
+            held: [false; 6],
+            sender: SendInputPlatform {
+                client_left: 0,
+                client_top: 0,
+                client_width: binding.client_rect.width,
+                client_height: binding.client_rect.height,
+            },
+        })
+    }
+
+    pub fn prepare_transitions(
+        &self,
+        transitions: &[(usize, bool)],
+    ) -> Result<PreparedMusicLaneInput, SafetyError> {
+        if transitions.is_empty() {
+            return Ok(PreparedMusicLaneInput {
+                inputs: Vec::new(),
+                next: self.held,
+            });
+        }
+        let mut next = self.held;
+        let mut inputs = Vec::with_capacity(transitions.len());
+        for &(lane, pressed) in transitions {
+            let Some(&(scan_code, extended)) = self.lane_keys.get(lane) else {
+                return Err(SafetyError::new(
+                    "music.autoplay_event_invalid",
+                    "music autoplay event references an invalid lane",
+                ));
+            };
+            if next[lane] == pressed {
+                return Err(SafetyError::new(
+                    "music.autoplay_event_invalid",
+                    "music autoplay event does not change lane state",
+                ));
+            }
+            inputs.push(SendInputPlatform::keyboard(scan_code, extended, !pressed));
+            next[lane] = pressed;
+        }
+        Ok(PreparedMusicLaneInput { inputs, next })
+    }
+
+    pub fn send_prepared(
+        &mut self,
+        prepared: PreparedMusicLaneInput,
+        detected_at: &[Instant],
+        input_deadline: Instant,
+        freshness: Duration,
+    ) -> Result<Instant, SafetyError> {
+        use windows::Win32::Foundation::HWND;
+
+        if prepared.inputs.len() != detected_at.len() {
+            return Err(SafetyError::new(
+                "music.autoplay_event_invalid",
+                "music autoplay input and event counts do not match",
+            ));
+        }
+        let Some((&first, rest)) = detected_at.split_first() else {
+            return Err(SafetyError::new(
+                "music.autoplay_event_invalid",
+                "music autoplay input batch is empty",
+            ));
+        };
+        let mut latest_detected_at = first;
+        let mut freshness_deadline = first.checked_add(freshness).ok_or_else(|| {
+            SafetyError::new(
+                "music.autoplay_event_invalid",
+                "music autoplay event freshness deadline overflowed",
+            )
+        })?;
+        for detected_at in rest {
+            latest_detected_at = latest_detected_at.max(*detected_at);
+            freshness_deadline =
+                freshness_deadline.min(detected_at.checked_add(freshness).ok_or_else(|| {
+                    SafetyError::new(
+                        "music.autoplay_event_invalid",
+                        "music autoplay event freshness deadline overflowed",
+                    )
+                })?);
+        }
+        let hwnd = HWND(self.hwnd as *mut std::ffi::c_void);
+        if unsafe { GetForegroundWindow() } != hwnd {
+            return Err(SafetyError::new(
+                "music.autoplay_target_not_foreground",
+                "music autoplay target is not the foreground window",
+            ));
+        }
+        let send_at = Instant::now();
+        validate_music_send_boundary(
+            latest_detected_at,
+            freshness_deadline,
+            input_deadline,
+            send_at,
+        )?;
+        self.sender.send(&prepared.inputs)?;
+        self.held = prepared.next;
+        Ok(send_at)
+    }
+
+    pub fn release_all(&mut self) -> Result<(), SafetyError> {
+        let inputs = self
+            .lane_keys
+            .iter()
+            .map(|&(scan_code, extended)| SendInputPlatform::keyboard(scan_code, extended, true))
+            .collect::<Vec<_>>();
+        self.sender.send(&inputs)?;
+        self.held = [false; 6];
+        Ok(())
+    }
 }
 
 impl RevalidatingInputPlatform {
@@ -281,6 +442,20 @@ impl<G: GuardianClient> WindowsInput<G> {
         self.require_target_permit(permit, &session, now)?;
         self.executor
             .arm_guarded_physical_frame(session, sequence, expires_at, keys, permit, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn arm_music_lane_sender(
+        &mut self,
+        session: SessionKey,
+        sequence: u64,
+        expires_at: Instant,
+        keys: &[(u16, bool)],
+        permit: &InputPermit<'_>,
+        now: Instant,
+    ) -> Result<MusicLaneSender, SafetyError> {
+        self.arm_guarded_physical_frame(session, sequence, expires_at, keys, permit, now)?;
+        MusicLaneSender::new(&self.binding, keys)
     }
 
     pub fn renew_guarded_physical_frame(
@@ -737,6 +912,49 @@ mod tests {
         assert_eq!(
             virtual_desktop_coordinates(-3_000, 3_000, -1920, -1080, 3840, 2160),
             (0, 65_535)
+        );
+    }
+
+    #[test]
+    fn music_send_boundary_rejects_exact_freshness_and_lease_deadlines() {
+        let start = Instant::now();
+        let freshness_deadline = start + Duration::from_millis(20);
+        let input_deadline = start + Duration::from_secs(1);
+
+        validate_music_send_boundary(
+            start,
+            freshness_deadline,
+            input_deadline,
+            freshness_deadline - Duration::from_nanos(1),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_music_send_boundary(
+                start,
+                freshness_deadline,
+                input_deadline,
+                freshness_deadline,
+            )
+            .unwrap_err()
+            .code(),
+            "music.autoplay_event_stale"
+        );
+        assert_eq!(
+            validate_music_send_boundary(start, input_deadline, input_deadline, input_deadline)
+                .unwrap_err()
+                .code(),
+            "input.lease_expired"
+        );
+        assert_eq!(
+            validate_music_send_boundary(
+                start + Duration::from_nanos(1),
+                freshness_deadline,
+                input_deadline,
+                start,
+            )
+            .unwrap_err()
+            .code(),
+            "music.autoplay_event_invalid"
         );
     }
 }

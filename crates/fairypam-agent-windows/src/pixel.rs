@@ -4,6 +4,15 @@ use fairypam_agent_core::target::TargetBinding;
 #[cfg(any(windows, test))]
 use crate::WindowsError;
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PixelSampleTiming {
+    pub foreground: std::time::Duration,
+    pub bitblt: std::time::Duration,
+    pub gdi_flush: std::time::Duration,
+    pub buffer_read: std::time::Duration,
+}
+
 #[cfg(any(windows, test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PixelRowPlan<const N: usize> {
@@ -181,17 +190,24 @@ impl<const N: usize> ClientPixelSampler<N> {
     }
 
     pub fn sample_blue(&self) -> Result<[u8; N], WindowsError> {
+        self.sample_blue_timed().map(|(blue, _)| blue)
+    }
+
+    pub fn sample_blue_timed(&self) -> Result<([u8; N], PixelSampleTiming), WindowsError> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::Graphics::Gdi::{BitBlt, GdiFlush, HDC, SRCCOPY};
         use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
         let hwnd = HWND(self.hwnd as *mut std::ffi::c_void);
+        let foreground_started = std::time::Instant::now();
         if unsafe { GetForegroundWindow() } != hwnd {
             return Err(WindowsError::new(
                 "music.autoplay_target_not_foreground",
                 "music autoplay target is not the foreground window",
             ));
         }
+        let foreground = foreground_started.elapsed();
+        let bitblt_started = std::time::Instant::now();
         unsafe {
             BitBlt(
                 HDC(self.target_dc as *mut std::ffi::c_void),
@@ -206,15 +222,29 @@ impl<const N: usize> ClientPixelSampler<N> {
             )
         }
         .map_err(|error| WindowsError::new("music.autoplay_sample_failed", error.to_string()))?;
+        let bitblt = bitblt_started.elapsed();
+        let flush_started = std::time::Instant::now();
         if !unsafe { GdiFlush() }.as_bool() {
             return Err(WindowsError::new(
                 "music.autoplay_sample_failed",
                 "GdiFlush failed after music sampler BitBlt",
             ));
         }
+        let gdi_flush = flush_started.elapsed();
+        let buffer_started = std::time::Instant::now();
         let bgra =
             unsafe { std::slice::from_raw_parts(self.bits as *const u8, self.plan.byte_len) };
-        self.plan.blue_channels(bgra)
+        let blue = self.plan.blue_channels(bgra)?;
+        let buffer_read = buffer_started.elapsed();
+        Ok((
+            blue,
+            PixelSampleTiming {
+                foreground,
+                bitblt,
+                gdi_flush,
+                buffer_read,
+            },
+        ))
     }
 
     fn release_resources(&mut self) {

@@ -31,6 +31,10 @@ const M1_ACTION_ID: &str = "gadget.quick_use";
 #[cfg(any(windows, test))]
 const MUSIC_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(any(windows, test))]
+const MUSIC_EVENT_FRESHNESS: Duration = Duration::from_millis(20);
+#[cfg(any(windows, test))]
+const MUSIC_EVENT_QUEUE_CAPACITY: usize = 32;
+#[cfg(any(windows, test))]
 const MUSIC_INPUT_LEASE: Duration = Duration::from_millis(1_000);
 #[cfg(any(windows, test))]
 const MUSIC_INPUT_RENEW: Duration = Duration::from_millis(500);
@@ -80,6 +84,62 @@ fn music_held_state(blue: [u8; 6]) -> [bool; 6] {
 }
 
 #[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug)]
+struct MusicLaneEvent {
+    generation: u64,
+    lane: usize,
+    detected_at: Instant,
+    pressed: bool,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MusicEventBatch {
+    transitions: Vec<(usize, bool)>,
+    detected_at: Vec<Instant>,
+}
+
+#[cfg(any(windows, test))]
+fn prepare_music_event_batch(
+    mut events: Vec<MusicLaneEvent>,
+    generation: u64,
+    now: Instant,
+    stopped: bool,
+) -> Result<MusicEventBatch, AgentError> {
+    if stopped {
+        return Ok(MusicEventBatch::default());
+    }
+    events.sort_by_key(|event| (event.detected_at, event.lane));
+    let mut batch = MusicEventBatch {
+        transitions: Vec::with_capacity(events.len()),
+        detected_at: Vec::with_capacity(events.len()),
+    };
+    for event in events {
+        if event.generation != generation || event.lane >= MUSIC_LANES.len() {
+            return Err(AgentError::new(
+                "music.autoplay_event_invalid",
+                "music autoplay event does not match the active input session",
+            ));
+        }
+        let Some(latency) = now.checked_duration_since(event.detected_at) else {
+            return Err(AgentError::new(
+                "music.autoplay_event_invalid",
+                "music autoplay event timestamp is in the future",
+            ));
+        };
+        if latency >= MUSIC_EVENT_FRESHNESS {
+            return Err(AgentError::new(
+                "music.autoplay_event_stale",
+                "music autoplay event exceeded the frozen freshness window",
+            ));
+        }
+        batch.transitions.push((event.lane, event.pressed));
+        batch.detected_at.push(event.detected_at);
+    }
+    Ok(batch)
+}
+
+#[cfg(any(windows, test))]
 #[derive(Default)]
 struct MusicAutoplayMetrics {
     sample_count: u64,
@@ -91,8 +151,389 @@ struct MusicAutoplayMetrics {
     target_revalidate_us: Vec<u64>,
     guardian_us: Vec<u64>,
     pixel_sample_us: Vec<u64>,
+    pixel_foreground_us: Vec<u64>,
+    pixel_bitblt_us: Vec<u64>,
+    pixel_gdi_flush_us: Vec<u64>,
+    pixel_buffer_read_us: Vec<u64>,
     input_pipeline_us: Vec<u64>,
     missed_sample_deadlines: u64,
+    stale_event_count: u64,
+    queue_overflow_count: u64,
+}
+
+#[cfg(any(windows, test))]
+impl MusicAutoplayMetrics {
+    fn with_capacity(maximum_duration: Duration) -> Self {
+        let samples = (maximum_duration.as_millis() / MUSIC_SAMPLE_INTERVAL.as_millis() + 1)
+            .min(120_001) as usize;
+        let target_checks = (maximum_duration.as_millis() / MUSIC_TARGET_REVALIDATE.as_millis() + 1)
+            .min(2_401) as usize;
+        let guardian_checks =
+            (maximum_duration.as_millis() / MUSIC_INPUT_RENEW.as_millis() + 1).min(1_201) as usize;
+        Self {
+            sample_intervals_us: Vec::with_capacity(samples),
+            scheduler_lateness_us: Vec::with_capacity(samples),
+            input_latency_us: Vec::with_capacity(samples.saturating_mul(MUSIC_LANES.len())),
+            supervision_check_us: Vec::with_capacity(samples),
+            monitor_check_us: Vec::with_capacity(samples),
+            target_revalidate_us: Vec::with_capacity(target_checks),
+            guardian_us: Vec::with_capacity(guardian_checks),
+            pixel_sample_us: Vec::with_capacity(samples),
+            pixel_foreground_us: Vec::with_capacity(samples),
+            pixel_bitblt_us: Vec::with_capacity(samples),
+            pixel_gdi_flush_us: Vec::with_capacity(samples),
+            pixel_buffer_read_us: Vec::with_capacity(samples),
+            input_pipeline_us: Vec::with_capacity(samples),
+            ..Self::default()
+        }
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        self.sample_count += other.sample_count;
+        self.sample_intervals_us
+            .append(&mut other.sample_intervals_us);
+        self.scheduler_lateness_us
+            .append(&mut other.scheduler_lateness_us);
+        self.input_latency_us.append(&mut other.input_latency_us);
+        self.supervision_check_us
+            .append(&mut other.supervision_check_us);
+        self.monitor_check_us.append(&mut other.monitor_check_us);
+        self.target_revalidate_us
+            .append(&mut other.target_revalidate_us);
+        self.guardian_us.append(&mut other.guardian_us);
+        self.pixel_sample_us.append(&mut other.pixel_sample_us);
+        self.pixel_foreground_us
+            .append(&mut other.pixel_foreground_us);
+        self.pixel_bitblt_us.append(&mut other.pixel_bitblt_us);
+        self.pixel_gdi_flush_us
+            .append(&mut other.pixel_gdi_flush_us);
+        self.pixel_buffer_read_us
+            .append(&mut other.pixel_buffer_read_us);
+        self.input_pipeline_us.append(&mut other.input_pipeline_us);
+        self.missed_sample_deadlines += other.missed_sample_deadlines;
+        self.stale_event_count += other.stale_event_count;
+        self.queue_overflow_count += other.queue_overflow_count;
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Default)]
+struct MusicRowSample {
+    blue: [u8; 6],
+    foreground: Duration,
+    bitblt: Duration,
+    gdi_flush: Duration,
+    buffer_read: Duration,
+}
+
+#[cfg(any(windows, test))]
+trait MusicRowSamplerIo {
+    fn sample(&mut self) -> Result<MusicRowSample, AgentError>;
+}
+
+#[cfg(any(windows, test))]
+#[allow(clippy::too_many_arguments)]
+fn run_music_row_sampler_loop<I, Now, Sleep, Send>(
+    io: &mut I,
+    start_at: Instant,
+    deadline: Instant,
+    generation: u64,
+    stop: &AtomicBool,
+    metrics: &mut MusicAutoplayMetrics,
+    mut now: Now,
+    mut sleep: Sleep,
+    mut send: Send,
+) -> Result<(), AgentError>
+where
+    I: MusicRowSamplerIo,
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+    Send: FnMut(MusicLaneEvent) -> Result<(), AgentError>,
+{
+    let before_start = now();
+    if before_start < start_at {
+        sleep(start_at - before_start);
+    }
+    let mut next_sample = start_at;
+    let mut previous_sample = None;
+    let mut held = [false; 6];
+    while !stop.load(Ordering::Acquire) {
+        let loop_now = now();
+        if loop_now >= deadline {
+            return Err(AgentError::new(
+                "music.autoplay_timeout",
+                "local music autoplay exceeded its bounded duration",
+            ));
+        }
+        metrics.scheduler_lateness_us.push(
+            loop_now
+                .checked_duration_since(next_sample)
+                .unwrap_or_default()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        metrics.sample_count += 1;
+        if let Some(previous) = previous_sample.replace(loop_now) {
+            if let Some(interval) = loop_now.checked_duration_since(previous) {
+                metrics
+                    .sample_intervals_us
+                    .push(interval.as_micros().min(u128::from(u64::MAX)) as u64);
+            }
+        }
+        let sampled_at = Instant::now();
+        let sample = io.sample()?;
+        metrics
+            .pixel_sample_us
+            .push(sampled_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+        for (values, duration) in [
+            (&mut metrics.pixel_foreground_us, sample.foreground),
+            (&mut metrics.pixel_bitblt_us, sample.bitblt),
+            (&mut metrics.pixel_gdi_flush_us, sample.gdi_flush),
+            (&mut metrics.pixel_buffer_read_us, sample.buffer_read),
+        ] {
+            values.push(duration.as_micros().min(u128::from(u64::MAX)) as u64);
+        }
+        let desired = music_held_state(sample.blue);
+        let detected_at = now();
+        if !stop.load(Ordering::Acquire) {
+            for lane in 0..MUSIC_LANES.len() {
+                if desired[lane] != held[lane] {
+                    send(MusicLaneEvent {
+                        generation,
+                        lane,
+                        detected_at,
+                        pressed: desired[lane],
+                    })?;
+                    held[lane] = desired[lane];
+                }
+            }
+        }
+        next_sample += MUSIC_SAMPLE_INTERVAL;
+        let after_work = now();
+        while next_sample < after_work {
+            next_sample += MUSIC_SAMPLE_INTERVAL;
+            metrics.missed_sample_deadlines += 1;
+        }
+        if next_sample > after_work {
+            sleep(next_sample - after_work);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+trait MusicSafetyIo {
+    fn check_supervision(&mut self) -> Result<(), AgentError>;
+    fn check_monitor(&mut self) -> Result<(), AgentError>;
+    fn validate_target(&mut self) -> Result<(), AgentError>;
+    fn renew_guard(&mut self, sequence: u64) -> Result<(), AgentError>;
+}
+
+#[cfg(any(windows, test))]
+fn advance_music_deadline(mut deadline: Instant, interval: Duration, now: Instant) -> Instant {
+    while deadline <= now {
+        deadline += interval;
+    }
+    deadline
+}
+
+#[cfg(any(windows, test))]
+#[allow(clippy::too_many_arguments)]
+fn run_music_safety_loop<I, Now, Sleep>(
+    io: &mut I,
+    start_at: Instant,
+    deadline: Instant,
+    stop: &AtomicBool,
+    metrics: &mut MusicAutoplayMetrics,
+    mut now: Now,
+    mut sleep: Sleep,
+) -> Result<(), AgentError>
+where
+    I: MusicSafetyIo,
+    Now: FnMut() -> Instant,
+    Sleep: FnMut(Duration),
+{
+    let before_start = now();
+    if before_start < start_at {
+        sleep(start_at - before_start);
+    }
+    let mut next_monitor = start_at;
+    let mut next_target = start_at + MUSIC_TARGET_REVALIDATE;
+    let mut next_guardian = start_at + MUSIC_INPUT_RENEW;
+    let mut sequence = 1_u64;
+    while !stop.load(Ordering::Acquire) {
+        let loop_now = now();
+        if loop_now >= deadline {
+            return Err(AgentError::new(
+                "music.autoplay_timeout",
+                "local music autoplay exceeded its bounded duration",
+            ));
+        }
+        timed_music_stage(&mut metrics.supervision_check_us, || io.check_supervision())?;
+        if loop_now >= next_monitor {
+            timed_music_stage(&mut metrics.monitor_check_us, || io.check_monitor())?;
+            next_monitor = advance_music_deadline(next_monitor, MUSIC_SAMPLE_INTERVAL, now());
+        }
+        if loop_now >= next_target {
+            timed_music_stage(&mut metrics.target_revalidate_us, || io.validate_target())?;
+            next_target = advance_music_deadline(next_target, MUSIC_TARGET_REVALIDATE, now());
+        }
+        if loop_now >= next_guardian {
+            sequence = sequence.checked_add(1).ok_or_else(|| {
+                AgentError::new(
+                    "input.sequence_exhausted",
+                    "local music input sequence exhausted",
+                )
+            })?;
+            timed_music_stage(&mut metrics.guardian_us, || io.renew_guard(sequence))?;
+            next_guardian = advance_music_deadline(next_guardian, MUSIC_INPUT_RENEW, now());
+        }
+        let after_work = now();
+        let next = next_monitor.min(next_target).min(next_guardian);
+        if next > after_work {
+            sleep(next - after_work);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone)]
+struct MusicStopState {
+    stopped: Arc<AtomicBool>,
+    first_error: Arc<Mutex<Option<AgentError>>>,
+}
+
+#[cfg(any(windows, test))]
+impl MusicStopState {
+    fn new(stopped: Arc<AtomicBool>) -> Self {
+        Self {
+            stopped,
+            first_error: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn fail(&self, error: AgentError) {
+        if let Ok(mut first_error) = self.first_error.lock() {
+            if first_error.is_none() {
+                *first_error = Some(error);
+            }
+        }
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    fn error(&self) -> Option<AgentError> {
+        self.first_error.lock().ok().and_then(|value| value.clone())
+    }
+}
+
+#[cfg(any(windows, test))]
+trait MusicTransitionSender {
+    type Prepared;
+
+    fn prepare_transitions(
+        &mut self,
+        transitions: &[(usize, bool)],
+    ) -> Result<Self::Prepared, AgentError>;
+    fn send_prepared(
+        &mut self,
+        prepared: Self::Prepared,
+        detected_at: &[Instant],
+        input_deadline: Instant,
+    ) -> Result<Instant, AgentError>;
+    fn release_all(&mut self) -> Result<(), AgentError>;
+}
+
+#[cfg(any(windows, test))]
+#[allow(clippy::too_many_arguments)]
+fn run_music_sender_loop<S, Now, Lease>(
+    sender: &mut S,
+    receiver: &std::sync::mpsc::Receiver<MusicLaneEvent>,
+    generation: u64,
+    deadline: Instant,
+    state: &MusicStopState,
+    metrics: &mut MusicAutoplayMetrics,
+    mut now: Now,
+    mut input_deadline: Lease,
+) -> Result<(), AgentError>
+where
+    S: MusicTransitionSender,
+    Now: FnMut() -> Instant,
+    Lease: FnMut() -> Result<Instant, AgentError>,
+{
+    while !state.stopped.load(Ordering::Acquire) {
+        let loop_now = now();
+        if loop_now >= deadline {
+            return Err(AgentError::new(
+                "music.autoplay_timeout",
+                "local music autoplay exceeded its bounded duration",
+            ));
+        }
+        let wait = (deadline - loop_now).min(MUSIC_SAMPLE_INTERVAL);
+        let first = match receiver.recv_timeout(wait) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                if state.stopped.load(Ordering::Acquire) =>
+            {
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(AgentError::new(
+                    "music.autoplay_sampler_failed",
+                    "music autoplay sampler stopped without a terminal signal",
+                ));
+            }
+        };
+        let mut events = Vec::with_capacity(MUSIC_EVENT_QUEUE_CAPACITY);
+        events.push(first);
+        events.extend(receiver.try_iter());
+        let send_now = now();
+        let batch = match prepare_music_event_batch(
+            events,
+            generation,
+            send_now,
+            state.stopped.load(Ordering::Acquire),
+        ) {
+            Ok(batch) => batch,
+            Err(error) => {
+                if error.code() == "music.autoplay_event_stale" {
+                    metrics.stale_event_count += 1;
+                }
+                return Err(error);
+            }
+        };
+        if batch.transitions.is_empty() || state.stopped.load(Ordering::Acquire) {
+            continue;
+        }
+        let started_at = Instant::now();
+        let prepared = sender.prepare_transitions(&batch.transitions)?;
+        if state.stopped.load(Ordering::Acquire) {
+            continue;
+        }
+        let input_deadline = input_deadline()?;
+        let send_at = match sender.send_prepared(prepared, &batch.detected_at, input_deadline) {
+            Ok(send_at) => send_at,
+            Err(error) => {
+                if error.code() == "music.autoplay_event_stale" {
+                    metrics.stale_event_count += 1;
+                }
+                return Err(error);
+            }
+        };
+        metrics
+            .input_pipeline_us
+            .push(started_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+        for detected_at in batch.detected_at {
+            metrics.input_latency_us.push(
+                send_at
+                    .duration_since(detected_at)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64,
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
@@ -135,7 +576,7 @@ fn music_metric_log_line(metrics: &MusicAutoplayMetrics, attempt: &AttemptRef) -
     let sample = music_metric_summary(&metrics.sample_intervals_us);
     let input = music_metric_summary(&metrics.input_latency_us);
     format!(
-        "music autoplay timing summary task_run_id={} attempt_id={} sample_count={} sample_interval_p50_us={} sample_interval_p95_us={} sample_interval_p99_us={} sample_interval_max_us={} input_count={} input_latency_p50_us={} input_latency_p95_us={} input_latency_p99_us={} input_latency_max_us={} missed_sample_deadlines={}",
+        "music autoplay timing summary task_run_id={} attempt_id={} sample_count={} sample_interval_p50_us={} sample_interval_p95_us={} sample_interval_p99_us={} sample_interval_max_us={} input_count={} input_latency_p50_us={} input_latency_p95_us={} input_latency_p99_us={} input_latency_max_us={} missed_sample_deadlines={} stale_event_count={} queue_overflow_count={}",
         attempt.task_run_id,
         attempt.attempt_id,
         metrics.sample_count,
@@ -149,6 +590,8 @@ fn music_metric_log_line(metrics: &MusicAutoplayMetrics, attempt: &AttemptRef) -
         input[2],
         input[3],
         metrics.missed_sample_deadlines,
+        metrics.stale_event_count,
+        metrics.queue_overflow_count,
     )
 }
 
@@ -156,7 +599,7 @@ fn music_metric_log_line(metrics: &MusicAutoplayMetrics, attempt: &AttemptRef) -
 fn music_stage_metric_log_lines(
     metrics: &MusicAutoplayMetrics,
     attempt: &AttemptRef,
-) -> [String; 7] {
+) -> [String; 11] {
     [
         ("scheduler_lateness", &metrics.scheduler_lateness_us),
         ("supervision_check", &metrics.supervision_check_us),
@@ -164,6 +607,10 @@ fn music_stage_metric_log_lines(
         ("target_revalidate", &metrics.target_revalidate_us),
         ("guardian", &metrics.guardian_us),
         ("pixel_sample", &metrics.pixel_sample_us),
+        ("pixel_foreground", &metrics.pixel_foreground_us),
+        ("pixel_bitblt", &metrics.pixel_bitblt_us),
+        ("pixel_gdi_flush", &metrics.pixel_gdi_flush_us),
+        ("pixel_buffer_read", &metrics.pixel_buffer_read_us),
         ("input_pipeline", &metrics.input_pipeline_us),
     ]
     .map(|(name, values)| {
@@ -215,8 +662,8 @@ fn merge_music_autoplay_errors(
 ) -> Option<AgentError> {
     match (operation_error, metrics_error) {
         (Some(operation), Some(metrics)) => Some(AgentError::new(
-            "music.autoplay_metrics_unavailable",
-            format!("{metrics}; worker result: {operation}"),
+            operation.code(),
+            format!("{operation}; metrics result: {metrics}"),
         )),
         (operation, None) => operation,
         (None, metrics) => metrics,
@@ -281,125 +728,6 @@ fn music_input_expiry_if_running(
     }
     let expires_at = music_input_expiry(supervision_deadline, now)?;
     Ok(Some(expires_at))
-}
-
-#[cfg(any(windows, test))]
-trait MusicAutoplayIo {
-    fn check_monitor(&mut self) -> Result<(), AgentError>;
-    fn validate_target(&mut self) -> Result<(), AgentError>;
-    fn sample_blue(&mut self) -> Result<[u8; 6], AgentError>;
-    fn arm_guard(&mut self, sequence: u64) -> Result<bool, AgentError>;
-    fn renew_guard(&mut self, sequence: u64) -> Result<bool, AgentError>;
-    fn apply_held(&mut self, held: [bool; 6]) -> Result<Option<Duration>, AgentError>;
-}
-
-#[cfg(any(windows, test))]
-fn run_music_autoplay_loop<I, Supervision, Now, Sleep, Stop>(
-    io: &mut I,
-    maximum_duration: Duration,
-    metrics: &mut MusicAutoplayMetrics,
-    mut supervision_deadline: Supervision,
-    mut now: Now,
-    mut sleep: Sleep,
-    mut stop: Stop,
-) -> Result<(), AgentError>
-where
-    I: MusicAutoplayIo,
-    Supervision: FnMut() -> Result<Instant, AgentError>,
-    Now: FnMut() -> Instant,
-    Sleep: FnMut(Duration),
-    Stop: FnMut() -> bool,
-{
-    let started_at = now();
-    let deadline = started_at + maximum_duration;
-    let mut held = [false; 6];
-    let mut sequence = 0_u64;
-    let mut next_renew = started_at;
-    let mut next_revalidate = started_at;
-    let mut next_sample = started_at;
-    let mut previous_sample = None;
-    while !stop() {
-        let loop_now = now();
-        if loop_now >= deadline {
-            return Err(AgentError::new(
-                "music.autoplay_timeout",
-                "local music autoplay exceeded its bounded duration",
-            ));
-        }
-        metrics.scheduler_lateness_us.push(
-            loop_now
-                .checked_duration_since(next_sample)
-                .unwrap_or_default()
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64,
-        );
-        let supervised_until =
-            timed_music_stage(&mut metrics.supervision_check_us, &mut supervision_deadline)?;
-        music_input_expiry(supervised_until, loop_now)?;
-        timed_music_stage(&mut metrics.monitor_check_us, || io.check_monitor())?;
-        if loop_now >= next_revalidate {
-            timed_music_stage(&mut metrics.target_revalidate_us, || io.validate_target())?;
-            next_revalidate = loop_now + MUSIC_TARGET_REVALIDATE;
-        }
-        if sequence == 0 {
-            if stop() {
-                break;
-            }
-            sequence = 1;
-            if !timed_music_stage(&mut metrics.guardian_us, || io.arm_guard(sequence))? {
-                break;
-            }
-            next_renew = loop_now + MUSIC_INPUT_RENEW;
-        } else if loop_now >= next_renew {
-            if stop() {
-                break;
-            }
-            sequence = sequence.checked_add(1).ok_or_else(|| {
-                AgentError::new(
-                    "input.sequence_exhausted",
-                    "local music input sequence exhausted",
-                )
-            })?;
-            if !timed_music_stage(&mut metrics.guardian_us, || io.renew_guard(sequence))? {
-                break;
-            }
-            next_renew = loop_now + MUSIC_INPUT_RENEW;
-        }
-        metrics.sample_count += 1;
-        if let Some(previous) = previous_sample.replace(loop_now) {
-            if let Some(interval) = loop_now.checked_duration_since(previous) {
-                metrics
-                    .sample_intervals_us
-                    .push(interval.as_micros().min(u128::from(u64::MAX)) as u64);
-            }
-        }
-        let blue = timed_music_stage(&mut metrics.pixel_sample_us, || io.sample_blue())?;
-        let desired = music_held_state(blue);
-        if desired != held {
-            if stop() {
-                break;
-            }
-            let Some(latency) =
-                timed_music_stage(&mut metrics.input_pipeline_us, || io.apply_held(desired))?
-            else {
-                break;
-            };
-            metrics
-                .input_latency_us
-                .push(latency.as_micros().min(u128::from(u64::MAX)) as u64);
-            held = desired;
-        }
-        next_sample += MUSIC_SAMPLE_INTERVAL;
-        let after_work = now();
-        while next_sample < after_work {
-            next_sample += MUSIC_SAMPLE_INTERVAL;
-            metrics.missed_sample_deadlines += 1;
-        }
-        if next_sample > after_work {
-            sleep(next_sample - after_work);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(any(windows, test))]
@@ -3181,19 +3509,72 @@ fn validate_music_target(snapshot: &TargetSnapshot) -> Result<(), AgentError> {
 }
 
 #[cfg(windows)]
-struct WindowsMusicAutoplayIo<'a> {
+struct WindowsMusicSafetyIo<'a> {
     input: &'a mut WindowsTaskInput,
     binding: TargetBinding,
     snapshot: Option<TargetSnapshot>,
     lane_keys: Vec<(u16, bool)>,
     targets: fairypam_agent_windows::WindowsTargetPlatform<fairypam_agent_windows::NativeWindows>,
-    sampler: fairypam_agent_windows::ClientPixelSampler<6>,
     supervision_deadline: Arc<Mutex<Instant>>,
+    input_deadline: Arc<Mutex<Instant>>,
     stop: &'a AtomicBool,
 }
 
 #[cfg(windows)]
-impl WindowsMusicAutoplayIo<'_> {
+struct WindowsMusicRowSampler {
+    sampler: fairypam_agent_windows::ClientPixelSampler<6>,
+}
+
+#[cfg(windows)]
+impl MusicRowSamplerIo for WindowsMusicRowSampler {
+    fn sample(&mut self) -> Result<MusicRowSample, AgentError> {
+        let (blue, timing) = self.sampler.sample_blue_timed().map_err(AgentError::from)?;
+        Ok(MusicRowSample {
+            blue,
+            foreground: timing.foreground,
+            bitblt: timing.bitblt,
+            gdi_flush: timing.gdi_flush,
+            buffer_read: timing.buffer_read,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl MusicTransitionSender for fairypam_agent_windows::MusicLaneSender {
+    type Prepared = fairypam_agent_windows::PreparedMusicLaneInput;
+
+    fn prepare_transitions(
+        &mut self,
+        transitions: &[(usize, bool)],
+    ) -> Result<Self::Prepared, AgentError> {
+        fairypam_agent_windows::MusicLaneSender::prepare_transitions(self, transitions)
+            .map_err(|error| AgentError::new(error.code(), error.to_string()))
+    }
+
+    fn send_prepared(
+        &mut self,
+        prepared: Self::Prepared,
+        detected_at: &[Instant],
+        input_deadline: Instant,
+    ) -> Result<Instant, AgentError> {
+        fairypam_agent_windows::MusicLaneSender::send_prepared(
+            self,
+            prepared,
+            detected_at,
+            input_deadline,
+            MUSIC_EVENT_FRESHNESS,
+        )
+        .map_err(|error| AgentError::new(error.code(), error.to_string()))
+    }
+
+    fn release_all(&mut self) -> Result<(), AgentError> {
+        fairypam_agent_windows::MusicLaneSender::release_all(self)
+            .map_err(|error| AgentError::new(error.code(), error.to_string()))
+    }
+}
+
+#[cfg(windows)]
+impl WindowsMusicSafetyIo<'_> {
     fn supervised_until(&self) -> Result<Instant, AgentError> {
         self.supervision_deadline
             .lock()
@@ -3239,29 +3620,51 @@ impl WindowsMusicAutoplayIo<'_> {
         )))
     }
 
-    fn input_context(&self) -> Result<Option<(TargetSnapshot, Instant)>, AgentError> {
-        let snapshot = self.snapshot.clone().ok_or_else(|| {
-            AgentError::new(
-                "music.autoplay_target_invalid",
-                "music autoplay target has not been revalidated",
+    fn arm_sender(
+        &mut self,
+        sequence: u64,
+    ) -> Result<fairypam_agent_windows::MusicLaneSender, AgentError> {
+        use fairypam_agent_input::InputPermit;
+
+        let Some((snapshot, input_now, expires_at)) = self.renewal_context()? else {
+            return Err(AgentError::new(
+                "music.autoplay_start_failed",
+                "music autoplay stopped before the input session was armed",
+            ));
+        };
+        let permit = InputPermit::from_capability(
+            self.input
+                .machine
+                .issue_input_capability(input_now, &snapshot, true)?,
+        );
+        let sender = self
+            .input
+            .input
+            .arm_music_lane_sender(
+                self.input.session.clone(),
+                sequence,
+                expires_at,
+                &self.lane_keys,
+                &permit,
+                input_now,
             )
-        })?;
-        let input_now = Instant::now();
-        if music_input_expiry_if_running(
-            self.supervised_until()?,
-            input_now,
-            self.stop.load(Ordering::Acquire),
-        )?
-        .is_none()
-        {
-            return Ok(None);
-        }
-        Ok(Some((snapshot, input_now)))
+            .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+        *self.input_deadline.lock().map_err(|_| {
+            AgentError::new(
+                "music.autoplay_supervision_failed",
+                "music autoplay input deadline is unavailable",
+            )
+        })? = expires_at;
+        Ok(sender)
     }
 }
 
 #[cfg(windows)]
-impl MusicAutoplayIo for WindowsMusicAutoplayIo<'_> {
+impl MusicSafetyIo for WindowsMusicSafetyIo<'_> {
+    fn check_supervision(&mut self) -> Result<(), AgentError> {
+        music_input_expiry(self.supervised_until()?, Instant::now()).map(|_| ())
+    }
+
     fn check_monitor(&mut self) -> Result<(), AgentError> {
         fairypam_agent_windows::require_local_input_monitor()
     }
@@ -3275,40 +3678,11 @@ impl MusicAutoplayIo for WindowsMusicAutoplayIo<'_> {
         Ok(())
     }
 
-    fn sample_blue(&mut self) -> Result<[u8; 6], AgentError> {
-        self.sampler.sample_blue().map_err(AgentError::from)
-    }
-
-    fn arm_guard(&mut self, sequence: u64) -> Result<bool, AgentError> {
+    fn renew_guard(&mut self, sequence: u64) -> Result<(), AgentError> {
         use fairypam_agent_input::InputPermit;
 
         let Some((snapshot, input_now, expires_at)) = self.renewal_context()? else {
-            return Ok(false);
-        };
-        let permit = InputPermit::from_capability(
-            self.input
-                .machine
-                .issue_input_capability(input_now, &snapshot, true)?,
-        );
-        self.input
-            .input
-            .arm_guarded_physical_frame(
-                self.input.session.clone(),
-                sequence,
-                expires_at,
-                &self.lane_keys,
-                &permit,
-                input_now,
-            )
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
-        Ok(true)
-    }
-
-    fn renew_guard(&mut self, sequence: u64) -> Result<bool, AgentError> {
-        use fairypam_agent_input::InputPermit;
-
-        let Some((snapshot, input_now, expires_at)) = self.renewal_context()? else {
-            return Ok(false);
+            return Ok(());
         };
         let permit = InputPermit::from_capability(
             self.input
@@ -3325,31 +3699,13 @@ impl MusicAutoplayIo for WindowsMusicAutoplayIo<'_> {
                 input_now,
             )
             .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
-        Ok(true)
-    }
-
-    fn apply_held(&mut self, held: [bool; 6]) -> Result<Option<Duration>, AgentError> {
-        use fairypam_agent_input::InputPermit;
-
-        let Some((snapshot, input_now)) = self.input_context()? else {
-            return Ok(None);
-        };
-        let keys = held
-            .iter()
-            .zip(&self.lane_keys)
-            .filter_map(|(active, key)| active.then_some(*key))
-            .collect::<Vec<_>>();
-        let permit = InputPermit::from_capability(
-            self.input
-                .machine
-                .issue_input_capability(input_now, &snapshot, true)?,
-        );
-        let started_at = Instant::now();
-        self.input
-            .input
-            .apply_guarded_physical_frame(&self.input.session, &keys, &permit, input_now)
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
-        Ok(Some(started_at.elapsed()))
+        *self.input_deadline.lock().map_err(|_| {
+            AgentError::new(
+                "music.autoplay_supervision_failed",
+                "music autoplay input deadline is unavailable",
+            )
+        })? = expires_at;
+        Ok(())
     }
 }
 
@@ -3361,44 +3717,275 @@ fn run_music_autoplay(
     attempt: AttemptRef,
     maximum_duration: Duration,
     supervision_deadline: Arc<Mutex<Instant>>,
-    stop: &AtomicBool,
+    stop: Arc<AtomicBool>,
 ) -> (WindowsTaskInput, Option<AgentError>, Result<(), AgentError>) {
     use fairypam_agent_input::ReleaseReason;
 
-    let loop_deadline = Arc::clone(&supervision_deadline);
-    let mut metrics = MusicAutoplayMetrics::default();
+    let mut metrics = MusicAutoplayMetrics::with_capacity(maximum_duration);
     let (input, operation_error, release) = finish_music_autoplay_worker(
         input,
         |input| {
             let points = MUSIC_LANES.map(|(_, x, y)| (x, y));
-            let mut io = WindowsMusicAutoplayIo {
+            let input_deadline = Arc::new(Mutex::new(Instant::now()));
+            let mut safety = WindowsMusicSafetyIo {
                 input,
                 binding: binding.clone(),
                 snapshot: None,
-                lane_keys,
+                lane_keys: lane_keys.clone(),
                 targets: fairypam_agent_windows::WindowsTargetPlatform::new(
                     fairypam_agent_windows::NativeWindows,
                 ),
-                sampler: fairypam_agent_windows::ClientPixelSampler::new(&binding, &points)?,
-                supervision_deadline,
-                stop,
+                supervision_deadline: Arc::clone(&supervision_deadline),
+                input_deadline: Arc::clone(&input_deadline),
+                stop: &stop,
             };
-            run_music_autoplay_loop(
-                &mut io,
-                maximum_duration,
-                &mut metrics,
-                || {
-                    loop_deadline.lock().map(|value| *value).map_err(|_| {
-                        AgentError::new(
-                            "music.autoplay_supervision_failed",
-                            "music autoplay supervision lease is unavailable",
+            safety.check_monitor()?;
+            safety.validate_target()?;
+            let mut lane_sender = safety.arm_sender(1)?;
+
+            let state = MusicStopState::new(Arc::clone(&stop));
+            let (event_sender, event_receiver) =
+                std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
+
+            let sampler_state = state.clone();
+            let sampler_binding = binding.clone();
+            let (sampler_ready_sender, sampler_ready_receiver) = std::sync::mpsc::sync_channel(1);
+            let (sampler_start_sender, sampler_start_receiver) = std::sync::mpsc::sync_channel(1);
+            let sampler_thread = match std::thread::Builder::new()
+                .name("fairypam-music-row-sampler".into())
+                .spawn(move || {
+                    let mut sampler_metrics = MusicAutoplayMetrics::with_capacity(maximum_duration);
+                    let mut queue_overflows = 0_u64;
+                    let sampler = match fairypam_agent_windows::ClientPixelSampler::new(
+                        &sampler_binding,
+                        &points,
+                    ) {
+                        Ok(sampler) => sampler,
+                        Err(error) => {
+                            let error = AgentError::from(error);
+                            let _ = sampler_ready_sender.send(Err(error.clone()));
+                            sampler_state.fail(error.clone());
+                            return (sampler_metrics, Err(error));
+                        }
+                    };
+                    if sampler_ready_sender.send(Ok(())).is_err() {
+                        let error = AgentError::new(
+                            "music.autoplay_start_failed",
+                            "music sampler startup receiver is unavailable",
+                        );
+                        sampler_state.fail(error.clone());
+                        return (sampler_metrics, Err(error));
+                    }
+                    let (start_at, deadline) = match sampler_start_receiver.recv() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            let error = AgentError::new(
+                                "music.autoplay_start_failed",
+                                "music sampler did not receive the shared start deadline",
+                            );
+                            sampler_state.fail(error.clone());
+                            return (sampler_metrics, Err(error));
+                        }
+                    };
+                    let mut io = WindowsMusicRowSampler { sampler };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_music_row_sampler_loop(
+                            &mut io,
+                            start_at,
+                            deadline,
+                            1,
+                            &sampler_state.stopped,
+                            &mut sampler_metrics,
+                            Instant::now,
+                            std::thread::sleep,
+                            |event| match event_sender.try_send(event) {
+                                Ok(()) => Ok(()),
+                                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                    queue_overflows += 1;
+                                    Err(AgentError::new(
+                                        "music.autoplay_queue_overflow",
+                                        "music autoplay event queue is full",
+                                    ))
+                                }
+                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                    Err(AgentError::new(
+                                        "music.autoplay_sender_failed",
+                                        "music autoplay sender is unavailable",
+                                    ))
+                                }
+                            },
                         )
-                    })
-                },
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(AgentError::new(
+                            "music.autoplay_worker_failed",
+                            "music row sampler panicked",
+                        ))
+                    });
+                    if let Err(error) = &result {
+                        sampler_state.fail(error.clone());
+                    }
+                    sampler_metrics.queue_overflow_count = queue_overflows;
+                    (sampler_metrics, result)
+                }) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    let _ = lane_sender.release_all();
+                    return Err(AgentError::new(
+                        "music.autoplay_start_failed",
+                        error.to_string(),
+                    ));
+                }
+            };
+            match sampler_ready_receiver.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let _ = lane_sender.release_all();
+                    let _ = sampler_thread.join();
+                    return Err(error);
+                }
+                Err(_) => {
+                    let _ = lane_sender.release_all();
+                    let _ = sampler_thread.join();
+                    return Err(AgentError::new(
+                        "music.autoplay_start_failed",
+                        "music sampler stopped during startup",
+                    ));
+                }
+            }
+
+            let start_at = Instant::now() + MUSIC_SAMPLE_INTERVAL;
+            let deadline = start_at + maximum_duration;
+
+            let sender_state = state.clone();
+            let sender_input_deadline = Arc::clone(&input_deadline);
+            let (sender_start, sender_receive) = std::sync::mpsc::sync_channel(1);
+            let sender_thread = std::thread::Builder::new()
+                .name("fairypam-music-sender".into())
+                .spawn(move || {
+                    let mut sender = sender_receive
+                        .recv()
+                        .expect("music sender handle lives until sender startup");
+                    let mut sender_metrics = MusicAutoplayMetrics::with_capacity(maximum_duration);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_music_sender_loop(
+                            &mut sender,
+                            &event_receiver,
+                            1,
+                            deadline,
+                            &sender_state,
+                            &mut sender_metrics,
+                            Instant::now,
+                            || {
+                                sender_input_deadline
+                                    .lock()
+                                    .map(|value| *value)
+                                    .map_err(|_| {
+                                        AgentError::new(
+                                            "music.autoplay_supervision_failed",
+                                            "music autoplay input deadline is unavailable",
+                                        )
+                                    })
+                            },
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(AgentError::new(
+                            "music.autoplay_worker_failed",
+                            "music sender panicked",
+                        ))
+                    });
+                    if let Err(error) = &result {
+                        sender_state.fail(error.clone());
+                    }
+                    let release = sender.release_all();
+                    (sender_metrics, result, release)
+                })
+                .map_err(|error| AgentError::new("music.autoplay_start_failed", error.to_string()));
+            let sender_thread = match sender_thread {
+                Ok(thread) => thread,
+                Err(error) => {
+                    state.fail(error.clone());
+                    let _ = sampler_start_sender.send((start_at, deadline));
+                    let _ = lane_sender.release_all();
+                    let _ = sampler_thread.join();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = sender_start.send(lane_sender) {
+                let mut sender = error.0;
+                let _ = sender.release_all();
+                state.fail(AgentError::new(
+                    "music.autoplay_start_failed",
+                    "music sender stopped during startup",
+                ));
+                let _ = sampler_start_sender.send((start_at, deadline));
+                let _ = sender_thread.join();
+                let _ = sampler_thread.join();
+                return Err(AgentError::new(
+                    "music.autoplay_start_failed",
+                    "music sender stopped during startup",
+                ));
+            }
+            if sampler_start_sender.send((start_at, deadline)).is_err() {
+                let error = AgentError::new(
+                    "music.autoplay_start_failed",
+                    "music sampler stopped during startup",
+                );
+                state.fail(error.clone());
+                let _ = sampler_thread.join();
+                let (_, _, sender_release) = sender_thread.join().map_err(|_| {
+                    AgentError::new("music.autoplay_worker_failed", "music sender panicked")
+                })?;
+                sender_release?;
+                return Err(error);
+            }
+
+            let safety_result = run_music_safety_loop(
+                &mut safety,
+                start_at,
+                deadline,
+                &stop,
+                &mut metrics,
                 Instant::now,
                 std::thread::sleep,
-                || stop.load(Ordering::Acquire),
-            )
+            );
+            if let Err(error) = &safety_result {
+                state.fail(error.clone());
+            }
+            stop.store(true, Ordering::Release);
+
+            let (sampler_metrics, sampler_result) = match sampler_thread.join() {
+                Ok(value) => value,
+                Err(_) => {
+                    state.fail(AgentError::new(
+                        "music.autoplay_worker_failed",
+                        "music row sampler panicked",
+                    ));
+                    (MusicAutoplayMetrics::default(), Ok(()))
+                }
+            };
+            metrics.merge(sampler_metrics);
+            let (sender_metrics, sender_result, sender_release) = match sender_thread.join() {
+                Ok(value) => value,
+                Err(_) => {
+                    state.fail(AgentError::new(
+                        "music.autoplay_worker_failed",
+                        "music sender panicked",
+                    ));
+                    (MusicAutoplayMetrics::default(), Ok(()), Ok(()))
+                }
+            };
+            metrics.merge(sender_metrics);
+            for result in [sender_release, safety_result, sampler_result, sender_result] {
+                if let Err(error) = result {
+                    state.fail(error);
+                }
+            }
+            if let Some(error) = state.error() {
+                return Err(error);
+            }
+            Ok(())
         },
         |input| {
             input
@@ -3999,7 +4586,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                     worker_attempt,
                     maximum_duration,
                     worker_supervision_deadline,
-                    &worker_stop,
+                    worker_stop,
                 )
             }) {
             Ok(thread) => thread,
@@ -4070,6 +4657,7 @@ impl RuntimeCapture for WindowsCapture {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
 
@@ -4295,13 +4883,19 @@ mod tests {
             target_revalidate_us: vec![50],
             guardian_us: vec![60],
             pixel_sample_us: vec![70, 80],
+            pixel_foreground_us: vec![11],
+            pixel_bitblt_us: vec![22],
+            pixel_gdi_flush_us: vec![33],
+            pixel_buffer_read_us: vec![44],
             input_pipeline_us: vec![90, 100],
             missed_sample_deadlines: 1,
+            stale_event_count: 0,
+            queue_overflow_count: 0,
         };
         let line = music_metric_log_line(&metrics, &attempt);
         assert_eq!(
             line,
-            "music autoplay timing summary task_run_id=task-1 attempt_id=attempt-1 sample_count=3 sample_interval_p50_us=4900 sample_interval_p95_us=4900 sample_interval_p99_us=4900 sample_interval_max_us=5000 input_count=2 input_latency_p50_us=100 input_latency_p95_us=100 input_latency_p99_us=100 input_latency_max_us=300 missed_sample_deadlines=1"
+            "music autoplay timing summary task_run_id=task-1 attempt_id=attempt-1 sample_count=3 sample_interval_p50_us=4900 sample_interval_p95_us=4900 sample_interval_p99_us=4900 sample_interval_max_us=5000 input_count=2 input_latency_p50_us=100 input_latency_p95_us=100 input_latency_p99_us=100 input_latency_max_us=300 missed_sample_deadlines=1 stale_event_count=0 queue_overflow_count=0"
         );
         let stage_lines = music_stage_metric_log_lines(&metrics, &attempt);
         assert_eq!(
@@ -4313,7 +4907,7 @@ mod tests {
             "music autoplay stage timing task_run_id=task-1 attempt_id=attempt-1 supervision_check_count=2 supervision_check_p50_us=10 supervision_check_p95_us=10 supervision_check_p99_us=10 supervision_check_max_us=20"
         );
         assert_eq!(
-            stage_lines[6],
+            stage_lines[10],
             "music autoplay stage timing task_run_id=task-1 attempt_id=attempt-1 input_pipeline_count=2 input_pipeline_p50_us=90 input_pipeline_p95_us=90 input_pipeline_p99_us=90 input_pipeline_max_us=100"
         );
 
@@ -4331,12 +4925,12 @@ mod tests {
             log.append(crate::runtime_api::LogLevel::Info, message)
         })
         .unwrap();
-        let entries = log.tail(8, &crate::runtime_api::LogLevel::Info).unwrap();
+        let entries = log.tail(12, &crate::runtime_api::LogLevel::Info).unwrap();
         let entries = entries["entries"].as_array().unwrap();
-        for (entry, stage) in entries.iter().take(7).zip(stage_lines.iter().rev()) {
+        for (entry, stage) in entries.iter().take(11).zip(stage_lines.iter().rev()) {
             assert_eq!(entry["message"], *stage);
         }
-        assert_eq!(entries[7]["message"], line);
+        assert_eq!(entries[11]["message"], line);
         std::fs::remove_dir_all(root).unwrap();
 
         let write_error = persist_music_metric_summary_with(&metrics, &attempt, |_| {
@@ -4349,8 +4943,10 @@ mod tests {
             Some(write_error),
         )
         .unwrap();
-        assert_eq!(combined.code(), "music.autoplay_metrics_unavailable");
-        assert!(combined.to_string().contains("target_invalid"));
+        assert_eq!(combined.code(), "target_invalid");
+        assert!(combined
+            .to_string()
+            .contains("music.autoplay_metrics_unavailable"));
     }
 
     #[test]
@@ -4405,241 +5001,317 @@ mod tests {
         ));
     }
 
-    struct FakeMusicIo {
-        monitor_error: bool,
-        target_error: bool,
-        target_checks: usize,
-        samples: VecDeque<[u8; 6]>,
-        arms: Vec<u64>,
-        renewals: Vec<u64>,
-        applications: Vec<[bool; 6]>,
+    #[test]
+    fn music_event_batch_preserves_same_lane_edges_and_orders_ties_by_lane() {
+        let now = Instant::now();
+        let events = vec![
+            MusicLaneEvent {
+                generation: 7,
+                lane: 2,
+                detected_at: now - Duration::from_millis(2),
+                pressed: true,
+            },
+            MusicLaneEvent {
+                generation: 7,
+                lane: 0,
+                detected_at: now - Duration::from_millis(2),
+                pressed: true,
+            },
+            MusicLaneEvent {
+                generation: 7,
+                lane: 2,
+                detected_at: now - Duration::from_millis(1),
+                pressed: false,
+            },
+        ];
+
+        let batch = prepare_music_event_batch(events, 7, now, false).unwrap();
+
+        assert_eq!(batch.transitions, [(0, true), (2, true), (2, false)]);
+        assert_eq!(
+            batch.detected_at,
+            [
+                now - Duration::from_millis(2),
+                now - Duration::from_millis(2),
+                now - Duration::from_millis(1),
+            ]
+        );
     }
 
-    impl FakeMusicIo {
-        fn new(_start: Instant) -> Self {
-            Self {
-                monitor_error: false,
-                target_error: false,
-                target_checks: 0,
-                samples: VecDeque::from([[219, 255, 255, 255, 255, 255]; 3]),
-                arms: Vec::new(),
-                renewals: Vec::new(),
-                applications: Vec::new(),
+    #[test]
+    fn music_event_batch_rejects_stale_or_wrong_generation_and_stop_discards() {
+        let now = Instant::now();
+        let event = MusicLaneEvent {
+            generation: 4,
+            lane: 1,
+            detected_at: now - MUSIC_EVENT_FRESHNESS,
+            pressed: true,
+        };
+        assert_eq!(
+            prepare_music_event_batch(vec![event], 4, now, false)
+                .unwrap_err()
+                .code(),
+            "music.autoplay_event_stale"
+        );
+        assert_eq!(
+            prepare_music_event_batch(
+                vec![MusicLaneEvent {
+                    detected_at: now,
+                    ..event
+                }],
+                5,
+                now,
+                false,
+            )
+            .unwrap_err()
+            .code(),
+            "music.autoplay_event_invalid"
+        );
+        assert!(prepare_music_event_batch(vec![event], 4, now, true)
+            .unwrap()
+            .transitions
+            .is_empty());
+    }
+
+    struct FakeMusicSender {
+        stop: Arc<AtomicBool>,
+        send_at: Instant,
+        batches: Vec<Vec<(usize, bool)>>,
+    }
+
+    impl MusicTransitionSender for FakeMusicSender {
+        type Prepared = Vec<(usize, bool)>;
+
+        fn prepare_transitions(
+            &mut self,
+            transitions: &[(usize, bool)],
+        ) -> Result<Self::Prepared, AgentError> {
+            Ok(transitions.to_vec())
+        }
+
+        fn send_prepared(
+            &mut self,
+            prepared: Self::Prepared,
+            detected_at: &[Instant],
+            input_deadline: Instant,
+        ) -> Result<Instant, AgentError> {
+            if input_deadline <= self.send_at {
+                return Err(AgentError::new(
+                    "input.lease_expired",
+                    "test input lease expired",
+                ));
             }
+            for detected_at in detected_at {
+                if self
+                    .send_at
+                    .checked_duration_since(*detected_at)
+                    .is_none_or(|latency| latency >= MUSIC_EVENT_FRESHNESS)
+                {
+                    return Err(AgentError::new(
+                        "music.autoplay_event_stale",
+                        "test event exceeded freshness",
+                    ));
+                }
+            }
+            self.batches.push(prepared);
+            self.stop.store(true, Ordering::Release);
+            Ok(self.send_at)
+        }
+
+        fn release_all(&mut self) -> Result<(), AgentError> {
+            Ok(())
         }
     }
 
-    impl MusicAutoplayIo for FakeMusicIo {
-        fn check_monitor(&mut self) -> Result<(), AgentError> {
-            if self.monitor_error {
-                Err(AgentError::new(
-                    "environment.monitor_failed",
-                    "test monitor failure",
-                ))
-            } else {
+    #[test]
+    fn music_sender_batches_available_edges_once_and_stops_before_more_input() {
+        let now = Instant::now();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let state = MusicStopState::new(Arc::clone(&stopped));
+        let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
+        for pressed in [true, false] {
+            send.send(MusicLaneEvent {
+                generation: 1,
+                lane: 0,
+                detected_at: now - Duration::from_millis(1),
+                pressed,
+            })
+            .unwrap();
+        }
+        let mut sender = FakeMusicSender {
+            stop: Arc::clone(&stopped),
+            send_at: now,
+            batches: Vec::new(),
+        };
+
+        run_music_sender_loop(
+            &mut sender,
+            &receive,
+            1,
+            now + Duration::from_secs(1),
+            &state,
+            &mut MusicAutoplayMetrics::default(),
+            || now,
+            || Ok(now + Duration::from_secs(1)),
+        )
+        .unwrap();
+
+        assert_eq!(sender.batches, [vec![(0, true), (0, false)]]);
+        sender.release_all().unwrap();
+    }
+
+    #[test]
+    fn music_sender_rechecks_freshness_at_the_sendinput_boundary() {
+        let now = Instant::now();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let state = MusicStopState::new(Arc::clone(&stopped));
+        let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
+        send.send(MusicLaneEvent {
+            generation: 1,
+            lane: 0,
+            detected_at: now - Duration::from_millis(19),
+            pressed: true,
+        })
+        .unwrap();
+        let mut sender = FakeMusicSender {
+            stop: stopped,
+            send_at: now + Duration::from_millis(2),
+            batches: Vec::new(),
+        };
+        let mut metrics = MusicAutoplayMetrics::default();
+
+        let error = run_music_sender_loop(
+            &mut sender,
+            &receive,
+            1,
+            now + Duration::from_secs(1),
+            &state,
+            &mut metrics,
+            || now,
+            || Ok(now + Duration::from_secs(1)),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "music.autoplay_event_stale");
+        assert!(sender.batches.is_empty());
+        assert_eq!(metrics.stale_event_count, 1);
+    }
+
+    struct FakeMusicRowSampler;
+
+    impl MusicRowSamplerIo for FakeMusicRowSampler {
+        fn sample(&mut self) -> Result<MusicRowSample, AgentError> {
+            Ok(MusicRowSample {
+                blue: [219, 255, 255, 255, 255, 255],
+                ..MusicRowSample::default()
+            })
+        }
+    }
+
+    #[test]
+    fn music_row_sampler_emits_only_detected_edges() {
+        let start = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut events = Vec::new();
+        let mut metrics = MusicAutoplayMetrics::default();
+
+        run_music_row_sampler_loop(
+            &mut FakeMusicRowSampler,
+            start,
+            start + Duration::from_secs(1),
+            3,
+            &stop,
+            &mut metrics,
+            || start,
+            |_| {},
+            |event| {
+                events.push(event);
+                stop.store(true, Ordering::Release);
                 Ok(())
-            }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].generation, 3);
+        assert_eq!(events[0].lane, 0);
+        assert!(events[0].pressed);
+        assert_eq!(metrics.sample_count, 1);
+    }
+
+    struct FakeMusicSafety {
+        stop: Arc<AtomicBool>,
+        monitor_checks: usize,
+        target_checks: usize,
+        guardian_sequences: Vec<u64>,
+    }
+
+    impl MusicSafetyIo for FakeMusicSafety {
+        fn check_supervision(&mut self) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        fn check_monitor(&mut self) -> Result<(), AgentError> {
+            self.monitor_checks += 1;
+            Ok(())
         }
 
         fn validate_target(&mut self) -> Result<(), AgentError> {
             self.target_checks += 1;
-            if self.target_error {
-                Err(AgentError::new("target_invalid", "test target failure"))
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
 
-        fn sample_blue(&mut self) -> Result<[u8; 6], AgentError> {
-            Ok(self.samples.pop_front().unwrap_or([255; 6]))
-        }
-
-        fn arm_guard(&mut self, sequence: u64) -> Result<bool, AgentError> {
-            self.arms.push(sequence);
-            Ok(true)
-        }
-
-        fn renew_guard(&mut self, sequence: u64) -> Result<bool, AgentError> {
-            self.renewals.push(sequence);
-            Ok(true)
-        }
-
-        fn apply_held(&mut self, held: [bool; 6]) -> Result<Option<Duration>, AgentError> {
-            self.applications.push(held);
-            Ok(Some(Duration::from_micros(100)))
+        fn renew_guard(&mut self, sequence: u64) -> Result<(), AgentError> {
+            self.guardian_sequences.push(sequence);
+            self.stop.store(true, Ordering::Release);
+            Ok(())
         }
     }
 
     #[test]
-    fn music_loop_renews_unchanged_state_at_five_hundred_milliseconds() {
+    fn music_safety_uses_one_background_schedule_without_catchup() {
         let start = Instant::now();
-        let mut io = FakeMusicIo::new(start);
-        let mut times = VecDeque::from([
-            start,
-            start,
-            start,
-            start + Duration::from_millis(100),
-            start + Duration::from_millis(100),
-            start + MUSIC_INPUT_RENEW,
-            start + MUSIC_INPUT_RENEW,
-        ]);
-        let mut stops = VecDeque::from([false, false, false, false, false, false, true]);
+        let clock = Cell::new(start);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut io = FakeMusicSafety {
+            stop: Arc::clone(&stop),
+            monitor_checks: 0,
+            target_checks: 0,
+            guardian_sequences: Vec::new(),
+        };
 
-        run_music_autoplay_loop(
+        run_music_safety_loop(
             &mut io,
-            Duration::from_secs(10),
+            start,
+            start + Duration::from_secs(1),
+            &stop,
             &mut MusicAutoplayMetrics::default(),
-            || Ok(start + Duration::from_secs(2)),
-            || times.pop_front().unwrap(),
-            |_| {},
-            || stops.pop_front().unwrap(),
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
         )
         .unwrap();
 
-        assert_eq!(io.arms, [1]);
-        assert_eq!(io.renewals, [2]);
-        assert_eq!(io.applications, [[true, false, false, false, false, false]]);
+        assert_eq!(io.monitor_checks, 101);
         assert_eq!(io.target_checks, 2);
+        assert_eq!(io.guardian_sequences, [2]);
     }
 
     #[test]
-    fn music_loop_sleeps_to_the_absolute_five_millisecond_deadline() {
-        let start = Instant::now();
-        let mut io = FakeMusicIo::new(start);
-        let mut times = VecDeque::from([start, start, start + Duration::from_millis(2)]);
-        let mut stops = VecDeque::from([false, false, false, true]);
-        let mut sleeps = Vec::new();
+    fn music_state_keeps_the_first_error_and_metrics_are_preallocated() {
+        let state = MusicStopState::new(Arc::new(AtomicBool::new(false)));
+        state.fail(AgentError::new("first", "first failure"));
+        state.fail(AgentError::new("second", "second failure"));
+        assert_eq!(state.error().unwrap().code(), "first");
 
-        run_music_autoplay_loop(
-            &mut io,
-            Duration::from_secs(10),
-            &mut MusicAutoplayMetrics::default(),
-            || Ok(start + Duration::from_secs(2)),
-            || times.pop_front().unwrap(),
-            |duration| sleeps.push(duration),
-            || stops.pop_front().unwrap_or(true),
-        )
-        .unwrap();
-
-        assert_eq!(sleeps, [Duration::from_millis(3)]);
-    }
-
-    #[test]
-    fn music_loop_records_scheduler_lateness_against_the_absolute_deadline() {
-        let start = Instant::now();
-        let mut io = FakeMusicIo::new(start);
-        let mut times = VecDeque::from([
-            start,
-            start + Duration::from_millis(12),
-            start + Duration::from_millis(12),
-        ]);
-        let mut stops = VecDeque::from([false, false, false, true]);
-        let mut metrics = MusicAutoplayMetrics::default();
-
-        run_music_autoplay_loop(
-            &mut io,
-            Duration::from_secs(10),
-            &mut metrics,
-            || Ok(start + Duration::from_secs(2)),
-            || times.pop_front().unwrap(),
-            |_| {},
-            || stops.pop_front().unwrap_or(true),
-        )
-        .unwrap();
-
-        assert_eq!(metrics.scheduler_lateness_us, [12_000]);
-    }
-
-    #[test]
-    fn music_loop_attributes_each_hot_path_stage_without_changing_scheduling() {
-        let start = Instant::now();
-        let mut io = FakeMusicIo::new(start);
-        let mut times = VecDeque::from([start, start, start + Duration::from_millis(2)]);
-        let mut stops = VecDeque::from([false, false, false, true]);
-        let mut metrics = MusicAutoplayMetrics::default();
-
-        run_music_autoplay_loop(
-            &mut io,
-            Duration::from_secs(10),
-            &mut metrics,
-            || Ok(start + Duration::from_secs(2)),
-            || times.pop_front().unwrap(),
-            |_| {},
-            || stops.pop_front().unwrap_or(true),
-        )
-        .unwrap();
-
-        assert_eq!(metrics.supervision_check_us.len(), 1);
-        assert_eq!(metrics.monitor_check_us.len(), 1);
-        assert_eq!(metrics.target_revalidate_us.len(), 1);
-        assert_eq!(metrics.guardian_us.len(), 1);
-        assert_eq!(metrics.pixel_sample_us.len(), 1);
-        assert_eq!(metrics.input_pipeline_us.len(), 1);
+        let mut metrics = MusicAutoplayMetrics::with_capacity(Duration::from_secs(1));
+        assert!(metrics.sample_intervals_us.capacity() >= 201);
+        assert!(metrics.input_latency_us.capacity() >= 201 * MUSIC_LANES.len());
+        let other = MusicAutoplayMetrics {
+            sample_count: 1,
+            ..MusicAutoplayMetrics::default()
+        };
+        metrics.merge(other);
         assert_eq!(metrics.sample_count, 1);
-    }
-
-    #[test]
-    fn music_loop_fails_before_io_when_supervision_expires() {
-        let start = Instant::now();
-        let mut io = FakeMusicIo::new(start);
-        let mut times = VecDeque::from([start, start + Duration::from_secs(2)]);
-        let error = run_music_autoplay_loop(
-            &mut io,
-            Duration::from_secs(10),
-            &mut MusicAutoplayMetrics::default(),
-            || Ok(start + Duration::from_secs(2)),
-            || times.pop_front().unwrap(),
-            |_| {},
-            || false,
-        )
-        .unwrap_err();
-
-        assert_eq!(error.code(), "music.autoplay_supervision_expired");
-        assert!(io.applications.is_empty());
-    }
-
-    #[test]
-    fn music_loop_stops_before_the_final_input_send() {
-        let start = Instant::now();
-        let mut io = FakeMusicIo::new(start);
-        let mut times = VecDeque::from([start, start]);
-        let mut stops = VecDeque::from([false, true]);
-
-        run_music_autoplay_loop(
-            &mut io,
-            Duration::from_secs(10),
-            &mut MusicAutoplayMetrics::default(),
-            || Ok(start + Duration::from_secs(2)),
-            || times.pop_front().unwrap(),
-            |_| {},
-            || stops.pop_front().unwrap_or(true),
-        )
-        .unwrap();
-
-        assert!(io.applications.is_empty());
-    }
-
-    #[test]
-    fn music_loop_monitor_and_target_errors_prevent_input() {
-        for target_error in [false, true] {
-            let start = Instant::now();
-            let mut io = FakeMusicIo::new(start);
-            io.monitor_error = !target_error;
-            io.target_error = target_error;
-            let mut times = VecDeque::from([start, start]);
-
-            assert!(run_music_autoplay_loop(
-                &mut io,
-                Duration::from_secs(10),
-                &mut MusicAutoplayMetrics::default(),
-                || Ok(start + Duration::from_secs(2)),
-                || times.pop_front().unwrap(),
-                |_| {},
-                || false,
-            )
-            .is_err());
-            assert!(io.applications.is_empty());
-        }
     }
 
     #[test]
@@ -4678,36 +5350,6 @@ mod tests {
             "input.release_failed"
         );
         assert_eq!(retry, Some(7));
-    }
-
-    #[test]
-    fn music_autonomous_timeout_still_releases_input() {
-        let start = Instant::now();
-        let mut times = VecDeque::from([start, start + Duration::from_secs(600)]);
-        let input = (FakeMusicIo::new(start), true);
-        let (input, operation_error, release) = finish_music_autoplay_worker(
-            input,
-            |input| {
-                run_music_autoplay_loop(
-                    &mut input.0,
-                    Duration::from_secs(600),
-                    &mut MusicAutoplayMetrics::default(),
-                    || Ok(start + Duration::from_secs(600)),
-                    || times.pop_front().unwrap(),
-                    |_| {},
-                    || false,
-                )
-            },
-            |input| {
-                input.1 = false;
-                Ok(())
-            },
-        );
-
-        assert_eq!(operation_error.unwrap().code(), "music.autoplay_timeout");
-        assert!(input.0.applications.is_empty());
-        assert!(!input.1);
-        assert!(release.is_ok());
     }
 
     fn candidate() -> TargetCandidate {
