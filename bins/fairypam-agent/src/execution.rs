@@ -441,7 +441,6 @@ trait MusicTransitionSender {
         detected_at: &[Instant],
         input_deadline: Instant,
     ) -> Result<Instant, AgentError>;
-    fn release_all(&mut self) -> Result<(), AgentError>;
 }
 
 #[cfg(any(windows, test))]
@@ -3566,11 +3565,6 @@ impl MusicTransitionSender for fairypam_agent_windows::MusicLaneSender {
         )
         .map_err(|error| AgentError::new(error.code(), error.to_string()))
     }
-
-    fn release_all(&mut self) -> Result<(), AgentError> {
-        fairypam_agent_windows::MusicLaneSender::release_all(self)
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))
-    }
 }
 
 #[cfg(windows)]
@@ -5120,10 +5114,6 @@ mod tests {
             self.stop.store(true, Ordering::Release);
             Ok(self.send_at)
         }
-
-        fn release_all(&mut self) -> Result<(), AgentError> {
-            Ok(())
-        }
     }
 
     #[test]
@@ -5160,7 +5150,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(sender.batches, [vec![(0, true), (0, false)]]);
-        sender.release_all().unwrap();
     }
 
     #[test]
