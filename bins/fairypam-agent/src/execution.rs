@@ -87,6 +87,7 @@ fn music_held_state(blue: [u8; 6]) -> [bool; 6] {
 #[derive(Clone, Copy, Debug)]
 struct MusicLaneEvent {
     generation: u64,
+    recovery_epoch: u64,
     lane: usize,
     detected_at: Instant,
     pressed: bool,
@@ -97,12 +98,14 @@ struct MusicLaneEvent {
 struct MusicEventBatch {
     transitions: Vec<(usize, bool)>,
     detected_at: Vec<Instant>,
+    resample_required: bool,
 }
 
 #[cfg(any(windows, test))]
 fn prepare_music_event_batch(
     mut events: Vec<MusicLaneEvent>,
     generation: u64,
+    recovery_epoch: u64,
     now: Instant,
     stopped: bool,
 ) -> Result<MusicEventBatch, AgentError> {
@@ -113,13 +116,20 @@ fn prepare_music_event_batch(
     let mut batch = MusicEventBatch {
         transitions: Vec::with_capacity(events.len()),
         detected_at: Vec::with_capacity(events.len()),
+        resample_required: false,
     };
     for event in events {
-        if event.generation != generation || event.lane >= MUSIC_LANES.len() {
+        if event.generation != generation
+            || event.recovery_epoch > recovery_epoch
+            || event.lane >= MUSIC_LANES.len()
+        {
             return Err(AgentError::new(
                 "music.autoplay_event_invalid",
                 "music autoplay event does not match the active input session",
             ));
+        }
+        if event.recovery_epoch < recovery_epoch {
+            continue;
         }
         let Some(latency) = now.checked_duration_since(event.detected_at) else {
             return Err(AgentError::new(
@@ -128,13 +138,15 @@ fn prepare_music_event_batch(
             ));
         };
         if latency >= MUSIC_EVENT_FRESHNESS {
-            return Err(AgentError::new(
-                "music.autoplay_event_stale",
-                "music autoplay event exceeded the frozen freshness window",
-            ));
+            batch.resample_required = true;
+            continue;
         }
         batch.transitions.push((event.lane, event.pressed));
         batch.detected_at.push(event.detected_at);
+    }
+    if batch.resample_required {
+        batch.transitions.clear();
+        batch.detected_at.clear();
     }
     Ok(batch)
 }
@@ -238,7 +250,7 @@ fn run_music_row_sampler_loop<I, Now, Sleep, Send>(
     start_at: Instant,
     deadline: Instant,
     generation: u64,
-    stop: &AtomicBool,
+    state: &MusicStopState,
     metrics: &mut MusicAutoplayMetrics,
     mut now: Now,
     mut sleep: Sleep,
@@ -257,7 +269,8 @@ where
     let mut next_sample = start_at;
     let mut previous_sample = None;
     let mut held = [false; 6];
-    while !stop.load(Ordering::Acquire) {
+    let mut held_epoch = state.recovery_epoch.load(Ordering::Acquire);
+    while !state.stopped.load(Ordering::Acquire) {
         let loop_now = now();
         if loop_now >= deadline {
             return Err(AgentError::new(
@@ -280,6 +293,7 @@ where
                     .push(interval.as_micros().min(u128::from(u64::MAX)) as u64);
             }
         }
+        let sample_epoch = state.recovery_epoch.load(Ordering::Acquire);
         let sampled_at = Instant::now();
         let sample = io.sample()?;
         metrics
@@ -293,13 +307,22 @@ where
         ] {
             values.push(duration.as_micros().min(u128::from(u64::MAX)) as u64);
         }
+        let current_epoch = state.recovery_epoch.load(Ordering::Acquire);
+        if sample_epoch != current_epoch {
+            continue;
+        }
         let desired = music_held_state(sample.blue);
         let detected_at = now();
-        if !stop.load(Ordering::Acquire) {
+        if held_epoch != current_epoch {
+            held = [false; 6];
+            held_epoch = current_epoch;
+        }
+        if !state.stopped.load(Ordering::Acquire) {
             for lane in 0..MUSIC_LANES.len() {
                 if desired[lane] != held[lane] {
                     send(MusicLaneEvent {
                         generation,
+                        recovery_epoch: current_epoch,
                         lane,
                         detected_at,
                         pressed: desired[lane],
@@ -401,6 +424,7 @@ where
 #[derive(Clone)]
 struct MusicStopState {
     stopped: Arc<AtomicBool>,
+    recovery_epoch: Arc<AtomicU64>,
     first_error: Arc<Mutex<Option<AgentError>>>,
 }
 
@@ -409,6 +433,7 @@ impl MusicStopState {
     fn new(stopped: Arc<AtomicBool>) -> Self {
         Self {
             stopped,
+            recovery_epoch: Arc::new(AtomicU64::new(0)),
             first_error: Arc::new(Mutex::new(None)),
         }
     }
@@ -424,6 +449,20 @@ impl MusicStopState {
 
     fn error(&self) -> Option<AgentError> {
         self.first_error.lock().ok().and_then(|value| value.clone())
+    }
+
+    fn advance_recovery_epoch(&self) -> Result<(), AgentError> {
+        self.recovery_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map(|_| ())
+            .map_err(|_| {
+                AgentError::new(
+                    "music.autoplay_event_invalid",
+                    "music autoplay recovery epoch is exhausted",
+                )
+            })
     }
 }
 
@@ -441,6 +480,18 @@ trait MusicTransitionSender {
         detected_at: &[Instant],
         input_deadline: Instant,
     ) -> Result<Instant, AgentError>;
+    fn release_stale(&mut self) -> Result<(), AgentError>;
+}
+
+#[cfg(any(windows, test))]
+fn recover_music_sender<S: MusicTransitionSender>(
+    sender: &mut S,
+    state: &MusicStopState,
+    metrics: &mut MusicAutoplayMetrics,
+) -> Result<(), AgentError> {
+    metrics.stale_event_count += 1;
+    sender.release_stale()?;
+    state.advance_recovery_epoch()
 }
 
 #[cfg(any(windows, test))]
@@ -488,20 +539,17 @@ where
         events.push(first);
         events.extend(receiver.try_iter());
         let send_now = now();
-        let batch = match prepare_music_event_batch(
+        let batch = prepare_music_event_batch(
             events,
             generation,
+            state.recovery_epoch.load(Ordering::Acquire),
             send_now,
             state.stopped.load(Ordering::Acquire),
-        ) {
-            Ok(batch) => batch,
-            Err(error) => {
-                if error.code() == "music.autoplay_event_stale" {
-                    metrics.stale_event_count += 1;
-                }
-                return Err(error);
-            }
-        };
+        )?;
+        if batch.resample_required {
+            recover_music_sender(sender, state, metrics)?;
+            continue;
+        }
         if batch.transitions.is_empty() || state.stopped.load(Ordering::Acquire) {
             continue;
         }
@@ -513,12 +561,11 @@ where
         let input_deadline = input_deadline()?;
         let send_at = match sender.send_prepared(prepared, &batch.detected_at, input_deadline) {
             Ok(send_at) => send_at,
-            Err(error) => {
-                if error.code() == "music.autoplay_event_stale" {
-                    metrics.stale_event_count += 1;
-                }
-                return Err(error);
+            Err(error) if error.code() == "music.autoplay_event_stale" => {
+                recover_music_sender(sender, state, metrics)?;
+                continue;
             }
+            Err(error) => return Err(error),
         };
         metrics
             .input_pipeline_us
@@ -3565,6 +3612,11 @@ impl MusicTransitionSender for fairypam_agent_windows::MusicLaneSender {
         )
         .map_err(|error| AgentError::new(error.code(), error.to_string()))
     }
+
+    fn release_stale(&mut self) -> Result<(), AgentError> {
+        fairypam_agent_windows::MusicLaneSender::release_all(self)
+            .map_err(|error| AgentError::new(error.code(), error.to_string()))
+    }
 }
 
 #[cfg(windows)]
@@ -3788,7 +3840,7 @@ fn run_music_autoplay(
                             start_at,
                             deadline,
                             1,
-                            &sampler_state.stopped,
+                            &sampler_state,
                             &mut sampler_metrics,
                             Instant::now,
                             std::thread::sleep,
@@ -5004,25 +5056,28 @@ mod tests {
         let events = vec![
             MusicLaneEvent {
                 generation: 7,
+                recovery_epoch: 0,
                 lane: 2,
                 detected_at: now - Duration::from_millis(2),
                 pressed: true,
             },
             MusicLaneEvent {
                 generation: 7,
+                recovery_epoch: 0,
                 lane: 0,
                 detected_at: now - Duration::from_millis(2),
                 pressed: true,
             },
             MusicLaneEvent {
                 generation: 7,
+                recovery_epoch: 0,
                 lane: 2,
                 detected_at: now - Duration::from_millis(1),
                 pressed: false,
             },
         ];
 
-        let batch = prepare_music_event_batch(events, 7, now, false).unwrap();
+        let batch = prepare_music_event_batch(events, 7, 0, now, false).unwrap();
 
         assert_eq!(batch.transitions, [(0, true), (2, true), (2, false)]);
         assert_eq!(
@@ -5036,21 +5091,19 @@ mod tests {
     }
 
     #[test]
-    fn music_event_batch_rejects_stale_or_wrong_generation_and_stop_discards() {
+    fn music_event_batch_marks_stale_for_resample_and_rejects_wrong_generation() {
         let now = Instant::now();
         assert_eq!(MUSIC_EVENT_FRESHNESS, Duration::from_millis(80));
         let event = MusicLaneEvent {
             generation: 4,
+            recovery_epoch: 0,
             lane: 1,
             detected_at: now - MUSIC_EVENT_FRESHNESS,
             pressed: true,
         };
-        assert_eq!(
-            prepare_music_event_batch(vec![event], 4, now, false)
-                .unwrap_err()
-                .code(),
-            "music.autoplay_event_stale"
-        );
+        let stale = prepare_music_event_batch(vec![event], 4, 0, now, false).unwrap();
+        assert!(stale.resample_required);
+        assert!(stale.transitions.is_empty());
         assert_eq!(
             prepare_music_event_batch(
                 vec![MusicLaneEvent {
@@ -5058,6 +5111,7 @@ mod tests {
                     ..event
                 }],
                 5,
+                0,
                 now,
                 false,
             )
@@ -5065,7 +5119,7 @@ mod tests {
             .code(),
             "music.autoplay_event_invalid"
         );
-        assert!(prepare_music_event_batch(vec![event], 4, now, true)
+        assert!(prepare_music_event_batch(vec![event], 4, 0, now, true)
             .unwrap()
             .transitions
             .is_empty());
@@ -5075,6 +5129,10 @@ mod tests {
         stop: Arc<AtomicBool>,
         send_at: Instant,
         batches: Vec<Vec<(usize, bool)>>,
+        stale_releases: usize,
+        fail_stale_release: bool,
+        force_stale_once: bool,
+        stop_on_release: bool,
     }
 
     impl MusicTransitionSender for FakeMusicSender {
@@ -5093,6 +5151,13 @@ mod tests {
             detected_at: &[Instant],
             input_deadline: Instant,
         ) -> Result<Instant, AgentError> {
+            if self.force_stale_once {
+                self.force_stale_once = false;
+                return Err(AgentError::new(
+                    "music.autoplay_event_stale",
+                    "test event exceeded freshness at the send boundary",
+                ));
+            }
             if input_deadline <= self.send_at {
                 return Err(AgentError::new(
                     "input.lease_expired",
@@ -5115,6 +5180,20 @@ mod tests {
             self.stop.store(true, Ordering::Release);
             Ok(self.send_at)
         }
+
+        fn release_stale(&mut self) -> Result<(), AgentError> {
+            self.stale_releases += 1;
+            if self.fail_stale_release {
+                return Err(AgentError::new(
+                    "input.release_failed",
+                    "test stale release failed",
+                ));
+            }
+            if self.stop_on_release {
+                self.stop.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
     }
 
     #[test]
@@ -5126,6 +5205,7 @@ mod tests {
         for pressed in [true, false] {
             send.send(MusicLaneEvent {
                 generation: 1,
+                recovery_epoch: 0,
                 lane: 0,
                 detected_at: now - Duration::from_millis(1),
                 pressed,
@@ -5136,6 +5216,10 @@ mod tests {
             stop: Arc::clone(&stopped),
             send_at: now,
             batches: Vec::new(),
+            stale_releases: 0,
+            fail_stale_release: false,
+            force_stale_once: false,
+            stop_on_release: false,
         };
 
         run_music_sender_loop(
@@ -5161,18 +5245,22 @@ mod tests {
         let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
         send.send(MusicLaneEvent {
             generation: 1,
+            recovery_epoch: 0,
             lane: 0,
             detected_at: now,
             pressed: true,
         })
         .unwrap();
         let mut sender = FakeMusicSender {
-            stop: stopped,
+            stop: Arc::clone(&stopped),
             send_at: now + Duration::from_millis(50),
             batches: Vec::new(),
+            stale_releases: 0,
+            fail_stale_release: false,
+            force_stale_once: false,
+            stop_on_release: false,
         };
         let mut metrics = MusicAutoplayMetrics::default();
-
         run_music_sender_loop(
             &mut sender,
             &receive,
@@ -5187,6 +5275,181 @@ mod tests {
 
         assert_eq!(sender.batches, [vec![(0, true)]]);
         assert_eq!(metrics.stale_event_count, 0);
+    }
+
+    #[test]
+    fn music_sender_releases_and_resamples_instead_of_replaying_stale_edges() {
+        let now = Instant::now();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let state = MusicStopState::new(Arc::clone(&stopped));
+        let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
+        send.send(MusicLaneEvent {
+            generation: 1,
+            recovery_epoch: 0,
+            lane: 0,
+            detected_at: now - MUSIC_EVENT_FRESHNESS,
+            pressed: true,
+        })
+        .unwrap();
+        let mut sender = FakeMusicSender {
+            stop: Arc::clone(&stopped),
+            send_at: now,
+            batches: Vec::new(),
+            stale_releases: 0,
+            fail_stale_release: false,
+            force_stale_once: false,
+            stop_on_release: false,
+        };
+        let mut metrics = MusicAutoplayMetrics::default();
+        let injected = Cell::new(false);
+        let recovery_send = send.clone();
+
+        run_music_sender_loop(
+            &mut sender,
+            &receive,
+            1,
+            now + Duration::from_secs(1),
+            &state,
+            &mut metrics,
+            || {
+                if state.recovery_epoch.load(Ordering::Acquire) == 1 && !injected.replace(true) {
+                    for event in [
+                        MusicLaneEvent {
+                            generation: 1,
+                            recovery_epoch: 0,
+                            lane: 0,
+                            detected_at: now,
+                            pressed: false,
+                        },
+                        MusicLaneEvent {
+                            generation: 1,
+                            recovery_epoch: 1,
+                            lane: 0,
+                            detected_at: now,
+                            pressed: true,
+                        },
+                    ] {
+                        recovery_send.send(event).unwrap();
+                    }
+                }
+                now
+            },
+            || Ok(now + Duration::from_secs(1)),
+        )
+        .unwrap();
+
+        assert_eq!(sender.batches, [vec![(0, true)]]);
+        assert_eq!(sender.stale_releases, 1);
+        assert_eq!(state.recovery_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.stale_event_count, 1);
+    }
+
+    #[test]
+    fn music_sender_recovers_when_edge_expires_at_send_boundary() {
+        let now = Instant::now();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let state = MusicStopState::new(Arc::clone(&stopped));
+        let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
+        send.send(MusicLaneEvent {
+            generation: 1,
+            recovery_epoch: 0,
+            lane: 0,
+            detected_at: now,
+            pressed: true,
+        })
+        .unwrap();
+        let mut sender = FakeMusicSender {
+            stop: Arc::clone(&stopped),
+            send_at: now,
+            batches: Vec::new(),
+            stale_releases: 0,
+            fail_stale_release: false,
+            force_stale_once: true,
+            stop_on_release: false,
+        };
+        let mut metrics = MusicAutoplayMetrics::default();
+        let injected = Cell::new(false);
+        let recovery_send = send.clone();
+
+        run_music_sender_loop(
+            &mut sender,
+            &receive,
+            1,
+            now + Duration::from_secs(1),
+            &state,
+            &mut metrics,
+            || {
+                if state.recovery_epoch.load(Ordering::Acquire) == 1 && !injected.replace(true) {
+                    for event in [
+                        MusicLaneEvent {
+                            generation: 1,
+                            recovery_epoch: 0,
+                            lane: 0,
+                            detected_at: now,
+                            pressed: false,
+                        },
+                        MusicLaneEvent {
+                            generation: 1,
+                            recovery_epoch: 1,
+                            lane: 0,
+                            detected_at: now,
+                            pressed: true,
+                        },
+                    ] {
+                        recovery_send.send(event).unwrap();
+                    }
+                }
+                now
+            },
+            || Ok(now + Duration::from_secs(1)),
+        )
+        .unwrap();
+
+        assert_eq!(sender.batches, [vec![(0, true)]]);
+        assert_eq!(sender.stale_releases, 1);
+        assert_eq!(state.recovery_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.stale_event_count, 1);
+    }
+
+    #[test]
+    fn music_sender_fails_closed_when_stale_release_fails() {
+        let now = Instant::now();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let state = MusicStopState::new(Arc::clone(&stopped));
+        let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
+        send.send(MusicLaneEvent {
+            generation: 1,
+            recovery_epoch: 0,
+            lane: 0,
+            detected_at: now - MUSIC_EVENT_FRESHNESS,
+            pressed: true,
+        })
+        .unwrap();
+        let mut sender = FakeMusicSender {
+            stop: stopped,
+            send_at: now,
+            batches: Vec::new(),
+            stale_releases: 0,
+            fail_stale_release: true,
+            force_stale_once: false,
+            stop_on_release: false,
+        };
+
+        let error = run_music_sender_loop(
+            &mut sender,
+            &receive,
+            1,
+            now + Duration::from_secs(1),
+            &state,
+            &mut MusicAutoplayMetrics::default(),
+            || now,
+            || Ok(now + Duration::from_secs(1)),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "input.release_failed");
+        assert_eq!(sender.stale_releases, 1);
+        assert_eq!(state.recovery_epoch.load(Ordering::Acquire), 0);
     }
 
     struct FakeMusicRowSampler;
@@ -5204,6 +5467,7 @@ mod tests {
     fn music_row_sampler_emits_only_detected_edges() {
         let start = Instant::now();
         let stop = Arc::new(AtomicBool::new(false));
+        let state = MusicStopState::new(Arc::clone(&stop));
         let mut events = Vec::new();
         let mut metrics = MusicAutoplayMetrics::default();
 
@@ -5212,7 +5476,7 @@ mod tests {
             start,
             start + Duration::from_secs(1),
             3,
-            &stop,
+            &state,
             &mut metrics,
             || start,
             |_| {},
@@ -5229,6 +5493,58 @@ mod tests {
         assert_eq!(events[0].lane, 0);
         assert!(events[0].pressed);
         assert_eq!(metrics.sample_count, 1);
+    }
+
+    #[test]
+    fn music_row_sampler_discards_inflight_sample_and_reemits_after_recovery_epoch() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = MusicStopState::new(Arc::clone(&stop));
+        let mut events = Vec::new();
+        struct RecoverDuringFirstSample {
+            state: MusicStopState,
+            samples: usize,
+        }
+        impl MusicRowSamplerIo for RecoverDuringFirstSample {
+            fn sample(&mut self) -> Result<MusicRowSample, AgentError> {
+                self.samples += 1;
+                if self.samples == 1 {
+                    self.state.advance_recovery_epoch()?;
+                }
+                Ok(MusicRowSample {
+                    blue: [219, 255, 255, 255, 255, 255],
+                    ..MusicRowSample::default()
+                })
+            }
+        }
+        let mut sampler = RecoverDuringFirstSample {
+            state: state.clone(),
+            samples: 0,
+        };
+
+        run_music_row_sampler_loop(
+            &mut sampler,
+            start,
+            start + Duration::from_secs(1),
+            3,
+            &state,
+            &mut MusicAutoplayMetrics::default(),
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+            |event| {
+                events.push(event);
+                stop.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sampler.samples, 2);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].recovery_epoch, 1);
+        assert_eq!(events[0].lane, 0);
+        assert!(events[0].pressed);
     }
 
     struct FakeMusicSafety {
