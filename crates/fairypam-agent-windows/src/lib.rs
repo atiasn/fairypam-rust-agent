@@ -33,7 +33,7 @@ pub use capture::BitBltCaptureBackend;
 #[cfg(windows)]
 pub use local_input::{require_local_input_monitor, LocalInputMonitor};
 #[cfg(windows)]
-pub use pixel::{ClientPointSampler, PointPixelSampleTiming};
+pub use pixel::{ClientPixelSampler, PixelSampleTiming};
 #[cfg(windows)]
 pub use send_input::{MusicLaneSender, PreparedMusicLaneInput, WindowsInput};
 #[cfg(windows)]
