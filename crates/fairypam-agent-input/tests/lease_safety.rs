@@ -235,7 +235,9 @@ fn verified_profile() -> VerifiedProfile {
                 ),
                 (
                     "camera.wheel".into(),
-                    ActionDefinition::Wheel { maximum_delta: 240 },
+                    ActionDefinition::Wheel {
+                        maximum_delta: 76_800,
+                    },
                 ),
             ]),
         },
@@ -709,7 +711,7 @@ fn invalid_wheel_rejects_the_entire_physical_frame_before_side_effects() {
             now + Duration::from_secs(1),
             &[(17, false)],
             &[],
-            360,
+            76_920,
             None,
             &authority.permit(now),
             now,
@@ -752,6 +754,37 @@ fn physical_frame_positions_the_pointer_before_wheel_without_button_holds() {
         vec![(Some((500_000, 500_000)), -120)]
     );
     assert!(executor.held_actions().is_empty());
+}
+
+#[test]
+fn physical_frame_keeps_a_large_page_scroll_as_one_aggregate_delta() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let mut executor = LeaseExecutor::new(
+        &verified_profile(),
+        FakeInput::default(),
+        FakeGuardian::default(),
+    )
+    .unwrap();
+
+    executor
+        .apply_physical_frame(
+            session(1),
+            1,
+            now + Duration::from_secs(1),
+            &[],
+            &[],
+            -39_600,
+            Some((500_000, 500_000)),
+            &authority.permit(now),
+            now,
+        )
+        .unwrap();
+
+    assert_eq!(
+        executor.platform().wheel_events,
+        vec![(Some((500_000, 500_000)), -39_600)]
+    );
 }
 
 #[test]

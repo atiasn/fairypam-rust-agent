@@ -332,8 +332,10 @@ fn validate_actions(actions: &BTreeMap<String, ActionDefinition>) -> Result<(), 
                 | ActionDefinition::PhysicalPulse { scan_code, .. } => {
                     (1..=255).contains(scan_code)
                 }
-                ActionDefinition::Wheel { maximum_delta }
-                | ActionDefinition::RelativeMouse { maximum_delta } => {
+                ActionDefinition::Wheel { maximum_delta } => {
+                    *maximum_delta >= 120 && maximum_delta % 120 == 0
+                }
+                ActionDefinition::RelativeMouse { maximum_delta } => {
                     (1..=2_000).contains(maximum_delta)
                 }
                 ActionDefinition::ClientPointClick { .. } => true,

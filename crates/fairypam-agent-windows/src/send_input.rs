@@ -21,6 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::{LockedInputTarget, NativeWindows, WindowsTargetPlatform};
 
 pub(crate) const SEND_INPUT_MARKER: usize = 0x4650_414D;
+const MAX_WHEEL_EVENT_DELTA: i32 = 32_760;
 
 pub(crate) fn send_foreground_activation_probe() -> u32 {
     let input = INPUT {
@@ -329,11 +330,24 @@ impl SendInputPlatform {
         ]
     }
 
-    fn screen_point_wheel_inputs(screen_x: i64, screen_y: i64, delta: i32) -> [INPUT; 2] {
-        [
-            Self::screen_point_move_input(screen_x, screen_y),
-            Self::mouse(MOUSEEVENTF_WHEEL, 0, 0, delta as u32),
-        ]
+    fn wheel_inputs(delta: i32) -> Vec<INPUT> {
+        let mut remaining = i64::from(delta);
+        let mut inputs = Vec::new();
+        while remaining != 0 {
+            let chunk = remaining.clamp(
+                -i64::from(MAX_WHEEL_EVENT_DELTA),
+                i64::from(MAX_WHEEL_EVENT_DELTA),
+            );
+            inputs.push(Self::mouse(MOUSEEVENTF_WHEEL, 0, 0, chunk as i32 as u32));
+            remaining -= chunk;
+        }
+        inputs
+    }
+
+    fn screen_point_wheel_inputs(screen_x: i64, screen_y: i64, delta: i32) -> Vec<INPUT> {
+        let mut inputs = vec![Self::screen_point_move_input(screen_x, screen_y)];
+        inputs.extend(Self::wheel_inputs(delta));
+        inputs
     }
 
     fn client_screen_point(&self, x_ppm: u32, y_ppm: u32) -> (i64, i64) {
@@ -710,7 +724,7 @@ impl InputPlatform for SendInputPlatform {
     }
 
     fn wheel(&mut self, delta: i32) -> Result<(), SafetyError> {
-        self.send(&[Self::mouse(MOUSEEVENTF_WHEEL, 0, 0, delta as u32)])
+        self.send(&Self::wheel_inputs(delta))
     }
 
     fn wheel_at_client_point(
@@ -890,17 +904,21 @@ mod tests {
     }
 
     #[test]
-    fn positioned_wheel_moves_then_wheels_without_mouse_buttons() {
-        let inputs = SendInputPlatform::screen_point_wheel_inputs(0, 0, -120);
+    fn positioned_wheel_splits_an_aggregate_delta_in_one_input_batch() {
+        let inputs = SendInputPlatform::screen_point_wheel_inputs(0, 0, -39_600);
         let move_input = unsafe { inputs[0].Anonymous.mi };
-        let wheel_input = unsafe { inputs[1].Anonymous.mi };
+        let first_wheel = unsafe { inputs[1].Anonymous.mi };
+        let second_wheel = unsafe { inputs[2].Anonymous.mi };
 
+        assert_eq!(inputs.len(), 3);
         assert_eq!(
             move_input.dwFlags,
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
         );
-        assert_eq!(wheel_input.dwFlags, MOUSEEVENTF_WHEEL);
-        assert_eq!(wheel_input.mouseData, (-120_i32) as u32);
+        assert_eq!(first_wheel.dwFlags, MOUSEEVENTF_WHEEL);
+        assert_eq!(first_wheel.mouseData, (-32_760_i32) as u32);
+        assert_eq!(second_wheel.dwFlags, MOUSEEVENTF_WHEEL);
+        assert_eq!(second_wheel.mouseData, (-6_840_i32) as u32);
     }
 
     #[test]

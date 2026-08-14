@@ -51,6 +51,12 @@ fn valid_content() -> ProfileContent {
                     ActionDefinition::RelativeMouse { maximum_delta: 200 },
                 ),
                 (
+                    "inventory.scroll".into(),
+                    ActionDefinition::Wheel {
+                        maximum_delta: 76_800,
+                    },
+                ),
+                (
                     "ui.confirm".into(),
                     ActionDefinition::ClientPointClick {
                         button: ClientPointButton::Left,
@@ -81,7 +87,7 @@ fn production_genshin_profile_matches_the_formal_root_and_target() {
     .unwrap();
 
     assert_eq!(profile.profile().id, "genshin-impact");
-    assert_eq!(profile.profile().version, "1.6.0");
+    assert_eq!(profile.profile().version, "1.7.0");
     assert!(profile
         .profile()
         .target
