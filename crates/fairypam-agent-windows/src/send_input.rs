@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::{LockedInputTarget, NativeWindows, WindowsTargetPlatform};
 
 pub(crate) const SEND_INPUT_MARKER: usize = 0x4650_414D;
-const MAX_WHEEL_EVENT_DELTA: i32 = 32_760;
+const MAX_WHEEL_EVENT_DELTA: i32 = 1_200;
 
 pub(crate) fn send_foreground_activation_probe() -> u32 {
     let input = INPUT {
@@ -908,17 +908,17 @@ mod tests {
         let inputs = SendInputPlatform::screen_point_wheel_inputs(0, 0, -39_600);
         let move_input = unsafe { inputs[0].Anonymous.mi };
         let first_wheel = unsafe { inputs[1].Anonymous.mi };
-        let second_wheel = unsafe { inputs[2].Anonymous.mi };
 
-        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs.len(), 34);
         assert_eq!(
             move_input.dwFlags,
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
         );
         assert_eq!(first_wheel.dwFlags, MOUSEEVENTF_WHEEL);
-        assert_eq!(first_wheel.mouseData, (-32_760_i32) as u32);
-        assert_eq!(second_wheel.dwFlags, MOUSEEVENTF_WHEEL);
-        assert_eq!(second_wheel.mouseData, (-6_840_i32) as u32);
+        assert!(inputs[1..].iter().all(|input| {
+            let wheel = unsafe { input.Anonymous.mi };
+            wheel.dwFlags == MOUSEEVENTF_WHEEL && wheel.mouseData == (-1_200_i32) as u32
+        }));
     }
 
     #[test]
