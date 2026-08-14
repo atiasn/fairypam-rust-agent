@@ -592,7 +592,6 @@ impl Translator {
             || value.lease_ms > contract.max_input_lease_ms.min(self.hub_max_input_lease_ms)
             || !canonical_keys(&value.held_keys)
             || !canonical_buttons(&value.held_mouse_buttons)
-            || !(-1200..=1200).contains(&value.wheel_delta)
             || value.wheel_delta % 120 != 0
             || value
                 .source_frame_sequence
@@ -1466,7 +1465,7 @@ mod tests {
                     extended: false,
                 }],
                 held_mouse_buttons: vec![wire::MouseButton::Left as i32],
-                wheel_delta: 1200,
+                wheel_delta: -39_600,
                 source_frame_sequence: Some(7),
                 wheel_x_ppm: Some(500_000),
                 wheel_y_ppm: Some(500_000),
@@ -1480,7 +1479,7 @@ mod tests {
         assert_eq!(frame.input_sequence, 1);
         assert_eq!(frame.held_keys[0].scan_code, 17);
         assert_eq!(frame.held_mouse_buttons, [wire::MouseButton::Left as i32]);
-        assert_eq!(frame.wheel_delta, 1200);
+        assert_eq!(frame.wheel_delta, -39_600);
         assert_eq!(frame.source_frame_sequence, Some(7));
         assert_eq!(frame.wheel_x_ppm, Some(500_000));
         assert_eq!(frame.wheel_y_ppm, Some(500_000));
