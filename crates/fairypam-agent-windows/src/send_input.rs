@@ -22,6 +22,7 @@ use crate::{LockedInputTarget, NativeWindows, WindowsTargetPlatform};
 
 pub(crate) const SEND_INPUT_MARKER: usize = 0x4650_414D;
 const MAX_WHEEL_EVENT_DELTA: i32 = 1_200;
+const WHEEL_EVENT_INTERVAL: Duration = Duration::from_millis(40);
 
 pub(crate) fn send_foreground_activation_probe() -> u32 {
     let input = INPUT {
@@ -227,6 +228,42 @@ impl RevalidatingInputPlatform {
         self.sender = SendInputPlatform::for_locked_target(&target);
         Ok(())
     }
+
+    fn refresh_without_focus(&mut self) -> Result<(), SafetyError> {
+        let target = self
+            .targets
+            .revalidate_locked_input_target(&self.binding)
+            .map_err(|error| SafetyError::new(error.code(), error.to_string()))?;
+        self.sender = SendInputPlatform::for_locked_target(&target);
+        Ok(())
+    }
+
+    fn send_wheel(
+        &mut self,
+        delta: i32,
+        point: Option<(u32, u32)>,
+        expires_at: Instant,
+    ) -> Result<(), SafetyError> {
+        let deltas = SendInputPlatform::wheel_deltas(delta);
+        dispatch_wheel_deltas(
+            &deltas,
+            expires_at,
+            |wheel_delta| {
+                self.refresh_without_focus()?;
+                require_current_wheel_lease(expires_at, Instant::now())?;
+                let wheel = SendInputPlatform::mouse(MOUSEEVENTF_WHEEL, 0, 0, wheel_delta as u32);
+                if let Some((x_ppm, y_ppm)) = point {
+                    let (x, y) = self.sender.client_screen_point(x_ppm, y_ppm);
+                    self.sender
+                        .send(&[SendInputPlatform::screen_point_move_input(x, y), wheel])
+                } else {
+                    self.sender.send(&[wheel])
+                }
+            },
+            Instant::now,
+            std::thread::sleep,
+        )
+    }
 }
 
 impl SendInputPlatform {
@@ -330,24 +367,28 @@ impl SendInputPlatform {
         ]
     }
 
-    fn wheel_inputs(delta: i32) -> Vec<INPUT> {
+    fn wheel_deltas(delta: i32) -> Vec<i32> {
         let mut remaining = i64::from(delta);
-        let mut inputs = Vec::new();
+        let mut deltas = Vec::new();
         while remaining != 0 {
             let chunk = remaining.clamp(
                 -i64::from(MAX_WHEEL_EVENT_DELTA),
                 i64::from(MAX_WHEEL_EVENT_DELTA),
             );
-            inputs.push(Self::mouse(MOUSEEVENTF_WHEEL, 0, 0, chunk as i32 as u32));
+            deltas.push(chunk as i32);
             remaining -= chunk;
         }
-        inputs
+        deltas
     }
 
-    fn screen_point_wheel_inputs(screen_x: i64, screen_y: i64, delta: i32) -> Vec<INPUT> {
-        let mut inputs = vec![Self::screen_point_move_input(screen_x, screen_y)];
-        inputs.extend(Self::wheel_inputs(delta));
-        inputs
+    fn send_wheel_deltas(&self, deltas: &[i32], expires_at: Instant) -> Result<(), SafetyError> {
+        dispatch_wheel_deltas(
+            deltas,
+            expires_at,
+            |delta| self.send(&[Self::mouse(MOUSEEVENTF_WHEEL, 0, 0, delta as u32)]),
+            Instant::now,
+            std::thread::sleep,
+        )
     }
 
     fn client_screen_point(&self, x_ppm: u32, y_ppm: u32) -> (i64, i64) {
@@ -357,6 +398,34 @@ impl SendInputPlatform {
             i64::from(self.client_top)
                 + i64::from(self.client_height.saturating_sub(1)) * i64::from(y_ppm) / 1_000_000,
         )
+    }
+}
+
+fn dispatch_wheel_deltas(
+    deltas: &[i32],
+    expires_at: Instant,
+    mut send: impl FnMut(i32) -> Result<(), SafetyError>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), SafetyError> {
+    for (index, delta) in deltas.iter().copied().enumerate() {
+        require_current_wheel_lease(expires_at, now())?;
+        send(delta)?;
+        if index + 1 < deltas.len() {
+            sleep(WHEEL_EVENT_INTERVAL);
+        }
+    }
+    Ok(())
+}
+
+fn require_current_wheel_lease(expires_at: Instant, now: Instant) -> Result<(), SafetyError> {
+    if now < expires_at {
+        Ok(())
+    } else {
+        Err(SafetyError::new(
+            "input.lease_expired",
+            "wheel input lease expired during local dispatch",
+        ))
     }
 }
 
@@ -616,9 +685,8 @@ impl InputPlatform for RevalidatingInputPlatform {
         self.sender.release_mouse_button(button)
     }
 
-    fn wheel(&mut self, delta: i32) -> Result<(), SafetyError> {
-        self.refresh()?;
-        self.sender.wheel(delta)
+    fn wheel(&mut self, delta: i32, expires_at: Instant) -> Result<(), SafetyError> {
+        self.send_wheel(delta, None, expires_at)
     }
 
     fn wheel_at_client_point(
@@ -626,9 +694,9 @@ impl InputPlatform for RevalidatingInputPlatform {
         x_ppm: u32,
         y_ppm: u32,
         delta: i32,
+        expires_at: Instant,
     ) -> Result<(), SafetyError> {
-        self.refresh()?;
-        self.sender.wheel_at_client_point(x_ppm, y_ppm, delta)
+        self.send_wheel(delta, Some((x_ppm, y_ppm)), expires_at)
     }
 
     fn pulse_scan_code(&mut self, scan_code: u16) -> Result<(), SafetyError> {
@@ -723,8 +791,8 @@ impl InputPlatform for SendInputPlatform {
         self.send(&[Self::mouse(flags, 0, 0, data)])
     }
 
-    fn wheel(&mut self, delta: i32) -> Result<(), SafetyError> {
-        self.send(&Self::wheel_inputs(delta))
+    fn wheel(&mut self, delta: i32, expires_at: Instant) -> Result<(), SafetyError> {
+        self.send_wheel_deltas(&Self::wheel_deltas(delta), expires_at)
     }
 
     fn wheel_at_client_point(
@@ -732,9 +800,12 @@ impl InputPlatform for SendInputPlatform {
         x_ppm: u32,
         y_ppm: u32,
         delta: i32,
+        expires_at: Instant,
     ) -> Result<(), SafetyError> {
+        require_current_wheel_lease(expires_at, Instant::now())?;
         let (x, y) = self.client_screen_point(x_ppm, y_ppm);
-        self.send(&Self::screen_point_wheel_inputs(x, y, delta))
+        self.send(&[Self::screen_point_move_input(x, y)])?;
+        self.send_wheel_deltas(&Self::wheel_deltas(delta), expires_at)
     }
 
     fn relative_mouse(&mut self, delta_x: i32, delta_y: i32) -> Result<(), SafetyError> {
@@ -904,21 +975,72 @@ mod tests {
     }
 
     #[test]
-    fn positioned_wheel_splits_an_aggregate_delta_in_one_input_batch() {
-        let inputs = SendInputPlatform::screen_point_wheel_inputs(0, 0, -39_600);
-        let move_input = unsafe { inputs[0].Anonymous.mi };
-        let first_wheel = unsafe { inputs[1].Anonymous.mi };
+    fn aggregate_wheel_is_dispatched_as_locally_paced_native_events() {
+        let start = Instant::now();
+        let deltas = SendInputPlatform::wheel_deltas(-39_600);
+        let mut sent = Vec::new();
+        let mut intervals = Vec::new();
 
-        assert_eq!(inputs.len(), 34);
-        assert_eq!(
-            move_input.dwFlags,
-            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
-        );
-        assert_eq!(first_wheel.dwFlags, MOUSEEVENTF_WHEEL);
-        assert!(inputs[1..].iter().all(|input| {
-            let wheel = unsafe { input.Anonymous.mi };
-            wheel.dwFlags == MOUSEEVENTF_WHEEL && wheel.mouseData == (-1_200_i32) as u32
-        }));
+        dispatch_wheel_deltas(
+            &deltas,
+            start + Duration::from_secs(4),
+            |delta| {
+                sent.push(delta);
+                Ok(())
+            },
+            || start,
+            |interval| intervals.push(interval),
+        )
+        .unwrap();
+
+        assert_eq!(deltas, vec![-1_200; 33]);
+        assert_eq!(sent, deltas);
+        assert_eq!(intervals, vec![Duration::from_millis(40); 32]);
+    }
+
+    #[test]
+    fn aggregate_wheel_stops_at_deadline_or_first_dispatch_failure() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(4);
+        let deltas = SendInputPlatform::wheel_deltas(76_800);
+        let mut sent = Vec::new();
+        let mut checks = [start, deadline].into_iter();
+        let error = dispatch_wheel_deltas(
+            &deltas,
+            deadline,
+            |delta| {
+                sent.push(delta);
+                Ok(())
+            },
+            || checks.next().unwrap_or(deadline),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(deltas, vec![1_200; 64]);
+        assert_eq!(sent, vec![1_200]);
+        assert_eq!(error.code(), "input.lease_expired");
+
+        let mut attempts = 0;
+        let error = dispatch_wheel_deltas(
+            &deltas,
+            deadline,
+            |_| {
+                attempts += 1;
+                if attempts == 4 {
+                    Err(SafetyError::new(
+                        "target.foreground_changed",
+                        "target changed",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            || start,
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 4);
+        assert_eq!(error.code(), "target.foreground_changed");
     }
 
     #[test]

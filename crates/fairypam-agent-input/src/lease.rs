@@ -200,12 +200,20 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
             return Ok(());
         }
         match wheel_point {
-            Some((x_ppm, y_ppm)) => self
-                .platform
-                .wheel_at_client_point(x_ppm, y_ppm, wheel_delta),
-            None => self.platform.wheel(wheel_delta),
+            Some((x_ppm, y_ppm)) => {
+                self.platform
+                    .wheel_at_client_point(x_ppm, y_ppm, wheel_delta, expires_at)
+            }
+            None => self.platform.wheel(wheel_delta, expires_at),
         }
-        .map_err(|error| self.fail_closed(ReleaseReason::PlatformFailure, error))
+        .map_err(|error| {
+            let reason = if error.code() == "input.lease_expired" {
+                ReleaseReason::LeaseExpired
+            } else {
+                ReleaseReason::PlatformFailure
+            };
+            self.fail_closed(reason, error)
+        })
     }
 
     pub fn arm_guarded_physical_frame(

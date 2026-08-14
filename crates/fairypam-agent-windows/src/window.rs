@@ -477,6 +477,11 @@ fn revalidate_input_target(
     binding: &TargetBinding,
 ) -> Result<LockedInputTarget, AgentError> {
     let current = revalidate_or_focus_target(api, binding)?;
+    locked_input_target(current)
+}
+
+#[cfg(any(windows, test))]
+fn locked_input_target(current: WindowsTargetCandidate) -> Result<LockedInputTarget, AgentError> {
     if current.minimized || !current.capturable {
         return Err(WindowsError::new(
             "target.input_not_permitted",
@@ -501,6 +506,24 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
         binding: &TargetBinding,
     ) -> Result<LockedInputTarget, AgentError> {
         revalidate_input_target(&mut self.api, binding)
+    }
+
+    #[cfg(any(windows, test))]
+    pub fn revalidate_locked_input_target(
+        &mut self,
+        binding: &TargetBinding,
+    ) -> Result<LockedInputTarget, AgentError> {
+        self.api.check_environment()?;
+        let current = revalidate_identity(&mut self.api, &binding_identity(binding)?)?;
+        self.api.check_environment()?;
+        if !current.foreground {
+            return Err(WindowsError::new(
+                "target.input_not_permitted",
+                "input target is no longer the foreground window",
+            )
+            .into());
+        }
+        locked_input_target(current)
     }
 
     pub fn capture_identity(
@@ -738,6 +761,23 @@ mod tests {
 
         assert_eq!(targets.api().focus_activation_probe, [true, true, true]);
         assert!(targets.api().candidates[0].foreground);
+    }
+
+    #[test]
+    fn in_flight_input_revalidation_never_refocuses_a_background_target() {
+        let binding = input_binding();
+        let mut targets =
+            WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![input_candidate(false)]));
+
+        assert_eq!(
+            targets
+                .revalidate_locked_input_target(&binding)
+                .unwrap_err()
+                .code(),
+            "target.input_not_permitted"
+        );
+        assert!(targets.api().focus_activation_probe.is_empty());
+        assert!(!targets.api().candidates[0].foreground);
     }
 
     #[test]

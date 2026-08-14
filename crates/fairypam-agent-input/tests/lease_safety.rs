@@ -20,6 +20,7 @@ struct FakeInput {
     released: Vec<u16>,
     events: Option<Arc<Mutex<Vec<&'static str>>>>,
     fail_pulse: bool,
+    fail_wheel_lease: bool,
     emergency_releases: Vec<Vec<u16>>,
     wheel_events: Vec<(Option<(u32, u32)>, i32)>,
 }
@@ -74,7 +75,13 @@ impl InputPlatform for FakeInput {
         Ok(())
     }
 
-    fn wheel(&mut self, delta: i32) -> Result<(), SafetyError> {
+    fn wheel(&mut self, delta: i32, _expires_at: Instant) -> Result<(), SafetyError> {
+        if self.fail_wheel_lease {
+            return Err(SafetyError::new(
+                "input.lease_expired",
+                "wheel lease expired",
+            ));
+        }
         self.wheel_events.push((None, delta));
         Ok(())
     }
@@ -84,7 +91,14 @@ impl InputPlatform for FakeInput {
         x_ppm: u32,
         y_ppm: u32,
         delta: i32,
+        _expires_at: Instant,
     ) -> Result<(), SafetyError> {
+        if self.fail_wheel_lease {
+            return Err(SafetyError::new(
+                "input.lease_expired",
+                "wheel lease expired",
+            ));
+        }
         self.wheel_events.push((Some((x_ppm, y_ppm)), delta));
         Ok(())
     }
@@ -771,7 +785,7 @@ fn physical_frame_keeps_a_large_page_scroll_as_one_aggregate_delta() {
         .apply_physical_frame(
             session(1),
             1,
-            now + Duration::from_secs(1),
+            now + Duration::from_secs(4),
             &[],
             &[],
             -39_600,
@@ -784,6 +798,41 @@ fn physical_frame_keeps_a_large_page_scroll_as_one_aggregate_delta() {
     assert_eq!(
         executor.platform().wheel_events,
         vec![(Some((500_000, 500_000)), -39_600)]
+    );
+}
+
+#[test]
+fn physical_frame_maps_mid_wheel_expiry_to_lease_expired_release() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let mut executor = LeaseExecutor::new(
+        &verified_profile(),
+        FakeInput {
+            fail_wheel_lease: true,
+            ..Default::default()
+        },
+        FakeGuardian::default(),
+    )
+    .unwrap();
+
+    let error = executor
+        .apply_physical_frame(
+            session(1),
+            1,
+            now + Duration::from_secs(4),
+            &[],
+            &[],
+            -39_600,
+            None,
+            &authority.permit(now),
+            now,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code(), "input.lease_expired");
+    assert_eq!(
+        executor.last_release_reason(),
+        Some(ReleaseReason::LeaseExpired)
     );
 }
 

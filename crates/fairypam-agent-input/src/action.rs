@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use fairypam_agent_core::profile::{ActionDefinition, ClientPointButton, VerifiedProfile};
 use fairypam_agent_guardian_protocol::{ActionId, PhysicalHold};
@@ -305,7 +306,7 @@ pub trait InputPlatform: Send {
         ))
     }
 
-    fn wheel(&mut self, _delta: i32) -> Result<(), SafetyError> {
+    fn wheel(&mut self, _delta: i32, _expires_at: Instant) -> Result<(), SafetyError> {
         Err(SafetyError::new(
             "input.platform_unsupported",
             "mouse wheel input is unsupported by this platform",
@@ -317,6 +318,7 @@ pub trait InputPlatform: Send {
         _x_ppm: u32,
         _y_ppm: u32,
         _delta: i32,
+        _expires_at: Instant,
     ) -> Result<(), SafetyError> {
         Err(SafetyError::new(
             "input.platform_unsupported",
