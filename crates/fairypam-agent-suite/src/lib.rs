@@ -574,6 +574,7 @@ fn reject_forbidden_executables(
                 .to_ascii_lowercase();
             if is_executable_member(&relative)
                 && !allowed_product_executable(&relative)
+                && !allowed_installed_product_executable(&relative)
                 && !INSTALLER_OWNED_EXECUTABLES.contains(&relative.as_str())
                 && entry.path() != bootstrap_helper
             {
@@ -643,6 +644,21 @@ fn allowed_product_executable(value: &str) -> bool {
     let folded = value.to_ascii_lowercase();
     REQUIRED_VERSIONED_EXECUTABLES.contains(&folded.as_str())
         || folded == REQUIRED_STABLE_EXECUTABLE
+}
+
+fn allowed_installed_product_executable(value: &str) -> bool {
+    let mut components = value.split('/');
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ),
+        (Some("versions"), Some(build_id), Some(executable), None)
+            if safe_identifier(build_id, 128)
+                && REQUIRED_VERSIONED_EXECUTABLES.contains(&executable)
+    )
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -851,9 +867,21 @@ mod tests {
         )
         .unwrap();
         fs::write(directory.join("uninstall.exe"), b"uninstaller").unwrap();
+        let installed_version = directory.join("versions/suite-1");
+        fs::create_dir_all(&installed_version).unwrap();
+        fs::write(
+            installed_version.join("fairypam-agent-guardian.exe"),
+            b"installed guardian",
+        )
+        .unwrap();
+        fs::write(
+            installed_version.join("fairypam-agent-tauri-ui.exe"),
+            b"installed gui",
+        )
+        .unwrap();
 
         validate_flat_layout(&directory, &manifest, &bootstrap_helper).unwrap();
-        fs::write(directory.join("unexpected.exe"), b"unexpected").unwrap();
+        fs::write(installed_version.join("unexpected.exe"), b"unexpected").unwrap();
         assert_eq!(
             validate_flat_layout(&directory, &manifest, &bootstrap_helper)
                 .unwrap_err()
