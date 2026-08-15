@@ -8,13 +8,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fairypam_agent_core::AgentError;
 use fairypam_agent_protocol::v2::{
-    agent_telemetry_event, agent_telemetry_record, command_identity, hub_telemetry_command,
-    telemetry_attribute, AgentLogChunk, AgentLogReadRequest, AgentTelemetryBatch,
-    AgentTelemetryEvent, AgentTelemetryRecord, DiagnosticLease, DiagnosticLeaseDisposition,
-    DiagnosticLeaseReceipt, DiagnosticTargetType, HubTelemetryCommand, RevokeDiagnosticLease,
-    TelemetryAttribute, TelemetryDisposition, TelemetryEventSignal, TelemetryMetricKind,
-    TelemetryMetricSignal, TelemetryRecordReceipt, TelemetrySeverity, TelemetrySpanSignal,
-    TelemetrySpanStatus,
+    agent_telemetry_event, agent_telemetry_record, command_identity, telemetry_attribute,
+    AgentLogChunk, AgentLogReadRequest, AgentTelemetryBatch, AgentTelemetryEvent,
+    AgentTelemetryRecord, DiagnosticLease, DiagnosticLeaseDisposition, DiagnosticLeaseReceipt,
+    DiagnosticTargetType, RevokeDiagnosticLease, TelemetryAttribute, TelemetryDisposition,
+    TelemetryEventSignal, TelemetryMetricKind, TelemetryMetricSignal, TelemetryRecordReceipt,
+    TelemetrySeverity, TelemetrySpanSignal, TelemetrySpanStatus,
 };
 use fairypam_agent_protocol::{
     canonical_telemetry_record, decode_telemetry_record, encode_telemetry_record,
@@ -1198,10 +1197,6 @@ pub fn log_chunks(
 
 pub fn log_read_error(request: &AgentLogReadRequest, code: &str) -> AgentTelemetryEvent {
     log_chunk(request, 0, &[], true, Some(code))
-}
-
-pub fn command_payload(command: &HubTelemetryCommand) -> Option<&hub_telemetry_command::Payload> {
-    command.payload.as_ref()
 }
 
 pub fn lease_receipt_event(receipt: DiagnosticLeaseReceipt) -> AgentTelemetryEvent {
