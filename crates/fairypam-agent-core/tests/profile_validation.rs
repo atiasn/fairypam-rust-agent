@@ -87,7 +87,14 @@ fn production_genshin_profile_matches_the_formal_root_and_target() {
     .unwrap();
 
     assert_eq!(profile.profile().id, "genshin-impact");
-    assert_eq!(profile.profile().version, "1.7.0");
+    assert_eq!(profile.profile().version, "1.8.0");
+    assert!(matches!(
+        profile.profile().actions.get("input.f"),
+        Some(ActionDefinition::PhysicalPulse {
+            scan_code: 33,
+            extended: false,
+        })
+    ));
     assert!(profile
         .profile()
         .target

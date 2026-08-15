@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "ed25519-dalek",
  "fairypam-agent-core",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent-core"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "ed25519-dalek",
  "fairypam-agent-transport",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent-guardian"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "fairypam-agent-guardian-protocol",
  "serde_json",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent-guardian-protocol"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent-input"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "fairypam-agent-core",
  "fairypam-agent-guardian-protocol",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent-installer"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "fairypam-agent-suite",
  "fairypam-agent-transport",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent-suite"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "semver",
  "serde",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent-transport"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "fairypam-agent-protocol",
  "fastrand",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "fairypam-agent-windows"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "fairypam-agent-core",
  "fairypam-agent-input",

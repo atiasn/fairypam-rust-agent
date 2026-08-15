@@ -136,6 +136,7 @@ impl ActionMap {
         for key in keys {
             let mut hold = None;
             let mut pulse = None;
+            let mut pulse_ambiguous = false;
             for (id, action) in &self.actions {
                 match action {
                     ResolvedAction::HoldKey {
@@ -145,12 +146,20 @@ impl ActionMap {
                     ResolvedAction::PulseKey {
                         scan_code,
                         extended,
-                    } if (*scan_code, *extended) == *key => pulse.get_or_insert(id.clone()),
+                    } if (*scan_code, *extended) == *key => {
+                        pulse_ambiguous |= pulse.replace(id.clone()).is_some();
+                        continue;
+                    }
                     _ => continue,
                 };
             }
             if let Some(action) = hold {
                 holds.insert(action);
+            } else if pulse_ambiguous {
+                return Err(SafetyError::new(
+                    "input.frame_invalid",
+                    "physical pulse key is not unique in the verified Profile",
+                ));
             } else if let Some(action) = pulse {
                 pulses.insert(action);
             } else {

@@ -1100,7 +1100,7 @@ pub trait RuntimePlatform: Send {
         wheel_point: Option<(u32, u32)>,
         source_frame: Option<(&AtomicU64, u64)>,
         client_point: Option<(i32, u32, u32)>,
-    ) -> Result<(), AgentError>;
+    ) -> Result<bool, AgentError>;
 
     fn release_task_input(&mut self) -> Result<(), AgentError>;
 
@@ -1655,31 +1655,30 @@ impl CommandExecutor {
                 .and_then(|command| command.session.as_ref())
                 .ok_or_else(task_reference_invalid)?;
             let expires_at = Instant::now() + Duration::from_millis(u64::from(frame.lease_ms));
-            let error = self
-                .platform
-                .apply_task_input_frame(
-                    &profile,
-                    &binding,
-                    session,
-                    frame.input_sequence,
-                    expires_at,
-                    &frame.held_keys,
-                    &frame.held_mouse_buttons,
-                    frame.wheel_delta,
-                    frame.wheel_x_ppm.zip(frame.wheel_y_ppm),
-                    source_frame
-                        .as_ref()
-                        .map(|(current, expected)| (current.as_ref(), *expected)),
-                    client_point,
-                )
-                .err();
+            let frame_result = self.platform.apply_task_input_frame(
+                &profile,
+                &binding,
+                session,
+                frame.input_sequence,
+                expires_at,
+                &frame.held_keys,
+                &frame.held_mouse_buttons,
+                frame.wheel_delta,
+                frame.wheel_x_ppm.zip(frame.wheel_y_ppm),
+                source_frame
+                    .as_ref()
+                    .map(|(current, expected)| (current.as_ref(), *expected)),
+                client_point,
+            );
+            let holds_active = frame_result.as_ref().ok().copied().unwrap_or(false);
+            let error = frame_result.err();
             let outcome = input_frame_outcome(error.as_ref());
             Ok(CommandOutcome::task(
                 self.task_attempt.complete_input_frame(
                     task,
                     frame.source_frame_sequence,
                     outcome,
-                    !frame.held_keys.is_empty() || !frame.held_mouse_buttons.is_empty(),
+                    holds_active,
                     error.as_ref().map(AgentError::code),
                 )?,
             ))
@@ -2833,7 +2832,7 @@ impl CommandExecutor {
                 None,
                 None,
             )
-            .and_then(|()| {
+            .and_then(|_| {
                 self.platform.apply_task_input_frame(
                     &profile,
                     &binding,
@@ -2931,7 +2930,7 @@ fn task_reference_invalid() -> AgentError {
 fn input_frame_outcome(error: Option<&AgentError>) -> TaskCommandOutcomeState {
     match error.map(AgentError::code) {
         None => TaskCommandOutcomeState::Applied,
-        Some("guardian.unavailable") => TaskCommandOutcomeState::NotApplied,
+        Some("guardian.unavailable" | "input.frame_invalid") => TaskCommandOutcomeState::NotApplied,
         Some(_) => TaskCommandOutcomeState::Uncertain,
     }
 }
@@ -3190,7 +3189,7 @@ impl RuntimePlatform for UnsupportedPlatform {
         _wheel_point: Option<(u32, u32)>,
         _source_frame: Option<(&AtomicU64, u64)>,
         _client_point: Option<(i32, u32, u32)>,
-    ) -> Result<(), AgentError> {
+    ) -> Result<bool, AgentError> {
         Err(AgentError::new(
             "input.platform_unsupported",
             "task input requires Windows",
@@ -4447,7 +4446,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         wheel_point: Option<(u32, u32)>,
         source_frame: Option<(&AtomicU64, u64)>,
         client_point: Option<(i32, u32, u32)>,
-    ) -> Result<(), AgentError> {
+    ) -> Result<bool, AgentError> {
         use fairypam_agent_input::InputPermit;
 
         let lease_duration = expires_at.saturating_duration_since(Instant::now());
@@ -4499,9 +4498,9 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 &permit,
                 now,
             )
-            .and_then(|()| {
+            .and_then(|holds_active| {
                 let Some((button, x_ppm, y_ppm)) = client_point else {
-                    return Ok(());
+                    return Ok(holds_active);
                 };
                 ensure_current_source_frame(source_frame).map_err(|error| {
                     fairypam_agent_input::SafetyError::new(error.code(), error.to_string())
@@ -4515,7 +4514,8 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                     &input.session,
                     &permit,
                     now,
-                )
+                )?;
+                Ok(holds_active)
             })
             .map_err(|error| AgentError::new(error.code(), error.to_string()))
     }
@@ -4820,6 +4820,13 @@ mod tests {
                     (
                         M1_ACTION_ID.into(),
                         ActionDefinition::Pulse { scan_code: 44 },
+                    ),
+                    (
+                        "input.f".into(),
+                        ActionDefinition::PhysicalPulse {
+                            scan_code: 33,
+                            extended: false,
+                        },
                     ),
                     (
                         "combat.normal_attack".into(),
@@ -5759,6 +5766,7 @@ mod tests {
         fail_begin_monitor: bool,
         fail_close: bool,
         capture_error: Option<AgentError>,
+        input_frame_error: Option<AgentError>,
         music_autoplay_starts: usize,
         music_autoplay_stops: usize,
         music_autoplay_error: Option<AgentError>,
@@ -5908,21 +5916,40 @@ mod tests {
 
         fn apply_task_input_frame(
             &mut self,
-            _profile: &VerifiedProfile,
+            profile: &VerifiedProfile,
             _binding: &TargetBinding,
             _session: &SessionRef,
             _sequence: u64,
             _expires_at: Instant,
-            _keys: &[v2::PhysicalKey],
-            _buttons: &[i32],
+            keys: &[v2::PhysicalKey],
+            buttons: &[i32],
             _wheel_delta: i32,
             _wheel_point: Option<(u32, u32)>,
             source_frame: Option<(&AtomicU64, u64)>,
             client_point: Option<(i32, u32, u32)>,
-        ) -> Result<(), AgentError> {
+        ) -> Result<bool, AgentError> {
             let mut state = self.state.lock().unwrap();
+            if let Some(error) = state.input_frame_error.take() {
+                return Err(error);
+            }
             ensure_current_source_frame(source_frame)?;
-            state.input_active = true;
+            let holds_active = keys.iter().any(|key| {
+                profile
+                    .profile()
+                    .actions
+                    .values()
+                    .any(|action| match action {
+                        ActionDefinition::Hold { scan_code } => {
+                            *scan_code == key.scan_code as u16 && !key.extended
+                        }
+                        ActionDefinition::PhysicalHold {
+                            scan_code,
+                            extended,
+                        } => *scan_code == key.scan_code as u16 && *extended == key.extended,
+                        _ => false,
+                    })
+            }) || !buttons.is_empty();
+            state.input_active = holds_active;
             if client_point.is_some() && state.advance_source_before_click {
                 if let Some((current, _)) = source_frame {
                     current.fetch_add(1, Ordering::Release);
@@ -5930,7 +5957,7 @@ mod tests {
             }
             ensure_current_source_frame(source_frame)?;
             state.point_clicks += usize::from(client_point.is_some());
-            Ok(())
+            Ok(holds_active)
         }
 
         fn release_task_input(&mut self) -> Result<(), AgentError> {
@@ -6240,6 +6267,75 @@ mod tests {
             } if receipt.error_code.as_deref() == Some("source_frame_stale")
         ));
         assert_eq!(stale_state.lock().unwrap().point_clicks, 0);
+    }
+
+    #[test]
+    fn v2_physical_pulse_receipt_confirms_released_input() {
+        let profile = verified_profile();
+        let (contract, reference) = v2_task_contract(&profile);
+        let (mut executor, state) = executor_with_state();
+        assert!(matches!(
+            executor.execute_v2_begin(&task_ref(&reference, "pulse-begin"), &contract),
+            CommandOutcome::TaskAck { .. }
+        ));
+        executor.binding = Some(binding());
+
+        assert!(matches!(
+            executor.execute_v2_input_frame(
+                &task_ref(&reference, "pulse-frame"),
+                &v2::InputFrame {
+                    input_sequence: 1,
+                    lease_ms: 500,
+                    held_keys: vec![v2::PhysicalKey {
+                        scan_code: 33,
+                        extended: false,
+                    }],
+                    ..v2::InputFrame::default()
+                },
+                None,
+            ),
+            CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
+                if outcome.outcome == TaskCommandOutcomeState::Applied as i32
+                    && receipt.input_state == TaskInputState::Released as i32
+        ));
+        assert!(!state.lock().unwrap().input_active);
+    }
+
+    #[test]
+    fn v2_rejected_mixed_pulse_receipt_is_definitely_not_applied() {
+        let profile = verified_profile();
+        let (contract, reference) = v2_task_contract(&profile);
+        let (mut executor, state) = executor_with_state();
+        assert!(matches!(
+            executor.execute_v2_begin(&task_ref(&reference, "mixed-begin"), &contract),
+            CommandOutcome::TaskAck { .. }
+        ));
+        executor.binding = Some(binding());
+        state.lock().unwrap().input_frame_error = Some(AgentError::new(
+            "input.frame_invalid",
+            "a physical pulse must be the only side effect in its input frame",
+        ));
+
+        assert!(matches!(
+            executor.execute_v2_input_frame(
+                &task_ref(&reference, "mixed-frame"),
+                &v2::InputFrame {
+                    input_sequence: 1,
+                    lease_ms: 500,
+                    held_keys: vec![
+                        v2::PhysicalKey { scan_code: 33, extended: false },
+                        v2::PhysicalKey { scan_code: 30, extended: false },
+                    ],
+                    ..v2::InputFrame::default()
+                },
+                None,
+            ),
+            CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
+                if outcome.outcome == TaskCommandOutcomeState::NotApplied as i32
+                    && receipt.input_state == TaskInputState::Released as i32
+                    && receipt.error_code.as_deref() == Some("input.frame_invalid")
+        ));
+        assert!(!state.lock().unwrap().input_active);
     }
 
     #[test]
@@ -7325,11 +7421,16 @@ mod tests {
     #[test]
     fn guardian_start_failure_is_definitely_not_applied() {
         let guardian = AgentError::new("guardian.unavailable", "guardian did not start");
+        let invalid = AgentError::new("input.frame_invalid", "input frame was rejected");
         let other = AgentError::new("input.failed", "input result is unknown");
 
         assert_eq!(input_frame_outcome(None), TaskCommandOutcomeState::Applied);
         assert_eq!(
             input_frame_outcome(Some(&guardian)),
+            TaskCommandOutcomeState::NotApplied
+        );
+        assert_eq!(
+            input_frame_outcome(Some(&invalid)),
             TaskCommandOutcomeState::NotApplied
         );
         assert_eq!(

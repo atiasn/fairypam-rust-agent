@@ -216,6 +216,29 @@ impl LocalAuthorization for TestAuthorization {
 }
 
 fn verified_profile() -> VerifiedProfile {
+    verified_profile_with_actions(BTreeMap::new())
+}
+
+fn verified_profile_with_actions(
+    extra_actions: BTreeMap<String, ActionDefinition>,
+) -> VerifiedProfile {
+    let mut actions = BTreeMap::from([
+        (
+            "movement.forward".into(),
+            ActionDefinition::Hold { scan_code: 17 },
+        ),
+        (
+            "combat.attack".into(),
+            ActionDefinition::Pulse { scan_code: 30 },
+        ),
+        (
+            "camera.wheel".into(),
+            ActionDefinition::Wheel {
+                maximum_delta: 76_800,
+            },
+        ),
+    ]);
+    actions.extend(extra_actions);
     let content = ProfileContent {
         schema_version: 1,
         profile: Profile {
@@ -238,22 +261,7 @@ fn verified_profile() -> VerifiedProfile {
                 maximum_fps: 30,
                 encodings: vec!["jpeg".into()],
             }],
-            actions: BTreeMap::from([
-                (
-                    "movement.forward".into(),
-                    ActionDefinition::Hold { scan_code: 17 },
-                ),
-                (
-                    "combat.attack".into(),
-                    ActionDefinition::Pulse { scan_code: 30 },
-                ),
-                (
-                    "camera.wheel".into(),
-                    ActionDefinition::Wheel {
-                        maximum_delta: 76_800,
-                    },
-                ),
-            ]),
+            actions,
         },
         files: Vec::new(),
     };
@@ -718,7 +726,7 @@ fn physical_frame_executes_profile_pulse_atomically() {
     )
     .unwrap();
 
-    executor
+    let holds_active = executor
         .apply_physical_frame(
             session(1),
             1,
@@ -732,8 +740,52 @@ fn physical_frame_executes_profile_pulse_atomically() {
         )
         .unwrap();
 
+    assert!(!holds_active);
     assert!(!executor.platform().pressed.contains(&30));
     assert_eq!(executor.platform().released, vec![30]);
+}
+
+#[test]
+fn physical_frame_rejects_duplicate_profile_pulses_before_side_effects() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let profile = verified_profile_with_actions(BTreeMap::from([
+        (
+            "pulse.first".into(),
+            ActionDefinition::PhysicalPulse {
+                scan_code: 40,
+                extended: false,
+            },
+        ),
+        (
+            "pulse.second".into(),
+            ActionDefinition::PhysicalPulse {
+                scan_code: 40,
+                extended: false,
+            },
+        ),
+    ]));
+    let mut executor =
+        LeaseExecutor::new(&profile, FakeInput::default(), FakeGuardian::default()).unwrap();
+
+    let error = executor
+        .apply_physical_frame(
+            session(1),
+            1,
+            now + Duration::from_secs(1),
+            &[(40, false)],
+            &[],
+            0,
+            None,
+            &authority.permit(now),
+            now,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code(), "input.frame_invalid");
+    assert!(executor.platform().pressed.is_empty());
+    assert!(executor.platform().released.is_empty());
+    assert!(executor.guardian().calls.is_empty());
 }
 
 #[test]

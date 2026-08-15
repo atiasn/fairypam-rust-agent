@@ -166,7 +166,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
         wheel_point: Option<(u32, u32)>,
         permit: &InputPermit<'_>,
         now: Instant,
-    ) -> Result<(), SafetyError> {
+    ) -> Result<bool, SafetyError> {
         let (desired_holds, pulse_actions) = self.actions.physical_frame_actions(keys, buttons)?;
         if pulse_actions.len() > 1
             || (!pulse_actions.is_empty()
@@ -195,6 +195,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
                 "wheel point must be normalized and accompany a wheel delta",
             ));
         }
+        let holds_active = !desired_holds.is_empty();
         self.apply_lease(
             InputLease {
                 session: session.clone(),
@@ -209,7 +210,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
             self.execute_pulse(action, &session, permit, now)?;
         }
         if wheel_delta == 0 {
-            return Ok(());
+            return Ok(holds_active);
         }
         match wheel_point {
             Some((x_ppm, y_ppm)) => {
@@ -218,6 +219,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
             }
             None => self.platform.wheel(wheel_delta, expires_at),
         }
+        .map(|()| holds_active)
         .map_err(|error| {
             let reason = if error.code() == "input.lease_expired" {
                 ReleaseReason::LeaseExpired

@@ -498,7 +498,7 @@ impl<G: GuardianClient> WindowsInput<G> {
         wheel_point: Option<(u32, u32)>,
         permit: &InputPermit<'_>,
         now: Instant,
-    ) -> Result<(), SafetyError> {
+    ) -> Result<bool, SafetyError> {
         self.require_target_permit(permit, &session, now)?;
         self.executor.apply_physical_frame(
             session,
