@@ -746,6 +746,66 @@ fn physical_frame_executes_profile_pulse_atomically() {
 }
 
 #[test]
+fn physical_frame_prefers_hold_for_same_tuple_pulse_alias() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let profile = verified_profile_with_actions(BTreeMap::from([
+        (
+            "alias.hold".into(),
+            ActionDefinition::PhysicalHold {
+                scan_code: 40,
+                extended: false,
+            },
+        ),
+        (
+            "alias.pulse".into(),
+            ActionDefinition::PhysicalPulse {
+                scan_code: 40,
+                extended: false,
+            },
+        ),
+    ]));
+    let mut executor =
+        LeaseExecutor::new(&profile, FakeInput::default(), FakeGuardian::default()).unwrap();
+
+    let holds_active = executor
+        .apply_physical_frame(
+            session(1),
+            1,
+            now + Duration::from_secs(1),
+            &[(40, false)],
+            &[],
+            0,
+            None,
+            &authority.permit(now),
+            now,
+        )
+        .unwrap();
+
+    assert!(holds_active);
+    assert!(executor.platform().pressed.contains(&40));
+    assert!(executor.platform().released.is_empty());
+
+    let holds_active = executor
+        .apply_physical_frame(
+            session(1),
+            2,
+            now + Duration::from_secs(1),
+            &[],
+            &[],
+            0,
+            None,
+            &authority.permit(now),
+            now,
+        )
+        .unwrap();
+
+    assert!(!holds_active);
+    assert!(!executor.platform().pressed.contains(&40));
+    assert_eq!(executor.platform().released, vec![40]);
+}
+
+#[test]
 fn physical_frame_rejects_duplicate_profile_pulses_before_side_effects() {
     let now = Instant::now();
     let authority = PermitAuthority::new(now);
