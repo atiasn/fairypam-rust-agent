@@ -123,6 +123,46 @@ impl ActionMap {
             .collect()
     }
 
+    pub(crate) fn physical_frame_actions(
+        &self,
+        keys: &[(u16, bool)],
+        buttons: &[SemanticMouseButton],
+    ) -> Result<(BTreeSet<ActionId>, BTreeSet<ActionId>), SafetyError> {
+        let mut holds = buttons
+            .iter()
+            .map(|button| self.action_for_button(*button))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let mut pulses = BTreeSet::new();
+        for key in keys {
+            let mut hold = None;
+            let mut pulse = None;
+            for (id, action) in &self.actions {
+                match action {
+                    ResolvedAction::HoldKey {
+                        scan_code,
+                        extended,
+                    } if (*scan_code, *extended) == *key => hold.get_or_insert(id.clone()),
+                    ResolvedAction::PulseKey {
+                        scan_code,
+                        extended,
+                    } if (*scan_code, *extended) == *key => pulse.get_or_insert(id.clone()),
+                    _ => continue,
+                };
+            }
+            if let Some(action) = hold {
+                holds.insert(action);
+            } else if let Some(action) = pulse {
+                pulses.insert(action);
+            } else {
+                return Err(SafetyError::new(
+                    "input.key_not_allowed",
+                    "physical key is not declared by the verified Profile",
+                ));
+            }
+        }
+        Ok((holds, pulses))
+    }
+
     fn action_for_key(&self, key: (u16, bool)) -> Result<ActionId, SafetyError> {
         self.actions
             .iter()

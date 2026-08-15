@@ -167,7 +167,16 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
         permit: &InputPermit<'_>,
         now: Instant,
     ) -> Result<(), SafetyError> {
-        let desired_holds = self.actions.physical_actions(keys, buttons)?;
+        let (desired_holds, pulse_actions) = self.actions.physical_frame_actions(keys, buttons)?;
+        if pulse_actions.len() > 1
+            || (!pulse_actions.is_empty()
+                && (!desired_holds.is_empty() || wheel_delta != 0 || wheel_point.is_some()))
+        {
+            return Err(SafetyError::new(
+                "input.frame_invalid",
+                "a physical pulse must be the only side effect in its input frame",
+            ));
+        }
         if wheel_delta != 0
             && !self.actions.wheel_limit().is_some_and(|limit| {
                 wheel_delta.unsigned_abs() <= limit as u32 && wheel_delta % 120 == 0
@@ -188,7 +197,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
         }
         self.apply_lease(
             InputLease {
-                session,
+                session: session.clone(),
                 sequence,
                 expires_at,
                 desired_holds,
@@ -196,6 +205,9 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
             permit,
             now,
         )?;
+        if let Some(action) = pulse_actions.first() {
+            self.execute_pulse(action, &session, permit, now)?;
+        }
         if wheel_delta == 0 {
             return Ok(());
         }

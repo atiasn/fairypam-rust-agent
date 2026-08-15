@@ -708,6 +708,66 @@ fn physical_frame_applies_and_releases_profile_declared_key() {
 }
 
 #[test]
+fn physical_frame_executes_profile_pulse_atomically() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let mut executor = LeaseExecutor::new(
+        &verified_profile(),
+        FakeInput::default(),
+        FakeGuardian::default(),
+    )
+    .unwrap();
+
+    executor
+        .apply_physical_frame(
+            session(1),
+            1,
+            now + Duration::from_secs(1),
+            &[(30, false)],
+            &[],
+            0,
+            None,
+            &authority.permit(now),
+            now,
+        )
+        .unwrap();
+
+    assert!(!executor.platform().pressed.contains(&30));
+    assert_eq!(executor.platform().released, vec![30]);
+}
+
+#[test]
+fn physical_frame_rejects_mixed_pulse_and_hold_before_side_effects() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let mut executor = LeaseExecutor::new(
+        &verified_profile(),
+        FakeInput::default(),
+        FakeGuardian::default(),
+    )
+    .unwrap();
+
+    let error = executor
+        .apply_physical_frame(
+            session(1),
+            1,
+            now + Duration::from_secs(1),
+            &[(17, false), (30, false)],
+            &[],
+            0,
+            None,
+            &authority.permit(now),
+            now,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code(), "input.frame_invalid");
+    assert!(executor.platform().pressed.is_empty());
+    assert!(executor.platform().released.is_empty());
+    assert!(executor.guardian().calls.is_empty());
+}
+
+#[test]
 fn invalid_wheel_rejects_the_entire_physical_frame_before_side_effects() {
     let now = Instant::now();
     let authority = PermitAuthority::new(now);
