@@ -3,6 +3,7 @@
 mod backoff;
 mod control;
 mod frame;
+mod telemetry;
 mod tls;
 
 pub use backoff::CappedBackoff;
@@ -14,9 +15,14 @@ pub use control::{
 pub use frame::{
     open_frame_tunnel, FrameSession, LatestFrameSlot, SessionFrameSlot, VerifiedFrameDirective,
 };
+pub use telemetry::{
+    hello_event as telemetry_hello_event, open_telemetry_tunnel, receive_telemetry_hello,
+    telemetry_queue, TelemetryReceiver, TelemetrySender, TelemetrySession,
+    TELEMETRY_QUEUE_CAPACITY,
+};
 pub use tls::{
-    connect_control, connect_frame, validate_transport_config, ControlChannel, FrameChannel,
-    TransportConfig,
+    connect_control, connect_frame, connect_telemetry, validate_transport_config, ControlChannel,
+    FrameChannel, TelemetryChannel, TransportConfig,
 };
 
 use thiserror::Error;

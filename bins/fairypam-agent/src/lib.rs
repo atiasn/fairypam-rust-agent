@@ -12,6 +12,7 @@ pub mod profile_store;
 pub mod runtime;
 pub mod runtime_api;
 mod task_attempt;
+mod telemetry;
 mod v2_adapter;
 
 pub const fn production_authorization() -> DenyAllAuthorization {

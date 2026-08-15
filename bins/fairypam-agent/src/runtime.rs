@@ -15,17 +15,18 @@ use fairypam_agent_core::supervisor::SessionSupervisor;
 use fairypam_agent_core::supervisor::{SessionDriver, SupervisorHooks};
 use fairypam_agent_core::AgentError;
 use fairypam_agent_protocol::v2::{
-    self as v2, agent_control_event, AgentControlEvent, AgentRuntimeState, AgentStatus, Heartbeat,
-    SessionRef,
+    self as v2, agent_control_event, hub_telemetry_command, AgentControlEvent, AgentRuntimeState,
+    AgentStatus, Heartbeat, SessionRef,
 };
 #[cfg(any(windows, test))]
 use fairypam_agent_transport::validate_transport_config;
 #[cfg(windows)]
 use fairypam_agent_transport::CappedBackoff;
 use fairypam_agent_transport::{
-    connect_control, connect_frame, control_queue, open_control_tunnel, open_frame_tunnel,
-    receive_hub_hello, ControlSender, ControlSession, SessionFrameSlot, TransportConfig,
-    TransportError, VerifiedSession,
+    connect_control, connect_frame, connect_telemetry, control_queue, open_control_tunnel,
+    open_frame_tunnel, open_telemetry_tunnel, receive_hub_hello, receive_telemetry_hello,
+    telemetry_hello_event, telemetry_queue, ControlSender, ControlSession, SessionFrameSlot,
+    TransportConfig, TransportError, VerifiedSession,
 };
 use http::Uri;
 #[cfg(any(windows, test))]
@@ -47,6 +48,7 @@ const REGISTRATION_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 use crate::runtime_api::LogLevel;
 #[cfg(any(windows, test))]
 use crate::runtime_api::RuntimeCommand as LocalCommand;
+use crate::telemetry::{TelemetryState, MAX_LOG_CHUNK_BYTES};
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -499,6 +501,8 @@ pub struct GrpcSessionDriver {
     registration_in_progress: Arc<AtomicBool>,
     registration_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     gui_shutdown: CancellationToken,
+    agent_process_generation_id: String,
+    telemetry: Arc<Mutex<TelemetryState>>,
 }
 
 impl GrpcSessionDriver {
@@ -523,6 +527,8 @@ impl GrpcSessionDriver {
         };
         state.record(LogLevel::Info, RuntimeLogMessage::Started);
         let gui_shutdown = CancellationToken::new();
+        let agent_process_generation_id = v2_adapter::process_generation_id();
+        let telemetry = new_telemetry_state(agent_process_generation_id.clone());
         Self {
             config: Arc::new(Mutex::new(config)),
             state: Arc::new(Mutex::new(state)),
@@ -532,12 +538,15 @@ impl GrpcSessionDriver {
             registration_in_progress: Arc::new(AtomicBool::new(false)),
             registration_worker: Arc::new(Mutex::new(None)),
             gui_shutdown,
+            agent_process_generation_id,
+            telemetry: Arc::new(Mutex::new(telemetry)),
         }
     }
 
     #[cfg(any(test, feature = "test-support"))]
     fn for_test() -> Self {
         let config = RuntimeConfig::unregistered();
+        let agent_process_generation_id = "11111111-1111-4111-8111-111111111111".to_owned();
         Self {
             config: Arc::new(Mutex::new(config)),
             state: Arc::new(Mutex::new(RuntimeState {
@@ -551,6 +560,10 @@ impl GrpcSessionDriver {
             registration_in_progress: Arc::new(AtomicBool::new(false)),
             registration_worker: Arc::new(Mutex::new(None)),
             gui_shutdown: CancellationToken::new(),
+            agent_process_generation_id: agent_process_generation_id.clone(),
+            telemetry: Arc::new(Mutex::new(TelemetryState::memory(
+                agent_process_generation_id,
+            ))),
         }
     }
 
@@ -786,6 +799,279 @@ impl GrpcSessionDriver {
             error_code,
         ))
     }
+
+    async fn run_telemetry_forever(
+        &self,
+        cancellation: CancellationToken,
+        session: VerifiedSession,
+    ) -> Result<(), AgentError> {
+        loop {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            if let Err(error) = self
+                .run_telemetry_once(cancellation.child_token(), &session)
+                .await
+            {
+                if let Ok(mut telemetry) = self.telemetry.lock() {
+                    telemetry.cancel_detail_on_disconnect();
+                }
+                tracing::warn!(code = error.code(), "Telemetry channel reconnecting");
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
+        }
+    }
+
+    async fn run_telemetry_once(
+        &self,
+        cancellation: CancellationToken,
+        control_session: &VerifiedSession,
+    ) -> Result<(), AgentError> {
+        let config = self.config.lock().map_err(lock_error)?.clone();
+        let connection = tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            result = connect_telemetry(&config.transport) => result.map_err(map_transport)?,
+        };
+        let (sender, receiver) = telemetry_queue();
+        sender
+            .send(telemetry_hello_event(
+                control_session,
+                self.agent_process_generation_id.clone(),
+            ))
+            .await
+            .map_err(map_transport)?;
+        let pending = open_telemetry_tunnel(&connection, receiver)
+            .await
+            .map_err(map_transport)?;
+        let mut commands = receive_telemetry_hello(pending)
+            .await
+            .map_err(map_transport)?;
+        let hello = *commands.hello();
+        let lease_receipts = self.telemetry.lock().map_err(lock_error)?.lease_receipts();
+        for receipt in lease_receipts {
+            sender
+                .send(crate::telemetry::lease_receipt_event(receipt))
+                .await
+                .map_err(map_transport)?;
+        }
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut log_tick = tokio::time::interval(transfer_interval(
+            MAX_LOG_CHUNK_BYTES,
+            hello.total_bytes_per_second,
+        ));
+        log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut pending_log_chunks = VecDeque::new();
+        let mut active_log_request = None;
+        let mut inflight_batch = None;
+        let mut next_backfill = Instant::now();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Ok(()),
+                command = commands.message() => {
+                    let command = command.map_err(map_transport)?.ok_or_else(|| {
+                        AgentError::new("runtime.telemetry_closed", "Hub closed the Telemetry stream")
+                    })?;
+                    match command.payload.as_ref() {
+                        Some(hub_telemetry_command::Payload::Receipt(receipt)) => {
+                            if inflight_batch == Some(receipt.batch_sequence) {
+                                self.telemetry
+                                    .lock()
+                                    .map_err(lock_error)?
+                                    .apply_receipts(&receipt.records)?;
+                                inflight_batch = None;
+                            }
+                        }
+                        Some(hub_telemetry_command::Payload::DiagnosticLease(lease)) => {
+                            let receipt = self.telemetry.lock().map_err(lock_error)?.handle_lease(
+                                lease,
+                                &config.transport.agent_id,
+                                control_session.generation(),
+                            )?;
+                            sender
+                                .send(crate::telemetry::lease_receipt_event(receipt))
+                                .await
+                                .map_err(map_transport)?;
+                        }
+                        Some(hub_telemetry_command::Payload::RevokeDiagnosticLease(revoke)) => {
+                            let receipt = self
+                                .telemetry
+                                .lock()
+                                .map_err(lock_error)?
+                                .handle_revoke(revoke)?;
+                            cancel_agent_log_reads_for_terminal(
+                                &mut pending_log_chunks,
+                                &receipt,
+                            );
+                            if receipt.target_type == v2::DiagnosticTargetType::Agent as i32 {
+                                active_log_request = None;
+                            }
+                            sender
+                                .send(crate::telemetry::lease_receipt_event(receipt))
+                                .await
+                                .map_err(map_transport)?;
+                        }
+                        Some(hub_telemetry_command::Payload::LogRead(request)) => {
+                            if active_log_request.is_some() {
+                                sender
+                                    .try_send(crate::telemetry::log_read_error(
+                                        request,
+                                        "diagnostic.log_read_busy",
+                                    ))
+                                    .map_err(map_transport)?;
+                                continue;
+                            }
+                            let chunks = {
+                                let telemetry = self.telemetry.lock().map_err(lock_error)?;
+                                crate::telemetry::log_chunks(
+                                    request,
+                                    &telemetry,
+                                    &config.transport.agent_id,
+                                    diagnostic_log(),
+                                )
+                            };
+                            active_log_request = Some(request.request_id.clone());
+                            pending_log_chunks.extend(chunks);
+                        }
+                        Some(hub_telemetry_command::Payload::CancelLogRead(cancel)) => {
+                            cancel_log_read(&mut pending_log_chunks, &cancel.request_id);
+                            if active_log_request.as_deref() == Some(cancel.request_id.as_str()) {
+                                active_log_request = None;
+                            }
+                        }
+                        Some(hub_telemetry_command::Payload::Hello(_)) | None => {
+                            return Err(AgentError::new(
+                                "runtime.telemetry_command_invalid",
+                                "Hub sent an invalid Telemetry command",
+                            ));
+                        }
+                    }
+                }
+                _ = log_tick.tick(), if !pending_log_chunks.is_empty() => {
+                    let chunk = pending_log_chunks
+                        .pop_front()
+                        .expect("log chunk queue is not empty");
+                    let completed_request = match chunk.payload.as_ref() {
+                        Some(v2::agent_telemetry_event::Payload::LogChunk(value)) if value.eof => {
+                            Some(value.request_id.clone())
+                        }
+                        _ => None,
+                    };
+                    sender.send(chunk).await.map_err(map_transport)?;
+                    if completed_request.as_deref() == active_log_request.as_deref() {
+                        active_log_request = None;
+                    }
+                    next_backfill = Instant::now() + Duration::from_secs(1);
+                }
+                _ = tick.tick() => {
+                    let expired = self.telemetry.lock().map_err(lock_error)?.expire_leases()?;
+                    for receipt in &expired {
+                        cancel_agent_log_reads_for_terminal(
+                            &mut pending_log_chunks,
+                            receipt,
+                        );
+                        if receipt.target_type == v2::DiagnosticTargetType::Agent as i32 {
+                            active_log_request = None;
+                        }
+                    }
+                    for receipt in expired {
+                        sender
+                            .try_send(crate::telemetry::lease_receipt_event(receipt))
+                            .map_err(map_transport)?;
+                    }
+                    if !pending_log_chunks.is_empty()
+                        || inflight_batch.is_some()
+                        || Instant::now() < next_backfill
+                    {
+                        continue;
+                    }
+                    let event = {
+                        let mut telemetry = self.telemetry.lock().map_err(lock_error)?;
+                        telemetry.refresh_queue_metrics()?;
+                        telemetry.next_batch(
+                            hello.max_batch_records.min(64) as usize,
+                            hello
+                                .max_batch_bytes
+                                .min(hello.backfill_bytes_per_second)
+                                .min(hello.total_bytes_per_second)
+                                .min(128 * 1024) as usize,
+                        )?
+                    };
+                    let Some(event) = event else { continue };
+                    let Some(v2::agent_telemetry_event::Payload::Batch(batch)) = event.payload.as_ref() else {
+                        return Err(AgentError::new(
+                            "runtime.telemetry_batch_invalid",
+                            "local Telemetry queue produced an invalid batch",
+                        ));
+                    };
+                    inflight_batch = Some(batch.batch_sequence);
+                    sender.send(event).await.map_err(map_transport)?;
+                    next_backfill = Instant::now() + Duration::from_secs(1);
+                }
+            }
+        }
+    }
+}
+
+fn cancel_log_read(chunks: &mut VecDeque<v2::AgentTelemetryEvent>, request_id: &str) {
+    chunks.retain(|event| {
+        !matches!(
+            event.payload.as_ref(),
+            Some(v2::agent_telemetry_event::Payload::LogChunk(chunk))
+                if chunk.request_id == request_id
+        )
+    });
+}
+
+fn cancel_agent_log_reads_for_terminal(
+    chunks: &mut VecDeque<v2::AgentTelemetryEvent>,
+    receipt: &v2::DiagnosticLeaseReceipt,
+) {
+    if receipt.target_type == v2::DiagnosticTargetType::Agent as i32
+        && matches!(
+            v2::DiagnosticLeaseDisposition::try_from(receipt.disposition),
+            Ok(v2::DiagnosticLeaseDisposition::Revoked | v2::DiagnosticLeaseDisposition::Expired)
+        )
+    {
+        chunks.clear();
+    }
+}
+
+fn transfer_interval(bytes: usize, bytes_per_second: u32) -> Duration {
+    Duration::from_secs_f64(bytes as f64 / bytes_per_second.max(1) as f64)
+}
+
+#[cfg(windows)]
+fn new_telemetry_state(process_generation_id: String) -> TelemetryState {
+    TelemetryState::production(process_generation_id.clone()).unwrap_or_else(|error| {
+        tracing::warn!(
+            code = error.code(),
+            "protected telemetry buffer is unavailable"
+        );
+        TelemetryState::memory(process_generation_id)
+    })
+}
+
+#[cfg(windows)]
+fn diagnostic_log() -> Result<crate::observability::FixedLog, AgentError> {
+    crate::observability::production_log()
+}
+
+#[cfg(not(windows))]
+fn diagnostic_log() -> Result<crate::observability::FixedLog, AgentError> {
+    Err(AgentError::new(
+        "diagnostic.log_read_unavailable",
+        "production Agent log is Windows-only",
+    ))
+}
+
+#[cfg(not(windows))]
+fn new_telemetry_state(process_generation_id: String) -> TelemetryState {
+    TelemetryState::memory(process_generation_id)
 }
 
 impl SessionDriver for GrpcSessionDriver {
@@ -814,6 +1100,7 @@ impl SessionDriver for GrpcSessionDriver {
                 config.transport.agent_id.clone(),
                 config.agent_version.clone(),
                 config.build_commit.clone(),
+                self.agent_process_generation_id.clone(),
                 &config.profiles,
                 config.profile_catalog.as_ref().and_then(|catalog| {
                     catalog
@@ -862,6 +1149,16 @@ impl SessionDriver for GrpcSessionDriver {
             RuntimeLogMessage::ControlConnectionEstablished,
         );
         drop(state);
+        if let Ok(mut telemetry) = self.telemetry.lock() {
+            let _ = telemetry.record_event(
+                "agent.control.connected",
+                v2::TelemetrySeverity::Info,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         self.execution
             .lock()
             .map_err(lock_error)?
@@ -890,10 +1187,24 @@ impl SessionDriver for GrpcSessionDriver {
         capture_health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         capture_health.tick().await;
         let mut translator = v2_adapter::Translator::new(session.max_input_lease_ms());
+        let telemetry_cancellation = cancellation.child_token();
+        let mut telemetry =
+            Box::pin(self.run_telemetry_forever(telemetry_cancellation.clone(), session.clone()));
         loop {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(cancelled()),
+                result = &mut telemetry => {
+                    if let Err(error) = result {
+                        tracing::warn!(code = error.code(), "Telemetry task stopped unexpectedly");
+                    }
+                    telemetry = Box::pin(
+                        self.run_telemetry_forever(
+                            telemetry_cancellation.clone(),
+                            session.clone(),
+                        ),
+                    );
+                }
                 _ = self.wait_for_reconnect() => {
                     return Err(AgentError::new(
                         "runtime.enrollment_changed",
@@ -950,9 +1261,20 @@ impl SessionDriver for GrpcSessionDriver {
                             "verified command lost CommandRef",
                         )
                     })?;
+                    let command_name = v2_adapter::command_name(&command);
+                    let command_started_at = telemetry_unix_nano();
                     let translated = match translator.translate(&command) {
                         Ok(command) => command,
                         Err(error) => {
+                            if let Ok(mut telemetry) = self.telemetry.lock() {
+                                let _ = telemetry.record_command_span(
+                                    command_name,
+                                    &identity,
+                                    command_started_at,
+                                    telemetry_unix_nano(),
+                                    Some(error.code()),
+                                );
+                            }
                             let event = match v2_adapter::internal_task_identity(&identity) {
                                 Ok(task) => {
                                     let mut execution = self.execution.lock().map_err(lock_error)?;
@@ -1062,6 +1384,15 @@ impl SessionDriver for GrpcSessionDriver {
                     if let Ok(mut state) = self.state.lock() {
                         state.record_command_diagnostic(&outcome);
                     }
+                    if let Ok(mut telemetry) = self.telemetry.lock() {
+                        let _ = telemetry.record_command_span(
+                            command_name,
+                            &identity,
+                            command_started_at,
+                            telemetry_unix_nano(),
+                            outcome.telemetry_error_code(),
+                        );
+                    }
                     let event = v2_adapter::result(identity, outcome);
                     sender.try_send(event).map_err(map_transport)?;
                     self.activate_profile_catalog_if_ready(&sender, &session)?;
@@ -1162,6 +1493,7 @@ pub struct RuntimeSafetyHooks {
     state: Arc<Mutex<RuntimeState>>,
     execution: Arc<Mutex<CommandExecutor>>,
     registration_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+    telemetry: Arc<Mutex<TelemetryState>>,
 }
 
 impl RuntimeSafetyHooks {
@@ -1171,6 +1503,7 @@ impl RuntimeSafetyHooks {
             state: Arc::clone(&driver.state),
             execution: Arc::clone(&driver.execution),
             registration_worker: Arc::clone(&driver.registration_worker),
+            telemetry: Arc::clone(&driver.telemetry),
         }
     }
 }
@@ -1222,6 +1555,9 @@ impl SupervisorHooks for RuntimeSafetyHooks {
     }
 
     fn clear_target_session(&mut self) {
+        if let Ok(mut telemetry) = self.telemetry.lock() {
+            telemetry.cancel_detail_on_disconnect();
+        }
         #[cfg(windows)]
         if let Some(root) = self
             .config
@@ -1463,6 +1799,11 @@ fn shutdown_embedded(
         state.record(LogLevel::Info, RuntimeLogMessage::LocalShutdownRequested);
     }
     let _ = supervisor.handle_control_failure()?;
+    driver
+        .telemetry
+        .lock()
+        .map_err(lock_error)?
+        .mark_clean_shutdown()?;
     Ok(())
 }
 
@@ -1972,6 +2313,14 @@ fn now_unix_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+fn telemetry_unix_nano() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use crate::runtime_api::{LogLevel, RuntimeCommand as LocalCommand};
@@ -1987,6 +2336,58 @@ mod tests {
         assert_eq!(
             registration_failure_code("registration-code=not-for-log"),
             "enrollment.failed"
+        );
+    }
+
+    #[test]
+    fn cancelled_log_read_drops_only_matching_chunks() {
+        let chunk = |request_id: &str| v2::AgentTelemetryEvent {
+            payload: Some(v2::agent_telemetry_event::Payload::LogChunk(
+                v2::AgentLogChunk {
+                    request_id: request_id.to_owned(),
+                    ..v2::AgentLogChunk::default()
+                },
+            )),
+        };
+        let mut chunks = VecDeque::from([chunk("cancelled"), chunk("kept")]);
+
+        cancel_log_read(&mut chunks, "cancelled");
+
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(
+            chunks.front().and_then(|event| event.payload.as_ref()),
+            Some(v2::agent_telemetry_event::Payload::LogChunk(chunk))
+                if chunk.request_id == "kept"
+        ));
+    }
+
+    #[test]
+    fn only_terminal_agent_lease_drops_pending_log_chunks() {
+        let mut chunks = VecDeque::from([v2::AgentTelemetryEvent::default()]);
+        let mut receipt = v2::DiagnosticLeaseReceipt {
+            target_type: v2::DiagnosticTargetType::TaskRun as i32,
+            disposition: v2::DiagnosticLeaseDisposition::Revoked as i32,
+            ..v2::DiagnosticLeaseReceipt::default()
+        };
+
+        cancel_agent_log_reads_for_terminal(&mut chunks, &receipt);
+        assert_eq!(chunks.len(), 1);
+
+        receipt.target_type = v2::DiagnosticTargetType::Agent as i32;
+        cancel_agent_log_reads_for_terminal(&mut chunks, &receipt);
+
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn telemetry_rate_uses_the_hub_advertised_limit() {
+        assert_eq!(
+            transfer_interval(32 * 1024, 256 * 1024),
+            Duration::from_millis(125)
+        );
+        assert_eq!(
+            transfer_interval(32 * 1024, 64 * 1024),
+            Duration::from_millis(500)
         );
     }
 

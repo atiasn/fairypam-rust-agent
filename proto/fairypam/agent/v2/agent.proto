@@ -12,10 +12,19 @@ service AgentFrameService {
   rpc FrameTunnel(stream FramePacket) returns (stream FrameDirective);
 }
 
+service AgentTelemetryService {
+  rpc TelemetryTunnel(stream AgentTelemetryEvent) returns (stream HubTelemetryCommand);
+}
+
 message SessionRef {
   string agent_id = 1;
   string session_id = 2;
   uint64 generation = 3;
+}
+
+message W3CTraceContext {
+  string traceparent = 1;
+  optional string tracestate = 2;
 }
 
 message CommandRef {
@@ -23,6 +32,7 @@ message CommandRef {
   string command_id = 2;
   uint64 sequence = 3;
   int64 expires_at_unix_ms = 4;
+  W3CTraceContext trace_context = 5;
 }
 
 message AttemptRef {
@@ -155,6 +165,7 @@ message AgentHello {
   repeated InstalledProfile installed_profiles = 7;
   optional uint64 active_profile_catalog_version = 8;
   optional string active_profile_catalog_digest = 9;
+  string agent_process_generation_id = 10;
 }
 
 message HubHello {
@@ -495,4 +506,236 @@ message FrameDirective {
   string capture_source_id = 2;
   optional uint64 accepted_frame_sequence = 3;
   bool accept_frames = 4;
+}
+
+message AgentTelemetryHello {
+  SessionRef control_session = 1;
+  string agent_process_generation_id = 2;
+  uint32 protocol_minor = 3;
+  repeated uint32 telemetry_schema_versions = 4;
+}
+
+message TelemetryAttribute {
+  string key = 1;
+  oneof value {
+    string string_value = 2;
+    sint64 int_value = 3;
+    double double_value = 4;
+    bool bool_value = 5;
+  }
+}
+
+message TelemetryEventSignal {
+  optional string message = 1;
+  optional string error_code = 2;
+  repeated TelemetryAttribute attributes = 3;
+}
+
+enum TelemetrySeverity {
+  TELEMETRY_SEVERITY_UNSPECIFIED = 0;
+  TELEMETRY_SEVERITY_TRACE = 1;
+  TELEMETRY_SEVERITY_DEBUG = 2;
+  TELEMETRY_SEVERITY_INFO = 3;
+  TELEMETRY_SEVERITY_WARN = 4;
+  TELEMETRY_SEVERITY_ERROR = 5;
+}
+
+message TelemetrySpanSignal {
+  bytes trace_id = 1;
+  bytes span_id = 2;
+  optional bytes parent_span_id = 3;
+  string name = 4;
+  int64 started_at_unix_nano = 5;
+  int64 ended_at_unix_nano = 6;
+  TelemetrySpanStatus status = 7;
+  optional string error_code = 8;
+  repeated TelemetryAttribute attributes = 9;
+  uint32 trace_flags = 10;
+  optional string tracestate = 11;
+}
+
+enum TelemetrySpanStatus {
+  TELEMETRY_SPAN_STATUS_UNSPECIFIED = 0;
+  TELEMETRY_SPAN_STATUS_UNSET = 1;
+  TELEMETRY_SPAN_STATUS_OK = 2;
+  TELEMETRY_SPAN_STATUS_ERROR = 3;
+}
+
+message TelemetryMetricSignal {
+  string name = 1;
+  TelemetryMetricKind kind = 2;
+  double sum = 3;
+  uint64 count = 4;
+  repeated double explicit_bounds = 5;
+  repeated uint64 bucket_counts = 6;
+  repeated TelemetryAttribute attributes = 7;
+}
+
+enum TelemetryMetricKind {
+  TELEMETRY_METRIC_KIND_UNSPECIFIED = 0;
+  TELEMETRY_METRIC_KIND_COUNTER_DELTA = 1;
+  TELEMETRY_METRIC_KIND_HISTOGRAM_DELTA = 2;
+  TELEMETRY_METRIC_KIND_GAUGE = 3;
+}
+
+message AgentTelemetryRecord {
+  uint32 schema_version = 1;
+  string event_id = 2;
+  string agent_process_generation_id = 3;
+  uint64 source_sequence = 4;
+  int64 occurred_at_unix_nano = 5;
+  optional string task_run_id = 6;
+  optional string attempt_id = 7;
+  optional string command_id = 8;
+  optional W3CTraceContext trace_context = 9;
+  oneof signal {
+    TelemetryEventSignal event = 10;
+    TelemetrySpanSignal span = 11;
+    TelemetryMetricSignal metric = 12;
+  }
+  TelemetrySeverity severity = 13;
+  string event_name = 14;
+  bytes record_digest = 15;
+  optional uint64 control_generation = 16;
+  bool delayed_backfill = 17;
+  optional string diagnostic_session_id = 18;
+  optional uint64 source_monotonic_ns = 19;
+  optional string diagnostic_lease_instance_id = 20;
+}
+
+message AgentTelemetryBatch {
+  uint64 batch_sequence = 1;
+  repeated AgentTelemetryRecord records = 2;
+}
+
+message AgentLogChunk {
+  string request_id = 1;
+  uint32 chunk_sequence = 2;
+  bytes payload = 3;
+  bool eof = 4;
+  optional string error_code = 5;
+}
+
+message AgentTelemetryEvent {
+  oneof payload {
+    AgentTelemetryHello hello = 1;
+    AgentTelemetryBatch batch = 2;
+    AgentLogChunk log_chunk = 3;
+    DiagnosticLeaseReceipt diagnostic_lease_receipt = 4;
+  }
+}
+
+enum TelemetryDisposition {
+  TELEMETRY_DISPOSITION_UNSPECIFIED = 0;
+  TELEMETRY_DISPOSITION_ACCEPTED = 1;
+  TELEMETRY_DISPOSITION_DUPLICATE = 2;
+  TELEMETRY_DISPOSITION_PERMANENT_REJECT = 3;
+}
+
+enum TelemetryRejectCode {
+  TELEMETRY_REJECT_CODE_UNSPECIFIED = 0;
+  TELEMETRY_REJECT_CODE_SCHEMA_UNSUPPORTED = 1;
+  TELEMETRY_REJECT_CODE_RECORD_INVALID = 2;
+  TELEMETRY_REJECT_CODE_RECORD_TOO_LARGE = 3;
+  TELEMETRY_REJECT_CODE_IDENTITY_CONFLICT = 4;
+}
+
+message TelemetryRecordReceipt {
+  string agent_process_generation_id = 1;
+  uint64 source_sequence = 2;
+  string event_id = 3;
+  TelemetryDisposition disposition = 4;
+  TelemetryRejectCode reject_code = 5;
+  optional uint64 timeline_sequence = 6;
+}
+
+message TelemetryBatchReceipt {
+  uint64 batch_sequence = 1;
+  repeated TelemetryRecordReceipt records = 2;
+}
+
+enum DiagnosticDetailLevel {
+  DIAGNOSTIC_DETAIL_LEVEL_UNSPECIFIED = 0;
+  DIAGNOSTIC_DETAIL_LEVEL_DEBUG = 1;
+}
+
+enum DiagnosticTargetType {
+  DIAGNOSTIC_TARGET_TYPE_UNSPECIFIED = 0;
+  DIAGNOSTIC_TARGET_TYPE_TASK_RUN = 1;
+  DIAGNOSTIC_TARGET_TYPE_AGENT = 2;
+  DIAGNOSTIC_TARGET_TYPE_HUB_COMPONENT = 3;
+}
+
+message DiagnosticLease {
+  string diagnostic_session_id = 1;
+  int64 expires_at_unix_ms = 2;
+  DiagnosticDetailLevel detail_level = 3;
+  DiagnosticTargetType target_type = 4;
+  string target_id = 5;
+  string lease_instance_id = 6;
+  string agent_process_generation_id = 7;
+  uint64 control_generation = 8;
+}
+
+message RevokeDiagnosticLease {
+  string diagnostic_session_id = 1;
+  string lease_instance_id = 2;
+  DiagnosticTargetType target_type = 3;
+  string target_id = 4;
+  string agent_process_generation_id = 5;
+  uint64 control_generation = 6;
+}
+
+enum DiagnosticLeaseDisposition {
+  DIAGNOSTIC_LEASE_DISPOSITION_UNSPECIFIED = 0;
+  DIAGNOSTIC_LEASE_DISPOSITION_APPLIED = 1;
+  DIAGNOSTIC_LEASE_DISPOSITION_REVOKED = 2;
+  DIAGNOSTIC_LEASE_DISPOSITION_EXPIRED = 3;
+  DIAGNOSTIC_LEASE_DISPOSITION_REJECTED = 4;
+}
+
+message DiagnosticLeaseReceipt {
+  string diagnostic_session_id = 1;
+  string lease_instance_id = 2;
+  DiagnosticTargetType target_type = 3;
+  string target_id = 4;
+  string agent_process_generation_id = 5;
+  uint64 control_generation = 6;
+  DiagnosticLeaseDisposition disposition = 7;
+  uint64 source_sequence_boundary = 8;
+  uint64 source_monotonic_ns = 9;
+  uint64 expires_monotonic_ns = 10;
+  optional string error_code = 11;
+}
+
+message HubTelemetryHello {
+  uint32 accepted_schema_version = 1;
+  uint32 max_record_bytes = 2;
+  uint32 max_batch_records = 3;
+  uint32 max_batch_bytes = 4;
+  uint32 backfill_bytes_per_second = 5;
+  uint32 total_bytes_per_second = 6;
+}
+
+message AgentLogReadRequest {
+  string request_id = 1;
+  string diagnostic_session_id = 2;
+  uint64 max_total_bytes = 3;
+  DiagnosticTargetType target_type = 4;
+  string target_id = 5;
+}
+
+message CancelAgentLogRead {
+  string request_id = 1;
+}
+
+message HubTelemetryCommand {
+  oneof payload {
+    HubTelemetryHello hello = 1;
+    TelemetryBatchReceipt receipt = 2;
+    DiagnosticLease diagnostic_lease = 3;
+    AgentLogReadRequest log_read = 4;
+    CancelAgentLogRead cancel_log_read = 5;
+    RevokeDiagnosticLease revoke_diagnostic_lease = 6;
+  }
 }

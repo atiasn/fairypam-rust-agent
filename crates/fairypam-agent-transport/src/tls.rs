@@ -38,6 +38,11 @@ pub struct FrameChannel {
     pub(crate) agent_id: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct TelemetryChannel {
+    pub(crate) channel: Channel,
+}
+
 pub async fn connect_control(config: &TransportConfig) -> Result<ControlChannel, TransportError> {
     let channel = connect_channel(
         &config.control_endpoint,
@@ -62,6 +67,18 @@ pub async fn connect_frame(config: &TransportConfig) -> Result<FrameChannel, Tra
         channel,
         agent_id: config.agent_id.clone(),
     })
+}
+
+pub async fn connect_telemetry(
+    config: &TransportConfig,
+) -> Result<TelemetryChannel, TransportError> {
+    let channel = connect_channel(
+        &config.control_endpoint,
+        config,
+        "transport.telemetry_connect_failed",
+    )
+    .await?;
+    Ok(TelemetryChannel { channel })
 }
 
 async fn connect_channel(

@@ -115,6 +115,56 @@ impl FixedLog {
         Ok(log_tail_json(&records, lines, level))
     }
 
+    pub fn snapshot(&self, max_bytes: usize) -> Result<Vec<u8>, AgentError> {
+        let mut result = Vec::new();
+        for index in (0..MAX_LOG_FILES).rev() {
+            let path = self.path(index);
+            let file = if self.private {
+                #[cfg(windows)]
+                {
+                    match path.symlink_metadata() {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => return Err(log_root_unavailable()),
+                        Ok(_) => crate::enrollment::open_private_read(&path)
+                            .map_err(|_| log_root_unavailable())?,
+                    }
+                }
+                #[cfg(not(windows))]
+                unreachable!("private logs are Windows-only")
+            } else {
+                let Ok(file) = fs::File::open(&path) else {
+                    continue;
+                };
+                file
+            };
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
+                let redacted = serde_json::from_str::<Value>(&line)
+                    .ok()
+                    .and_then(|value| {
+                        Some(json!({
+                            "level": value.get("level")?.as_str()?,
+                            "message": redact_log_line(value.get("message")?.as_str()?),
+                        }))
+                    })
+                    .and_then(|value| serde_json::to_vec(&value).ok());
+                let Some(mut redacted) = redacted else {
+                    continue;
+                };
+                redacted.push(b'\n');
+                if result.len().saturating_add(redacted.len()) > max_bytes {
+                    return Ok(result);
+                }
+                result.extend(redacted);
+            }
+            if self.private {
+                #[cfg(windows)]
+                crate::enrollment::verify_private_file(&path)
+                    .map_err(|_| log_root_unavailable())?;
+            }
+        }
+        Ok(result)
+    }
+
     fn rotate_if_needed(&self, incoming: u64) -> Result<(), AgentError> {
         let current = self.path(0);
         let size = current
@@ -190,6 +240,8 @@ pub fn redact_log_line(line: &str) -> String {
         "client_key",
         "certificate",
         "api_key",
+        "api-key",
+        "apikey",
         "registration_code",
     ]
     .into_iter()
@@ -198,11 +250,19 @@ pub fn redact_log_line(line: &str) -> String {
         || lower.contains("-----begin ")
         || contains_jwt(line)
         || contains_absolute_path(line)
+        || contains_player_uid(line)
     {
         "[已隐藏敏感日志内容]".to_owned()
     } else {
         line.chars().take(512).collect()
     }
+}
+
+fn contains_player_uid(value: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(9)
+        .any(|window| window.iter().all(u8::is_ascii_digit))
 }
 
 pub fn log_tail_json(records: &[AgentLogRecord], lines: u16, level: &LogLevel) -> Value {
@@ -945,6 +1005,7 @@ mod tests {
             "jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.0123456789abcdef",
             pem_marker.as_str(),
             "registration_code=one-time-code",
+            "player uid 123456789",
         ] {
             assert_eq!(redact_log_line(secret), "[已隐藏敏感日志内容]");
         }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use fairypam_agent_protocol::v2::agent_control_service_client::AgentControlServiceClient;
 use fairypam_agent_protocol::v2::{
     command_identity, hub_control_command, AgentControlEvent, CommandIdentity, CommandRef,
@@ -198,7 +200,7 @@ pub(crate) fn verify_hub_hello(
         || hello.heartbeat_interval_ms == 0
         || hello.max_input_lease_ms == 0
         || hello.max_frame_bytes == 0
-        || hello.accepted_protocol_minor != 6
+        || hello.accepted_protocol_minor != 7
     {
         return Err(TransportError::new(
             "transport.session_invalid",
@@ -217,7 +219,7 @@ pub(crate) fn verify_hub_hello(
 
 pub(crate) fn verify_control_command(
     session: &VerifiedSession,
-    command: HubControlCommand,
+    mut command: HubControlCommand,
 ) -> Result<VerifiedControlCommand, TransportError> {
     if matches!(
         command.payload.as_ref(),
@@ -251,6 +253,14 @@ pub(crate) fn verify_control_command(
             "Control command does not match the verified session generation",
         ));
     }
+    if command_ref(&command)
+        .and_then(|reference| reference.trace_context.as_ref())
+        .is_some_and(|context| !valid_trace_context(context))
+    {
+        if let Some(reference) = command_ref_mut(&mut command) {
+            reference.trace_context = None;
+        }
+    }
     Ok(VerifiedControlCommand(command))
 }
 
@@ -276,6 +286,115 @@ fn command_ref(command: &HubControlCommand) -> Option<&CommandRef> {
         Payload::InspectAttempt(value) => task_ref(value.reference.as_ref()),
         Payload::StopSession(value) => session_ref(value.reference.as_ref()),
     }
+}
+
+fn command_ref_mut(command: &mut HubControlCommand) -> Option<&mut CommandRef> {
+    use hub_control_command::Payload;
+    let identity = match command.payload.as_mut()? {
+        Payload::Hello(_) => return None,
+        Payload::LaunchTarget(value) => value.reference.as_mut(),
+        Payload::CloseTarget(value) => value.reference.as_mut(),
+        Payload::ConfigureIdleClose(value) => value.reference.as_mut(),
+        Payload::AcknowledgeManagedGameClose(_) | Payload::ProfileCatalog(_) => return None,
+        Payload::BeginAttempt(value) => value.reference.as_mut(),
+        Payload::StartAttemptTarget(value) => value.reference.as_mut(),
+        Payload::StartCapture(value) => value.reference.as_mut(),
+        Payload::CaptureFrame(value) => value.reference.as_mut(),
+        Payload::StopCapture(value) => value.reference.as_mut(),
+        Payload::StartMusicAutoplay(value) => value.reference.as_mut(),
+        Payload::StopMusicAutoplay(value) => value.reference.as_mut(),
+        Payload::InputFrame(value) => value.reference.as_mut(),
+        Payload::ClientPointClick(value) => value.reference.as_mut(),
+        Payload::ReleaseAll(value) => value.reference.as_mut(),
+        Payload::FinishAttempt(value) => value.reference.as_mut(),
+        Payload::InspectAttempt(value) => value.reference.as_mut(),
+        Payload::StopSession(value) => value.reference.as_mut(),
+    }?;
+    match identity.value.as_mut()? {
+        fairypam_agent_protocol::v2::command_identity::Value::Command(reference) => Some(reference),
+        fairypam_agent_protocol::v2::command_identity::Value::Task(task) => task.command.as_mut(),
+    }
+}
+
+fn valid_trace_context(context: &fairypam_agent_protocol::v2::W3cTraceContext) -> bool {
+    let parts = context.traceparent.split('-').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts[0] == "00"
+        && parts[1].len() == 32
+        && parts[2].len() == 16
+        && parts[3].len() == 2
+        && parts[1] != "00000000000000000000000000000000"
+        && parts[2] != "0000000000000000"
+        && parts[1..].iter().all(|part| {
+            part.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        && context
+            .tracestate
+            .as_ref()
+            .is_none_or(|value| valid_tracestate(value))
+}
+
+fn valid_tracestate(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 512
+        || matches!(bytes.first(), Some(b' ' | b'\t'))
+        || matches!(bytes.last(), Some(b' ' | b'\t'))
+    {
+        return false;
+    }
+    let members = value.split(',').collect::<Vec<_>>();
+    if members.len() > 32 {
+        return false;
+    }
+    let mut keys = HashSet::with_capacity(members.len());
+    members.into_iter().all(|raw_member| {
+        let member = raw_member.trim_matches([' ', '\t']);
+        let Some((key, member_value)) = member.split_once('=') else {
+            return false;
+        };
+        !member_value.contains('=')
+            && keys.insert(key)
+            && valid_tracestate_key(key)
+            && valid_tracestate_value(member_value)
+    })
+}
+
+fn valid_tracestate_key(value: &str) -> bool {
+    let allowed = |byte: &u8| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'_' | b'-' | b'*' | b'/')
+    };
+    match value.split_once('@') {
+        None => {
+            let bytes = value.as_bytes();
+            (1..=256).contains(&bytes.len())
+                && bytes[0].is_ascii_lowercase()
+                && bytes.iter().all(allowed)
+        }
+        Some((tenant, system)) if !system.contains('@') => {
+            let tenant = tenant.as_bytes();
+            let system = system.as_bytes();
+            (1..=241).contains(&tenant.len())
+                && (tenant[0].is_ascii_lowercase() || tenant[0].is_ascii_digit())
+                && tenant.iter().all(allowed)
+                && (1..=14).contains(&system.len())
+                && system[0].is_ascii_lowercase()
+                && system.iter().all(allowed)
+        }
+        Some(_) => false,
+    }
+}
+
+fn valid_tracestate_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=256).contains(&bytes.len())
+        && bytes.last() != Some(&b' ')
+        && bytes
+            .iter()
+            .all(|byte| (0x20..=0x7e).contains(byte) && !matches!(byte, b',' | b'='))
 }
 
 fn session_ref(identity: Option<&CommandIdentity>) -> Option<&CommandRef> {
@@ -350,6 +469,7 @@ mod v2_tests {
     use fairypam_agent_protocol::v2::{
         command_identity, hub_control_command, AcknowledgeManagedGameClose, CommandIdentity,
         CommandRef, HubControlCommand, HubHello, InputFrame, SessionRef, TaskCommandRef,
+        W3cTraceContext,
     };
 
     use super::*;
@@ -365,7 +485,7 @@ mod v2_tests {
                 heartbeat_interval_ms: 1_000,
                 max_input_lease_ms: 500,
                 max_frame_bytes: 1_024,
-                accepted_protocol_minor: 6,
+                accepted_protocol_minor: 7,
             },
             "agent-a",
         )
@@ -382,6 +502,7 @@ mod v2_tests {
             command_id: "cmd-1".into(),
             sequence,
             expires_at_unix_ms: i64::MAX,
+            trace_context: None,
         }
     }
 
@@ -403,6 +524,32 @@ mod v2_tests {
             verify_hub_hello(hello, "agent-a").unwrap_err().code(),
             "transport.session_invalid"
         );
+    }
+
+    #[test]
+    fn trace_context_rejects_malformed_or_duplicate_tracestate_members() {
+        let context = |tracestate: &str| W3cTraceContext {
+            traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".into(),
+            tracestate: Some(tracestate.into()),
+        };
+        assert!(valid_trace_context(&context(
+            "vendor=value,tenant@system=one two"
+        )));
+        for invalid in [
+            "",
+            "Vendor=value",
+            "a=",
+            "a=value=other",
+            "a=value,,b=two",
+            "a=value,a=other",
+            "a=value,",
+            "a=value ",
+        ] {
+            assert!(
+                !valid_trace_context(&context(invalid)),
+                "accepted {invalid:?}"
+            );
+        }
     }
 
     #[test]

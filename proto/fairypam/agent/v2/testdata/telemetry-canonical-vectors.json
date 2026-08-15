@@ -1,0 +1,7 @@
+[
+  {
+    "name": "event-unicode-negative-zero",
+    "canonical_json": "{\"agent_process_generation_id\":\"22222222-2222-4222-8222-222222222222\",\"delayed_backfill\":true,\"event\":{\"attributes\":[{\"double_value\":\"0000000000000000\",\"key\":\"a\"},{\"bool_value\":true,\"key\":\"ok\"},{\"int_value\":-2,\"key\":\"z\"}],\"error_code\":\"command.failed\",\"message\":\"quote\\\" slash/ line\\n中文 😀\"},\"event_id\":\"33333333-3333-4333-8333-333333333333\",\"event_name\":\"agent.command.completed\",\"occurred_at_unix_nano\":1700000000123456789,\"schema_version\":1,\"severity\":3,\"source_sequence\":7,\"task_run_id\":\"55555555-5555-4555-8555-555555555555\",\"trace_context\":{\"traceparent\":\"00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\",\"tracestate\":\"vendor=value\"}}",
+    "sha256": "82f02c775eb0aeea4ac27b34281e1c7816072b49a9d4cdd62541db933eab2b68"
+  }
+]

@@ -1146,6 +1146,14 @@ pub enum CommandOutcome {
 }
 
 impl CommandOutcome {
+    pub fn telemetry_error_code(&self) -> Option<&str> {
+        match self {
+            Self::CloseNack { code, .. } | Self::Nack { code, .. } => Some(code),
+            Self::TaskAck { receipt, .. } => receipt.error_code.as_deref(),
+            Self::Ack(_) | Self::CloseAck(_) => None,
+        }
+    }
+
     fn from_error(error: AgentError) -> Self {
         Self::Nack {
             code: error.code().to_owned(),

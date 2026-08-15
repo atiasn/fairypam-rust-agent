@@ -6,6 +6,7 @@ use fairypam_agent_protocol::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{execution::CommandOutcome, profile_store::ProfileStore};
 
@@ -123,6 +124,7 @@ pub fn hello(
     agent_id: String,
     agent_version: String,
     build_commit: String,
+    agent_process_generation_id: String,
     profiles: &ProfileStore,
     active_catalog: Option<(u64, &str)>,
 ) -> wire::AgentControlEvent {
@@ -132,7 +134,7 @@ pub fn hello(
                 agent_id,
                 agent_version,
                 protocol_major: 2,
-                protocol_minor: 6,
+                protocol_minor: 7,
                 build_commit,
                 suite_build_id: option_env!("FAIRYPAM_BUILD_ID")
                     .unwrap_or("unknown")
@@ -147,6 +149,7 @@ pub fn hello(
                     .collect(),
                 active_profile_catalog_version: active_catalog.map(|catalog| catalog.0),
                 active_profile_catalog_digest: active_catalog.map(|catalog| catalog.1.to_owned()),
+                agent_process_generation_id,
             },
         )),
     }
@@ -209,7 +212,7 @@ pub fn discovery_snapshot(
         payload: Some(wire::agent_control_event::Payload::DiscoverySnapshot(
             wire::DiscoverySnapshot {
                 session: Some(session),
-                scan_id: discovery_uuid(),
+                scan_id: new_uuid(),
                 observed_at_unix_ms: now_unix_ms(),
                 payload_digest,
                 games,
@@ -260,8 +263,15 @@ fn discovered_games(_profiles: &ProfileStore) -> Result<Vec<wire::DiscoveredGame
     Ok(Vec::new())
 }
 
-fn discovery_uuid() -> String {
-    let seed = format!("{}:{}", now_unix_ms(), std::process::id());
+static UUID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub fn new_uuid() -> String {
+    let seed = format!(
+        "{}:{}:{}",
+        now_unix_ms(),
+        std::process::id(),
+        UUID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
     let mut bytes: [u8; 16] = Sha256::digest(seed.as_bytes())[..16]
         .try_into()
         .expect("fixed digest slice");
@@ -272,6 +282,10 @@ fn discovery_uuid() -> String {
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
     )
+}
+
+pub fn process_generation_id() -> String {
+    new_uuid()
 }
 
 pub fn identity(command: &wire::HubControlCommand) -> Option<wire::CommandIdentity> {
@@ -295,6 +309,32 @@ pub fn identity(command: &wire::HubControlCommand) -> Option<wire::CommandIdenti
         Payload::FinishAttempt(value) => value.reference.clone(),
         Payload::InspectAttempt(value) => value.reference.clone(),
         Payload::StopSession(value) => value.reference.clone(),
+    }
+}
+
+pub fn command_name(command: &wire::HubControlCommand) -> &'static str {
+    use hub_control_command::Payload;
+    match command.payload.as_ref() {
+        Some(Payload::LaunchTarget(_)) => "launch_target",
+        Some(Payload::CloseTarget(_)) => "close_target",
+        Some(Payload::ConfigureIdleClose(_)) => "configure_idle_close",
+        Some(Payload::BeginAttempt(_)) => "begin_attempt",
+        Some(Payload::StartAttemptTarget(_)) => "start_attempt_target",
+        Some(Payload::StartCapture(_)) => "start_capture",
+        Some(Payload::CaptureFrame(_)) => "capture_frame",
+        Some(Payload::StopCapture(_)) => "stop_capture",
+        Some(Payload::StartMusicAutoplay(_)) => "start_music_autoplay",
+        Some(Payload::StopMusicAutoplay(_)) => "stop_music_autoplay",
+        Some(Payload::InputFrame(_)) => "input_frame",
+        Some(Payload::ClientPointClick(_)) => "client_point_click",
+        Some(Payload::ReleaseAll(_)) => "release_all",
+        Some(Payload::FinishAttempt(_)) => "finish_attempt",
+        Some(Payload::InspectAttempt(_)) => "inspect_attempt",
+        Some(Payload::StopSession(_)) => "stop_session",
+        Some(Payload::Hello(_)) => "hello",
+        Some(Payload::AcknowledgeManagedGameClose(_)) => "acknowledge_managed_game_close",
+        Some(Payload::ProfileCatalog(_)) => "profile_catalog",
+        None => "unknown",
     }
 }
 
@@ -889,6 +929,7 @@ fn map_receipt(
         command_id: receipt.last_command_id.clone(),
         sequence: receipt.last_command_sequence,
         expires_at_unix_ms: command.expires_at_unix_ms,
+        trace_context: command.trace_context.clone(),
     });
     let last_command = wire::TaskCommandRef {
         command,
@@ -982,6 +1023,7 @@ mod tests {
                 command_id: "close-1".into(),
                 sequence: 1,
                 expires_at_unix_ms: 1_700_000_000_000,
+                trace_context: None,
             })),
         };
         let receipt = wire::ManagedGameCloseReceipt {
@@ -1029,6 +1071,7 @@ mod tests {
                     command_id: format!("command-{sequence}"),
                     sequence,
                     expires_at_unix_ms: contract.deadline_unix_ms,
+                    trace_context: None,
                 }),
                 attempt: Some(wire::AttemptRef {
                     task_run_id: contract.task_run_id.clone(),
