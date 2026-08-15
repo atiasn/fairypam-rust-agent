@@ -205,23 +205,6 @@ fn active_suite(
 fn provision(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
     verify_bootstrap_install_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
-    let enrollment_root = std::path::Path::new(ENROLLMENT_ROOT);
-    match enrollment_root.symlink_metadata() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(ProvisionFailure::Enrollment),
-        Ok(_) => {
-            verify_private_directory(enrollment_root).map_err(|_| ProvisionFailure::Enrollment)?;
-            if std::fs::read_dir(enrollment_root)
-                .map_err(|_| ProvisionFailure::Enrollment)?
-                .next()
-                .transpose()
-                .map_err(|_| ProvisionFailure::Enrollment)?
-                .is_some()
-            {
-                return Err(ProvisionFailure::Enrollment);
-            }
-        }
-    }
     let activation = InstallActivation::from_flat_payload(install_root)?;
     let result = (|| {
         verify_nonreparse_directory(std::path::Path::new(PROGRAM_DATA))

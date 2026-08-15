@@ -505,6 +505,19 @@ fn embedded_product_removes_the_repair_helper_and_sibling_core() {
 }
 
 #[test]
+fn installer_repair_preserves_registered_agent_state() {
+    let provision = source_between(
+        INSTALLER_PROVISIONER,
+        "fn provision(install_root: &std::path::Path)",
+        "struct InstallActivation",
+    );
+    assert!(!provision.contains("std::fs::read_dir(enrollment_root)"));
+    assert!(!provision.contains("let enrollment_root ="));
+    assert!(provision.contains("(ENROLLMENT_ROOT, ProvisionFailure::Enrollment)"));
+    assert!(provision.contains("(PROFILE_CATALOG_ROOT, ProvisionFailure::ProfileCatalog)"));
+}
+
+#[test]
 fn embedded_gateway_has_no_pipe_or_sibling_core() {
     let commands = include_str!("../src/commands.rs");
     assert!(GATEWAY.contains("REGISTRATION_TIMEOUT: Duration = Duration::from_secs(20)"));
