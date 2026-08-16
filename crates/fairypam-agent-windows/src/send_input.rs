@@ -23,6 +23,7 @@ use crate::{LockedInputTarget, NativeWindows, WindowsTargetPlatform};
 pub(crate) const SEND_INPUT_MARKER: usize = 0x4650_414D;
 const MAX_WHEEL_EVENT_DELTA: i32 = 1_200;
 const WHEEL_EVENT_INTERVAL: Duration = Duration::from_millis(40);
+const CLIENT_POINT_CLICK_HOLD: Duration = Duration::from_millis(50);
 
 pub(crate) fn send_foreground_activation_probe() -> u32 {
     let input = INPUT {
@@ -416,6 +417,16 @@ fn dispatch_wheel_deltas(
         }
     }
     Ok(())
+}
+
+fn dispatch_client_point_click(
+    inputs: &[INPUT; 3],
+    mut send: impl FnMut(&[INPUT]) -> Result<(), SafetyError>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), SafetyError> {
+    send(&inputs[..2])?;
+    sleep(CLIENT_POINT_CLICK_HOLD);
+    send(&inputs[2..])
 }
 
 fn require_current_wheel_lease(expires_at: Instant, now: Instant) -> Result<(), SafetyError> {
@@ -819,7 +830,8 @@ impl InputPlatform for SendInputPlatform {
         y_ppm: u32,
     ) -> Result<(), SafetyError> {
         let (x, y) = self.client_screen_point(x_ppm, y_ppm);
-        self.send(&Self::screen_point_click_inputs(button, x, y))
+        let inputs = Self::screen_point_click_inputs(button, x, y);
+        dispatch_client_point_click(&inputs, |batch| self.send(batch), std::thread::sleep)
     }
 }
 
@@ -996,6 +1008,26 @@ mod tests {
         assert_eq!(deltas, vec![-1_200; 33]);
         assert_eq!(sent, deltas);
         assert_eq!(intervals, vec![Duration::from_millis(40); 32]);
+    }
+
+    #[test]
+    fn client_point_click_holds_button_between_native_batches() {
+        let inputs = [INPUT::default(), INPUT::default(), INPUT::default()];
+        let mut batch_sizes = Vec::new();
+        let mut intervals = Vec::new();
+
+        dispatch_client_point_click(
+            &inputs,
+            |batch| {
+                batch_sizes.push(batch.len());
+                Ok(())
+            },
+            |interval| intervals.push(interval),
+        )
+        .unwrap();
+
+        assert_eq!(batch_sizes, vec![2, 1]);
+        assert_eq!(intervals, vec![Duration::from_millis(50)]);
     }
 
     #[test]
