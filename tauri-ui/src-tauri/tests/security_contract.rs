@@ -4,6 +4,25 @@ const TAURI_CONFIG: &str = include_str!("../tauri.conf.json");
 const APP: &str = include_str!("../src/app.rs");
 const ENROLLMENT: &str = include_str!("../../../bins/fairypam-agent/src/enrollment.rs");
 const INSTALLER: &str = include_str!("../../../bins/fairypam-agent-installer/src/main.rs");
+const AGENT_WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
+
+#[test]
+fn product_version_matches_agent_suite() {
+    let config: serde_json::Value = serde_json::from_str(TAURI_CONFIG).unwrap();
+    let product_version = config["version"].as_str().unwrap();
+    let workspace_version = AGENT_WORKSPACE_MANIFEST
+        .split_once("[workspace.package]")
+        .unwrap()
+        .1
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("version = \"")
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap();
+
+    assert_eq!(product_version, workspace_version);
+}
 
 #[test]
 fn production_configuration_is_elevated_and_least_privilege() {

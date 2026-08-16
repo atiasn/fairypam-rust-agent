@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use fairypam_agent_guardian::monitor::{GuardianMonitor, ReleaseDriver};
 use fairypam_agent_guardian_protocol::ReleaseReason;
-use fairypam_agent_guardian_protocol::{ActionId, PhysicalHold};
+use fairypam_agent_guardian_protocol::{ActionId, MouseButton, PhysicalHold};
 
 #[derive(Default)]
 struct FakeRelease {
@@ -91,6 +91,53 @@ fn guardian_releases_when_agent_pid_exits() {
         monitor.last_release_reason(),
         Some(ReleaseReason::AgentExited)
     );
+}
+
+#[test]
+fn guardian_releases_transient_mouse_hold_when_agent_exits() {
+    let now = Instant::now();
+    let mut monitor = GuardianMonitor::new(FakeRelease::default());
+    monitor
+        .register_agent(42, 1, Duration::from_millis(300), now)
+        .unwrap();
+    let mouse_hold = PhysicalHold::MouseButton {
+        action_id: ActionId::new("ui.click").unwrap(),
+        button: MouseButton::Left,
+    };
+    monitor
+        .register_intent(1, vec![mouse_hold.clone()])
+        .unwrap();
+    monitor.commit_holds(1).unwrap();
+
+    monitor.tick(now + Duration::from_millis(1), false).unwrap();
+
+    assert_eq!(monitor.release_driver().released, vec![mouse_hold]);
+    assert_eq!(
+        monitor.last_release_reason(),
+        Some(ReleaseReason::AgentExited)
+    );
+}
+
+#[test]
+fn empty_hold_commit_clears_transient_mouse_without_native_release() {
+    let now = Instant::now();
+    let mut monitor = GuardianMonitor::new(FakeRelease::default());
+    monitor
+        .register_agent(42, 1, Duration::from_millis(300), now)
+        .unwrap();
+    let mouse_hold = PhysicalHold::MouseButton {
+        action_id: ActionId::new("ui.click").unwrap(),
+        button: MouseButton::Left,
+    };
+    monitor.register_intent(1, vec![mouse_hold]).unwrap();
+    monitor.commit_holds(1).unwrap();
+
+    monitor.register_intent(2, Vec::new()).unwrap();
+    monitor.commit_holds(2).unwrap();
+
+    assert!(monitor.committed_holds().is_empty());
+    assert_eq!(monitor.release_driver().calls, 0);
+    assert_eq!(monitor.last_release_reason(), None);
 }
 
 #[test]

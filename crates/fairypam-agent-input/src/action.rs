@@ -397,6 +397,7 @@ pub trait InputPlatform: Send {
         _button: SemanticMouseButton,
         _x_ppm: u32,
         _y_ppm: u32,
+        _expires_at: Instant,
     ) -> Result<(), SafetyError> {
         Err(SafetyError::new(
             "input.platform_unsupported",

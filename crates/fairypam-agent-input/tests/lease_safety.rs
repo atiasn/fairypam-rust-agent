@@ -5,13 +5,14 @@ use std::time::{Duration, Instant};
 use fairypam_agent_core::platform::{AuthorizationState, LocalAuthorization};
 use fairypam_agent_core::profile::{
     profile_content_sha256, verify_profile, ActionDefinition, CaptureRegion, CaptureSource,
-    Profile, ProfileContent, ProfileEnvelope, SignatureVerifier, TargetRules, VerifiedProfile,
+    ClientPointButton, Profile, ProfileContent, ProfileEnvelope, SignatureVerifier, TargetRules,
+    VerifiedProfile,
 };
 use fairypam_agent_core::state::Machine;
 use fairypam_agent_core::target::{ClientRect, IntegrityLevel, TargetBinding, TargetSnapshot};
 use fairypam_agent_input::{
     ActionId, GuardianClient, InputLease, InputPermit, InputPlatform, LeaseExecutor, ReleaseReason,
-    SafetyError, SessionKey,
+    SafetyError, SemanticMouseButton, SessionKey, CLIENT_POINT_CLICK_HOLD,
 };
 
 #[derive(Default)]
@@ -21,8 +22,11 @@ struct FakeInput {
     events: Option<Arc<Mutex<Vec<&'static str>>>>,
     fail_pulse: bool,
     fail_wheel_lease: bool,
+    fail_client_click: bool,
     emergency_releases: Vec<Vec<u16>>,
+    emergency_release_calls: usize,
     wheel_events: Vec<(Option<(u32, u32)>, i32)>,
+    client_clicks: Vec<(SemanticMouseButton, u32, u32)>,
 }
 
 impl InputPlatform for FakeInput {
@@ -67,6 +71,7 @@ impl InputPlatform for FakeInput {
     }
 
     fn emergency_release(&mut self, scan_codes: &[u16]) -> Result<(), SafetyError> {
+        self.emergency_release_calls += 1;
         self.emergency_releases.push(scan_codes.to_vec());
         for scan_code in scan_codes {
             self.pressed.remove(scan_code);
@@ -102,11 +107,31 @@ impl InputPlatform for FakeInput {
         self.wheel_events.push((Some((x_ppm, y_ppm)), delta));
         Ok(())
     }
+
+    fn client_point_click(
+        &mut self,
+        button: SemanticMouseButton,
+        x_ppm: u32,
+        y_ppm: u32,
+        _expires_at: Instant,
+    ) -> Result<(), SafetyError> {
+        if let Some(events) = &self.events {
+            events.lock().unwrap().push("local_click");
+        }
+        if self.fail_client_click {
+            return Err(SafetyError::new("input.send_failed", "button up failed"));
+        }
+        self.client_clicks.push((button, x_ppm, y_ppm));
+        Ok(())
+    }
 }
 
 #[derive(Default)]
 struct FakeGuardian {
     calls: Vec<&'static str>,
+    sequences: Vec<u64>,
+    registered_holds: Vec<BTreeSet<ActionId>>,
+    committed_holds: Vec<BTreeSet<ActionId>>,
     releases: Vec<ReleaseReason>,
     events: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
@@ -114,10 +139,12 @@ struct FakeGuardian {
 impl GuardianClient for FakeGuardian {
     fn register_intent(
         &mut self,
-        _sequence: u64,
-        _holds: &BTreeSet<ActionId>,
+        sequence: u64,
+        holds: &BTreeSet<ActionId>,
     ) -> Result<(), SafetyError> {
         self.calls.push("register_intent");
+        self.sequences.push(sequence);
+        self.registered_holds.push(holds.clone());
         if let Some(events) = &self.events {
             events.lock().unwrap().push("register_intent");
         }
@@ -126,10 +153,12 @@ impl GuardianClient for FakeGuardian {
 
     fn commit_holds(
         &mut self,
-        _sequence: u64,
-        _holds: &BTreeSet<ActionId>,
+        sequence: u64,
+        holds: &BTreeSet<ActionId>,
     ) -> Result<(), SafetyError> {
         self.calls.push("commit_holds");
+        self.sequences.push(sequence);
+        self.committed_holds.push(holds.clone());
         if let Some(events) = &self.events {
             events.lock().unwrap().push("commit_holds");
         }
@@ -147,6 +176,9 @@ impl GuardianClient for FakeGuardian {
     fn release_all(&mut self, reason: ReleaseReason) -> Result<(), SafetyError> {
         self.calls.push("release_all");
         self.releases.push(reason);
+        if let Some(events) = &self.events {
+            events.lock().unwrap().push("release_all");
+        }
         Ok(())
     }
 }
@@ -669,6 +701,168 @@ fn failed_pulse_fails_closed_and_releases_all_profile_inputs() {
     assert_eq!(executor.platform().emergency_releases, vec![vec![17, 30]]);
     assert_eq!(
         executor.guardian().releases,
+        vec![ReleaseReason::PlatformFailure]
+    );
+}
+
+#[test]
+fn client_point_click_commits_transient_guardian_hold_before_local_input() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut executor = LeaseExecutor::new(
+        &verified_profile_with_actions(BTreeMap::from([(
+            "ui.click".into(),
+            ActionDefinition::ClientPointClick {
+                button: ClientPointButton::Left,
+            },
+        )])),
+        FakeInput {
+            events: Some(Arc::clone(&events)),
+            ..FakeInput::default()
+        },
+        FakeGuardian {
+            events: Some(Arc::clone(&events)),
+            ..FakeGuardian::default()
+        },
+    )
+    .unwrap();
+    executor
+        .apply_lease(
+            InputLease {
+                session: session(1),
+                sequence: 1,
+                expires_at: now + Duration::from_secs(1),
+                desired_holds: BTreeSet::new(),
+            },
+            &authority.permit(now),
+            now,
+        )
+        .unwrap();
+    events.lock().unwrap().clear();
+
+    executor
+        .execute_client_point(
+            SemanticMouseButton::Left,
+            500_000,
+            600_000,
+            &session(1),
+            &authority.permit(now),
+            now,
+        )
+        .unwrap();
+
+    let click_action = ActionId::new("ui.click").unwrap();
+    assert_eq!(executor.guardian().sequences, vec![1, 1, 2, 2, 3, 3]);
+    assert_eq!(
+        executor.guardian().registered_holds,
+        vec![
+            BTreeSet::new(),
+            BTreeSet::from([click_action.clone()]),
+            BTreeSet::new(),
+        ]
+    );
+    assert_eq!(
+        executor.guardian().committed_holds,
+        vec![
+            BTreeSet::new(),
+            BTreeSet::from([click_action]),
+            BTreeSet::new(),
+        ]
+    );
+    assert!(executor.guardian().releases.is_empty());
+    assert_eq!(
+        executor.platform().client_clicks,
+        vec![(SemanticMouseButton::Left, 500_000, 600_000)]
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "register_intent",
+            "commit_holds",
+            "local_click",
+            "register_intent",
+            "commit_holds",
+        ]
+    );
+}
+
+#[test]
+fn client_point_click_fails_closed_before_short_lease_or_after_native_failure() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let profile = verified_profile_with_actions(BTreeMap::from([(
+        "ui.click".into(),
+        ActionDefinition::ClientPointClick {
+            button: ClientPointButton::Left,
+        },
+    )]));
+    let mut short =
+        LeaseExecutor::new(&profile, FakeInput::default(), FakeGuardian::default()).unwrap();
+    short
+        .apply_lease(
+            InputLease {
+                session: session(1),
+                sequence: 1,
+                expires_at: now + CLIENT_POINT_CLICK_HOLD - Duration::from_millis(1),
+                desired_holds: BTreeSet::new(),
+            },
+            &authority.permit(now),
+            now,
+        )
+        .unwrap();
+
+    let error = short
+        .execute_client_point(
+            SemanticMouseButton::Left,
+            1,
+            1,
+            &session(1),
+            &authority.permit(now),
+            now,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "input.lease_expired");
+    assert!(short.platform().client_clicks.is_empty());
+    assert_eq!(short.platform().emergency_release_calls, 1);
+    assert_eq!(short.guardian().releases, vec![ReleaseReason::LeaseExpired]);
+
+    let mut failed = LeaseExecutor::new(
+        &profile,
+        FakeInput {
+            fail_client_click: true,
+            ..FakeInput::default()
+        },
+        FakeGuardian::default(),
+    )
+    .unwrap();
+    failed
+        .apply_lease(
+            InputLease {
+                session: session(1),
+                sequence: 1,
+                expires_at: now + Duration::from_secs(1),
+                desired_holds: BTreeSet::new(),
+            },
+            &authority.permit(now),
+            now,
+        )
+        .unwrap();
+
+    let error = failed
+        .execute_client_point(
+            SemanticMouseButton::Left,
+            1,
+            1,
+            &session(1),
+            &authority.permit(now),
+            now,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "input.send_failed");
+    assert_eq!(failed.platform().emergency_release_calls, 1);
+    assert_eq!(
+        failed.guardian().releases,
         vec![ReleaseReason::PlatformFailure]
     );
 }

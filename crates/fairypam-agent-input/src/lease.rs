@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fairypam_agent_core::profile::VerifiedProfile;
 use fairypam_agent_core::state::InputCapability;
@@ -9,6 +9,8 @@ use thiserror::Error;
 use crate::{
     ActionId, ActionMap, InputPlatform, ReleaseReason, ResolvedAction, SemanticMouseButton,
 };
+
+pub const CLIENT_POINT_CLICK_HOLD: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug)]
 pub struct InputLease {
@@ -97,6 +99,7 @@ pub struct LeaseExecutor<P, G> {
     guardian: G,
     active_session: Option<SessionKey>,
     sequence: u64,
+    guardian_sequence: u64,
     expires_at: Option<Instant>,
     held_actions: BTreeSet<ActionId>,
     guarded_actions: BTreeSet<ActionId>,
@@ -120,6 +123,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
             guardian,
             active_session: None,
             sequence: 0,
+            guardian_sequence: 0,
             expires_at: None,
             held_actions: BTreeSet::new(),
             guarded_actions: BTreeSet::new(),
@@ -290,10 +294,14 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
             ));
         }
         self.platform.validate_before_input()?;
-        self.guardian.register_intent(sequence, &guarded_actions)?;
-        self.guardian.commit_holds(sequence, &guarded_actions)?;
+        let guardian_sequence = self.next_guardian_sequence()?;
+        self.guardian
+            .register_intent(guardian_sequence, &guarded_actions)?;
+        self.guardian
+            .commit_holds(guardian_sequence, &guarded_actions)?;
         self.active_session = Some(session);
         self.sequence = sequence;
+        self.guardian_sequence = guardian_sequence;
         self.expires_at = Some(expires_at);
         self.held_actions.clear();
         self.guarded_actions = guarded_actions;
@@ -317,7 +325,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
                     "guarded input renewal must advance its sequence and lease",
                 ));
             }
-            self.guardian.heartbeat(sequence)?;
+            self.guardian.heartbeat(self.guardian_sequence)?;
             self.sequence = sequence;
             self.expires_at = Some(expires_at);
             Ok(())
@@ -405,8 +413,9 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
             self.hold_action(action)?;
         }
         self.platform.validate_before_input()?;
+        let guardian_sequence = self.next_guardian_sequence()?;
         self.guardian
-            .register_intent(lease.sequence, &lease.desired_holds)?;
+            .register_intent(guardian_sequence, &lease.desired_holds)?;
 
         let previous = self.held_actions.clone();
         self.held_actions.extend(lease.desired_holds.clone());
@@ -414,9 +423,10 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
         self.held_actions = lease.desired_holds.clone();
         self.guarded_actions.clear();
         self.guardian
-            .commit_holds(lease.sequence, &lease.desired_holds)?;
+            .commit_holds(guardian_sequence, &lease.desired_holds)?;
         self.active_session = Some(lease.session);
         self.sequence = lease.sequence;
+        self.guardian_sequence = guardian_sequence;
         self.expires_at = Some(lease.expires_at);
         self.input_gate_open = true;
         Ok(())
@@ -483,7 +493,7 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
             return self.release_all(ReleaseReason::LeaseExpired);
         }
         if self.input_gate_open {
-            if let Err(error) = self.guardian.heartbeat(self.sequence) {
+            if let Err(error) = self.guardian.heartbeat(self.guardian_sequence) {
                 let _ = self.release_all(ReleaseReason::GuardianFailure);
                 return Err(error);
             }
@@ -596,7 +606,16 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
     ) -> Result<(), SafetyError> {
         let action = self.actions.action_for_button(button)?;
         let result = self.execute_client_point_inner(&action, x_ppm, y_ppm, session, permit, now);
-        result.map_err(|error| self.fail_closed(ReleaseReason::PlatformFailure, error))
+        result.map_err(|error| {
+            let reason = if error.code() == "input.lease_expired" {
+                ReleaseReason::LeaseExpired
+            } else if error.code().starts_with("guardian.") {
+                ReleaseReason::GuardianFailure
+            } else {
+                ReleaseReason::PlatformFailure
+            };
+            self.fail_closed(reason, error)
+        })
     }
 
     fn execute_client_point_inner(
@@ -609,21 +628,57 @@ impl<P: InputPlatform, G: GuardianClient> LeaseExecutor<P, G> {
         now: Instant,
     ) -> Result<(), SafetyError> {
         self.require_open_gate(session, permit, now)?;
+        let expires_at = self.expires_at.ok_or_else(|| {
+            SafetyError::new("input.gate_closed", "input gate has no active lease")
+        })?;
+        if expires_at.saturating_duration_since(now) < CLIENT_POINT_CLICK_HOLD {
+            return Err(SafetyError::new(
+                "input.lease_expired",
+                "client point click requires a lease covering the local button hold",
+            ));
+        }
         if x_ppm > 1_000_000 || y_ppm > 1_000_000 {
             return Err(SafetyError::new(
                 "input.client_point_invalid",
                 "client point must be normalized to the target client area",
             ));
         }
-        match self.actions.resolve(action)? {
-            ResolvedAction::ClientPointClick { button } => {
-                self.platform.client_point_click(*button, x_ppm, y_ppm)
+        let button = match self.actions.resolve(action)? {
+            ResolvedAction::ClientPointClick { button } => *button,
+            _ => {
+                return Err(SafetyError::new(
+                    "input.action_kind_invalid",
+                    "action is not a client point click",
+                ));
             }
-            _ => Err(SafetyError::new(
-                "input.action_kind_invalid",
-                "action is not a client point click",
-            )),
-        }
+        };
+        let transient_hold = BTreeSet::from([action.clone()]);
+        let guardian_sequence = self.next_guardian_sequence()?;
+        self.guardian
+            .register_intent(guardian_sequence, &transient_hold)?;
+        self.guardian
+            .commit_holds(guardian_sequence, &transient_hold)?;
+        self.guardian_sequence = guardian_sequence;
+        self.held_actions = transient_hold;
+        self.platform
+            .client_point_click(button, x_ppm, y_ppm, expires_at)?;
+        let clear_sequence = self.next_guardian_sequence()?;
+        let cleared_holds = BTreeSet::new();
+        self.guardian
+            .register_intent(clear_sequence, &cleared_holds)?;
+        self.guardian.commit_holds(clear_sequence, &cleared_holds)?;
+        self.guardian_sequence = clear_sequence;
+        self.held_actions.clear();
+        Ok(())
+    }
+
+    fn next_guardian_sequence(&self) -> Result<u64, SafetyError> {
+        self.guardian_sequence.checked_add(1).ok_or_else(|| {
+            SafetyError::new(
+                "guardian.sequence_invalid",
+                "Guardian sequence space is exhausted",
+            )
+        })
     }
 
     fn require_open_gate(
