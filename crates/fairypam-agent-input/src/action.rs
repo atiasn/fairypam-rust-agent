@@ -118,7 +118,13 @@ impl ActionMap {
         buttons: &[SemanticMouseButton],
     ) -> Result<BTreeSet<ActionId>, SafetyError> {
         keys.iter()
-            .map(|key| self.action_for_key(*key))
+            .map(|key| match self.action_for_key(*key)? {
+                (id, ResolvedAction::HoldKey { .. }) => Ok(id),
+                _ => Err(SafetyError::new(
+                    "input.action_kind_invalid",
+                    "guarded input accepts physical hold keys only",
+                )),
+            })
             .chain(buttons.iter().map(|button| self.action_for_button(*button)))
             .collect()
     }
@@ -134,64 +140,48 @@ impl ActionMap {
             .collect::<Result<BTreeSet<_>, _>>()?;
         let mut pulses = BTreeSet::new();
         for key in keys {
-            let mut hold = None;
-            let mut pulse = None;
-            let mut pulse_ambiguous = false;
-            for (id, action) in &self.actions {
-                match action {
-                    ResolvedAction::HoldKey {
-                        scan_code,
-                        extended,
-                    } if (*scan_code, *extended) == *key => hold.get_or_insert(id.clone()),
-                    ResolvedAction::PulseKey {
-                        scan_code,
-                        extended,
-                    } if (*scan_code, *extended) == *key => {
-                        pulse_ambiguous |= pulse.replace(id.clone()).is_some();
-                        continue;
-                    }
-                    _ => continue,
-                };
-            }
-            if let Some(action) = hold {
-                holds.insert(action);
-            } else if pulse_ambiguous {
-                return Err(SafetyError::new(
-                    "input.frame_invalid",
-                    "physical pulse key is not unique in the verified Profile",
-                ));
-            } else if let Some(action) = pulse {
-                pulses.insert(action);
-            } else {
-                return Err(SafetyError::new(
-                    "input.key_not_allowed",
-                    "physical key is not declared by the verified Profile",
-                ));
-            }
+            match self.action_for_key(*key)? {
+                (action, ResolvedAction::HoldKey { .. }) => holds.insert(action),
+                (action, ResolvedAction::PulseKey { .. }) => pulses.insert(action),
+                _ => unreachable!("physical key resolver only returns key actions"),
+            };
         }
         Ok((holds, pulses))
     }
 
-    fn action_for_key(&self, key: (u16, bool)) -> Result<ActionId, SafetyError> {
-        self.actions
-            .iter()
-            .find_map(|(id, action)| match action {
+    fn action_for_key(&self, key: (u16, bool)) -> Result<(ActionId, &ResolvedAction), SafetyError> {
+        let mut hold = None;
+        let mut pulse = None;
+        let mut pulse_ambiguous = false;
+        for (id, action) in &self.actions {
+            match action {
                 ResolvedAction::HoldKey {
                     scan_code,
                     extended,
+                } if (*scan_code, *extended) == key => {
+                    hold.get_or_insert((id.clone(), action));
                 }
-                | ResolvedAction::PulseKey {
+                ResolvedAction::PulseKey {
                     scan_code,
                     extended,
-                } if (*scan_code, *extended) == key => Some(id.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                SafetyError::new(
-                    "input.key_not_allowed",
-                    "physical key is not declared by the verified Profile",
-                )
-            })
+                } if (*scan_code, *extended) == key => {
+                    pulse_ambiguous |= pulse.replace((id.clone(), action)).is_some();
+                }
+                _ => {}
+            }
+        }
+        if pulse_ambiguous || (hold.is_some() && pulse.is_some()) {
+            return Err(SafetyError::new(
+                "input.frame_invalid",
+                "physical pulse key conflicts with another action in the verified Profile",
+            ));
+        }
+        hold.or(pulse).ok_or_else(|| {
+            SafetyError::new(
+                "input.key_not_allowed",
+                "physical key is not declared by the verified Profile",
+            )
+        })
     }
 
     pub(crate) fn action_for_button(

@@ -373,6 +373,132 @@ fn guarded_music_frame_arms_once_then_batches_without_reauthorizing() {
 }
 
 #[test]
+fn guarded_frame_rejects_pulse_collisions_before_arming() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let collisions = [
+        BTreeMap::from([
+            (
+                "alias.hold".into(),
+                ActionDefinition::PhysicalHold {
+                    scan_code: 40,
+                    extended: false,
+                },
+            ),
+            (
+                "alias.pulse".into(),
+                ActionDefinition::PhysicalPulse {
+                    scan_code: 40,
+                    extended: false,
+                },
+            ),
+        ]),
+        BTreeMap::from([
+            (
+                "pulse.first".into(),
+                ActionDefinition::PhysicalPulse {
+                    scan_code: 40,
+                    extended: false,
+                },
+            ),
+            (
+                "pulse.second".into(),
+                ActionDefinition::PhysicalPulse {
+                    scan_code: 40,
+                    extended: false,
+                },
+            ),
+        ]),
+    ];
+
+    for actions in collisions {
+        let mut executor = LeaseExecutor::new(
+            &verified_profile_with_actions(actions),
+            FakeInput::default(),
+            FakeGuardian::default(),
+        )
+        .unwrap();
+
+        let error = executor
+            .arm_guarded_physical_frame(
+                session(1),
+                1,
+                now + Duration::from_secs(1),
+                &[(40, false)],
+                &authority.permit(now),
+                now,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code(), "input.frame_invalid");
+        assert!(executor.platform().pressed.is_empty());
+        assert!(executor.guardian().registered_holds.is_empty());
+        assert!(executor.guardian().committed_holds.is_empty());
+    }
+}
+
+#[test]
+fn guarded_frame_rejects_late_pulse_collision_without_local_transition() {
+    let now = Instant::now();
+    let authority = PermitAuthority::new(now);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let profile = verified_profile_with_actions(BTreeMap::from([
+        (
+            "guard.valid".into(),
+            ActionDefinition::PhysicalHold {
+                scan_code: 41,
+                extended: false,
+            },
+        ),
+        (
+            "alias.hold".into(),
+            ActionDefinition::PhysicalHold {
+                scan_code: 40,
+                extended: false,
+            },
+        ),
+        (
+            "alias.pulse".into(),
+            ActionDefinition::PhysicalPulse {
+                scan_code: 40,
+                extended: false,
+            },
+        ),
+    ]));
+    let mut executor = LeaseExecutor::new(
+        &profile,
+        FakeInput {
+            events: Some(Arc::clone(&events)),
+            ..Default::default()
+        },
+        FakeGuardian {
+            events: Some(Arc::clone(&events)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let permit = authority.permit(now);
+
+    executor
+        .arm_guarded_physical_frame(
+            session(1),
+            1,
+            now + Duration::from_secs(1),
+            &[(41, false)],
+            &permit,
+            now,
+        )
+        .unwrap();
+    let error = executor
+        .apply_guarded_physical_frame(&session(1), &[(40, false)], &permit, now)
+        .unwrap_err();
+
+    assert_eq!(error.code(), "input.frame_invalid");
+    assert!(executor.platform().pressed.is_empty());
+    assert!(!events.lock().unwrap().contains(&"local_batch"));
+}
+
+#[test]
 fn expired_lease_releases_every_hold() {
     let now = Instant::now();
     let authority = PermitAuthority::new(now);
@@ -940,7 +1066,7 @@ fn physical_frame_executes_profile_pulse_atomically() {
 }
 
 #[test]
-fn physical_frame_prefers_hold_for_same_tuple_pulse_alias() {
+fn physical_frame_rejects_pulse_hold_collision_before_side_effects() {
     let now = Instant::now();
     let authority = PermitAuthority::new(now);
     let profile = verified_profile_with_actions(BTreeMap::from([
@@ -962,7 +1088,7 @@ fn physical_frame_prefers_hold_for_same_tuple_pulse_alias() {
     let mut executor =
         LeaseExecutor::new(&profile, FakeInput::default(), FakeGuardian::default()).unwrap();
 
-    let holds_active = executor
+    let error = executor
         .apply_physical_frame(
             session(1),
             1,
@@ -974,29 +1100,12 @@ fn physical_frame_prefers_hold_for_same_tuple_pulse_alias() {
             &authority.permit(now),
             now,
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert!(holds_active);
-    assert!(executor.platform().pressed.contains(&40));
+    assert_eq!(error.code(), "input.frame_invalid");
+    assert!(executor.platform().pressed.is_empty());
     assert!(executor.platform().released.is_empty());
-
-    let holds_active = executor
-        .apply_physical_frame(
-            session(1),
-            2,
-            now + Duration::from_secs(1),
-            &[],
-            &[],
-            0,
-            None,
-            &authority.permit(now),
-            now,
-        )
-        .unwrap();
-
-    assert!(!holds_active);
-    assert!(!executor.platform().pressed.contains(&40));
-    assert_eq!(executor.platform().released, vec![40]);
+    assert!(executor.guardian().calls.is_empty());
 }
 
 #[test]
