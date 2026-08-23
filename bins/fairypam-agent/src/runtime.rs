@@ -2631,7 +2631,7 @@ mod tests {
 
     #[test]
     fn enrollment_identity_change_resets_only_managed_game_namespace() {
-        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        let driver = GrpcSessionDriver::for_test();
         let local = driver.local_runtime();
         let old_agent_id = driver.config.lock().unwrap().transport.agent_id.clone();
         let policy = |state_version| v2::ConfigureIdleClose {

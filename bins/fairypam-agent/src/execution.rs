@@ -1292,11 +1292,15 @@ impl CommandExecutor {
         self.managed_game_agent_id = agent_id.to_owned();
         #[cfg(windows)]
         {
-            self.managed_game = ManagedGameLifecycle::persistent(
-                std::path::PathBuf::from(crate::enrollment::STATE_ROOT)
-                    .join("managed-game-lifecycle.json"),
-                agent_id,
-            );
+            self.managed_game = if self.runtime_mode == "production" {
+                ManagedGameLifecycle::persistent(
+                    std::path::PathBuf::from(crate::enrollment::STATE_ROOT)
+                        .join("managed-game-lifecycle.json"),
+                    agent_id,
+                )
+            } else {
+                ManagedGameLifecycle::memory()
+            };
         }
         #[cfg(not(windows))]
         {
