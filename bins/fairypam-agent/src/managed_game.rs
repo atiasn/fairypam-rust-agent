@@ -1,19 +1,19 @@
 use std::collections::BTreeMap;
 use std::fs;
-#[cfg(windows)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fairypam_agent_core::AgentError;
 use fairypam_agent_protocol::v2;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const MIN_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
 const MAX_IDLE_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct PolicySnapshot {
+    game_id: String,
     game_session_id: String,
     profile_id: String,
     state_version: u64,
@@ -25,6 +25,7 @@ struct PolicySnapshot {
 impl From<&v2::ConfigureIdleClose> for PolicySnapshot {
     fn from(value: &v2::ConfigureIdleClose) -> Self {
         Self {
+            game_id: value.game_id.clone(),
             game_session_id: value.game_session_id.clone(),
             profile_id: value.profile_id.clone(),
             state_version: value.state_version,
@@ -68,6 +69,7 @@ impl PendingCloseReceipt {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 struct PersistedState {
+    agent_id: Option<String>,
     policies: BTreeMap<String, PolicySnapshot>,
     status_sequence: u64,
     pending_close_receipt: Option<PendingCloseReceipt>,
@@ -101,9 +103,14 @@ impl ManagedGameLifecycle {
         }
     }
 
-    #[cfg(windows)]
-    pub fn persistent(path: PathBuf) -> Self {
-        let persisted = load(&path).unwrap_or_default();
+    pub fn persistent(legacy_path: PathBuf, agent_id: &str) -> Self {
+        let path = namespaced_path(&legacy_path, agent_id);
+        let persisted = load(&path)
+            .filter(|persisted| persisted.agent_id.as_deref() == Some(agent_id))
+            .unwrap_or_else(|| PersistedState {
+                agent_id: Some(agent_id.to_owned()),
+                ..PersistedState::default()
+            });
         let pending_close_report = persisted.pending_close_receipt.is_some();
         Self {
             path: Some(path),
@@ -116,12 +123,16 @@ impl ManagedGameLifecycle {
 
     pub fn bind_target(&mut self, profile_id: &str, now: Instant, now_unix_ms: i64) {
         self.bound_profile_id = Some(profile_id.to_owned());
-        self.active = self
+        let mut matching = self
             .persisted
             .policies
-            .get(profile_id)
-            .cloned()
-            .map(|policy| {
+            .values()
+            .filter(|policy| policy.profile_id == profile_id);
+        let policy = matching.next().cloned();
+        self.active = if matching.next().is_some() {
+            None
+        } else {
+            policy.map(|policy| {
                 let (closing, close_failed) = self.closing_state(&policy);
                 ActiveState {
                     policy,
@@ -130,7 +141,8 @@ impl ManagedGameLifecycle {
                     closing,
                     close_failed,
                 }
-            });
+            })
+        };
     }
 
     pub fn configure(
@@ -150,7 +162,7 @@ impl ManagedGameLifecycle {
                 "managed target remains in the closing gate",
             ));
         }
-        if let Some(current) = self.persisted.policies.get(&incoming.profile_id) {
+        if let Some(current) = self.persisted.policies.get(&incoming.game_id) {
             if incoming.state_version < current.state_version {
                 return Err(AgentError::new(
                     "idle_close.state_stale",
@@ -181,7 +193,7 @@ impl ManagedGameLifecycle {
         }
         self.persisted
             .policies
-            .insert(incoming.profile_id.clone(), incoming.clone());
+            .insert(incoming.game_id.clone(), incoming.clone());
         self.bump_sequence();
         self.persist()?;
         self.active = (self.bound_profile_id.as_deref() == Some(incoming.profile_id.as_str()))
@@ -296,7 +308,7 @@ impl ManagedGameLifecycle {
             });
             self.bump_sequence();
         } else {
-            self.persisted.policies.remove(&active.policy.profile_id);
+            self.persisted.policies.remove(&active.policy.game_id);
             self.persisted.closing = None;
             self.bound_profile_id = None;
             self.active = None;
@@ -364,7 +376,7 @@ impl ManagedGameLifecycle {
             occurred_at_unix_ms,
             error_code: None,
         };
-        self.persisted.policies.remove(&active.policy.profile_id);
+        self.persisted.policies.remove(&active.policy.game_id);
         self.persisted.closing = None;
         self.bound_profile_id = None;
         self.active = None;
@@ -480,7 +492,11 @@ pub fn close_event_id(receipt: &v2::ManagedGameCloseReceipt) -> String {
 }
 
 fn validate(value: &v2::ConfigureIdleClose) -> Result<(), AgentError> {
-    if value.game_session_id.is_empty() || value.profile_id.is_empty() || value.state_version == 0 {
+    if value.game_id.is_empty()
+        || value.game_session_id.is_empty()
+        || value.profile_id.is_empty()
+        || value.state_version == 0
+    {
         return Err(AgentError::new(
             "idle_close.state_invalid",
             "idle close identity is incomplete",
@@ -503,9 +519,13 @@ fn validate(value: &v2::ConfigureIdleClose) -> Result<(), AgentError> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn load(path: &Path) -> Option<PersistedState> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn namespaced_path(legacy_path: &Path, agent_id: &str) -> PathBuf {
+    let digest = Sha256::digest(agent_id.as_bytes());
+    legacy_path.with_file_name(format!("managed-game-lifecycle-{digest:x}.json"))
 }
 
 fn persistence_error(error: impl std::fmt::Display) -> AgentError {
@@ -518,9 +538,11 @@ fn persistence_error(error: impl std::fmt::Display) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn config(version: u64, enabled: bool, occupied: bool) -> v2::ConfigureIdleClose {
         v2::ConfigureIdleClose {
+            game_id: "game-1".into(),
             game_session_id: "game-session-1".into(),
             profile_id: "genshin-impact".into(),
             state_version: version,
@@ -544,6 +566,52 @@ mod tests {
         assert_eq!(
             lifecycle.status(start, 1_000).unwrap().state,
             v2::ManagedGameIdleState::Occupied as i32
+        );
+    }
+
+    #[test]
+    fn versions_are_scoped_by_game_not_profile() {
+        let start = Instant::now();
+        let mut lifecycle = ManagedGameLifecycle::memory();
+        let mut first = config(5, false, true);
+        let mut second = config(1, false, true);
+        second.game_id = "game-2".into();
+        second.game_session_id = "game-session-2".into();
+
+        lifecycle.configure(&first, start, 1_000).unwrap();
+        lifecycle.configure(&second, start, 1_000).unwrap();
+        first.state_version = 4;
+        assert_eq!(
+            lifecycle
+                .configure(&first, start, 1_000)
+                .unwrap_err()
+                .code(),
+            "idle_close.state_stale"
+        );
+        first.state_version = 5;
+        first.profile_id = "genshin-impact-v2".into();
+        assert_eq!(
+            lifecycle
+                .configure(&first, start, 1_000)
+                .unwrap_err()
+                .code(),
+            "idle_close.state_version_conflict"
+        );
+        first.state_version = 6;
+        lifecycle.configure(&first, start, 1_000).unwrap();
+        assert_eq!(lifecycle.persisted.policies.len(), 2);
+    }
+
+    #[test]
+    fn game_identity_is_required() {
+        let mut value = config(1, false, true);
+        value.game_id.clear();
+        assert_eq!(
+            ManagedGameLifecycle::memory()
+                .configure(&value, Instant::now(), 1_000)
+                .unwrap_err()
+                .code(),
+            "idle_close.state_invalid"
         );
     }
 
@@ -631,5 +699,54 @@ mod tests {
             .unwrap();
         lifecycle.prepare_close_replay();
         assert!(lifecycle.pending_close_receipt().is_none());
+    }
+
+    #[test]
+    fn persistent_state_is_isolated_by_agent_identity() {
+        let directory = tempdir().unwrap();
+        let legacy_path = directory.path().join("managed-game-lifecycle.json");
+        let legacy_bytes = br#"{"policies":{"genshin-impact":{"game_session_id":"old","profile_id":"genshin-impact","state_version":9,"enabled":true,"idle_timeout_ms":300000,"occupied":false}},"status_sequence":9}"#;
+        fs::write(&legacy_path, legacy_bytes).unwrap();
+        let start = Instant::now();
+
+        let mut old_agent = ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-a");
+        old_agent.bind_target("genshin-impact", start, 1_000);
+        old_agent
+            .configure(&config(9, true, false), start, 1_000)
+            .unwrap();
+        old_agent
+            .close_receipt(
+                v2::ManagedGameCloseTrigger::Idle,
+                v2::ManagedGameCloseResult::Failed,
+                2_000,
+                Some("target.close_failed".to_owned()),
+            )
+            .unwrap();
+
+        let mut new_agent = ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-b");
+        assert_eq!(new_agent.persisted.status_sequence, 0);
+        assert!(new_agent.persisted.pending_close_receipt.is_none());
+        assert!(new_agent.persisted.closing.is_none());
+        new_agent.bind_target("genshin-impact", start, 3_000);
+        new_agent
+            .configure(&config(1, false, true), start, 3_000)
+            .unwrap();
+        new_agent
+            .configure(&config(2, false, true), start, 3_500)
+            .unwrap();
+
+        let mut reopened = ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-b");
+        reopened.bind_target("genshin-impact", start, 4_000);
+        assert_eq!(
+            reopened
+                .configure(&config(1, false, true), start, 4_000)
+                .unwrap_err()
+                .code(),
+            "idle_close.state_stale"
+        );
+        reopened
+            .configure(&config(2, false, true), start, 4_000)
+            .unwrap();
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
     }
 }

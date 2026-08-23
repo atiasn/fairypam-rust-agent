@@ -324,6 +324,7 @@ message ConfigureIdleClose {
   bool enabled = 5;
   uint64 idle_timeout_ms = 6;
   bool occupied = 7;
+  string game_id = 8;
 }
 
 enum ManagedGameIdleState {

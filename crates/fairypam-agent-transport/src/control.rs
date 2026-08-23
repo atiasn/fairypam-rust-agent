@@ -200,7 +200,7 @@ pub(crate) fn verify_hub_hello(
         || hello.heartbeat_interval_ms == 0
         || hello.max_input_lease_ms == 0
         || hello.max_frame_bytes == 0
-        || hello.accepted_protocol_minor != 7
+        || hello.accepted_protocol_minor != 8
     {
         return Err(TransportError::new(
             "transport.session_invalid",
@@ -485,7 +485,7 @@ mod v2_tests {
                 heartbeat_interval_ms: 1_000,
                 max_input_lease_ms: 500,
                 max_frame_bytes: 1_024,
-                accepted_protocol_minor: 7,
+                accepted_protocol_minor: 8,
             },
             "agent-a",
         )

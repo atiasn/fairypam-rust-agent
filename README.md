@@ -8,7 +8,7 @@
 正式入口：
 
 ```bash
-bash scripts/sync-rust-agent-public.sh --profile all --timeout-minutes 25 \
+bash ops/ci/rust-agent-public/sync.sh --profile all --timeout-minutes 25 \
   --enrollment-base-url https://hub.example.com
 ```
 

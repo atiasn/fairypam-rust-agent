@@ -137,7 +137,7 @@ pub fn hello_event(
                 generation: session.generation(),
             }),
             agent_process_generation_id: process_generation_id,
-            protocol_minor: 7,
+            protocol_minor: 8,
             telemetry_schema_versions: vec![1],
         })),
     }

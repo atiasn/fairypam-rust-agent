@@ -1262,29 +1262,57 @@ pub struct CommandExecutor {
     capture: Option<CaptureWorker>,
     frame_sequences: BTreeMap<String, Arc<AtomicU64>>,
     task_attempt: TaskAttemptRuntime,
+    managed_game_agent_id: String,
     managed_game: ManagedGameLifecycle,
     last_local_input_token: Option<u32>,
     profile_update_blocked: bool,
 }
 
 impl CommandExecutor {
-    pub fn production(profiles: ProfileStore) -> Self {
-        let executor = Self::with_platform_and_attempts(
+    pub fn production(profiles: ProfileStore, agent_id: &str) -> Self {
+        let mut executor = Self::with_platform_and_attempts(
             profiles,
             production_platform(),
             TaskAttemptRuntime::production(),
             "production",
         );
-        #[cfg(windows)]
-        let mut executor = executor;
+        executor.managed_game_agent_id = agent_id.to_owned();
         #[cfg(windows)]
         {
             executor.managed_game = ManagedGameLifecycle::persistent(
                 std::path::PathBuf::from(crate::enrollment::STATE_ROOT)
                     .join("managed-game-lifecycle.json"),
+                agent_id,
             );
         }
         executor
+    }
+
+    pub fn rebind_managed_game_identity(&mut self, agent_id: &str) {
+        self.managed_game_agent_id = agent_id.to_owned();
+        #[cfg(windows)]
+        {
+            self.managed_game = ManagedGameLifecycle::persistent(
+                std::path::PathBuf::from(crate::enrollment::STATE_ROOT)
+                    .join("managed-game-lifecycle.json"),
+                agent_id,
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = agent_id;
+            self.managed_game = ManagedGameLifecycle::memory();
+        }
+    }
+
+    pub fn ensure_agent_identity(&self, agent_id: &str) -> Result<(), AgentError> {
+        if self.managed_game_agent_id == agent_id {
+            return Ok(());
+        }
+        Err(AgentError::new(
+            "runtime.enrollment_changed",
+            "control session belongs to a replaced Agent identity",
+        ))
     }
 
     pub fn with_platform(profiles: ProfileStore, platform: Box<dyn RuntimePlatform>) -> Self {
@@ -1316,6 +1344,7 @@ impl CommandExecutor {
             capture: None,
             frame_sequences: BTreeMap::new(),
             task_attempt,
+            managed_game_agent_id: String::new(),
             managed_game: ManagedGameLifecycle::memory(),
             last_local_input_token: None,
             profile_update_blocked: false,
@@ -6175,7 +6204,7 @@ mod tests {
 
     #[test]
     fn production_executor_reports_production_runtime_mode() {
-        let executor = CommandExecutor::production(ProfileStore::default());
+        let executor = CommandExecutor::production(ProfileStore::default(), "agent-a");
 
         assert_eq!(executor.runtime_mode, "production");
     }
@@ -6684,6 +6713,7 @@ mod tests {
         let sink = Arc::new(CollectFrames::default());
         assert!(matches!(
             executor.execute_v2_configure_idle_close(&v2::ConfigureIdleClose {
+                game_id: "game-1".into(),
                 game_session_id: "game-session-1".into(),
                 profile_id: "testbed".into(),
                 state_version: 1,
@@ -7300,6 +7330,7 @@ mod tests {
             .id
             .clone();
         let config = v2::ConfigureIdleClose {
+            game_id: "22222222-2222-4222-8222-222222222222".into(),
             game_session_id: "33333333-3333-4333-8333-333333333333".into(),
             profile_id,
             state_version: 1,

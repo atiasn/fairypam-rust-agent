@@ -5,7 +5,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, test))]
 use std::sync::atomic::Ordering;
-use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::sync::{atomic::AtomicBool, Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -507,7 +507,8 @@ pub struct GrpcSessionDriver {
 
 impl GrpcSessionDriver {
     pub fn new(config: RuntimeConfig) -> Self {
-        let mut execution = CommandExecutor::production(config.profiles.clone());
+        let mut execution =
+            CommandExecutor::production(config.profiles.clone(), &config.transport.agent_id);
         execution.set_profile_update_blocked(
             !config.awaiting_enrollment
                 && config
@@ -543,9 +544,27 @@ impl GrpcSessionDriver {
         }
     }
 
+    fn execution_for_session(
+        &self,
+        session: &VerifiedSession,
+    ) -> Result<MutexGuard<'_, CommandExecutor>, AgentError> {
+        self.execution_for_agent_identity(session.agent_id())
+    }
+
+    fn execution_for_agent_identity(
+        &self,
+        agent_id: &str,
+    ) -> Result<MutexGuard<'_, CommandExecutor>, AgentError> {
+        let execution = self.execution.lock().map_err(lock_error)?;
+        execution.ensure_agent_identity(agent_id)?;
+        Ok(execution)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn for_test() -> Self {
         let config = RuntimeConfig::unregistered();
+        let mut execution = CommandExecutor::without_devices_for_test();
+        execution.rebind_managed_game_identity(&config.transport.agent_id);
         let agent_process_generation_id = "11111111-1111-4111-8111-111111111111".to_owned();
         Self {
             config: Arc::new(Mutex::new(config)),
@@ -554,7 +573,7 @@ impl GrpcSessionDriver {
                 persist_logs: false,
                 ..RuntimeState::default()
             })),
-            execution: Arc::new(Mutex::new(CommandExecutor::without_devices_for_test())),
+            execution: Arc::new(Mutex::new(execution)),
             enrollment_ready: Arc::new(tokio::sync::Notify::new()),
             reconnect_requested: Arc::new(tokio::sync::Notify::new()),
             registration_in_progress: Arc::new(AtomicBool::new(false)),
@@ -645,10 +664,8 @@ impl GrpcSessionDriver {
         sender: &ControlSender,
         session: &VerifiedSession,
     ) -> Result<(), AgentError> {
-        self.execution
-            .lock()
-            .map_err(lock_error)?
-            .set_profile_update_blocked(true);
+        let mut execution = self.execution_for_session(session)?;
+        execution.set_profile_update_blocked(true);
         let staged = {
             let mut config = self.config.lock().map_err(lock_error)?;
             let store = config.profile_catalog.as_mut().ok_or_else(|| {
@@ -670,13 +687,10 @@ impl GrpcSessionDriver {
                         None,
                     )?)
                     .map_err(map_transport)?;
-                self.activate_profile_catalog_if_ready(sender, session)
+                self.activate_profile_catalog_if_ready_locked(sender, session, &mut execution)
             }
             Ok(false) => {
-                self.execution
-                    .lock()
-                    .map_err(lock_error)?
-                    .set_profile_update_blocked(false);
+                execution.set_profile_update_blocked(false);
                 sender
                     .try_send(self.profile_catalog_event(
                         session,
@@ -704,7 +718,17 @@ impl GrpcSessionDriver {
         sender: &ControlSender,
         session: &VerifiedSession,
     ) -> Result<(), AgentError> {
-        if self.execution.lock().map_err(lock_error)?.task_active()? {
+        let mut execution = self.execution_for_session(session)?;
+        self.activate_profile_catalog_if_ready_locked(sender, session, &mut execution)
+    }
+
+    fn activate_profile_catalog_if_ready_locked(
+        &self,
+        sender: &ControlSender,
+        session: &VerifiedSession,
+        execution: &mut CommandExecutor,
+    ) -> Result<(), AgentError> {
+        if execution.task_active()? {
             return Ok(());
         }
         let pending = self
@@ -737,10 +761,8 @@ impl GrpcSessionDriver {
         };
         match activated {
             Ok(active) => {
-                let mut execution = self.execution.lock().map_err(lock_error)?;
                 execution.reload_profiles(active.profiles.clone());
                 execution.set_profile_update_blocked(false);
-                drop(execution);
                 sender
                     .try_send(self.profile_catalog_event(
                         session,
@@ -1220,9 +1242,13 @@ impl SessionDriver for GrpcSessionDriver {
                     }
                 }
                 _ = heartbeat.tick() => {
-                    self.activate_profile_catalog_if_ready(&sender, &session)?;
+                    let mut execution = self.execution_for_session(&session)?;
+                    self.activate_profile_catalog_if_ready_locked(
+                        &sender,
+                        &session,
+                        &mut execution,
+                    )?;
                     sender.try_send(heartbeat_event(&session)).map_err(map_transport)?;
-                    let mut execution = self.execution.lock().map_err(lock_error)?;
                     let runtime_state = execution.runtime_state()?;
                     sender.try_send(status_event(&session, runtime_state)).map_err(map_transport)?;
                     if let Some(status) = execution.managed_game_status() {
@@ -1230,7 +1256,7 @@ impl SessionDriver for GrpcSessionDriver {
                     }
                 }
                 _ = capture_health.tick() => {
-                    let mut execution = self.execution.lock().map_err(lock_error)?;
+                    let mut execution = self.execution_for_session(&session)?;
                     let event = execution.capture_failure_event(&ExecutionSession::from_verified(&session))?;
                     if let Some(event) = event {
                         sender.try_send(v2_adapter::safety_event(event)?).map_err(map_transport)?;
@@ -1243,9 +1269,7 @@ impl SessionDriver for GrpcSessionDriver {
                     if let Some(v2::hub_control_command::Payload::AcknowledgeManagedGameClose(value)) =
                         command.payload.as_ref()
                     {
-                        self.execution
-                            .lock()
-                            .map_err(lock_error)?
+                        self.execution_for_session(&session)?
                             .acknowledge_managed_game_close(value)?;
                         continue;
                     }
@@ -1277,7 +1301,7 @@ impl SessionDriver for GrpcSessionDriver {
                             }
                             let event = match v2_adapter::internal_task_identity(&identity) {
                                 Ok(task) => {
-                                    let mut execution = self.execution.lock().map_err(lock_error)?;
+                                    let mut execution = self.execution_for_session(&session)?;
                                     let outcome = if error.code() == "command.payload_digest_conflict" {
                                         execution.v2_payload_digest_conflict(&task)
                                     } else {
@@ -1291,13 +1315,14 @@ impl SessionDriver for GrpcSessionDriver {
                             continue;
                         }
                     };
+                    let mut execution = self.execution_for_session(&session)?;
                     let outcome = match translated {
                         v2_adapter::TranslatedCommand::Internal(internal) => {
                             let frames = {
                                 let state = self.state.lock().map_err(lock_error)?;
                                 state.frames.clone().ok_or_else(session_missing)?
                             };
-                            self.execution.lock().map_err(lock_error)?.execute(
+                            execution.execute(
                                 &internal,
                                 &ExecutionSession::from_verified(&session),
                                 Arc::new(frames) as Arc<dyn FrameSink>,
@@ -1318,16 +1343,13 @@ impl SessionDriver for GrpcSessionDriver {
                                     );
                                 }
                             };
-                            self.execution.lock().map_err(lock_error)?.execute_v2_close_target_with_progress(
+                            execution.execute_v2_close_target_with_progress(
                                 &value,
                                 &mut report,
                             )
                         }
                         v2_adapter::TranslatedCommand::ConfigureIdleClose { value } => {
-                            self.execution
-                                .lock()
-                                .map_err(lock_error)?
-                                .execute_v2_configure_idle_close(&value)
+                            execution.execute_v2_configure_idle_close(&value)
                         }
                         v2_adapter::TranslatedCommand::BeginAttempt {
                             task,
@@ -1335,23 +1357,17 @@ impl SessionDriver for GrpcSessionDriver {
                             digest_key,
                             payload_digest,
                         } => {
-                            let outcome = self.execution
-                                .lock()
-                                .map_err(lock_error)?
-                                .execute_v2_begin(&task, &contract);
+                            let outcome = execution.execute_v2_begin(&task, &contract);
                             if matches!(&outcome, CommandOutcome::TaskAck { .. }) {
                                 translator.accept_begin(contract, digest_key, payload_digest);
                             }
                             outcome
                         }
                         v2_adapter::TranslatedCommand::InputFrame { task, frame } => {
-                            self.execution
-                                .lock()
-                                .map_err(lock_error)?
-                                .execute_v2_input_frame(&task, &frame, None)
+                            execution.execute_v2_input_frame(&task, &frame, None)
                         }
                         v2_adapter::TranslatedCommand::ClientPointClick { task, value } => {
-                            self.execution.lock().map_err(lock_error)?.execute_v2_input_frame(
+                            execution.execute_v2_input_frame(
                                 &task,
                                 &v2::InputFrame {
                                     input_sequence: value.input_sequence,
@@ -1366,21 +1382,16 @@ impl SessionDriver for GrpcSessionDriver {
                     task,
                     maximum_duration_ms,
                     supervision_lease_ms,
-                } => self
-                    .execution
-                    .lock()
-                    .map_err(lock_error)?
-                    .execute_v2_start_music_autoplay(
+                } => execution.execute_v2_start_music_autoplay(
                         &task,
                         maximum_duration_ms,
                         supervision_lease_ms,
                     ),
-                        v2_adapter::TranslatedCommand::StopMusicAutoplay { task } => self
-                            .execution
-                            .lock()
-                            .map_err(lock_error)?
-                            .execute_v2_stop_music_autoplay(&task),
+                        v2_adapter::TranslatedCommand::StopMusicAutoplay { task } => {
+                            execution.execute_v2_stop_music_autoplay(&task)
+                        }
                     };
+                    drop(execution);
                     if let Ok(mut state) = self.state.lock() {
                         state.record_command_diagnostic(&outcome);
                     }
@@ -1444,48 +1455,76 @@ impl GrpcSessionDriver {
             let state = self.state.lock().map_err(lock_error)?;
             state.sender.clone().zip(state.session.clone())
         };
-        let receipt = {
-            let mut execution = self.execution.lock().map_err(lock_error)?;
-            let mut report = |game_session_id: &str, state_version, phase| {
-                let Some((sender, session)) = connection.as_ref() else {
-                    return;
-                };
-                let event = managed_game_close_progress_event(
-                    session,
-                    game_session_id,
-                    state_version,
-                    phase,
-                );
-                if let Err(error) = sender.try_send(event) {
-                    tracing::warn!(
-                        code = error.code(),
-                        "managed game close progress event was not sent"
-                    );
-                }
-            };
-            let _ = execution.close_idle_game_if_due_with_progress(&mut report)?;
-            execution.pending_managed_game_close()
+        let agent_id = match connection.as_ref() {
+            Some((_, session)) => session.agent_id().to_owned(),
+            None => self
+                .config
+                .lock()
+                .map_err(lock_error)?
+                .transport
+                .agent_id
+                .clone(),
         };
+        self.tick_managed_game_close_for_identity(&agent_id, connection.as_ref())
+    }
+
+    fn tick_managed_game_close_for_identity(
+        &self,
+        agent_id: &str,
+        connection: Option<&(ControlSender, VerifiedSession)>,
+    ) -> Result<(), AgentError> {
+        let mut execution = self.execution_for_agent_identity(agent_id)?;
+        let mut report = |game_session_id: &str, state_version, phase| {
+            let Some((sender, session)) = connection else {
+                return;
+            };
+            let event =
+                managed_game_close_progress_event(session, game_session_id, state_version, phase);
+            if let Err(error) = sender.try_send(event) {
+                tracing::warn!(
+                    code = error.code(),
+                    "managed game close progress event was not sent"
+                );
+            }
+        };
+        let _ = execution.close_idle_game_if_due_with_progress(&mut report)?;
+        let receipt = execution.pending_managed_game_close();
         let Some(receipt) = receipt else {
             return Ok(());
         };
-        let (sender, session) = {
-            let state = self.state.lock().map_err(lock_error)?;
-            let (Some(sender), Some(session)) = (state.sender.clone(), state.session.clone())
-            else {
-                return Ok(());
-            };
-            (sender, session)
+        let Some((sender, session)) = connection else {
+            return Ok(());
         };
         sender
-            .try_send(managed_game_close_event(&session, receipt))
+            .try_send(managed_game_close_event(session, receipt))
             .map_err(map_transport)?;
-        self.execution
-            .lock()
-            .map_err(lock_error)?
-            .mark_managed_game_close_reported();
+        execution.mark_managed_game_close_reported();
         Ok(())
     }
+}
+
+fn install_runtime_config(
+    execution: &Arc<Mutex<CommandExecutor>>,
+    current: &Arc<Mutex<RuntimeConfig>>,
+    config: RuntimeConfig,
+) -> Result<(), AgentError> {
+    let mut execution = execution.lock().map_err(lock_error)?;
+    let mut current = current.lock().map_err(lock_error)?;
+    if let Err(error) = execution.ensure_agent_identity(&config.transport.agent_id) {
+        if error.code() != "runtime.enrollment_changed" {
+            return Err(error);
+        }
+        execution.rebind_managed_game_identity(&config.transport.agent_id)
+    }
+    execution.reload_profiles(config.profiles.clone());
+    execution.set_profile_update_blocked(
+        config
+            .profile_catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.active().is_none()),
+    );
+    *current = config;
+    Ok(())
 }
 
 pub struct RuntimeSafetyHooks {
@@ -1566,21 +1605,10 @@ impl SupervisorHooks for RuntimeSafetyHooks {
             .and_then(|config| config.enrollment_root.clone())
             .filter(|root| enrollment_state_exists_at(root))
         {
-            match RuntimeConfig::from_enrollment_state_at(&root) {
-                Ok(config) => {
-                    if let Ok(mut execution) = self.execution.lock() {
-                        execution.reload_profiles(config.profiles.clone());
-                        execution.set_profile_update_blocked(
-                            config
-                                .profile_catalog
-                                .as_ref()
-                                .is_some_and(|catalog| catalog.active().is_none()),
-                        );
-                    }
-                    if let Ok(mut current) = self.config.lock() {
-                        *current = config;
-                    }
-                }
+            match RuntimeConfig::from_enrollment_state_at(&root)
+                .and_then(|config| install_runtime_config(&self.execution, &self.config, config))
+            {
+                Ok(()) => {}
                 Err(error) => {
                     if let Ok(mut state) = self.state.lock() {
                         state.last_error_code = "runtime.enrollment_refresh_failed".to_owned();
@@ -2066,22 +2094,13 @@ impl SharedRuntime {
     }
 
     fn activate_enrollment(&self, config: RuntimeConfig) -> Result<(), AgentError> {
-        let mut execution = self.execution.lock().map_err(lock_error)?;
+        install_runtime_config(&self.execution, &self.config, config)?;
         let mut state = self.state.lock().map_err(lock_error)?;
-        let mut current = self.config.lock().map_err(lock_error)?;
-        execution.reload_profiles(config.profiles.clone());
-        execution.set_profile_update_blocked(
-            config
-                .profile_catalog
-                .as_ref()
-                .is_some_and(|catalog| catalog.active().is_none()),
-        );
-        *current = config;
         state.control_state = ConnectionState::Reconnecting;
         state.frame_state = ConnectionState::Reconnecting;
         state.last_error_code = "runtime.enrollment_registered".to_owned();
         state.record(LogLevel::Info, RuntimeLogMessage::RegistrationCompleted);
-        drop((execution, state, current));
+        drop(state);
         self.enrollment_ready.notify_one();
         Ok(())
     }
@@ -2608,6 +2627,73 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(10), driver.wait_for_reconnect())
             .await
             .expect("re-registration must wake the active supervisor");
+    }
+
+    #[test]
+    fn enrollment_identity_change_resets_only_managed_game_namespace() {
+        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        let local = driver.local_runtime();
+        let old_agent_id = driver.config.lock().unwrap().transport.agent_id.clone();
+        let policy = |state_version| v2::ConfigureIdleClose {
+            game_id: "game-1".to_owned(),
+            game_session_id: "session-1".to_owned(),
+            profile_id: "genshin-impact".to_owned(),
+            state_version,
+            enabled: false,
+            idle_timeout_ms: 0,
+            occupied: true,
+            ..v2::ConfigureIdleClose::default()
+        };
+        assert!(matches!(
+            driver
+                .execution
+                .lock()
+                .unwrap()
+                .execute_v2_configure_idle_close(&policy(2)),
+            CommandOutcome::Ack(_)
+        ));
+
+        let mut same_identity = RuntimeConfig::unregistered();
+        same_identity.enrollment_generation = Some("generation-2".to_owned());
+        local.activate_enrollment(same_identity).unwrap();
+        assert!(matches!(
+            driver
+                .execution
+                .lock()
+                .unwrap()
+                .execute_v2_configure_idle_close(&policy(1)),
+            CommandOutcome::Nack { ref code, .. } if code == "idle_close.state_stale"
+        ));
+
+        let mut new_identity = RuntimeConfig::unregistered();
+        new_identity.transport.agent_id = "agent-b".to_owned();
+        new_identity.enrollment_generation = Some("generation-3".to_owned());
+        install_runtime_config(&driver.execution, &driver.config, new_identity.clone()).unwrap();
+        assert!(driver.execution_for_agent_identity("agent-b").is_ok());
+        let cleanup_identity_error = match driver.execution_for_agent_identity(&old_agent_id) {
+            Err(error) => error,
+            Ok(_) => panic!("cleanup refresh must reject the old agent identity"),
+        };
+        assert_eq!(cleanup_identity_error.code(), "runtime.enrollment_changed");
+        local.activate_enrollment(new_identity).unwrap();
+        let identity_error = match driver.execution_for_agent_identity(&old_agent_id) {
+            Err(error) => error,
+            Ok(_) => panic!("old agent identity must be rejected"),
+        };
+        assert_eq!(identity_error.code(), "runtime.enrollment_changed");
+        assert_eq!(
+            driver
+                .tick_managed_game_close_for_identity(&old_agent_id, None)
+                .unwrap_err()
+                .code(),
+            "runtime.enrollment_changed"
+        );
+        let mut execution = driver.execution.lock().unwrap();
+        execution.ensure_agent_identity("agent-b").unwrap();
+        assert!(matches!(
+            execution.execute_v2_configure_idle_close(&policy(1)),
+            CommandOutcome::Ack(_)
+        ));
     }
 
     #[test]

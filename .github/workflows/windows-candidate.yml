@@ -21,6 +21,7 @@ permissions:
 jobs:
   tauri-ui:
     name: Build non-promotable Windows product installer
+    if: github.repository == 'atiasn/fairypam-rust-agent'
     runs-on: windows-latest
     timeout-minutes: 45
     env:
