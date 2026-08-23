@@ -52,7 +52,8 @@ jobs:
           workspaces: |
             . -> target
             tauri-ui/src-tauri -> ../../target
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # ponytail: this 25-minute gate restores the shared cache but never waits to save it.
+          save-if: false
 
       - name: Test and build the product installer
         shell: pwsh
