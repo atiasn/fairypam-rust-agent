@@ -70,10 +70,6 @@ jobs:
           cargo fmt --all -- --check
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo build --release --locked -p fairypam-agent -p fairypam-agent-guardian -p fairypam-agent-installer -p fairypam-agent-suite
-          $env:FAIRYPAM_TEST_GUARDIAN_EXE = (Resolve-Path target\release\fairypam-agent-guardian.exe).Path
-          $env:FAIRYPAM_GUARDIAN_ENV_SENTINEL = 'must-not-reach-guardian'
-          cargo test --locked -p fairypam-agent-input --test windows_guardian_process -- --ignored --exact privilege_limited_guardian_process_starts
           New-Item -ItemType Directory -Force target\suite | Out-Null
           '{"schema_version":0,"promotable":false}' |
             Set-Content -NoNewline -Encoding utf8 target\suite\BUILD-MANIFEST.json
@@ -94,6 +90,10 @@ jobs:
             }
 
             npm run tauri build -- --no-bundle
+            cargo build --manifest-path ..\Cargo.toml --release --locked -p fairypam-agent -p fairypam-agent-guardian -p fairypam-agent-installer -p fairypam-agent-suite
+            $env:FAIRYPAM_TEST_GUARDIAN_EXE = (Resolve-Path ..\target\release\fairypam-agent-guardian.exe).Path
+            $env:FAIRYPAM_GUARDIAN_ENV_SENTINEL = 'must-not-reach-guardian'
+            cargo test --manifest-path ..\Cargo.toml --locked -p fairypam-agent-input --test windows_guardian_process -- --ignored --exact privilege_limited_guardian_process_starts
             ..\target\release\fairypam-build-suite.exe `
               --patch-tauri-nsis ..\target\release\fairypam-agent-tauri-ui.exe
             $suiteVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
