@@ -19,6 +19,38 @@ permissions:
   attestations: write
 
 jobs:
+  core-validation:
+    name: Validate Windows Agent core
+    if: github.repository == 'atiasn/fairypam-rust-agent'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $toolchain = (Get-Content rust-toolchain.toml | Select-String 'channel = "([^"]+)"').Matches.Groups[1].Value
+          rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy
+          rustup override set $toolchain
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: . -> target
+          save-if: false
+
+      - name: Validate Agent workspace
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
   tauri-ui:
     name: Build non-promotable Windows product installer
     if: github.repository == 'atiasn/fairypam-rust-agent'
@@ -67,9 +99,6 @@ jobs:
             throw 'candidate enrollment URL must match the product-fixed logical endpoint'
           }
           $env:FAIRYPAM_BUILD_COMMIT = (Get-Content SOURCE_COMMIT -Raw).Trim()
-          cargo fmt --all -- --check
-          cargo test --workspace --locked
-          cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo build --release --locked -p fairypam-agent-guardian -p fairypam-agent-installer
           $env:FAIRYPAM_TEST_GUARDIAN_EXE = (Resolve-Path target\release\fairypam-agent-guardian.exe).Path
           $env:FAIRYPAM_GUARDIAN_ENV_SENTINEL = 'must-not-reach-guardian'
@@ -298,7 +327,7 @@ jobs:
 
   verify-product-installer-attestation:
     name: Verify product installer attestation as a consumer
-    needs: tauri-ui
+    needs: [core-validation, tauri-ui]
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
