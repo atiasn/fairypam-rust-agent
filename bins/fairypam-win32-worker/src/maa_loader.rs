@@ -101,7 +101,7 @@ mod windows_impl {
         let result = control_unit_version(module);
         let _ = unsafe { FreeLibrary(module) };
         let version = result?;
-        if version != "5.12.3" {
+        if version.strip_prefix('v').unwrap_or(&version) != "5.12.3" {
             return Err(MaaRuntimeError::new(
                 "maa.control_unit_version_mismatch",
                 format!("loaded MaaWin32ControlUnit version is {version}"),

@@ -187,6 +187,8 @@ pub mod windows {
     use super::{CapturedFrame, GenericWindowsController, MouseButton, TargetGeometry};
     use crate::{health::RuntimeHealth, MaaRuntimeError};
 
+    const EXPECTED_MAA_RUNTIME_VERSION: &str = "5.12.3";
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MaaBackendSelection {
         pub screencap_method: sys::MaaWin32ScreencapMethod,
@@ -225,10 +227,10 @@ pub mod windows {
 
     impl MaaWindowsController {
         pub fn new(backend: MaaBackendSelection) -> Result<Self, MaaRuntimeError> {
-            if maa_framework::maa_version() != "5.12.3" {
+            if maa_runtime_version() != EXPECTED_MAA_RUNTIME_VERSION {
                 return Err(MaaRuntimeError::new(
                     "maa.runtime_version_mismatch",
-                    format!("loaded MaaVersion is {}", maa_framework::maa_version()),
+                    format!("loaded MaaVersion is {}", maa_runtime_version()),
                 ));
             }
             Ok(Self {
@@ -244,10 +246,10 @@ pub mod windows {
         pub fn load_library(path: &std::path::Path) -> Result<(), MaaRuntimeError> {
             maa_framework::load_library(path)
                 .map_err(|error| MaaRuntimeError::new("maa.runtime_load_failed", error))?;
-            if maa_framework::maa_version() != "5.12.3" {
+            if maa_runtime_version() != EXPECTED_MAA_RUNTIME_VERSION {
                 return Err(MaaRuntimeError::new(
                     "maa.runtime_version_mismatch",
-                    format!("loaded MaaVersion is {}", maa_framework::maa_version()),
+                    format!("loaded MaaVersion is {}", maa_runtime_version()),
                 ));
             }
             Ok(())
@@ -437,7 +439,7 @@ pub mod windows {
         fn get_health(&self) -> RuntimeHealth {
             let telemetry = self.telemetry.lock().ok();
             RuntimeHealth {
-                runtime_version: maa_framework::maa_version().to_owned(),
+                runtime_version: maa_runtime_version().to_owned(),
                 backend: format!(
                     "screencap={};mouse={};keyboard={}",
                     self.backend.screencap_method,
@@ -450,5 +452,10 @@ pub mod windows {
                 last_event: telemetry.and_then(|value| value.last_event.clone()),
             }
         }
+    }
+
+    fn maa_runtime_version() -> &'static str {
+        let version = maa_framework::maa_version();
+        version.strip_prefix('v').unwrap_or(version)
     }
 }
