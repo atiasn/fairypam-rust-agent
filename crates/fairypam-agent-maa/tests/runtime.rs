@@ -8,10 +8,11 @@ use fairypam_agent_maa::runtime_verify::{verify_runtime, VerifiedRuntime};
 use sha2::{Digest, Sha256};
 
 fn lock() -> RuntimeLock {
-    RuntimeLock::from_slice(include_bytes!(
-        "../../../../runtime/maa/maa-runtime.lock.json"
-    ))
-    .unwrap()
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let bytes = fs::read(manifest_dir.join("../../../runtime/maa/maa-runtime.lock.json"))
+        .or_else(|_| fs::read(manifest_dir.join("../../runtime/maa/maa-runtime.lock.json")))
+        .unwrap();
+    RuntimeLock::from_slice(&bytes).unwrap()
 }
 
 #[test]
