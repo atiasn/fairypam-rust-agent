@@ -1099,6 +1099,11 @@ fn worker_config(
     })
 }
 
+fn map_worker_error(error: fairypam_agent_maa::MaaRuntimeError) -> AgentError {
+    tracing::error!(error_code = error.code(), error = %error, "Win32 Worker operation failed");
+    AgentError::new(error.code(), error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{attachment_decision, AttachmentDecision, RuntimePlatform, WorkerRuntimePlatform};
@@ -1149,9 +1154,4 @@ mod tests {
             AttachmentDecision::Replace
         );
     }
-}
-
-fn map_worker_error(error: fairypam_agent_maa::MaaRuntimeError) -> AgentError {
-    tracing::error!(error_code = error.code(), error = %error, "Win32 Worker operation failed");
-    AgentError::new(error.code(), error.to_string())
 }

@@ -608,7 +608,6 @@ impl GrpcSessionDriver {
             reconnect_requested: Arc::clone(&self.reconnect_requested),
             registration_in_progress: Arc::clone(&self.registration_in_progress),
             registration_worker: Arc::clone(&self.registration_worker),
-            shutdown: self.shutdown.clone(),
         }
     }
 
@@ -1952,7 +1951,6 @@ pub(crate) struct LocalControlRuntime {
     reconnect_requested: Arc<tokio::sync::Notify>,
     registration_in_progress: Arc<AtomicBool>,
     registration_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    shutdown: CancellationToken,
 }
 
 #[cfg(any(windows, test))]
