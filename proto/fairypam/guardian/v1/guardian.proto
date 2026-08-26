@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package fairypam.guardian.v1;
+
+message GuardianEnvelope {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  oneof payload {
+    GuardianRequest request = 10;
+    GuardianResponse response = 11;
+  }
+}
+
+message GuardianRequest {
+  oneof payload {
+    RegisterAgent register_agent = 10;
+    Heartbeat heartbeat = 11;
+    RegisterIntent register_intent = 12;
+    CommitHolds commit_holds = 13;
+    ReleaseAll release_all = 14;
+    Status status = 15;
+    WorkerHealth worker_health = 16;
+  }
+}
+
+message RegisterAgent {
+  uint32 agent_pid = 1;
+  uint64 agent_process_handle = 2;
+  uint32 heartbeat_timeout_ms = 3;
+  optional string isolation_key_name = 4;
+}
+
+message Heartbeat { uint64 sequence = 1; }
+message WorkerHealth { bool ready = 1; }
+message RegisterIntent {
+  uint64 sequence = 1;
+  repeated PhysicalHold holds = 2;
+}
+message CommitHolds { uint64 sequence = 1; }
+message ReleaseAll { ReleaseReason reason = 1; }
+message Status {}
+
+message GuardianResponse {
+  oneof payload {
+    Ack ack = 10;
+    GuardianStatus status = 11;
+    GuardianError error = 12;
+  }
+}
+
+message Ack {
+  optional sint32 isolation_status = 1;
+  bool activation_pending = 2;
+}
+message GuardianStatus {
+  optional uint32 agent_pid = 1;
+  uint64 committed_hold_count = 2;
+  uint64 last_sequence = 3;
+}
+message GuardianError {
+  string code = 1;
+  string message = 2;
+}
+
+message PhysicalHold {
+  string action_id = 1;
+  oneof kind {
+    ScanCodeHold scan_code = 10;
+    MouseButtonHold mouse_button = 11;
+  }
+}
+
+message ScanCodeHold {
+  uint32 scan_code = 1;
+  bool extended = 2;
+}
+message MouseButtonHold { MouseButton button = 1; }
+
+enum MouseButton {
+  MOUSE_BUTTON_UNSPECIFIED = 0;
+  MOUSE_BUTTON_LEFT = 1;
+  MOUSE_BUTTON_RIGHT = 2;
+  MOUSE_BUTTON_MIDDLE = 3;
+  MOUSE_BUTTON_X1 = 4;
+  MOUSE_BUTTON_X2 = 5;
+}
+
+enum ReleaseReason {
+  RELEASE_REASON_UNSPECIFIED = 0;
+  RELEASE_REASON_LEASE_EXPIRED = 1;
+  RELEASE_REASON_FOCUS_LOST = 2;
+  RELEASE_REASON_SESSION_CHANGED = 3;
+  RELEASE_REASON_EMERGENCY_STOP = 4;
+  RELEASE_REASON_GUARDIAN_FAILURE = 5;
+  RELEASE_REASON_AGENT_EXITED = 6;
+  RELEASE_REASON_HEARTBEAT_EXPIRED = 7;
+  RELEASE_REASON_AGENT_DISCONNECTED = 8;
+  RELEASE_REASON_PLATFORM_FAILURE = 9;
+}

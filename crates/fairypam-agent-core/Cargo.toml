@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-fairypam-agent-transport = { path = "../fairypam-agent-transport" }
+fairypam-agent-transport = { path = "../fairypam-agent-transport", optional = true }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -15,3 +15,7 @@ ed25519-dalek.workspace = true
 tokio = { version = "1", features = ["time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
+
+[features]
+default = ["supervisor"]
+supervisor = ["dep:fairypam-agent-transport"]

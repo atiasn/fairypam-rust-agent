@@ -14,8 +14,14 @@ use fairypam_agent_core::profile::Ed25519SignatureVerifier;
 use fairypam_agent_core::supervisor::SessionSupervisor;
 use fairypam_agent_core::supervisor::{SessionDriver, SupervisorHooks};
 use fairypam_agent_core::AgentError;
-use fairypam_agent_protocol::v2::{
-    self as v2, agent_control_event, hub_telemetry_command, AgentControlEvent, AgentRuntimeState,
+#[cfg(any(windows, test))]
+use fairypam_agent_protocol::local_v1::{
+    local_control_request, local_control_response, DiagnosticsResult, EmergencyReleaseResult,
+    EnvironmentCheck, EnvironmentResult, LocalCommandOutcome, LocalControlRequest,
+    LocalControlResponse, RegistrationResult, StatusResult,
+};
+use fairypam_agent_protocol::v3::{
+    self as v3, agent_control_event, hub_telemetry_command, AgentControlEvent, AgentRuntimeState,
     AgentStatus, Heartbeat, SessionRef,
 };
 #[cfg(any(windows, test))]
@@ -32,7 +38,7 @@ use http::Uri;
 #[cfg(any(windows, test))]
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio_util::sync::CancellationToken;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use zeroize::Zeroizing;
 
 use crate::execution::{CommandExecutor, CommandOutcome, ExecutionSession, FrameSink};
@@ -42,7 +48,7 @@ use crate::observability;
 use crate::observability::AgentLogRecord;
 use crate::profile_catalog::ProfileCatalogStore;
 use crate::profile_store::ProfileStore;
-use crate::v2_adapter;
+use crate::v3_adapter;
 const REGISTRATION_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 use crate::runtime_api::LogLevel;
@@ -56,6 +62,7 @@ pub struct RuntimeConfig {
     pub agent_version: String,
     pub build_commit: String,
     pub profiles: ProfileStore,
+    pub profile_root_public_key_hex: Option<String>,
     profile_catalog: Option<ProfileCatalogStore>,
     enrollment_root: Option<PathBuf>,
     enrollment_generation: Option<String>,
@@ -130,6 +137,7 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles: ProfileStore::default(),
+            profile_root_public_key_hex: None,
             profile_catalog: None,
             #[cfg(windows)]
             enrollment_root: Some(PathBuf::from(crate::enrollment::STATE_ROOT)),
@@ -145,9 +153,8 @@ impl RuntimeConfig {
         if enrollment_state_exists() {
             return Self::from_enrollment_state();
         }
-        let verifier = Ed25519SignatureVerifier::from_public_key_hex(&required(
-            "FAIRYPAM_PROFILE_ROOT_PUBLIC_KEY_HEX",
-        )?)?;
+        let profile_root_public_key_hex = required("FAIRYPAM_PROFILE_ROOT_PUBLIC_KEY_HEX")?;
+        let verifier = Ed25519SignatureVerifier::from_public_key_hex(&profile_root_public_key_hex)?;
         let profiles = ProfileStore::load(&required_path("FAIRYPAM_PROFILE_DIR")?, &verifier)?;
         Ok(Self {
             transport: TransportConfig {
@@ -165,6 +172,7 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles,
+            profile_root_public_key_hex: Some(profile_root_public_key_hex),
             profile_catalog: None,
             enrollment_root: None,
             enrollment_generation: None,
@@ -235,6 +243,7 @@ impl RuntimeConfig {
                 .unwrap_or("unknown")
                 .to_owned(),
             profiles,
+            profile_root_public_key_hex: Some(document.profile_root_public_key_hex),
             profile_catalog: Some(profile_catalog),
             enrollment_root: Some(root.to_path_buf()),
             enrollment_generation: Some(generation),
@@ -500,15 +509,18 @@ pub struct GrpcSessionDriver {
     reconnect_requested: Arc<tokio::sync::Notify>,
     registration_in_progress: Arc<AtomicBool>,
     registration_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    gui_shutdown: CancellationToken,
+    shutdown: CancellationToken,
     agent_process_generation_id: String,
     telemetry: Arc<Mutex<TelemetryState>>,
 }
 
 impl GrpcSessionDriver {
     pub fn new(config: RuntimeConfig) -> Self {
-        let mut execution =
-            CommandExecutor::production(config.profiles.clone(), &config.transport.agent_id);
+        let mut execution = CommandExecutor::production(
+            config.profiles.clone(),
+            &config.transport.agent_id,
+            config.profile_root_public_key_hex.as_deref(),
+        );
         execution.set_profile_update_blocked(
             !config.awaiting_enrollment
                 && config
@@ -527,8 +539,8 @@ impl GrpcSessionDriver {
             RuntimeState::default()
         };
         state.record(LogLevel::Info, RuntimeLogMessage::Started);
-        let gui_shutdown = CancellationToken::new();
-        let agent_process_generation_id = v2_adapter::process_generation_id();
+        let shutdown = CancellationToken::new();
+        let agent_process_generation_id = v3_adapter::process_generation_id();
         let telemetry = new_telemetry_state(agent_process_generation_id.clone());
         Self {
             config: Arc::new(Mutex::new(config)),
@@ -538,7 +550,7 @@ impl GrpcSessionDriver {
             reconnect_requested: Arc::new(tokio::sync::Notify::new()),
             registration_in_progress: Arc::new(AtomicBool::new(false)),
             registration_worker: Arc::new(Mutex::new(None)),
-            gui_shutdown,
+            shutdown,
             agent_process_generation_id,
             telemetry: Arc::new(Mutex::new(telemetry)),
         }
@@ -561,7 +573,7 @@ impl GrpcSessionDriver {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn for_test() -> Self {
+    pub(crate) fn for_test() -> Self {
         let config = RuntimeConfig::unregistered();
         let mut execution = CommandExecutor::without_devices_for_test();
         execution.rebind_managed_game_identity(&config.transport.agent_id);
@@ -578,7 +590,7 @@ impl GrpcSessionDriver {
             reconnect_requested: Arc::new(tokio::sync::Notify::new()),
             registration_in_progress: Arc::new(AtomicBool::new(false)),
             registration_worker: Arc::new(Mutex::new(None)),
-            gui_shutdown: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
             agent_process_generation_id: agent_process_generation_id.clone(),
             telemetry: Arc::new(Mutex::new(TelemetryState::memory(
                 agent_process_generation_id,
@@ -587,8 +599,8 @@ impl GrpcSessionDriver {
     }
 
     #[cfg(any(windows, test))]
-    fn local_runtime(&self) -> SharedRuntime {
-        SharedRuntime {
+    pub(crate) fn local_control(&self) -> LocalControlRuntime {
+        LocalControlRuntime {
             execution: Arc::clone(&self.execution),
             state: Arc::clone(&self.state),
             config: Arc::clone(&self.config),
@@ -596,7 +608,7 @@ impl GrpcSessionDriver {
             reconnect_requested: Arc::clone(&self.reconnect_requested),
             registration_in_progress: Arc::clone(&self.registration_in_progress),
             registration_worker: Arc::clone(&self.registration_worker),
-            gui_shutdown: self.gui_shutdown.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 
@@ -660,7 +672,7 @@ impl GrpcSessionDriver {
 
     fn receive_profile_catalog(
         &self,
-        catalog: &v2::ProfileCatalog,
+        catalog: &v3::ProfileCatalog,
         sender: &ControlSender,
         session: &VerifiedSession,
     ) -> Result<(), AgentError> {
@@ -683,7 +695,7 @@ impl GrpcSessionDriver {
                         session,
                         catalog.catalog_version,
                         &catalog.catalog_digest,
-                        v2::ProfileCatalogApplyState::Pending,
+                        v3::ProfileCatalogApplyState::Pending,
                         None,
                     )?)
                     .map_err(map_transport)?;
@@ -696,7 +708,7 @@ impl GrpcSessionDriver {
                         session,
                         catalog.catalog_version,
                         &catalog.catalog_digest,
-                        v2::ProfileCatalogApplyState::Applied,
+                        v3::ProfileCatalogApplyState::Applied,
                         None,
                     )?)
                     .map_err(map_transport)
@@ -706,7 +718,7 @@ impl GrpcSessionDriver {
                     session,
                     catalog.catalog_version,
                     &catalog.catalog_digest,
-                    v2::ProfileCatalogApplyState::Rejected,
+                    v3::ProfileCatalogApplyState::Rejected,
                     Some(error.code().to_owned()),
                 )?)
                 .map_err(map_transport),
@@ -728,7 +740,7 @@ impl GrpcSessionDriver {
         session: &VerifiedSession,
         execution: &mut CommandExecutor,
     ) -> Result<(), AgentError> {
-        if execution.task_active()? {
+        if !execution.profile_activation_ready()? {
             return Ok(());
         }
         let pending = self
@@ -761,30 +773,33 @@ impl GrpcSessionDriver {
         };
         match activated {
             Ok(active) => {
-                execution.reload_profiles(active.profiles.clone());
-                execution.set_profile_update_blocked(false);
+                execution.emergency_release_input()?;
                 sender
                     .try_send(self.profile_catalog_event(
                         session,
                         active.version,
                         &active.digest,
-                        v2::ProfileCatalogApplyState::Applied,
+                        v3::ProfileCatalogApplyState::Applied,
                         None,
                     )?)
                     .map_err(map_transport)?;
                 sender
-                    .try_send(v2_adapter::discovery_snapshot(
+                    .try_send(v3_adapter::discovery_snapshot(
                         session_ref(session),
                         &active.profiles,
                     )?)
-                    .map_err(map_transport)
+                    .map_err(map_transport)?;
+                // Guardian must rebuild its fixed emergency-release set from the
+                // newly active signed Catalog before this Agent accepts input.
+                self.shutdown.cancel();
+                Ok(())
             }
             Err(error) => sender
                 .try_send(self.profile_catalog_event(
                     session,
                     version,
                     &digest,
-                    v2::ProfileCatalogApplyState::Rejected,
+                    v3::ProfileCatalogApplyState::Rejected,
                     Some(error.code().to_owned()),
                 )?)
                 .map_err(map_transport),
@@ -796,7 +811,7 @@ impl GrpcSessionDriver {
         session: &VerifiedSession,
         desired_version: u64,
         desired_digest: &str,
-        state: v2::ProfileCatalogApplyState,
+        state: v3::ProfileCatalogApplyState,
         error_code: Option<String>,
     ) -> Result<AgentControlEvent, AgentError> {
         let active = self
@@ -810,7 +825,7 @@ impl GrpcSessionDriver {
                     .active()
                     .map(|active| (active.version, active.digest.clone()))
             });
-        Ok(v2_adapter::profile_catalog_status(
+        Ok(v3_adapter::profile_catalog_status(
             session_ref(session),
             desired_version,
             desired_digest.to_owned(),
@@ -929,7 +944,7 @@ impl GrpcSessionDriver {
                                 &mut pending_log_chunks,
                                 &receipt,
                             );
-                            if receipt.target_type == v2::DiagnosticTargetType::Agent as i32 {
+                            if receipt.target_type == v3::DiagnosticTargetType::Agent as i32 {
                                 active_log_request = None;
                             }
                             sender
@@ -978,7 +993,7 @@ impl GrpcSessionDriver {
                         .pop_front()
                         .expect("log chunk queue is not empty");
                     let completed_request = match chunk.payload.as_ref() {
-                        Some(v2::agent_telemetry_event::Payload::LogChunk(value)) if value.eof => {
+                        Some(v3::agent_telemetry_event::Payload::LogChunk(value)) if value.eof => {
                             Some(value.request_id.clone())
                         }
                         _ => None,
@@ -996,7 +1011,7 @@ impl GrpcSessionDriver {
                             &mut pending_log_chunks,
                             receipt,
                         );
-                        if receipt.target_type == v2::DiagnosticTargetType::Agent as i32 {
+                        if receipt.target_type == v3::DiagnosticTargetType::Agent as i32 {
                             active_log_request = None;
                         }
                     }
@@ -1024,7 +1039,7 @@ impl GrpcSessionDriver {
                         )?
                     };
                     let Some(event) = event else { continue };
-                    let Some(v2::agent_telemetry_event::Payload::Batch(batch)) = event.payload.as_ref() else {
+                    let Some(v3::agent_telemetry_event::Payload::Batch(batch)) = event.payload.as_ref() else {
                         return Err(AgentError::new(
                             "runtime.telemetry_batch_invalid",
                             "local Telemetry queue produced an invalid batch",
@@ -1039,24 +1054,24 @@ impl GrpcSessionDriver {
     }
 }
 
-fn cancel_log_read(chunks: &mut VecDeque<v2::AgentTelemetryEvent>, request_id: &str) {
+fn cancel_log_read(chunks: &mut VecDeque<v3::AgentTelemetryEvent>, request_id: &str) {
     chunks.retain(|event| {
         !matches!(
             event.payload.as_ref(),
-            Some(v2::agent_telemetry_event::Payload::LogChunk(chunk))
+            Some(v3::agent_telemetry_event::Payload::LogChunk(chunk))
                 if chunk.request_id == request_id
         )
     });
 }
 
 fn cancel_agent_log_reads_for_terminal(
-    chunks: &mut VecDeque<v2::AgentTelemetryEvent>,
-    receipt: &v2::DiagnosticLeaseReceipt,
+    chunks: &mut VecDeque<v3::AgentTelemetryEvent>,
+    receipt: &v3::DiagnosticLeaseReceipt,
 ) {
-    if receipt.target_type == v2::DiagnosticTargetType::Agent as i32
+    if receipt.target_type == v3::DiagnosticTargetType::Agent as i32
         && matches!(
-            v2::DiagnosticLeaseDisposition::try_from(receipt.disposition),
-            Ok(v2::DiagnosticLeaseDisposition::Revoked | v2::DiagnosticLeaseDisposition::Expired)
+            v3::DiagnosticLeaseDisposition::try_from(receipt.disposition),
+            Ok(v3::DiagnosticLeaseDisposition::Revoked | v3::DiagnosticLeaseDisposition::Expired)
         )
     {
         chunks.clear();
@@ -1118,7 +1133,7 @@ impl SessionDriver for GrpcSessionDriver {
         };
         let (sender, receiver) = control_queue();
         sender
-            .send(v2_adapter::hello(
+            .send(v3_adapter::hello(
                 config.transport.agent_id.clone(),
                 config.agent_version.clone(),
                 config.build_commit.clone(),
@@ -1147,7 +1162,7 @@ impl SessionDriver for GrpcSessionDriver {
             .try_send(status_event(&session, runtime_state))
             .map_err(map_transport)?;
         sender
-            .try_send(v2_adapter::discovery_snapshot(
+            .try_send(v3_adapter::discovery_snapshot(
                 session_ref(&session),
                 &config.profiles,
             )?)
@@ -1174,7 +1189,7 @@ impl SessionDriver for GrpcSessionDriver {
         if let Ok(mut telemetry) = self.telemetry.lock() {
             let _ = telemetry.record_event(
                 "agent.control.connected",
-                v2::TelemetrySeverity::Info,
+                v3::TelemetrySeverity::Info,
                 None,
                 None,
                 None,
@@ -1208,7 +1223,7 @@ impl SessionDriver for GrpcSessionDriver {
         let mut capture_health = tokio::time::interval(Duration::from_millis(250));
         capture_health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         capture_health.tick().await;
-        let mut translator = v2_adapter::Translator::new(session.max_input_lease_ms());
+        let mut translator = v3_adapter::Translator::new(session.max_input_lease_ms());
         let telemetry_cancellation = cancellation.child_token();
         let mut telemetry =
             Box::pin(self.run_telemetry_forever(telemetry_cancellation.clone(), session.clone()));
@@ -1257,35 +1272,50 @@ impl SessionDriver for GrpcSessionDriver {
                 }
                 _ = capture_health.tick() => {
                     let mut execution = self.execution_for_session(&session)?;
+                    for event in execution.tick_safety(&ExecutionSession::from_verified(&session))? {
+                        sender.try_send(v3_adapter::safety_event(event)?).map_err(map_transport)?;
+                    }
                     let event = execution.capture_failure_event(&ExecutionSession::from_verified(&session))?;
                     if let Some(event) = event {
-                        sender.try_send(v2_adapter::safety_event(event)?).map_err(map_transport)?;
+                        sender.try_send(v3_adapter::safety_event(event)?).map_err(map_transport)?;
+                    }
+                    match execution.realtime_program_events(&ExecutionSession::from_verified(&session)) {
+                        Ok(events) => {
+                            for event in events {
+                                sender.try_send(event).map_err(map_transport)?;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(code = error.code(), "Realtime Program Worker became uncertain");
+                            sender.try_send(realtime_failure_event(&session, error.code()))
+                                .map_err(map_transport)?;
+                        }
                     }
                 }
                 command = control.message() => {
                     let command = command.map_err(map_transport)?.ok_or_else(|| {
                         AgentError::new("runtime.control_closed", "Hub closed the Control stream")
                     })?.into_inner();
-                    if let Some(v2::hub_control_command::Payload::AcknowledgeManagedGameClose(value)) =
+                    if let Some(v3::hub_control_command::Payload::AcknowledgeManagedGameClose(value)) =
                         command.payload.as_ref()
                     {
                         self.execution_for_session(&session)?
                             .acknowledge_managed_game_close(value)?;
                         continue;
                     }
-                    if let Some(v2::hub_control_command::Payload::ProfileCatalog(value)) =
+                    if let Some(v3::hub_control_command::Payload::ProfileCatalog(value)) =
                         command.payload.as_ref()
                     {
                         self.receive_profile_catalog(value, &sender, &session)?;
                         continue;
                     }
-                    let identity = v2_adapter::identity(&command).ok_or_else(|| {
+                    let identity = v3_adapter::identity(&command).ok_or_else(|| {
                         AgentError::new(
                             "runtime.command_invalid",
                             "verified command lost CommandRef",
                         )
                     })?;
-                    let command_name = v2_adapter::command_name(&command);
+                    let command_name = v3_adapter::command_name(&command);
                     let command_started_at = telemetry_unix_nano();
                     let translated = match translator.translate(&command) {
                         Ok(command) => command,
@@ -1299,25 +1329,26 @@ impl SessionDriver for GrpcSessionDriver {
                                     Some(error.code()),
                                 );
                             }
-                            let event = match v2_adapter::internal_task_identity(&identity) {
+                            let event = match v3_adapter::internal_task_identity(&identity) {
                                 Ok(task) => {
                                     let mut execution = self.execution_for_session(&session)?;
-                                    let outcome = if error.code() == "command.payload_digest_conflict" {
-                                        execution.v2_payload_digest_conflict(&task)
+                                    let mut outcome = if error.code() == "command.payload_digest_conflict" {
+                                        execution.v3_payload_digest_conflict(&task)
                                     } else {
-                                        execution.reject_v2_task(&task, error.code())
+                                        execution.reject_v3_task(&task, error.code())
                                     };
-                                    v2_adapter::result(identity, outcome)
+                                    execution.stamp_target_generation(&mut outcome);
+                                    v3_adapter::result(identity, outcome)
                                 }
-                                Err(_) => v2_adapter::error(identity, &error),
+                                Err(_) => v3_adapter::error(identity, &error),
                             };
                             sender.try_send(event).map_err(map_transport)?;
                             continue;
                         }
                     };
                     let mut execution = self.execution_for_session(&session)?;
-                    let outcome = match translated {
-                        v2_adapter::TranslatedCommand::Internal(internal) => {
+                    let mut outcome = match translated {
+                        v3_adapter::TranslatedCommand::Internal(internal) => {
                             let frames = {
                                 let state = self.state.lock().map_err(lock_error)?;
                                 state.frames.clone().ok_or_else(session_missing)?
@@ -1328,7 +1359,7 @@ impl SessionDriver for GrpcSessionDriver {
                                 Arc::new(frames) as Arc<dyn FrameSink>,
                             )
                         }
-                        v2_adapter::TranslatedCommand::CloseTarget { value } => {
+                        v3_adapter::TranslatedCommand::CloseTarget { value } => {
                             let mut report = |phase| {
                                 let event = managed_game_close_progress_event(
                                     &session,
@@ -1343,54 +1374,53 @@ impl SessionDriver for GrpcSessionDriver {
                                     );
                                 }
                             };
-                            execution.execute_v2_close_target_with_progress(
+                            execution.execute_v3_close_target_with_progress(
                                 &value,
                                 &mut report,
                             )
                         }
-                        v2_adapter::TranslatedCommand::ConfigureIdleClose { value } => {
-                            execution.execute_v2_configure_idle_close(&value)
+                        v3_adapter::TranslatedCommand::ConfigureIdleClose { value } => {
+                            execution.execute_v3_configure_idle_close(&value)
                         }
-                        v2_adapter::TranslatedCommand::BeginAttempt {
+                        v3_adapter::TranslatedCommand::BeginAttempt {
                             task,
                             contract,
                             digest_key,
                             payload_digest,
                         } => {
-                            let outcome = execution.execute_v2_begin(&task, &contract);
+                            let outcome = execution.execute_v3_begin(&task, &contract);
                             if matches!(&outcome, CommandOutcome::TaskAck { .. }) {
                                 translator.accept_begin(contract, digest_key, payload_digest);
                             }
                             outcome
                         }
-                        v2_adapter::TranslatedCommand::InputFrame { task, frame } => {
-                            execution.execute_v2_input_frame(&task, &frame, None)
+                        v3_adapter::TranslatedCommand::InputFrame { task, frame } => {
+                            execution.execute_v3_input_frame(&task, &frame, None)
                         }
-                        v2_adapter::TranslatedCommand::ClientPointClick { task, value } => {
-                            execution.execute_v2_input_frame(
+                        v3_adapter::TranslatedCommand::ClientPointClick { task, value } => {
+                            execution.execute_v3_input_frame(
                                 &task,
-                                &v2::InputFrame {
+                                &v3::InputFrame {
                                     input_sequence: value.input_sequence,
                                     lease_ms: value.lease_ms,
                                     source_frame_sequence: Some(value.source_frame_sequence),
-                                    ..v2::InputFrame::default()
+                                    target_generation: value.target_generation,
+                                    ..v3::InputFrame::default()
                                 },
-                                Some((value.button, value.x_ppm, value.y_ppm)),
+                                Some((&value.action_id, value.x_ppm, value.y_ppm)),
                             )
                         }
-                v2_adapter::TranslatedCommand::StartMusicAutoplay {
-                    task,
-                    maximum_duration_ms,
-                    supervision_lease_ms,
-                } => execution.execute_v2_start_music_autoplay(
-                        &task,
-                        maximum_duration_ms,
-                        supervision_lease_ms,
-                    ),
-                        v2_adapter::TranslatedCommand::StopMusicAutoplay { task } => {
-                            execution.execute_v2_stop_music_autoplay(&task)
+                        v3_adapter::TranslatedCommand::StartRealtimeProgram { task, value } => {
+                            execution.execute_v3_start_realtime_program(&task, &value)
+                        }
+                        v3_adapter::TranslatedCommand::RenewRealtimeProgram { task, value } => {
+                            execution.execute_v3_renew_realtime_program(&task, &value)
+                        }
+                        v3_adapter::TranslatedCommand::StopRealtimeProgram { task, value } => {
+                            execution.execute_v3_stop_realtime_program(&task, &value)
                         }
                     };
+                    execution.stamp_target_generation(&mut outcome);
                     drop(execution);
                     if let Ok(mut state) = self.state.lock() {
                         state.record_command_diagnostic(&outcome);
@@ -1404,7 +1434,7 @@ impl SessionDriver for GrpcSessionDriver {
                             outcome.telemetry_error_code(),
                         );
                     }
-                    let event = v2_adapter::result(identity, outcome);
+                    let event = v3_adapter::result(identity, outcome);
                     sender.try_send(event).map_err(map_transport)?;
                     self.activate_profile_catalog_if_ready(&sender, &session)?;
                 }
@@ -1516,7 +1546,10 @@ fn install_runtime_config(
         }
         execution.rebind_managed_game_identity(&config.transport.agent_id)
     }
-    execution.reload_profiles(config.profiles.clone());
+    execution.reload_profiles_with_key(
+        config.profiles.clone(),
+        config.profile_root_public_key_hex.as_deref(),
+    )?;
     execution.set_profile_update_blocked(
         config
             .profile_catalog
@@ -1651,138 +1684,126 @@ impl SupervisorHooks for RuntimeSafetyHooks {
     }
 }
 
-#[cfg(any(windows, test))]
-#[derive(Clone)]
-pub struct EmbeddedRuntimeHandle {
-    runtime: SharedRuntime,
-    completion: Arc<EmbeddedRuntimeCompletion>,
-}
-
-#[cfg(any(windows, test))]
-#[derive(Default)]
-struct EmbeddedRuntimeCompletion {
-    result: Mutex<Option<Result<(), String>>>,
-    completed: tokio::sync::Notify,
-}
-
-#[cfg(any(windows, test))]
-impl EmbeddedRuntimeCompletion {
-    fn finish(&self, result: &Result<(), AgentError>) {
-        let stored = result.as_ref().map(|_| ()).map_err(ToString::to_string);
-        if let Ok(mut current) = self.result.lock() {
-            *current = Some(stored);
-        }
-        self.completed.notify_waiters();
-    }
-
-    async fn wait(&self) -> Result<(), AgentError> {
-        loop {
-            let notified = self.completed.notified();
-            if let Some(result) = self.result.lock().map_err(lock_error)?.clone() {
-                return result
-                    .map_err(|message| AgentError::new("runtime.embedded_failed", message));
-            }
-            notified.await;
-        }
-    }
-
-    fn ensure_running(&self) -> Result<(), AgentError> {
-        match self.result.lock().map_err(lock_error)?.as_ref() {
-            None => Ok(()),
-            Some(Ok(())) => Err(AgentError::new(
-                "runtime.embedded_stopped",
-                "embedded runtime has stopped",
-            )),
-            Some(Err(message)) => Err(AgentError::new("runtime.embedded_failed", message.clone())),
-        }
-    }
-}
-
-#[cfg(any(windows, test))]
-impl EmbeddedRuntimeHandle {
-    pub fn execute(&self, command: &LocalCommand) -> Result<serde_json::Value, AgentError> {
-        self.completion.ensure_running()?;
-        match command {
-            LocalCommand::Status
-            | LocalCommand::Doctor
-            | LocalCommand::ListProfiles
-            | LocalCommand::ReleaseAll
-            | LocalCommand::ResetEmergencyStop
-            | LocalCommand::GetConnectionStatus
-            | LocalCommand::RunEnvironmentCheck
-            | LocalCommand::GetLogTail { .. }
-            | LocalCommand::ScanInstalledGames
-            | LocalCommand::LaunchTarget { .. }
-            | LocalCommand::CloseTarget
-            | LocalCommand::CapturePreview
-            | LocalCommand::InputProbe { .. }
-            | LocalCommand::RegisterHub { .. } => self.runtime.execute_embedded(command),
-            LocalCommand::ShutdownAgent => {
-                self.runtime.record_local_operation(command);
-                self.runtime
-                    .execution
-                    .lock()
-                    .map_err(lock_error)?
-                    .shutdown()?;
-                self.runtime.gui_shutdown.cancel();
-                Ok(serde_json::json!({"state": "shutting_down"}))
-            }
-            _ => Err(AgentError::new(
-                "local.embedded_command_not_allowed",
-                "the embedded GUI runtime does not expose this command",
-            )),
-        }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn for_test() -> Self {
-        let driver = GrpcSessionDriver::for_test();
-        Self {
-            runtime: driver.local_runtime(),
-            completion: Arc::new(EmbeddedRuntimeCompletion::default()),
-        }
-    }
-
-    pub async fn wait_for_shutdown(&self, timeout: Duration) -> Result<(), AgentError> {
-        tokio::time::timeout(timeout, self.completion.wait())
-            .await
-            .map_err(|_| {
-                AgentError::new(
-                    "runtime.shutdown_timeout",
-                    "embedded runtime did not finish cleanup before the deadline",
-                )
-            })?
-    }
-}
-
 #[cfg(windows)]
-pub fn start_embedded(
+pub async fn run_production(
     config: RuntimeConfig,
-) -> Result<
-    (
-        EmbeddedRuntimeHandle,
-        impl std::future::Future<Output = Result<(), AgentError>>,
-    ),
-    AgentError,
-> {
+    guardian_pipe: String,
+) -> Result<(), AgentError> {
     verify_active_agent_suite()?;
-    let instance = AgentInstance::acquire()?;
-    let driver = GrpcSessionDriver::new(config);
-    let completion = Arc::new(EmbeddedRuntimeCompletion::default());
-    let handle = EmbeddedRuntimeHandle {
-        runtime: driver.local_runtime(),
-        completion: Arc::clone(&completion),
-    };
-    Ok((handle, async move {
-        let _instance = instance;
-        let result = run_embedded_driver(driver).await;
-        completion.finish(&result);
-        result
-    }))
+    run_standalone(config, Some(guardian_pipe)).await
 }
 
 #[cfg(windows)]
-async fn run_embedded_driver(driver: GrpcSessionDriver) -> Result<(), AgentError> {
+pub async fn run_development(config: RuntimeConfig) -> Result<(), AgentError> {
+    run_standalone(config, None).await
+}
+
+#[cfg(windows)]
+async fn run_standalone(
+    config: RuntimeConfig,
+    guardian_pipe: Option<String>,
+) -> Result<(), AgentError> {
+    let _instance = AgentInstance::acquire()?;
+    let driver = GrpcSessionDriver::new(config);
+    let guardian = guardian_pipe
+        .map(|pipe_name| {
+            crate::guardian_channel::GuardianChannel::start(
+                &driver.config.lock().map_err(lock_error)?.profiles,
+                driver.shutdown.clone(),
+                pipe_name,
+                Arc::clone(&driver.execution),
+            )
+        })
+        .transpose();
+    let guardian = match guardian {
+        Ok(guardian) => guardian,
+        Err(error) => return Err(error),
+    };
+    let worker_info = match driver
+        .execution
+        .lock()
+        .map_err(lock_error)?
+        .ensure_worker_ready()
+    {
+        Ok(info) => info,
+        Err(error) => {
+            let _ = guardian.map(|guardian| guardian.stop());
+            return Err(error);
+        }
+    };
+    if let Some(info) = worker_info {
+        let attributes = [
+            ("maa.runtime.version", info.maa_runtime_version.as_str()),
+            ("windows.capture.backend", info.capture_backend.as_str()),
+            ("windows.input.backend", info.input_backend.as_str()),
+        ]
+        .into_iter()
+        .map(|(key, value)| v3::TelemetryAttribute {
+            key: key.to_owned(),
+            value: Some(v3::telemetry_attribute::Value::StringValue(
+                value.to_owned(),
+            )),
+        })
+        .collect();
+        driver
+            .telemetry
+            .lock()
+            .map_err(lock_error)?
+            .record_event_with_attributes(
+                "agent.windows_io.ready",
+                v3::TelemetrySeverity::Info,
+                None,
+                None,
+                None,
+                None,
+                attributes,
+            )?;
+        tracing::info!(
+            maa_runtime_version = info.maa_runtime_version,
+            capture_backend = info.capture_backend,
+            input_backend = info.input_backend,
+            "Win32 Worker ready"
+        );
+    }
+    let local_control = match crate::local_control::LocalControlServer::start(
+        driver.local_control(),
+        driver.shutdown.clone(),
+    ) {
+        Ok(server) => server,
+        Err(error) => {
+            let _ = guardian.map(|guardian| guardian.stop());
+            return Err(error);
+        }
+    };
+    let shutdown = driver.shutdown.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown.cancel();
+        }
+    });
+    let runtime_result = run_driver(driver).await;
+    let local_control_result = local_control.stop();
+    let guardian_result = guardian.map_or(Ok(()), |guardian| guardian.stop());
+    let cleanup_result = match (local_control_result, guardian_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(local), Err(guardian)) => Err(AgentError::new(
+            "runtime.cleanup_failed",
+            format!("{local}; {guardian}"),
+        )),
+    };
+    match (runtime_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(runtime), Err(guardian)) => Err(AgentError::new(
+            "runtime.cleanup_failed",
+            format!("{runtime}; {guardian}"),
+        )),
+    }
+}
+
+#[cfg(windows)]
+async fn run_driver(driver: GrpcSessionDriver) -> Result<(), AgentError> {
     let hooks = RuntimeSafetyHooks::for_driver(&driver);
     let backoff = CappedBackoff::new(Duration::from_millis(250), Duration::from_secs(30))
         .map_err(map_transport)?;
@@ -1790,8 +1811,8 @@ async fn run_embedded_driver(driver: GrpcSessionDriver) -> Result<(), AgentError
     if !driver.is_registered()? {
         tokio::select! {
             result = driver.wait_until_registered() => result?,
-            _ = driver.gui_shutdown.cancelled() => {
-                return shutdown_embedded(&driver, &mut supervisor);
+            _ = driver.shutdown.cancelled() => {
+                return shutdown_runtime(&driver, &mut supervisor);
             }
         }
     }
@@ -1810,16 +1831,16 @@ async fn run_embedded_driver(driver: GrpcSessionDriver) -> Result<(), AgentError
                     tracing::warn!(code = error.code(), "managed game idle-close tick paused");
                 }
             },
-            _ = driver.gui_shutdown.cancelled() => {
+            _ = driver.shutdown.cancelled() => {
                 drop(supervisor_run);
-                return shutdown_embedded(&driver, &mut supervisor);
+                return shutdown_runtime(&driver, &mut supervisor);
             }
         }
     }
 }
 
 #[cfg(windows)]
-fn shutdown_embedded(
+fn shutdown_runtime(
     driver: &GrpcSessionDriver,
     supervisor: &mut SessionSupervisor<RuntimeSafetyHooks>,
 ) -> Result<(), AgentError> {
@@ -1923,7 +1944,7 @@ impl Drop for AgentInstance {
 
 #[cfg(any(windows, test))]
 #[derive(Clone)]
-struct SharedRuntime {
+pub(crate) struct LocalControlRuntime {
     execution: Arc<Mutex<CommandExecutor>>,
     state: Arc<Mutex<RuntimeState>>,
     config: Arc<Mutex<RuntimeConfig>>,
@@ -1931,12 +1952,162 @@ struct SharedRuntime {
     reconnect_requested: Arc<tokio::sync::Notify>,
     registration_in_progress: Arc<AtomicBool>,
     registration_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    gui_shutdown: CancellationToken,
+    shutdown: CancellationToken,
 }
 
 #[cfg(any(windows, test))]
-impl SharedRuntime {
-    fn execute_embedded(&self, command: &LocalCommand) -> Result<serde_json::Value, AgentError> {
+impl LocalControlRuntime {
+    #[cfg(any(windows, test))]
+    pub(crate) fn handle_local_request(
+        &self,
+        mut request: LocalControlRequest,
+    ) -> LocalControlResponse {
+        let request_id = std::mem::take(&mut request.request_id);
+        let command = request.command.take();
+        if matches!(
+            command,
+            Some(local_control_request::Command::EmergencyRelease(_))
+        ) {
+            return match self.execute_local(&LocalCommand::ReleaseAll) {
+                Ok(value) => {
+                    let cleanup_complete = value["cleanup_complete"].as_bool().unwrap_or(false);
+                    LocalControlResponse {
+                        request_id,
+                        outcome: if cleanup_complete {
+                            LocalCommandOutcome::Applied
+                        } else {
+                            LocalCommandOutcome::Uncertain
+                        } as i32,
+                        error_code: value["error_code"].as_str().map(str::to_owned),
+                        result: Some(local_control_response::Result::EmergencyRelease(
+                            EmergencyReleaseResult {
+                                cleanup_complete,
+                                holds: value["holds"].as_u64().unwrap_or_default() as u32,
+                            },
+                        )),
+                    }
+                }
+                Err(error) => LocalControlResponse {
+                    request_id,
+                    outcome: LocalCommandOutcome::Uncertain as i32,
+                    error_code: Some(error.code().to_owned()),
+                    result: None,
+                },
+            };
+        }
+        let result = match command {
+            Some(local_control_request::Command::GetStatus(_)) => self
+                .local_status()
+                .map(local_control_response::Result::Status),
+            Some(local_control_request::Command::GetEnvironment(_)) => self
+                .local_environment()
+                .map(local_control_response::Result::Environment),
+            Some(local_control_request::Command::RegisterHub(mut value)) => {
+                let code = Zeroizing::new(std::mem::take(&mut value.registration_code));
+                self.execute_local(&LocalCommand::RegisterHub {
+                    registration_code: code,
+                })
+                .map(|_| {
+                    local_control_response::Result::Registration(RegistrationResult {
+                        pending: true,
+                    })
+                })
+            }
+            Some(local_control_request::Command::EmergencyRelease(_)) => unreachable!(),
+            Some(local_control_request::Command::ExportDiagnostics(_)) => {
+                #[cfg(windows)]
+                let bundle = self.diagnostic_bundle();
+                #[cfg(all(test, not(windows)))]
+                let bundle = Err(AgentError::new(
+                    "diagnostic.platform_unsupported",
+                    "diagnostic export requires Windows",
+                ));
+                bundle.map(|bundle| {
+                    local_control_response::Result::Diagnostics(DiagnosticsResult {
+                        bundle,
+                        suggested_file_name: format!("fairypam-diagnostics-{}.json", now_unix_ms()),
+                    })
+                })
+            }
+            None => Err(AgentError::new(
+                "local.command_missing",
+                "local control request has no command",
+            )),
+        };
+        match result {
+            Ok(result) => LocalControlResponse {
+                request_id,
+                outcome: LocalCommandOutcome::Applied as i32,
+                error_code: None,
+                result: Some(result),
+            },
+            Err(error) => LocalControlResponse {
+                request_id,
+                outcome: LocalCommandOutcome::NotApplied as i32,
+                error_code: Some(error.code().to_owned()),
+                result: None,
+            },
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    fn local_status(&self) -> Result<StatusResult, AgentError> {
+        let status = self.execute_local(&LocalCommand::Status)?;
+        let connection = self.connection_status()?;
+        let registered = !self.config.lock().map_err(lock_error)?.awaiting_enrollment;
+        Ok(StatusResult {
+            runtime_state: json_string(&status, "state"),
+            control_state: json_string(&connection, "control"),
+            frame_state: json_string(&connection, "frame"),
+            task_active: status["task_active"].as_bool().unwrap_or(false),
+            capture_active: status["capture_active"].as_bool().unwrap_or(false),
+            registered,
+            recovery_code: json_string(&connection, "recovery_code"),
+        })
+    }
+
+    #[cfg(any(windows, test))]
+    fn local_environment(&self) -> Result<EnvironmentResult, AgentError> {
+        let value = self.environment_check()?;
+        let checks = value["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|check| EnvironmentCheck {
+                id: json_string(check, "id"),
+                status: json_string(check, "status"),
+                code: json_string(check, "code"),
+                recovery: json_string(check, "recovery"),
+            })
+            .collect();
+        Ok(EnvironmentResult {
+            registration_ready: value["registration_ready"].as_bool().unwrap_or(false),
+            registration_pending: value["registration_pending"].as_bool().unwrap_or(false),
+            checks,
+        })
+    }
+
+    #[cfg(windows)]
+    fn diagnostic_bundle(&self) -> Result<Vec<u8>, AgentError> {
+        const MAX_EXPORTED_LOG_BYTES: usize = 48 * 1024;
+
+        let status = self.execute_local(&LocalCommand::Status)?;
+        let connection = self.connection_status()?;
+        let environment = self.environment_check()?;
+        let logs = observability::production_log()?.snapshot(MAX_EXPORTED_LOG_BYTES)?;
+        let bundle = serde_json::json!({
+            "schema_version": 1,
+            "generated_at_unix_ms": now_unix_ms(),
+            "status": status,
+            "connection": connection,
+            "environment": environment,
+            "logs_ndjson": String::from_utf8_lossy(&logs),
+        });
+        serde_json::to_vec_pretty(&bundle)
+            .map_err(|error| AgentError::new("diagnostic.export_failed", error.to_string()))
+    }
+
+    fn execute_local(&self, command: &LocalCommand) -> Result<serde_json::Value, AgentError> {
         self.record_local_operation(command);
         match command {
             LocalCommand::GetConnectionStatus => self.connection_status(),
@@ -2207,6 +2378,11 @@ fn registration_pending() -> serde_json::Value {
     serde_json::json!({"status": "pending"})
 }
 
+#[cfg(any(windows, test))]
+fn json_string(value: &serde_json::Value, key: &str) -> String {
+    value[key].as_str().unwrap_or_default().to_owned()
+}
+
 fn regular_nonempty_file(path: &Path) -> bool {
     path.symlink_metadata().is_ok_and(|metadata| {
         metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0
@@ -2281,7 +2457,7 @@ fn status_event(session: &VerifiedSession, state: AgentRuntimeState) -> AgentCon
 
 fn managed_game_idle_event(
     session: &VerifiedSession,
-    mut status: v2::ManagedGameIdleStatus,
+    mut status: v3::ManagedGameIdleStatus,
 ) -> AgentControlEvent {
     status.session = Some(session_ref(session));
     AgentControlEvent {
@@ -2291,12 +2467,12 @@ fn managed_game_idle_event(
 
 fn managed_game_close_event(
     session: &VerifiedSession,
-    receipt: v2::ManagedGameCloseReceipt,
+    receipt: v3::ManagedGameCloseReceipt,
 ) -> AgentControlEvent {
     let event_id = close_event_id(&receipt);
     AgentControlEvent {
         payload: Some(agent_control_event::Payload::ManagedGameCloseEvent(
-            v2::ManagedGameCloseEvent {
+            v3::ManagedGameCloseEvent {
                 session: Some(session_ref(session)),
                 event_id,
                 receipt: Some(receipt),
@@ -2309,11 +2485,11 @@ fn managed_game_close_progress_event(
     session: &VerifiedSession,
     game_session_id: &str,
     state_version: u64,
-    phase: v2::ManagedGameClosePhase,
+    phase: v3::ManagedGameClosePhase,
 ) -> AgentControlEvent {
     AgentControlEvent {
         payload: Some(agent_control_event::Payload::ManagedGameCloseProgress(
-            v2::ManagedGameCloseProgress {
+            v3::ManagedGameCloseProgress {
                 session: Some(session_ref(session)),
                 game_session_id: game_session_id.to_owned(),
                 state_version,
@@ -2321,6 +2497,18 @@ fn managed_game_close_progress_event(
                 occurred_at_unix_ms: now_unix_ms(),
             },
         )),
+    }
+}
+
+fn realtime_failure_event(session: &VerifiedSession, reason_code: &str) -> AgentControlEvent {
+    AgentControlEvent {
+        payload: Some(agent_control_event::Payload::SafetyEvent(v3::SafetyEvent {
+            session: Some(session_ref(session)),
+            reason_code: reason_code.to_owned(),
+            state: AgentRuntimeState::RecoveryBlocked as i32,
+            attempt: None,
+            attempt_receipt: None,
+        })),
     }
 }
 
@@ -2359,12 +2547,49 @@ mod tests {
     }
 
     #[test]
+    fn local_control_exposes_typed_status_and_confirmed_release() {
+        let local = GrpcSessionDriver::for_test().local_control();
+        let request = |command| LocalControlRequest {
+            request_id: "shell-test".into(),
+            deadline_unix_ms: now_unix_ms() + 1_000,
+            command: Some(command),
+        };
+        let status =
+            local.handle_local_request(request(local_control_request::Command::GetStatus(
+                fairypam_agent_protocol::local_v1::GetStatus {},
+            )));
+        assert_eq!(status.outcome, LocalCommandOutcome::Applied as i32);
+        assert!(matches!(
+            status.result,
+            Some(local_control_response::Result::Status(StatusResult {
+                registered: false,
+                ..
+            }))
+        ));
+
+        let released =
+            local.handle_local_request(request(local_control_request::Command::EmergencyRelease(
+                fairypam_agent_protocol::local_v1::EmergencyRelease {},
+            )));
+        assert_eq!(released.outcome, LocalCommandOutcome::Applied as i32);
+        assert!(matches!(
+            released.result,
+            Some(local_control_response::Result::EmergencyRelease(
+                EmergencyReleaseResult {
+                    cleanup_complete: true,
+                    holds: 0,
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn cancelled_log_read_drops_only_matching_chunks() {
-        let chunk = |request_id: &str| v2::AgentTelemetryEvent {
-            payload: Some(v2::agent_telemetry_event::Payload::LogChunk(
-                v2::AgentLogChunk {
+        let chunk = |request_id: &str| v3::AgentTelemetryEvent {
+            payload: Some(v3::agent_telemetry_event::Payload::LogChunk(
+                v3::AgentLogChunk {
                     request_id: request_id.to_owned(),
-                    ..v2::AgentLogChunk::default()
+                    ..v3::AgentLogChunk::default()
                 },
             )),
         };
@@ -2375,24 +2600,24 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert!(matches!(
             chunks.front().and_then(|event| event.payload.as_ref()),
-            Some(v2::agent_telemetry_event::Payload::LogChunk(chunk))
+            Some(v3::agent_telemetry_event::Payload::LogChunk(chunk))
                 if chunk.request_id == "kept"
         ));
     }
 
     #[test]
     fn only_terminal_agent_lease_drops_pending_log_chunks() {
-        let mut chunks = VecDeque::from([v2::AgentTelemetryEvent::default()]);
-        let mut receipt = v2::DiagnosticLeaseReceipt {
-            target_type: v2::DiagnosticTargetType::TaskRun as i32,
-            disposition: v2::DiagnosticLeaseDisposition::Revoked as i32,
-            ..v2::DiagnosticLeaseReceipt::default()
+        let mut chunks = VecDeque::from([v3::AgentTelemetryEvent::default()]);
+        let mut receipt = v3::DiagnosticLeaseReceipt {
+            target_type: v3::DiagnosticTargetType::TaskRun as i32,
+            disposition: v3::DiagnosticLeaseDisposition::Revoked as i32,
+            ..v3::DiagnosticLeaseReceipt::default()
         };
 
         cancel_agent_log_reads_for_terminal(&mut chunks, &receipt);
         assert_eq!(chunks.len(), 1);
 
-        receipt.target_type = v2::DiagnosticTargetType::Agent as i32;
+        receipt.target_type = v3::DiagnosticTargetType::Agent as i32;
         cancel_agent_log_reads_for_terminal(&mut chunks, &receipt);
 
         assert!(chunks.is_empty());
@@ -2420,48 +2645,6 @@ mod tests {
         assert!(worker.lock().unwrap().is_some());
         join_registration_worker(&worker, Duration::from_secs(1)).unwrap();
         assert!(worker.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn embedded_runtime_exposes_fixed_local_domain_commands() {
-        let handle = EmbeddedRuntimeHandle::for_test();
-        let shutdown = handle.runtime.gui_shutdown.clone();
-        let completion = Arc::clone(&handle.completion);
-
-        assert!(handle.execute(&LocalCommand::Status).is_ok());
-        assert_eq!(
-            handle.execute(&LocalCommand::CloseTarget).unwrap()["closed"],
-            true
-        );
-        for command in [
-            LocalCommand::LaunchTarget {
-                profile_id: "missing-profile".into(),
-            },
-            LocalCommand::CapturePreview,
-            LocalCommand::InputProbe {
-                action: crate::runtime_api::InputProbeAction::MoveForward,
-            },
-        ] {
-            assert_ne!(
-                handle.execute(&command).unwrap_err().code(),
-                "local.embedded_command_not_allowed"
-            );
-        }
-        let released = handle.execute(&LocalCommand::ReleaseAll).unwrap();
-        assert_eq!(released["state"], "EmergencyStopped");
-        assert_eq!(released["cleanup_complete"], true);
-        assert_eq!(
-            handle.execute(&LocalCommand::ResetEmergencyStop).unwrap()["state"],
-            "ConnectedIdle"
-        );
-        assert!(!shutdown.is_cancelled());
-        assert!(handle.execute(&LocalCommand::ShutdownAgent).is_ok());
-        assert!(shutdown.is_cancelled());
-        completion.finish(&Err(AgentError::new("runtime.test_failure", "stopped")));
-        assert_eq!(
-            handle.execute(&LocalCommand::Status).unwrap_err().code(),
-            "runtime.embedded_failed"
-        );
     }
 
     #[test]
@@ -2545,16 +2728,16 @@ mod tests {
     #[tokio::test]
     async fn unregistered_embedded_runtime_notifies_supervisor() {
         let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
-        let local = driver.local_runtime();
+        let local = driver.local_control();
 
         assert!(!driver.is_registered().unwrap());
         assert!(local
-            .execute_embedded(&LocalCommand::GetConnectionStatus)
+            .execute_local(&LocalCommand::GetConnectionStatus)
             .unwrap()
             .get("hub_address")
             .is_none());
         let diagnostics = local
-            .execute_embedded(&LocalCommand::RunEnvironmentCheck)
+            .execute_local(&LocalCommand::RunEnvironmentCheck)
             .unwrap();
         assert_eq!(diagnostics["registration_pending"], false);
         for id in ["certificate", "control", "frame"] {
@@ -2584,7 +2767,7 @@ mod tests {
             .registration_in_progress
             .store(true, Ordering::Release);
         let pending_diagnostics = local
-            .execute_embedded(&LocalCommand::RunEnvironmentCheck)
+            .execute_local(&LocalCommand::RunEnvironmentCheck)
             .unwrap();
         assert_eq!(pending_diagnostics["registration_pending"], true);
         // Production log tailing requires installer-provisioned private paths.
@@ -2618,7 +2801,7 @@ mod tests {
 
         assert!(driver.is_registered().unwrap());
         let status = local
-            .execute_embedded(&LocalCommand::GetConnectionStatus)
+            .execute_local(&LocalCommand::GetConnectionStatus)
             .unwrap();
         assert!(status.get("hub_address").is_none());
         assert!(!status.to_string().contains("hub.example"));
@@ -2632,9 +2815,9 @@ mod tests {
     #[test]
     fn enrollment_identity_change_resets_only_managed_game_namespace() {
         let driver = GrpcSessionDriver::for_test();
-        let local = driver.local_runtime();
+        let local = driver.local_control();
         let old_agent_id = driver.config.lock().unwrap().transport.agent_id.clone();
-        let policy = |state_version| v2::ConfigureIdleClose {
+        let policy = |state_version| v3::ConfigureIdleClose {
             game_id: "game-1".to_owned(),
             game_session_id: "session-1".to_owned(),
             profile_id: "genshin-impact".to_owned(),
@@ -2642,14 +2825,14 @@ mod tests {
             enabled: false,
             idle_timeout_ms: 0,
             occupied: true,
-            ..v2::ConfigureIdleClose::default()
+            ..v3::ConfigureIdleClose::default()
         };
         assert!(matches!(
             driver
                 .execution
                 .lock()
                 .unwrap()
-                .execute_v2_configure_idle_close(&policy(2)),
+                .execute_v3_configure_idle_close(&policy(2)),
             CommandOutcome::Ack(_)
         ));
 
@@ -2661,7 +2844,7 @@ mod tests {
                 .execution
                 .lock()
                 .unwrap()
-                .execute_v2_configure_idle_close(&policy(1)),
+                .execute_v3_configure_idle_close(&policy(1)),
             CommandOutcome::Nack { ref code, .. } if code == "idle_close.state_stale"
         ));
 
@@ -2691,7 +2874,7 @@ mod tests {
         let mut execution = driver.execution.lock().unwrap();
         execution.ensure_agent_identity("agent-b").unwrap();
         assert!(matches!(
-            execution.execute_v2_configure_idle_close(&policy(1)),
+            execution.execute_v3_configure_idle_close(&policy(1)),
             CommandOutcome::Ack(_)
         ));
     }

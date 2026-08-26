@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 
 use fairypam_agent_core::target::TargetBinding;
 use fairypam_agent_core::AgentError;
-use fairypam_agent_protocol::v1::{
+use fairypam_agent_protocol::internal_v1::{
     AgentAttemptContractV1, AttemptRef, TaskAttemptReceiptV1, TaskAttemptState, TaskCaptureState,
     TaskCommandOutcomeState, TaskCommandOutcomeV1, TaskCommandRef, TaskInputState,
     TaskOwnedTargetState, TaskSideEffectState,
 };
-use fairypam_agent_protocol::v2;
+use fairypam_agent_protocol::v3;
 use fairypam_agent_protocol::{verify_agent_attempt_contract, verify_execution_contract};
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +60,7 @@ impl TaskAttemptRuntime {
     }
 
     #[cfg(test)]
-    fn at(root: PathBuf) -> Self {
+    pub(crate) fn at(root: PathBuf) -> Self {
         Self {
             root: Some(root),
             active: None,
@@ -122,7 +122,7 @@ impl TaskAttemptRuntime {
     pub fn begin_v2(
         &mut self,
         task: &TaskCommandRef,
-        contract: &v2::ExecutionContract,
+        contract: &v3::ExecutionContract,
     ) -> Result<TaskAttemptReceiptV1, AgentError> {
         verify_execution_contract(contract)
             .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
@@ -134,7 +134,7 @@ impl TaskAttemptRuntime {
         {
             return Err(AgentError::new(
                 "attempt_contract_mismatch",
-                "task attempt reference does not match the v2 contract",
+                "task attempt reference does not match the v3 contract",
             ));
         }
         self.load_active()?;
@@ -574,6 +574,16 @@ impl TaskAttemptRuntime {
             ));
         }
         if !allow_uncertain
+            && active.contract.contract_version > 1
+            && active.contract.deadline_unix_ms <= current_unix_ms()
+        {
+            self.active = Some(active);
+            return Err(AgentError::new(
+                "task.contract_expired",
+                "execution contract deadline has expired",
+            ));
+        }
+        if !allow_uncertain
             && matches!(
                 TaskSideEffectState::try_from(active.side_effect_state),
                 Ok(TaskSideEffectState::IntentRecorded | TaskSideEffectState::Uncertain)
@@ -889,6 +899,61 @@ impl TaskAttemptRuntime {
         Ok(Some(receipt))
     }
 
+    pub fn mark_active_side_effect_uncertain(
+        &mut self,
+        error_code: &str,
+        input_released: bool,
+    ) -> Result<Option<TaskAttemptReceiptV1>, AgentError> {
+        self.load_active()?;
+        let Some(mut active) = self.active.take() else {
+            return Ok(None);
+        };
+        active.side_effect_state = TaskSideEffectState::Uncertain as i32;
+        active.input_state = if input_released {
+            TaskInputState::Released as i32
+        } else {
+            TaskInputState::Unknown as i32
+        };
+        active.cleanup_complete = false;
+        active.error_code = Some(error_code.to_owned());
+        if let Err(error) = self.persist(&active) {
+            self.active = Some(active);
+            return Err(error);
+        }
+        let receipt = active.receipt();
+        self.active = Some(active);
+        Ok(Some(receipt))
+    }
+
+    pub fn mark_input_released(
+        &mut self,
+        error_code: &str,
+    ) -> Result<Option<TaskAttemptReceiptV1>, AgentError> {
+        self.load_active()?;
+        let Some(mut active) = self.active.take() else {
+            return Ok(None);
+        };
+        active.input_state = TaskInputState::Released as i32;
+        active.cleanup_complete = false;
+        active.error_code = Some(error_code.to_owned());
+        if let Err(error) = self.persist(&active) {
+            self.active = Some(active);
+            return Err(error);
+        }
+        let receipt = active.receipt();
+        self.active = Some(active);
+        Ok(Some(receipt))
+    }
+
+    pub fn active_contract_expired(&mut self, now_unix_ms: i64) -> Result<bool, AgentError> {
+        self.load_active()?;
+        Ok(self.active.as_ref().is_some_and(|active| {
+            active.attempt_state != TaskAttemptState::Terminal as i32
+                && active.contract.contract_version > 1
+                && active.contract.deadline_unix_ms <= now_unix_ms
+        }))
+    }
+
     pub fn emergency_stopped(&mut self) -> Result<bool, AgentError> {
         self.load_active()?;
         Ok(self.emergency_stopped)
@@ -1157,7 +1222,7 @@ impl StoredContract {
             return verify_agent_attempt_contract(&self.message())
                 .map_err(|error| AgentError::new(error.code(), error.to_string()));
         }
-        let contract = v2::ExecutionContract {
+        let contract = v3::ExecutionContract {
             task_run_id: self.task_run_id.clone(),
             attempt_id: self.attempt_id.clone(),
             agent_build_id: self.agent_build_id.clone(),
@@ -1194,15 +1259,15 @@ impl From<&AgentAttemptContractV1> for StoredContract {
     }
 }
 
-impl From<&v2::ExecutionContract> for StoredContract {
-    fn from(contract: &v2::ExecutionContract) -> Self {
+impl From<&v3::ExecutionContract> for StoredContract {
+    fn from(contract: &v3::ExecutionContract) -> Self {
         Self {
             task_run_id: contract.task_run_id.clone(),
             attempt_id: contract.attempt_id.clone(),
             agent_build_id: contract.agent_build_id.clone(),
             profile_id: contract.profile_id.clone(),
             profile_digest: contract.profile_digest.clone(),
-            cleanup_policy: "release_input_and_close_owned_target".into(),
+            cleanup_policy: "release_input_keep_managed_target".into(),
             contract_version: contract.contract_version,
             contract_digest: contract.contract_digest.clone(),
             allowed_capabilities: contract.allowed_capabilities.clone(),
@@ -1319,7 +1384,7 @@ impl AttemptState {
 
     fn record_command(
         &mut self,
-        command: &fairypam_agent_protocol::v1::CommandRef,
+        command: &fairypam_agent_protocol::internal_v1::CommandRef,
         payload_digest: &str,
         command_limit: usize,
     ) -> Result<(), AgentError> {
@@ -1379,6 +1444,7 @@ impl AttemptState {
             owned_target_state: self.owned_target_state,
             cleanup_complete: Some(self.cleanup_complete),
             error_code: self.error_code.clone(),
+            target_generation: 0,
         }
     }
 
@@ -1548,6 +1614,7 @@ impl StoredCommandResult {
                 owned_target_state: self.owned_target_state,
                 cleanup_complete: Some(self.cleanup_complete),
                 error_code: self.receipt_error_code.clone(),
+                target_generation: 0,
             },
         })
     }
@@ -1589,7 +1656,13 @@ impl StoredCommandResult {
 
 fn validate_task(
     task: &TaskCommandRef,
-) -> Result<(&AttemptRef, &fairypam_agent_protocol::v1::CommandRef), AgentError> {
+) -> Result<
+    (
+        &AttemptRef,
+        &fairypam_agent_protocol::internal_v1::CommandRef,
+    ),
+    AgentError,
+> {
     let reference = task.attempt.as_ref().ok_or_else(task_ref_invalid)?;
     let command = task.command.as_ref().ok_or_else(task_ref_invalid)?;
     if command.session.is_none()
@@ -1597,7 +1670,7 @@ fn validate_task(
         || !is_digest(&task.payload_digest)
         || !is_uuid(&reference.task_run_id)
         || !is_uuid(&reference.attempt_id)
-        || !matches!(reference.contract_version, 1 | 2)
+        || !matches!(reference.contract_version, 1 | 3)
         || !is_digest(&reference.contract_digest)
     {
         return Err(task_ref_invalid());
@@ -1610,8 +1683,8 @@ fn verify_stored_contract(contract: &AgentAttemptContractV1) -> Result<(), Agent
         return verify_agent_attempt_contract(contract)
             .map_err(|error| AgentError::new(error.code(), error.to_string()));
     }
-    if contract.contract_version != 2
-        || contract.cleanup_policy != "release_input_and_close_owned_target"
+    if contract.contract_version != 3
+        || contract.cleanup_policy != "release_input_keep_managed_target"
         || !is_uuid(&contract.task_run_id)
         || !is_uuid(&contract.attempt_id)
         || contract.agent_build_id.is_empty()
@@ -1621,7 +1694,7 @@ fn verify_stored_contract(contract: &AgentAttemptContractV1) -> Result<(), Agent
     {
         return Err(AgentError::new(
             "task.contract_value_invalid",
-            "translated v2 task contract is invalid",
+            "translated v3 task contract is invalid",
         ));
     }
     Ok(())
@@ -1743,10 +1816,18 @@ fn io_error(code: &'static str, error: std::io::Error) -> AgentError {
     AgentError::new(code, format!("task attempt ledger I/O failed: {error}"))
 }
 
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fairypam_agent_protocol::v1::{CommandRef, SessionRef};
+    use fairypam_agent_protocol::internal_v1::{CommandRef, SessionRef};
     use sha2::{Digest, Sha256};
 
     fn contract() -> AgentAttemptContractV1 {
@@ -1789,6 +1870,70 @@ mod tests {
             }),
             payload_digest: payload.to_string().repeat(64),
         }
+    }
+
+    fn v3_contract(deadline_unix_ms: i64) -> v3::ExecutionContract {
+        let mut contract = v3::ExecutionContract {
+            task_run_id: "11111111-1111-4111-8111-111111111111".into(),
+            attempt_id: "22222222-2222-4222-8222-222222222222".into(),
+            agent_build_id: "test-build".into(),
+            profile_id: "genshin-impact".into(),
+            profile_digest: "b".repeat(64),
+            allowed_capabilities: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            deadline_unix_ms,
+            max_input_lease_ms: 1_000,
+            cleanup_policy: v3::CleanupPolicy::ReleaseInputKeepManagedTarget as i32,
+            contract_version: 3,
+            contract_digest: String::new(),
+        };
+        contract.contract_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                fairypam_agent_protocol::canonical_execution_contract(&contract).unwrap()
+            )
+        );
+        contract
+    }
+
+    fn v3_task(
+        contract: &v3::ExecutionContract,
+        command_id: &str,
+        payload: char,
+    ) -> TaskCommandRef {
+        TaskCommandRef {
+            command: Some(CommandRef {
+                session: Some(SessionRef {
+                    agent_id: "agent".into(),
+                    session_id: "session".into(),
+                    generation: 7,
+                }),
+                command_id: command_id.into(),
+                sequence: payload as u64,
+                expires_at_unix_ms: i64::MAX,
+            }),
+            attempt: Some(AttemptRef {
+                task_run_id: contract.task_run_id.clone(),
+                attempt_id: contract.attempt_id.clone(),
+                contract_version: contract.contract_version,
+                contract_digest: contract.contract_digest.clone(),
+            }),
+            payload_digest: payload.to_string().repeat(64),
+        }
+    }
+
+    #[test]
+    fn v3_contract_deadline_blocks_new_commands_and_watchdog_detects_expiry() {
+        let contract = v3_contract(current_unix_ms() - 1);
+        let begin = v3_task(&contract, "begin", 'a');
+        let mut runtime = TaskAttemptRuntime::memory();
+        runtime.begin_v2(&begin, &contract).unwrap();
+        assert!(runtime.active_contract_expired(current_unix_ms()).unwrap());
+        let command = v3_task(&contract, "input", 'b');
+        let error = match runtime.prepare(&command, true) {
+            Err(error) => error,
+            Ok(_) => panic!("expired contract accepted a new command"),
+        };
+        assert_eq!(error.code(), "task.contract_expired");
     }
 
     fn target_binding(hwnd: u64, started_at: u64) -> TargetBinding {
@@ -1986,7 +2131,7 @@ mod tests {
     #[test]
     fn command_capacity_matches_the_shared_product_budget() {
         let budget: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../proto/fairypam/agent/v2/testdata/task-command-budget.json"
+            "../../../proto/fairypam/agent/v3/testdata/task-command-budget.json"
         ))
         .unwrap();
         assert_eq!(
@@ -2083,6 +2228,30 @@ mod tests {
         assert_eq!(receipt.attempt_state, TaskAttemptState::NotFound as i32);
         assert!(receipt.attempt.is_none());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn asynchronous_worker_failure_marks_the_active_attempt_uncertain() {
+        let contract = contract();
+        let begin = task(&contract, "begin-1", 'a');
+        let mut runtime = TaskAttemptRuntime::memory();
+        runtime.begin(&begin, &contract).unwrap();
+
+        let receipt = runtime
+            .mark_active_side_effect_uncertain("worker.side_effect_uncertain", true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            receipt.side_effect_state,
+            TaskSideEffectState::Uncertain as i32
+        );
+        assert_eq!(receipt.input_state, TaskInputState::Released as i32);
+        assert_eq!(
+            receipt.error_code.as_deref(),
+            Some("worker.side_effect_uncertain")
+        );
+        assert_eq!(receipt.cleanup_complete, Some(false));
     }
 
     #[test]

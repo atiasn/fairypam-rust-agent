@@ -5,6 +5,10 @@ use fairypam_agent_core::platform::{AuthorizationState, DenyAllAuthorization, Lo
 #[cfg(windows)]
 pub mod enrollment;
 pub mod execution;
+#[cfg(windows)]
+mod guardian_channel;
+#[cfg(windows)]
+mod local_control;
 mod managed_game;
 mod observability;
 mod profile_catalog;
@@ -13,7 +17,7 @@ pub mod runtime;
 pub mod runtime_api;
 mod task_attempt;
 mod telemetry;
-mod v2_adapter;
+mod v3_adapter;
 
 pub const fn production_authorization() -> DenyAllAuthorization {
     DenyAllAuthorization

@@ -38,7 +38,14 @@ fn profile() -> fairypam_agent_core::profile::VerifiedProfile {
                 "maximum_fps": 10,
                 "encodings": ["png"]
             }],
-            "actions": { "movement.forward": { "kind": "hold", "scan_code": 17 } }
+            "actions": {
+                "movement.forward": {
+                    "kind": "hold",
+                    "maa_virtual_key": 87,
+                    "physical_scan_code": 17,
+                    "extended": false
+                }
+            }
         },
         "files": []
     }))

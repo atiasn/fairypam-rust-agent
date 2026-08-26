@@ -84,13 +84,25 @@ pub enum CaptureRegion {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActionDefinition {
-    Hold { scan_code: u16 },
-    Pulse { scan_code: u16 },
-    PhysicalHold { scan_code: u16, extended: bool },
-    PhysicalPulse { scan_code: u16, extended: bool },
-    Wheel { maximum_delta: i32 },
-    RelativeMouse { maximum_delta: i32 },
-    ClientPointClick { button: ClientPointButton },
+    Hold {
+        maa_virtual_key: u16,
+        physical_scan_code: u16,
+        extended: bool,
+    },
+    Pulse {
+        maa_virtual_key: u16,
+        physical_scan_code: u16,
+        extended: bool,
+    },
+    Wheel {
+        maximum_delta: i32,
+    },
+    RelativeMouse {
+        maximum_delta: i32,
+    },
+    ClientPointClick {
+        button: ClientPointButton,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -239,6 +251,7 @@ fn validate_profile_identity(profile: &Profile) -> Result<(), AgentError> {
 }
 
 fn validate_files(files: &[ProfileFile]) -> Result<(), AgentError> {
+    let mut paths = HashSet::new();
     for file in files {
         let path = Path::new(&file.path);
         let path_is_relative = !path.is_absolute()
@@ -258,7 +271,7 @@ fn validate_files(files: &[ProfileFile]) -> Result<(), AgentError> {
                 format!("profile file extension is not allowed: {}", file.path),
             ));
         }
-        if !path_is_relative || !is_sha256(&file.sha256) {
+        if !path_is_relative || !is_sha256(&file.sha256) || !paths.insert(file.path.as_str()) {
             return Err(AgentError::new(
                 "profile.schema_invalid",
                 "profile file path or hash is invalid",
@@ -326,12 +339,16 @@ fn validate_actions(actions: &BTreeMap<String, ActionDefinition>) -> Result<(), 
                         || matches!(byte, b'.' | b'_' | b'-')
                 });
             let definition_is_valid = match definition {
-                ActionDefinition::Hold { scan_code }
-                | ActionDefinition::Pulse { scan_code }
-                | ActionDefinition::PhysicalHold { scan_code, .. }
-                | ActionDefinition::PhysicalPulse { scan_code, .. } => {
-                    (1..=255).contains(scan_code)
+                ActionDefinition::Hold {
+                    maa_virtual_key,
+                    physical_scan_code,
+                    ..
                 }
+                | ActionDefinition::Pulse {
+                    maa_virtual_key,
+                    physical_scan_code,
+                    ..
+                } => (1..=255).contains(maa_virtual_key) && (1..=255).contains(physical_scan_code),
                 ActionDefinition::Wheel { maximum_delta } => {
                     *maximum_delta >= 120 && maximum_delta % 120 == 0
                 }

@@ -106,11 +106,7 @@ pub trait WindowsApi: Send {
     fn check_environment(&mut self) -> Result<(), WindowsError> {
         Ok(())
     }
-    fn focus_target(
-        &mut self,
-        identity: &TargetIdentity,
-        allow_activation_probe: bool,
-    ) -> Result<(), WindowsError>;
+    fn focus_target(&mut self, identity: &TargetIdentity) -> Result<(), WindowsError>;
     fn close_target(
         &mut self,
         identity: &TargetIdentity,
@@ -126,7 +122,7 @@ pub trait WindowsApi: Send {
 #[derive(Clone, Debug, Default)]
 pub struct FakeWindows {
     candidates: Vec<WindowsTargetCandidate>,
-    focus_activation_probe: Vec<bool>,
+    focus_requests: usize,
     focus_failures_remaining: usize,
     environment_checks: usize,
     environment_failure_on_check: Option<usize>,
@@ -136,7 +132,7 @@ impl FakeWindows {
     pub fn with_candidates(candidates: Vec<WindowsTargetCandidate>) -> Self {
         Self {
             candidates,
-            focus_activation_probe: Vec::new(),
+            focus_requests: 0,
             focus_failures_remaining: 0,
             environment_checks: 0,
             environment_failure_on_check: None,
@@ -180,14 +176,10 @@ impl WindowsApi for FakeWindows {
         Ok(())
     }
 
-    fn focus_target(
-        &mut self,
-        identity: &TargetIdentity,
-        allow_activation_probe: bool,
-    ) -> Result<(), WindowsError> {
+    fn focus_target(&mut self, identity: &TargetIdentity) -> Result<(), WindowsError> {
         let current = self.snapshot(identity.hwnd)?;
         require_same_identity(identity, &current.identity)?;
-        self.focus_activation_probe.push(allow_activation_probe);
+        self.focus_requests += 1;
         if self.focus_failures_remaining > 0 {
             self.focus_failures_remaining -= 1;
             return Err(WindowsError::new(
@@ -449,7 +441,7 @@ fn revalidate_or_focus_target(
         if current.foreground && !current.minimized {
             return Ok(current);
         }
-        if let Err(error) = api.focus_target(&current.identity, true) {
+        if let Err(error) = api.focus_target(&current.identity) {
             if error.code() != "target.focus_failed" {
                 return Err(error.into());
             }
@@ -728,14 +720,14 @@ mod tests {
         input_targets.lock_input_target(&binding).unwrap();
         assert!(input_targets.api().candidates[0].foreground);
         assert!(!input_targets.api().candidates[1].foreground);
-        assert_eq!(input_targets.api().focus_activation_probe, [true]);
+        assert_eq!(input_targets.api().focus_requests, 1);
 
         let mut capture_targets =
             WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![background_game, other]));
         capture_targets.capture_identity(&binding).unwrap();
         assert!(capture_targets.api().candidates[0].foreground);
         assert!(!capture_targets.api().candidates[1].foreground);
-        assert_eq!(capture_targets.api().focus_activation_probe, [true]);
+        assert_eq!(capture_targets.api().focus_requests, 1);
 
         for foreground in [true, false] {
             let mut minimized = input_candidate(foreground);
@@ -759,7 +751,7 @@ mod tests {
 
         targets.capture_identity(&binding).unwrap();
 
-        assert_eq!(targets.api().focus_activation_probe, [true, true, true]);
+        assert_eq!(targets.api().focus_requests, 3);
         assert!(targets.api().candidates[0].foreground);
     }
 
@@ -776,7 +768,7 @@ mod tests {
                 .code(),
             "target.input_not_permitted"
         );
-        assert!(targets.api().focus_activation_probe.is_empty());
+        assert_eq!(targets.api().focus_requests, 0);
         assert!(!targets.api().candidates[0].foreground);
     }
 
@@ -800,7 +792,7 @@ mod tests {
             recovering.capture_identity(&binding).unwrap_err().code(),
             "environment.local_input_detected"
         );
-        assert_eq!(recovering.api().focus_activation_probe, [true]);
+        assert_eq!(recovering.api().focus_requests, 1);
     }
 
     #[test]
@@ -811,7 +803,7 @@ mod tests {
 
         let focused = targets.focus(&binding).unwrap();
         assert!(focused.foreground);
-        assert_eq!(targets.api().focus_activation_probe, [true]);
+        assert_eq!(targets.api().focus_requests, 1);
 
         targets.close(&binding, Duration::from_secs(1)).unwrap();
         let error = targets.revalidate(&binding).unwrap_err();
@@ -865,12 +857,8 @@ impl WindowsApi for NativeWindows {
             .map_err(|error| WindowsError::new(error.code(), error.to_string()))
     }
 
-    fn focus_target(
-        &mut self,
-        identity: &TargetIdentity,
-        allow_activation_probe: bool,
-    ) -> Result<(), WindowsError> {
-        native::focus_target(identity, allow_activation_probe)
+    fn focus_target(&mut self, identity: &TargetIdentity) -> Result<(), WindowsError> {
+        native::focus_target(identity)
     }
 
     fn close_target(
@@ -921,7 +909,6 @@ mod native {
         SetForegroundWindow, ShowWindowAsync, SW_RESTORE, WM_CLOSE,
     };
 
-    use crate::send_input::send_foreground_activation_probe;
     use crate::{normalized_process_path_sha256, validate_dpi};
 
     use super::{
@@ -1037,10 +1024,7 @@ mod native {
         })
     }
 
-    pub(super) fn focus_target(
-        identity: &TargetIdentity,
-        allow_activation_probe: bool,
-    ) -> Result<(), WindowsError> {
+    pub(super) fn focus_target(identity: &TargetIdentity) -> Result<(), WindowsError> {
         let current = candidate_from_raw_hwnd(identity.hwnd)?;
         require_same_identity(identity, &current.identity)?;
         let hwnd = HWND(identity.hwnd as *mut c_void);
@@ -1073,19 +1057,13 @@ mod native {
             return Ok(());
         }
 
-        let mut noop_input_sent = 0;
-        let mut brought_to_top = false;
-        let mut input_retry_accepted = false;
-        if allow_activation_probe {
-            let refreshed = candidate_from_raw_hwnd(identity.hwnd)?;
-            require_same_identity(identity, &refreshed.identity)?;
-            noop_input_sent = send_foreground_activation_probe();
-            brought_to_top = unsafe { BringWindowToTop(hwnd) }.is_ok();
-            let (accepted, succeeded) = request_foreground(hwnd, Duration::from_millis(800));
-            input_retry_accepted = accepted;
-            if succeeded {
-                return Ok(());
-            }
+        let refreshed = candidate_from_raw_hwnd(identity.hwnd)?;
+        require_same_identity(identity, &refreshed.identity)?;
+        let brought_to_top = unsafe { BringWindowToTop(hwnd) }.is_ok();
+        let (input_retry_accepted, succeeded) =
+            request_foreground(hwnd, Duration::from_millis(800));
+        if succeeded {
+            return Ok(());
         }
 
         let foreground = unsafe { GetForegroundWindow() };
@@ -1095,7 +1073,7 @@ mod native {
         Err(WindowsError::new(
             "target.focus_failed",
             format!(
-                "target did not become the foreground window; desktop_receives_input={input_desktop:?}, minimized={}, direct_accepted={direct_accepted}, allow_activation_probe={allow_activation_probe}, noop_input_sent={noop_input_sent}, brought_to_top={brought_to_top}, input_retry_accepted={input_retry_accepted}, foreground_hwnd=0x{:x}, foreground_thread_id={foreground_thread_id_after}, foreground_pid={foreground_pid}, target_hwnd=0x{:x}, target_pid={}",
+                "target did not become the foreground window; desktop_receives_input={input_desktop:?}, minimized={}, direct_accepted={direct_accepted}, brought_to_top={brought_to_top}, input_retry_accepted={input_retry_accepted}, foreground_hwnd=0x{:x}, foreground_thread_id={foreground_thread_id_after}, foreground_pid={foreground_pid}, target_hwnd=0x{:x}, target_pid={}",
                 current.minimized,
                 foreground.0 as usize,
                 identity.hwnd as usize,

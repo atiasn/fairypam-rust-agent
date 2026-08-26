@@ -51,234 +51,161 @@ jobs:
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  tauri-ui:
-    name: Build non-promotable Windows product installer
+  product-build:
+    name: Build and smoke non-promotable Windows product
+    needs: core-validation
     if: github.repository == 'atiasn/fairypam-rust-agent'
     runs-on: windows-latest
     timeout-minutes: 45
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      FAIRYPAM_BUILD_ID: product-installer-${{ github.run_id }}-${{ github.run_attempt }}
+      FAIRYPAM_ENROLLMENT_BASE_URL: ${{ inputs.enrollment_base_url }}
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Node for the Tauri UI
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: tauri-ui/package-lock.json
-
-      - name: Install pinned Rust toolchain
+      - name: Install pinned Rust toolchain and NSIS
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $toolchain = (Get-Content rust-toolchain.toml | Select-String 'channel = "([^"]+)"').Matches.Groups[1].Value
-          rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy
+          rustup toolchain install $toolchain --profile minimal
           rustup override set $toolchain
-          rustc --version
-          cargo --version
+          choco install nsis --yes --no-progress
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          workspaces: |
-            . -> target
-            tauri-ui/src-tauri -> ../../target
-          # ponytail: this 25-minute gate restores the shared cache but never waits to save it.
+          workspaces: . -> target
           save-if: false
 
-      - name: Test and build the product installer
+      - name: Prepare and smoke the pinned official MAA runtime
         shell: pwsh
-        env:
-          FAIRYPAM_ALLOW_UNSIGNED_CANDIDATE_REPAIR: '1'
-          FAIRYPAM_BUILD_ID: product-installer-${{ github.run_id }}-${{ github.run_attempt }}
-          FAIRYPAM_ENROLLMENT_BASE_URL: ${{ inputs.enrollment_base_url }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           if ($env:FAIRYPAM_ENROLLMENT_BASE_URL -cne 'https://enroll.fp.atiasn.com') {
             throw 'candidate enrollment URL must match the product-fixed logical endpoint'
           }
-          $env:FAIRYPAM_BUILD_COMMIT = (Get-Content SOURCE_COMMIT -Raw).Trim()
-          cargo build --release --locked -p fairypam-agent-guardian -p fairypam-agent-installer
-          $env:FAIRYPAM_TEST_GUARDIAN_EXE = (Resolve-Path target\release\fairypam-agent-guardian.exe).Path
-          $env:FAIRYPAM_GUARDIAN_ENV_SENTINEL = 'must-not-reach-guardian'
-          cargo test --locked -p fairypam-agent-input --test windows_guardian_process -- --ignored --exact privilege_limited_guardian_process_starts
-          New-Item -ItemType Directory -Force target\suite | Out-Null
-          '{"schema_version":0,"promotable":false}' |
-            Set-Content -NoNewline -Encoding utf8 target\suite\BUILD-MANIFEST.json
-          Push-Location tauri-ui
-          try {
-            npm ci
-            npm run check:security
-            npm test -- --run
-
-            Push-Location src-tauri
-            try {
-              cargo fmt --all -- --check
-              cargo test --all-targets --locked
-              cargo clippy --all-targets --locked -- -D warnings
-            }
-            finally {
-              Pop-Location
-            }
-
-            npm run tauri build -- --no-bundle
-            cargo build --manifest-path ..\Cargo.toml --release --locked -p fairypam-agent -p fairypam-agent-suite
-            ..\target\release\fairypam-build-suite.exe `
-              --patch-tauri-nsis ..\target\release\fairypam-agent-tauri-ui.exe
-            $suiteVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-            $builtAt = [DateTime]::UtcNow.ToString('o')
-            ..\target\release\fairypam-build-suite.exe `
-              --build-id $env:FAIRYPAM_BUILD_ID `
-              --source-commit $env:FAIRYPAM_BUILD_COMMIT `
-              --suite-version $suiteVersion `
-              --built-at $builtAt `
-              --build-origin 'github-actions/windows-candidate.yml' `
-              --output ..\target\suite\BUILD-MANIFEST.json `
-              --guardian ..\target\release\fairypam-agent-guardian.exe `
-              --gui ..\target\release\fairypam-agent-tauri-ui.exe `
-              --helper ..\target\release\fairypam-agent-installer.exe
-            npm run tauri bundle -- --bundles nsis
-            npm run check:command-surface
-            git diff --exit-code -- src-tauri/Cargo.lock
+          New-Item -ItemType Directory -Force target/downloads, target/runtime-signing | Out-Null
+          $lock = Get-Content runtime/maa/maa-runtime.lock.json -Raw | ConvertFrom-Json
+          if ($lock.sdk_version -cne '5.12.3' -or $lock.release_asset -cne 'MAA-win-x86_64-v5.12.3.zip') {
+            throw 'runtime lock is not the frozen MAA 5.12.3 profile'
           }
-          finally {
-            Pop-Location
-          }
+          $archive = Join-Path target/downloads $lock.release_asset
+          Invoke-WebRequest -Uri $lock.release_url -OutFile $archive
+          $archiveHash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($archiveHash -cne $lock.release_sha256) { throw 'official MAA archive hash mismatch' }
 
-      - name: Smoke fresh NSIS product install
+          cargo build --release --locked -p fairypam-agent-maa --bin sign-runtime
+          $candidateSeed = '0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9a'
+          $candidateSeed | & target/release/sign-runtime.exe `
+            --lock runtime/maa/maa-runtime.lock.json `
+            --manifest target/runtime-signing/maa-runtime.manifest.json `
+            --public-key-output target/runtime-signing/public-key.hex
+          $runtimePublicKey = (Get-Content target/runtime-signing/public-key.hex -Raw).Trim()
+          & scripts/prepare-maa-runtime.ps1 `
+            -Archive $archive `
+            -Lock runtime/maa/maa-runtime.lock.json `
+            -SignedManifest target/runtime-signing/maa-runtime.manifest.json `
+            -Output target/maa-runtime
+          Copy-Item runtime/maa/THIRD-PARTY-NOTICES.md target/maa-runtime
+
+          $env:FAIRYPAM_MAA_RUNTIME_ROOT_PUBLIC_KEY_HEX = $runtimePublicKey
+          cargo build --release --locked `
+            -p fairypam-agent `
+            -p fairypam-agent-guardian `
+            -p fairypam-agent-shell `
+            -p fairypam-win32-worker `
+            -p fairypam-agent-installer `
+            -p fairypam-agent-suite
+          & target/release/fairypam-win32-worker.exe `
+            --smoke-test target/maa-runtime `
+            --runtime-root-public-key $runtimePublicKey
+
+      - name: Build standalone Shell-first NSIS installer
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $setup = @(Get-ChildItem target/release/bundle/nsis -Filter '*-setup.exe')
-          if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
-          & whoami.exe /groups /fo csv /nh
-          $installRoot = 'C:\Program Files\FairyPam'
-          $installer = Start-Process -FilePath $setup[0].FullName -ArgumentList '/S' -Wait -PassThru
-          if ($installer.ExitCode -ne 0) {
-            $bootstrapHelper = Join-Path $installRoot '.fairypam-installer\payload\resources\runtime\fairypam-agent-installer.exe'
-            $requiredPaths = [ordered]@{
-              current = Join-Path $installRoot 'current.json'
-              versions = Join-Path $installRoot 'versions'
-              runtime_helper = Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'
-              bootstrap_helper = $bootstrapHelper
-            }
-            foreach ($entry in $requiredPaths.GetEnumerator()) {
-              $exists = Test-Path -LiteralPath $entry.Value
-              Write-Host "FairyPam diagnostic path: name=$($entry.Key) exists=$exists path=$($entry.Value)"
-            }
-            if (Test-Path -LiteralPath $installRoot -PathType Container) {
-              try {
-                Write-Host "FairyPam installation root SDDL: $((Get-Acl -LiteralPath $installRoot).Sddl)"
-              }
-              catch {
-                Write-Host 'FairyPam installation root exists but its SDDL could not be read.'
-              }
-              Get-ChildItem -LiteralPath $installRoot -Force -Recurse | ForEach-Object {
-                $kind = if ($_.PSIsContainer) { 'directory' } else { 'file' }
-                $length = if ($_.PSIsContainer) { 0 } else { $_.Length }
-                $relative = [System.IO.Path]::GetRelativePath($installRoot, $_.FullName)
-                try {
-                  $sddl = (Get-Acl -LiteralPath $_.FullName).Sddl
-                }
-                catch {
-                  $sddl = 'unavailable'
-                }
-                Write-Host "FairyPam diagnostic tree: kind=$kind relative=$relative length=$length sddl=$sddl"
-              }
-            }
-            else {
-              Write-Host 'FairyPam installation root does not exist after failed setup.'
-            }
-            if (Test-Path -LiteralPath $bootstrapHelper -PathType Leaf) {
-              try {
-                $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-                $startInfo.FileName = $bootstrapHelper
-                $startInfo.UseShellExecute = $false
-                $startInfo.ArgumentList.Add('--preflight')
-                $startInfo.ArgumentList.Add($installRoot)
-                $preflight = [System.Diagnostics.Process]::Start($startInfo)
-                $preflight.WaitForExit()
-                Write-Host "FairyPam diagnostic preflight: status=completed exit_code=$($preflight.ExitCode)"
-                $preflight.Dispose()
-              }
-              catch {
-                Write-Host "FairyPam diagnostic preflight: status=launch_failed hresult=$($_.Exception.HResult) type=$($_.Exception.GetType().FullName)"
-              }
-            }
-            else {
-              Write-Host 'FairyPam diagnostic preflight: status=helper_missing'
-            }
-            $stageNames = @{
-              1 = 'sddl'
-              2 = 'security-attributes'
-              3 = 'create-directory'
-              4 = 'pin'
-              5 = 'verify'
-              6 = 'not-directory'
-              7 = 'reparse'
-              8 = 'validation'
-              9 = 'release'
-            }
-            $exitCode = [int64]$installer.ExitCode
-            $stageId = [math]::Floor($exitCode / 65536)
-            $detail = $exitCode % 65536
-            $stageName = $stageNames[[int]$stageId]
-            if ($null -ne $stageName) {
-              throw "NSIS setup failed with exit code $exitCode (stage=$stageName, detail=$detail)"
-            }
-            throw "NSIS setup failed with exit code $exitCode"
+          $payload = Join-Path $PWD 'target/suite-payload'
+          New-Item -ItemType Directory -Force `
+            $payload, `
+            (Join-Path $payload 'resources/runtime'), `
+            (Join-Path $payload 'runtime'), `
+            (Join-Path $PWD 'dist') | Out-Null
+          Copy-Item target/release/fairypam-agent.exe $payload
+          Copy-Item target/release/fairypam-agent-guardian.exe $payload
+          Copy-Item target/release/fairypam-agent-shell.exe $payload
+          Copy-Item target/release/fairypam-win32-worker.exe $payload
+          Copy-Item target/release/fairypam-agent-installer.exe (Join-Path $payload 'resources/runtime')
+          Copy-Item target/maa-runtime (Join-Path $payload 'runtime/maa') -Recurse
+
+          $sourceCommit = (Get-Content SOURCE_COMMIT -Raw).Trim()
+          $suiteVersion = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          & target/release/fairypam-build-suite.exe `
+            --build-id $env:FAIRYPAM_BUILD_ID `
+            --source-commit $sourceCommit `
+            --suite-version $suiteVersion `
+            --built-at ([DateTime]::UtcNow.ToString('o')) `
+            --build-origin 'github-actions/windows-candidate.yml' `
+            --output (Join-Path $payload 'BUILD-MANIFEST.json') `
+            --agent target/release/fairypam-agent.exe `
+            --guardian target/release/fairypam-agent-guardian.exe `
+            --shell target/release/fairypam-agent-shell.exe `
+            --worker target/release/fairypam-win32-worker.exe `
+            --runtime-dir target/maa-runtime `
+            --helper target/release/fairypam-agent-installer.exe
+
+          $setup = Join-Path $PWD 'dist/fairypam-agent-setup-windows.exe'
+          $makensis = (Get-Command makensis.exe).Source
+          & $makensis `
+            "/DFAIRYPAM_PAYLOAD_ROOT=$payload" `
+            "/DFAIRYPAM_OUTFILE=$setup" `
+            "/DFAIRYPAM_VERSION=$suiteVersion" `
+            installer/windows/installer.nsi
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $setup -PathType Leaf)) {
+            throw 'standalone NSIS build failed'
           }
+
+      - name: Smoke fresh Shell-first product install
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $setup = Resolve-Path dist/fairypam-agent-setup-windows.exe
+          $installRoot = 'C:\Program Files\FairyPam'
+          $installer = Start-Process -FilePath $setup -ArgumentList '/S' -Wait -PassThru
+          if ($installer.ExitCode -ne 0) { throw "NSIS setup failed: $($installer.ExitCode)" }
           $current = Get-Content (Join-Path $installRoot 'current.json') -Raw | ConvertFrom-Json
           $versionRoot = Join-Path $installRoot "versions\$($current.build_id)"
           foreach ($path in @(
             (Join-Path $versionRoot 'BUILD-MANIFEST.json'),
-            (Join-Path $versionRoot 'fairypam-agent-tauri-ui.exe'),
+            (Join-Path $versionRoot 'fairypam-agent.exe'),
             (Join-Path $versionRoot 'fairypam-agent-guardian.exe'),
+            (Join-Path $versionRoot 'fairypam-agent-shell.exe'),
+            (Join-Path $versionRoot 'fairypam-win32-worker.exe'),
+            (Join-Path $versionRoot 'runtime\maa\THIRD-PARTY-NOTICES.md'),
+            (Join-Path $versionRoot 'runtime\maa\active.json'),
+            (Join-Path $versionRoot 'runtime\maa\versions\5.12.3\bin\MaaFramework.dll'),
             (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'),
-            (Join-Path $installRoot 'uninstall.exe')
+            (Join-Path $installRoot 'uninstall.exe'),
+            (Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'FairyPam.lnk')
           )) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "missing installed product file: $path" }
           }
-          $profileCatalogRoot = 'C:\ProgramData\FairyPam.Agent\Agent\profile-catalog'
-          if (-not (Test-Path -LiteralPath $profileCatalogRoot -PathType Container)) {
-            throw "missing protected Profile Catalog root: $profileCatalogRoot"
-          }
-          $allowedProductExecutables = @(
-            (Join-Path $versionRoot 'fairypam-agent-tauri-ui.exe'),
-            (Join-Path $versionRoot 'fairypam-agent-guardian.exe'),
-            (Join-Path $installRoot 'resources\runtime\fairypam-agent-installer.exe'),
-            (Join-Path $installRoot 'uninstall.exe')
-          ) | ForEach-Object { [IO.Path]::GetFullPath($_) }
-          foreach ($executable in Get-ChildItem -LiteralPath $installRoot -Recurse -File | Where-Object {
-            $_.Extension.ToLowerInvariant() -in @('.exe', '.dll', '.msi', '.ps1', '.bat', '.cmd')
-          }) {
-            if ($allowedProductExecutables -notcontains $executable.FullName) {
-              throw "executable is outside the exact product allowlist: $($executable.FullName)"
-            }
+          if (@(Get-ChildItem $installRoot -Recurse -File -Filter 'fairypam-agent-tauri-ui.exe').Count -ne 0) {
+            throw 'Tauri UI entered the production installation'
           }
           foreach ($taskName in @('FairyPam Agent', 'FairyPam Agent UI')) {
             if (@(Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue).Count -ne 0) {
               throw "forbidden scheduled task found: $taskName"
             }
           }
-          $siblingCore = @(Get-CimInstance Win32_Process -Filter "Name = 'fairypam-agent.exe'" | Where-Object {
-            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installRoot, [StringComparison]::OrdinalIgnoreCase)
-          })
-          if ($siblingCore.Count -ne 0) { throw 'forbidden sibling Core process is running from the product install' }
 
       - name: Package product installer receipt
         shell: pwsh
-        env:
-          FAIRYPAM_ENROLLMENT_BASE_URL: ${{ inputs.enrollment_base_url }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $setup = @(Get-ChildItem target/release/bundle/nsis -Filter '*-setup.exe')
-          if ($setup.Count -ne 1) { throw "expected exactly one NSIS setup executable, found $($setup.Count)" }
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item $setup[0] dist/fairypam-agent-setup-windows.exe
           $artifact = Get-Item dist/fairypam-agent-setup-windows.exe
-          $manifest = Get-Item target/suite/BUILD-MANIFEST.json
+          $manifest = Get-Item target/suite-payload/BUILD-MANIFEST.json
           $manifestBody = Get-Content $manifest.FullName -Raw | ConvertFrom-Json
           $enrollmentBaseUrlSha256 = [Convert]::ToHexString(
             [Security.Cryptography.SHA256]::HashData(
@@ -291,7 +218,7 @@ jobs:
             promotable = $false
             source_commit = (Get-Content SOURCE_COMMIT -Raw).Trim()
             public_commit = '${{ github.sha }}'
-            build_id = 'product-installer-${{ github.run_id }}-${{ github.run_attempt }}'
+            build_id = $env:FAIRYPAM_BUILD_ID
             run_id = '${{ github.run_id }}'
             run_attempt = '${{ github.run_attempt }}'
             enrollment_base_url_sha256 = $enrollmentBaseUrlSha256
@@ -300,9 +227,20 @@ jobs:
             suite_version = $manifestBody.suite_version
             suite_manifest_sha256 = (Get-FileHash $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
             suite_manifest_size = $manifest.Length
+            maa_runtime_version = '5.12.3'
             install_mode = 'perMachine'
             state_root = 'C:\ProgramData\FairyPam.Agent\Agent'
-            layout = @('current.json', 'versions/<build-id>/BUILD-MANIFEST.json', 'versions/<build-id>/fairypam-agent-tauri-ui.exe', 'versions/<build-id>/fairypam-agent-guardian.exe', 'resources/runtime/fairypam-agent-installer.exe')
+            entrypoint = 'FairyPam.lnk -> fairypam-agent-installer.exe --launch-shell'
+            layout = @(
+              'current.json',
+              'versions/<build-id>/BUILD-MANIFEST.json',
+              'versions/<build-id>/fairypam-agent.exe',
+              'versions/<build-id>/fairypam-agent-guardian.exe',
+              'versions/<build-id>/fairypam-agent-shell.exe',
+              'versions/<build-id>/fairypam-win32-worker.exe',
+              'versions/<build-id>/runtime/maa/versions/5.12.3',
+              'resources/runtime/fairypam-agent-installer.exe'
+            )
           } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 dist/product-installer-receipt.json
 
       - name: Attest product setup provenance
@@ -327,7 +265,7 @@ jobs:
 
   verify-product-installer-attestation:
     name: Verify product installer attestation as a consumer
-    needs: [core-validation, tauri-ui]
+    needs: [core-validation, product-build]
     runs-on: windows-latest
     timeout-minutes: 15
     steps:

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fairypam_agent_core::profile::{verify_profile, Ed25519SignatureVerifier};
 use fairypam_agent_core::AgentError;
-use fairypam_agent_protocol::v2;
+use fairypam_agent_protocol::v3;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,7 +43,7 @@ struct CatalogPointer {
 struct Candidate {
     manifest: CatalogManifest,
     profiles: ProfileStore,
-    files: Vec<(String, Vec<u8>)>,
+    files: Vec<(PathBuf, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,7 +90,7 @@ impl ProfileCatalogStore {
         })
     }
 
-    pub fn stage(&mut self, catalog: &v2::ProfileCatalog) -> Result<bool, AgentError> {
+    pub fn stage(&mut self, catalog: &v3::ProfileCatalog) -> Result<bool, AgentError> {
         let candidate = validate_catalog(catalog, &self.verifier, self.active.as_ref())?;
         if self.active.as_ref().is_some_and(|active| {
             active.version == candidate.manifest.catalog_version
@@ -119,22 +119,25 @@ impl ProfileCatalogStore {
         let result = (|| {
             let profiles_root = directory.join("profiles");
             create_private_directory(&profiles_root)?;
-            for (profile_id, bytes) in &candidate.files {
-                let profile_root = profiles_root.join(profile_id);
-                create_private_directory(&profile_root)?;
-                write_private(&profile_root.join("profile.json"), bytes)?;
+            for (relative, bytes) in &candidate.files {
+                let target = profiles_root.join(relative);
+                create_private_parents(&profiles_root, &target)?;
+                write_private(&target, bytes)?;
             }
             write_private(
                 &directory.join("catalog.json"),
                 &serde_json::to_vec(&candidate.manifest).map_err(persistence_error)?,
             )?;
-            load_generation(&directory, &self.verifier).map(|_| ())
+            load_generation(&directory, &self.verifier)
         })();
-        if result.is_err() {
-            let _ = remove_private_directory(&directory);
-            return result.map(|_| false);
-        }
-        self.pending = Some(candidate);
+        let persisted = match result {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                let _ = remove_private_directory(&directory);
+                return Err(error);
+            }
+        };
+        self.pending = Some(persisted);
         Ok(true)
     }
 
@@ -203,7 +206,7 @@ impl ProfileCatalogStore {
 }
 
 fn validate_catalog(
-    catalog: &v2::ProfileCatalog,
+    catalog: &v3::ProfileCatalog,
     verifier: &Ed25519SignatureVerifier,
     active: Option<&ActiveCatalog>,
 ) -> Result<Candidate, AgentError> {
@@ -242,13 +245,36 @@ fn validate_catalog(
             return Err(invalid("profile_catalog.size_exceeded"));
         }
         let profile = verify_profile(&value.profile_json, verifier)?;
-        if !profile.files().is_empty()
-            || value.profile_id != profile.profile().id
+        if value.profile_id != profile.profile().id
             || value.profile_version != profile.profile().version
             || value.content_digest != profile.content_sha256()
             || Version::parse(&value.profile_version).is_err()
         {
             return Err(invalid("profile_catalog.profile_mismatch"));
+        }
+        if value
+            .files
+            .windows(2)
+            .any(|pair| pair[0].path >= pair[1].path)
+            || value.files.len() != profile.files().len()
+        {
+            return Err(invalid("profile_catalog.profile_file_mismatch"));
+        }
+        for (declared, supplied) in profile.files().iter().zip(&value.files) {
+            total = total.saturating_add(supplied.content.len());
+            if declared.path != supplied.path
+                || declared.sha256 != supplied.sha256
+                || supplied.content.is_empty()
+                || supplied.content.len() > MAX_PROFILE_BYTES
+                || total > MAX_CATALOG_BYTES
+                || format!("{:x}", Sha256::digest(&supplied.content)) != supplied.sha256
+            {
+                return Err(invalid("profile_catalog.profile_file_mismatch"));
+            }
+            files.push((
+                PathBuf::from(&value.profile_id).join(&supplied.path),
+                supplied.content.clone(),
+            ));
         }
         let entry = CatalogEntry {
             profile_id: value.profile_id.clone(),
@@ -258,7 +284,10 @@ fn validate_catalog(
         if entries.insert(value.profile_id.clone(), entry).is_some() {
             return Err(invalid("profile_catalog.profile_duplicate"));
         }
-        files.push((value.profile_id.clone(), value.profile_json.clone()));
+        files.push((
+            PathBuf::from(&value.profile_id).join("profile.json"),
+            value.profile_json.clone(),
+        ));
         verified.push(profile);
     }
     if let Some(active) = active {
@@ -351,23 +380,33 @@ fn load_generation(
         .profiles
         .iter()
         .map(|entry| {
-            read_private(
-                &directory
-                    .join("profiles")
-                    .join(&entry.profile_id)
-                    .join("profile.json"),
-                MAX_PROFILE_BYTES,
-            )
-            .map(|bytes| v2::ProfileCatalogProfile {
+            let profile_root = directory.join("profiles").join(&entry.profile_id);
+            let bytes = read_private(&profile_root.join("profile.json"), MAX_PROFILE_BYTES)?;
+            let profile = verify_profile(&bytes, verifier)?;
+            let files = profile
+                .files()
+                .iter()
+                .map(|file| {
+                    read_private(&profile_root.join(&file.path), MAX_PROFILE_BYTES).map(|content| {
+                        v3::ProfileCatalogFile {
+                            path: file.path.clone(),
+                            sha256: file.sha256.clone(),
+                            content,
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, AgentError>(v3::ProfileCatalogProfile {
                 profile_id: entry.profile_id.clone(),
                 profile_version: entry.profile_version.clone(),
                 content_digest: entry.content_digest.clone(),
                 profile_json: bytes,
+                files,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    validate_catalog(
-        &v2::ProfileCatalog {
+    Ok(validate_catalog(
+        &v3::ProfileCatalog {
             catalog_version: manifest.catalog_version,
             catalog_digest: manifest.catalog_digest.clone(),
             source_commit: manifest.source_commit.clone(),
@@ -375,7 +414,15 @@ fn load_generation(
         },
         verifier,
         None,
-    )
+    )?
+    .with_profiles_root(directory.join("profiles")))
+}
+
+impl Candidate {
+    fn with_profiles_root(mut self, root: PathBuf) -> Self {
+        self.profiles = self.profiles.with_root(root);
+        self
+    }
 }
 
 fn generation_name(manifest: &CatalogManifest) -> String {
@@ -442,6 +489,21 @@ fn verify_private_directory(path: &Path) -> Result<(), AgentError> {
 #[cfg(all(windows, not(test)))]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AgentError> {
     crate::enrollment::write_private(path, bytes)
+}
+
+fn create_private_parents(root: &Path, target: &Path) -> Result<(), AgentError> {
+    let relative = target
+        .parent()
+        .and_then(|parent| parent.strip_prefix(root).ok())
+        .ok_or_else(|| invalid("profile_catalog.profile_file_mismatch"))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        if !current.exists() {
+            create_private_directory(&current)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(not(windows), test))]
@@ -607,7 +669,11 @@ mod tests {
                 }],
                 actions: BTreeMap::from([(
                     "move.forward".into(),
-                    ActionDefinition::Hold { scan_code: 17 },
+                    ActionDefinition::Hold {
+                        maa_virtual_key: 0x57,
+                        physical_scan_code: 17,
+                        extended: false,
+                    },
                 )]),
             },
             files: Vec::new(),
@@ -629,21 +695,22 @@ mod tests {
         .unwrap()
     }
 
-    fn catalog(version: u64, profile_json: Vec<u8>) -> v2::ProfileCatalog {
+    fn catalog(version: u64, profile_json: Vec<u8>) -> v3::ProfileCatalog {
         let envelope: ProfileEnvelope = serde_json::from_slice(&profile_json).unwrap();
         let profile_id = envelope.content.profile.id;
         let profile_version = envelope.content.profile.version;
         let content_digest = envelope.content_sha256;
         let identity = format!("{profile_id}\0{profile_version}\0{content_digest}\n");
-        v2::ProfileCatalog {
+        v3::ProfileCatalog {
             catalog_version: version,
             catalog_digest: format!("{:x}", Sha256::digest(identity)),
             source_commit: "a".repeat(40),
-            profiles: vec![v2::ProfileCatalogProfile {
+            profiles: vec![v3::ProfileCatalogProfile {
                 profile_id,
                 profile_version,
                 content_digest,
                 profile_json,
+                files: Vec::new(),
             }],
         }
     }

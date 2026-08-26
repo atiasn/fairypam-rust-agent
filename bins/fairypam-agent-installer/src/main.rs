@@ -21,8 +21,8 @@ fn main() {
                 ("--preflight", None) => preflight(install_root),
                 ("--provision", None) => with_install_transaction(|| provision(install_root)),
                 ("--verify-installed-state", None) => installed_preflight(install_root),
-                ("--prepare-ui-data", None) => prepare_ui_data(install_root),
-                ("--launch-ui", None) => launch_ui(install_root),
+                ("--stop-shell", None) => stop_shell(install_root),
+                ("--launch-shell", None) => launch_shell(install_root),
                 ("--remove-runtime-state", None) => remove_runtime_state(install_root),
                 _ => Err(ProvisionFailure::InstallRoots),
             }
@@ -130,17 +130,16 @@ fn with_install_transaction<T>(
 }
 
 #[cfg(windows)]
-fn launch_ui(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+fn launch_shell(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    prepare_ui_data(install_root)?;
     let active = active_suite(install_root)?;
-    let gui = active.version_root.join("fairypam-agent-tauri-ui.exe");
+    let shell = active.version_root.join("fairypam-agent-shell.exe");
     let verb = HSTRING::from("runas");
-    let file = HSTRING::from(gui.to_string_lossy().as_ref());
+    let file = HSTRING::from(shell.to_string_lossy().as_ref());
     let directory = HSTRING::from(active.version_root.to_string_lossy().as_ref());
     let mut execute = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -160,37 +159,39 @@ fn launch_ui(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
 }
 
 #[cfg(windows)]
-fn prepare_ui_data(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
-    verify_installed_runtime_root(install_root).map_err(|_| ProvisionFailure::InstallRoots)?;
-    prepare_webview_data_root().map_err(|_| ProvisionFailure::Launch)
-}
+fn stop_shell(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
 
-#[cfg(windows)]
-fn prepare_webview_data_root() -> Result<(), ()> {
-    let app_root = local_app_data()?.join("app.fairypam.agent.ui");
-    let webview_root = app_root.join("webview");
-    if !token_is_elevated()? {
-        std::fs::create_dir_all(&webview_root).map_err(|_| ())?;
+    ensure_elevated().map_err(|_| ProvisionFailure::Elevated)?;
+    let executable = std::env::current_exe().map_err(|_| ProvisionFailure::InstallRoots)?;
+    let bootstrap = install_root
+        .join(INSTALL_BOOTSTRAP_DIRECTORY)
+        .join("payload/resources/runtime/fairypam-agent-installer.exe");
+    let installed = install_root.join("resources/runtime/fairypam-agent-installer.exe");
+    if !same_windows_path(&executable, &bootstrap) && !same_windows_path(&executable, &installed) {
+        return Err(ProvisionFailure::InstallRoots);
     }
-    verify_nonreparse_directory(&app_root)?;
-    verify_nonreparse_directory(&webview_root)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn local_app_data() -> Result<std::path::PathBuf, ()> {
-    use windows::Win32::{
-        System::Com::CoTaskMemFree,
-        UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT},
-    };
-
-    let path = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None) }
-        .map_err(|_| ())?;
-    let result = unsafe { path.to_string() }
-        .map(std::path::PathBuf::from)
-        .map_err(|_| ());
-    unsafe { CoTaskMemFree(Some(path.0.cast())) };
-    result
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let window = unsafe { FindWindowW(w!("FairyPamAgentShell"), None) };
+        let Ok(window) = window else {
+            return Ok(());
+        };
+        unsafe {
+            PostMessageW(
+                Some(window),
+                WM_CLOSE,
+                Default::default(),
+                Default::default(),
+            )
+        }
+        .map_err(|_| ProvisionFailure::Launch)?;
+        if std::time::Instant::now() >= deadline {
+            return Err(ProvisionFailure::Launch);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 #[cfg(windows)]
@@ -253,6 +254,7 @@ struct InstallActivation {
     version_root: std::path::PathBuf,
     manifest: fairypam_agent_suite::SuiteManifest,
     previous_pointer: Option<Vec<u8>>,
+    rollback_armed: bool,
     created_version: bool,
 }
 
@@ -261,7 +263,7 @@ impl InstallActivation {
     fn from_flat_payload(install_root: &std::path::Path) -> Result<Self, ProvisionFailure> {
         use fairypam_agent_suite::{
             manifest_sha256, read_manifest, validate_flat_layout, validate_installed_layout,
-            CurrentPointer, MemberScope, CURRENT_POINTER_FILE, MANIFEST_FILE,
+            CurrentPointer, MemberScope, RollbackPending, CURRENT_POINTER_FILE, MANIFEST_FILE,
         };
 
         let manifest_path = install_root.join(MANIFEST_FILE);
@@ -323,6 +325,7 @@ impl InstallActivation {
             }
             return Err(ProvisionFailure::InstallRoots);
         }
+        compatibility_smoke(&version_root)?;
         let pointer_path = install_root.join(CURRENT_POINTER_FILE);
         let previous_pointer = match pointer_path.symlink_metadata() {
             Ok(metadata)
@@ -341,12 +344,39 @@ impl InstallActivation {
             suite_version: manifest.suite_version.clone(),
             manifest_sha256: manifest_sha256(&manifest_bytes),
         };
-        replace_pointer(
+        let previous = previous_pointer
+            .as_ref()
+            .map(|_| {
+                fairypam_agent_suite::read_current_pointer(&pointer_path)
+                    .map_err(|_| ProvisionFailure::InstallRoots)
+            })
+            .transpose()?;
+        let rollback_armed = previous
+            .as_ref()
+            .is_some_and(|previous| previous != &pointer);
+        if let Some(previous) = previous.filter(|previous| previous != &pointer) {
+            fairypam_agent_suite::write_rollback_pending(
+                install_root,
+                &RollbackPending {
+                    schema_version: 1,
+                    candidate: pointer.clone(),
+                    previous,
+                },
+            )
+            .map_err(|_| ProvisionFailure::InstallRoots)?;
+        }
+        if let Err(error) = replace_pointer(
             &pointer_path,
             &serde_json::to_vec(&pointer).map_err(|_| ProvisionFailure::InstallRoots)?,
-        )?;
+        ) {
+            if rollback_armed {
+                let _ = fairypam_agent_suite::clear_rollback_pending(install_root);
+            }
+            return Err(error);
+        }
         if verify_install_tree(install_root).is_err() || active_suite(install_root).is_err() {
-            if restore_pointer(&pointer_path, previous_pointer.as_deref()).is_err()
+            if fairypam_agent_suite::clear_rollback_pending(install_root).is_err()
+                || restore_pointer(&pointer_path, previous_pointer.as_deref()).is_err()
                 || (created_version && std::fs::remove_dir_all(&version_root).is_err())
             {
                 return Err(ProvisionFailure::Rollback);
@@ -358,6 +388,7 @@ impl InstallActivation {
             version_root,
             manifest,
             previous_pointer,
+            rollback_armed,
             created_version,
         })
     }
@@ -387,12 +418,173 @@ impl InstallActivation {
         let pointer = self
             .install_root
             .join(fairypam_agent_suite::CURRENT_POINTER_FILE);
+        if self.rollback_armed {
+            fairypam_agent_suite::clear_rollback_pending(&self.install_root)
+                .map_err(|_| ProvisionFailure::Rollback)?;
+        }
         restore_pointer(&pointer, self.previous_pointer.as_deref())?;
         if self.created_version {
             std::fs::remove_dir_all(self.version_root).map_err(|_| ProvisionFailure::Rollback)?;
         }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn compatibility_smoke(version_root: &std::path::Path) -> Result<(), ProvisionFailure> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let release = SmokeInputRelease::new()?;
+    let public_key = option_env!("FAIRYPAM_MAA_RUNTIME_ROOT_PUBLIC_KEY_HEX")
+        .filter(|value| !value.is_empty())
+        .ok_or(ProvisionFailure::InstallRoots)?;
+    let mut command = Command::new(version_root.join("fairypam-win32-worker.exe"));
+    command
+        .arg("--smoke-test")
+        .arg(version_root.join("runtime/maa"))
+        .arg("--runtime-root-public-key")
+        .arg(public_key)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    let mut child = SmokeChild::new(
+        command
+            .spawn()
+            .map_err(|_| ProvisionFailure::InstallRoots)?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = loop {
+        if Instant::now() >= deadline {
+            break Err(ProvisionFailure::InstallRoots);
+        }
+        match child.try_wait().map_err(|_| ProvisionFailure::InstallRoots) {
+            Ok(Some(status)) if status.success() => break Ok(()),
+            Ok(Some(_)) | Err(_) => break Err(ProvisionFailure::InstallRoots),
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    finish_smoke(outcome, || child.terminate_and_wait(), || release.release())
+}
+
+#[cfg(windows)]
+const SMOKE_VIRTUAL_KEY: u32 = 0x87;
+
+#[cfg(windows)]
+struct SmokeInputRelease {
+    armed: bool,
+}
+
+#[cfg(windows)]
+struct SmokeChild {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+#[cfg(windows)]
+impl SmokeChild {
+    fn new(child: std::process::Child) -> Self {
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        self.reaped = status.is_some();
+        Ok(status)
+    }
+
+    fn terminate_and_wait(&mut self) -> Result<(), ProvisionFailure> {
+        if self.reaped {
+            return Ok(());
+        }
+        let _ = self.child.kill();
+        self.child
+            .wait()
+            .map(|_| self.reaped = true)
+            .map_err(|_| ProvisionFailure::InstallRoots)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SmokeChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl SmokeInputRelease {
+    fn new() -> Result<Self, ProvisionFailure> {
+        smoke_physical_key()?;
+        Ok(Self { armed: true })
+    }
+
+    fn release(mut self) -> Result<(), ProvisionFailure> {
+        let result = release_smoke_input();
+        self.armed = result.is_err();
+        result
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SmokeInputRelease {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = release_smoke_input();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn smoke_physical_key(
+) -> Result<fairypam_agent_realtime::input_batch::PhysicalKey, ProvisionFailure> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX};
+
+    let mapped = unsafe { MapVirtualKeyW(SMOKE_VIRTUAL_KEY, MAPVK_VK_TO_VSC_EX) };
+    let scan_code = u16::try_from(mapped & 0xff).map_err(|_| ProvisionFailure::InstallRoots)?;
+    if scan_code == 0 {
+        return Err(ProvisionFailure::InstallRoots);
+    }
+    Ok(fairypam_agent_realtime::input_batch::PhysicalKey {
+        action_id: "maa.compatibility-smoke".to_owned(),
+        scan_code,
+        extended: mapped & 0xff00 != 0,
+    })
+}
+
+#[cfg(windows)]
+fn release_smoke_input() -> Result<(), ProvisionFailure> {
+    use fairypam_agent_realtime::input_batch::windows::WindowsPhysicalInputBatch;
+    use fairypam_agent_realtime::input_batch::PhysicalInputBatch;
+
+    let mut input = WindowsPhysicalInputBatch::new(vec![smoke_physical_key()?])
+        .map_err(|_| ProvisionFailure::InstallRoots)?;
+    input
+        .release_all()
+        .map_err(|_| ProvisionFailure::InstallRoots)
+}
+
+#[cfg(windows)]
+fn finish_smoke(
+    outcome: Result<(), ProvisionFailure>,
+    terminate: impl FnOnce() -> Result<(), ProvisionFailure>,
+    release: impl FnOnce() -> Result<(), ProvisionFailure>,
+) -> Result<(), ProvisionFailure> {
+    let termination = terminate();
+    let release = release();
+    termination?;
+    release?;
+    outcome
 }
 
 #[cfg(windows)]
@@ -1293,6 +1485,7 @@ mod tests {
                 }],
             },
             previous_pointer: Some(b"previous-pointer".to_vec()),
+            rollback_armed: false,
             created_version: true,
         };
         assert!(matches!(
@@ -1307,6 +1500,62 @@ mod tests {
         assert!(!version_root.exists());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_smoke_releases_a_key_left_down_by_the_worker() {
+        use fairypam_agent_realtime::input_batch::windows::WindowsPhysicalInputBatch;
+        use fairypam_agent_realtime::input_batch::{
+            KeyTransition, PhysicalInputBatch, PhysicalKey,
+        };
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+        let Ok(release) = SmokeInputRelease::new() else {
+            panic!("smoke release guard must initialize");
+        };
+        assert!(release_smoke_input().is_ok());
+        let Ok(key): Result<PhysicalKey, _> = smoke_physical_key() else {
+            panic!("smoke physical key must resolve");
+        };
+        let mut input = WindowsPhysicalInputBatch::new(vec![key.clone()]).unwrap();
+        input
+            .apply(&[KeyTransition { key, pressed: true }])
+            .unwrap();
+        assert_ne!(
+            unsafe { GetAsyncKeyState(SMOKE_VIRTUAL_KEY as i32) } as u16 & 0x8000,
+            0
+        );
+
+        assert!(finish_smoke(
+            Err(ProvisionFailure::InstallRoots),
+            || Ok(()),
+            || release.release()
+        )
+        .is_err());
+        assert_eq!(
+            unsafe { GetAsyncKeyState(SMOKE_VIRTUAL_KEY as i32) } as u16 & 0x8000,
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn smoke_cleanup_terminates_before_releasing() {
+        let order = std::cell::RefCell::new(Vec::new());
+        assert!(finish_smoke(
+            Err(ProvisionFailure::InstallRoots),
+            || {
+                order.borrow_mut().push("terminate");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("release");
+                Ok(())
+            }
+        )
+        .is_err());
+        assert_eq!(*order.borrow(), ["terminate", "release"]);
     }
 
     #[test]

@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package fairypam.local.v1;
+
+message LocalControlEnvelope {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  oneof payload {
+    LocalControlRequest request = 10;
+    LocalControlResponse response = 11;
+  }
+}
+
+message LocalControlRequest {
+  string request_id = 1;
+  int64 deadline_unix_ms = 2;
+  oneof command {
+    GetStatus get_status = 10;
+    GetEnvironment get_environment = 11;
+    RegisterHub register_hub = 12;
+    EmergencyRelease emergency_release = 13;
+    ExportDiagnostics export_diagnostics = 14;
+  }
+}
+
+message GetStatus {}
+message GetEnvironment {}
+message EmergencyRelease {}
+message ExportDiagnostics {}
+
+message RegisterHub {
+  string registration_code = 1;
+}
+
+enum LocalCommandOutcome {
+  LOCAL_COMMAND_OUTCOME_UNSPECIFIED = 0;
+  LOCAL_COMMAND_OUTCOME_APPLIED = 1;
+  LOCAL_COMMAND_OUTCOME_NOT_APPLIED = 2;
+  LOCAL_COMMAND_OUTCOME_UNCERTAIN = 3;
+}
+
+message LocalControlResponse {
+  string request_id = 1;
+  LocalCommandOutcome outcome = 2;
+  optional string error_code = 3;
+  oneof result {
+    StatusResult status = 10;
+    EnvironmentResult environment = 11;
+    RegistrationResult registration = 12;
+    EmergencyReleaseResult emergency_release = 13;
+    DiagnosticsResult diagnostics = 14;
+  }
+}
+
+message StatusResult {
+  string runtime_state = 1;
+  string control_state = 2;
+  string frame_state = 3;
+  bool task_active = 4;
+  bool capture_active = 5;
+  bool registered = 6;
+  string recovery_code = 7;
+}
+
+message EnvironmentCheck {
+  string id = 1;
+  string status = 2;
+  string code = 3;
+  string recovery = 4;
+}
+
+message EnvironmentResult {
+  bool registration_ready = 1;
+  bool registration_pending = 2;
+  repeated EnvironmentCheck checks = 3;
+}
+
+message RegistrationResult {
+  bool pending = 1;
+}
+
+message EmergencyReleaseResult {
+  bool cleanup_complete = 1;
+  uint32 holds = 2;
+}
+
+message DiagnosticsResult {
+  bytes bundle = 1;
+  string suggested_file_name = 2;
+}

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use fairypam_agent_protocol::v2::{AgentControlEvent, FramePacket};
+use fairypam_agent_protocol::v3::{AgentControlEvent, FramePacket};
 use fairypam_agent_transport::{control_queue, LatestFrameSlot};
 
 #[tokio::test]

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fairypam_agent_core::AgentError;
-use fairypam_agent_protocol::v2::{
+use fairypam_agent_protocol::v3::{
     agent_telemetry_event, agent_telemetry_record, command_identity, telemetry_attribute,
     AgentLogChunk, AgentLogReadRequest, AgentTelemetryBatch, AgentTelemetryEvent,
     AgentTelemetryRecord, DiagnosticLease, DiagnosticLeaseDisposition, DiagnosticLeaseReceipt,
@@ -293,6 +293,28 @@ impl TelemetryState {
         attempt_id: Option<String>,
         command_id: Option<String>,
     ) -> Result<(), AgentError> {
+        self.record_event_with_attributes(
+            event_name,
+            severity,
+            message,
+            task_run_id,
+            attempt_id,
+            command_id,
+            Vec::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_event_with_attributes(
+        &mut self,
+        event_name: &str,
+        severity: TelemetrySeverity,
+        message: Option<&str>,
+        task_run_id: Option<String>,
+        attempt_id: Option<String>,
+        command_id: Option<String>,
+        attributes: Vec<TelemetryAttribute>,
+    ) -> Result<(), AgentError> {
         self.source_sequence = self
             .source_sequence
             .checked_add(1)
@@ -300,7 +322,7 @@ impl TelemetryState {
         let diagnostic = self.matching_lease(task_run_id.as_deref());
         let mut record = AgentTelemetryRecord {
             schema_version: 1,
-            event_id: crate::v2_adapter::new_uuid(),
+            event_id: crate::v3_adapter::new_uuid(),
             agent_process_generation_id: self.process_generation_id.clone(),
             source_sequence: self.source_sequence,
             occurred_at_unix_nano: now_unix_nano(),
@@ -310,6 +332,7 @@ impl TelemetryState {
             signal: Some(agent_telemetry_record::Signal::Event(
                 TelemetryEventSignal {
                     message: message.map(str::to_owned),
+                    attributes,
                     ..Default::default()
                 },
             )),
@@ -340,7 +363,7 @@ impl TelemetryState {
     pub fn record_command_span(
         &mut self,
         name: &str,
-        identity: &fairypam_agent_protocol::v2::CommandIdentity,
+        identity: &fairypam_agent_protocol::v3::CommandIdentity,
         started_at_unix_nano: i64,
         ended_at_unix_nano: i64,
         error_code: Option<&str>,
@@ -382,7 +405,7 @@ impl TelemetryState {
             .source_sequence
             .checked_add(1)
             .ok_or_else(buffer_invalid)?;
-        let event_id = crate::v2_adapter::new_uuid();
+        let event_id = crate::v3_adapter::new_uuid();
         let span_id = Sha256::digest(event_id.as_bytes())[..8].to_vec();
         let mut record = AgentTelemetryRecord {
             schema_version: 1,
@@ -531,7 +554,7 @@ impl TelemetryState {
         let valid = target_valid
             && self.root.is_some()
             && lease.detail_level
-                == fairypam_agent_protocol::v2::DiagnosticDetailLevel::Debug as i32
+                == fairypam_agent_protocol::v3::DiagnosticDetailLevel::Debug as i32
             && lease.agent_process_generation_id == self.process_generation_id
             && lease.control_generation == control_generation
             && lease.expires_at_unix_ms > now_ms;
@@ -870,7 +893,7 @@ impl TelemetryState {
             .ok_or_else(buffer_invalid)?;
         let mut record = AgentTelemetryRecord {
             schema_version: 1,
-            event_id: crate::v2_adapter::new_uuid(),
+            event_id: crate::v3_adapter::new_uuid(),
             agent_process_generation_id: self.process_generation_id.clone(),
             source_sequence: self.source_sequence,
             occurred_at_unix_nano: now_unix_nano(),
@@ -905,7 +928,7 @@ impl TelemetryState {
             .ok_or_else(buffer_invalid)?;
         let mut record = AgentTelemetryRecord {
             schema_version: 1,
-            event_id: crate::v2_adapter::new_uuid(),
+            event_id: crate::v3_adapter::new_uuid(),
             agent_process_generation_id: self.process_generation_id.clone(),
             source_sequence: self.source_sequence,
             occurred_at_unix_nano: now_unix_nano(),
@@ -1289,15 +1312,53 @@ mod tests {
         target_id: &str,
     ) -> DiagnosticLease {
         DiagnosticLease {
-            diagnostic_session_id: crate::v2_adapter::new_uuid(),
+            diagnostic_session_id: crate::v3_adapter::new_uuid(),
             expires_at_unix_ms: now_unix_ms() as i64 + 60_000,
-            detail_level: fairypam_agent_protocol::v2::DiagnosticDetailLevel::Debug as i32,
+            detail_level: fairypam_agent_protocol::v3::DiagnosticDetailLevel::Debug as i32,
             target_type: target_type as i32,
             target_id: target_id.to_owned(),
             lease_instance_id: lease_instance_id.to_owned(),
             agent_process_generation_id: "11111111-1111-4111-8111-111111111111".to_owned(),
             control_generation: 7,
         }
+    }
+
+    #[test]
+    fn windows_io_runtime_attributes_reach_the_hub_batch() {
+        let mut state = TelemetryState::memory("11111111-1111-4111-8111-111111111111".to_owned());
+        let attributes = [
+            ("maa.runtime.version", "5.12.3"),
+            ("windows.capture.backend", "maa-win32:wgc"),
+            ("windows.input.backend", "maa-win32:sendinput"),
+        ]
+        .into_iter()
+        .map(|(key, value)| string_attribute(key, value))
+        .collect::<Vec<_>>();
+        state
+            .record_event_with_attributes(
+                "agent.windows_io.ready",
+                TelemetrySeverity::Info,
+                None,
+                None,
+                None,
+                None,
+                attributes.clone(),
+            )
+            .unwrap();
+
+        let event = state.next_batch(64, 256 * 1024).unwrap().unwrap();
+        let agent_telemetry_event::Payload::Batch(batch) = event.payload.unwrap() else {
+            panic!("expected telemetry batch")
+        };
+        let record = batch
+            .records
+            .iter()
+            .find(|record| record.event_name == "agent.windows_io.ready")
+            .unwrap();
+        let Some(agent_telemetry_record::Signal::Event(signal)) = record.signal.as_ref() else {
+            panic!("expected telemetry event")
+        };
+        assert_eq!(signal.attributes, attributes);
     }
 
     #[test]
@@ -1466,7 +1527,7 @@ mod tests {
 
     #[test]
     fn task_lease_adds_claimed_debug_detail_only_for_the_matching_command() {
-        use fairypam_agent_protocol::v2::{
+        use fairypam_agent_protocol::v3::{
             AttemptRef, CommandIdentity, CommandRef, TaskCommandRef,
         };
 

@@ -1,6 +1,7 @@
 pub mod platform;
 pub mod profile;
 pub mod state;
+#[cfg(feature = "supervisor")]
 pub mod supervisor;
 pub mod target;
 

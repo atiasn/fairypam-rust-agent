@@ -1,10 +1,10 @@
 use std::pin::Pin;
 use std::time::Duration;
 
-use fairypam_agent_protocol::v2::agent_control_service_server::{
+use fairypam_agent_protocol::v3::agent_control_service_server::{
     AgentControlService, AgentControlServiceServer,
 };
-use fairypam_agent_protocol::v2::{
+use fairypam_agent_protocol::v3::{
     agent_control_event, hub_control_command, AgentControlEvent, AgentHello, HubControlCommand,
     HubHello, SessionRef,
 };
@@ -54,7 +54,7 @@ impl AgentControlService for HelloService {
                         heartbeat_interval_ms: 1_000,
                         max_input_lease_ms: 500,
                         max_frame_bytes: 1_024,
-                        accepted_protocol_minor: 8,
+                        accepted_protocol_minor: fairypam_agent_protocol::AGENT_PROTOCOL_MINOR,
                     })),
                 }))
                 .await
@@ -98,8 +98,8 @@ async fn control_mtls_is_agent_bound_and_independent_from_frame_availability() {
             payload: Some(agent_control_event::Payload::Hello(AgentHello {
                 agent_id: AGENT_A.into(),
                 agent_version: "0.1.0".into(),
-                protocol_major: 2,
-                protocol_minor: 8,
+                protocol_major: fairypam_agent_protocol::AGENT_PROTOCOL_MAJOR,
+                protocol_minor: fairypam_agent_protocol::AGENT_PROTOCOL_MINOR,
                 build_commit: "test".into(),
                 installed_profiles: Vec::new(),
                 agent_process_generation_id: "11111111-1111-4111-8111-111111111111".into(),

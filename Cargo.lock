@@ -264,31 +264,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-deque"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
-dependencies = [
- "crossbeam-epoch",
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-epoch"
-version = "0.9.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-utils"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
-
-[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -440,7 +415,8 @@ version = "0.1.12"
 dependencies = [
  "ed25519-dalek",
  "fairypam-agent-core",
- "fairypam-agent-input",
+ "fairypam-agent-guardian-protocol",
+ "fairypam-agent-maa",
  "fairypam-agent-protocol",
  "fairypam-agent-suite",
  "fairypam-agent-transport",
@@ -482,8 +458,8 @@ name = "fairypam-agent-guardian"
 version = "0.1.12"
 dependencies = [
  "fairypam-agent-guardian-protocol",
- "serde_json",
- "thiserror",
+ "fairypam-agent-protocol",
+ "fairypam-agent-suite",
  "windows",
 ]
 
@@ -491,8 +467,8 @@ dependencies = [
 name = "fairypam-agent-guardian-protocol"
 version = "0.1.12"
 dependencies = [
- "serde",
- "serde_json",
+ "fairypam-agent-protocol",
+ "prost",
  "thiserror",
 ]
 
@@ -504,17 +480,33 @@ dependencies = [
  "fairypam-agent-guardian-protocol",
  "serde_json",
  "thiserror",
- "windows",
 ]
 
 [[package]]
 name = "fairypam-agent-installer"
 version = "0.1.12"
 dependencies = [
+ "fairypam-agent-realtime",
  "fairypam-agent-suite",
- "fairypam-agent-transport",
  "serde",
  "serde_json",
+ "windows",
+]
+
+[[package]]
+name = "fairypam-agent-maa"
+version = "0.1.12"
+dependencies = [
+ "ed25519-dalek",
+ "fairypam-agent-core",
+ "fairypam-agent-protocol",
+ "maa-framework",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
  "windows",
 ]
 
@@ -530,6 +522,30 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "windows",
+]
+
+[[package]]
+name = "fairypam-agent-realtime"
+version = "0.1.12"
+dependencies = [
+ "fairypam-agent-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "windows",
+]
+
+[[package]]
+name = "fairypam-agent-shell"
+version = "0.1.12"
+dependencies = [
+ "fairypam-agent-protocol",
+ "fairypam-agent-suite",
+ "windows",
+ "zeroize",
 ]
 
 [[package]]
@@ -569,14 +585,25 @@ name = "fairypam-agent-windows"
 version = "0.1.12"
 dependencies = [
  "fairypam-agent-core",
- "fairypam-agent-input",
- "image",
  "serde_json",
  "sha2",
  "thiserror",
- "tokio",
  "windows",
- "windows-capture",
+]
+
+[[package]]
+name = "fairypam-win32-worker"
+version = "0.1.12"
+dependencies = [
+ "fairypam-agent-core",
+ "fairypam-agent-maa",
+ "fairypam-agent-protocol",
+ "fairypam-agent-realtime",
+ "image",
+ "prost",
+ "serde",
+ "serde_json",
+ "windows",
 ]
 
 [[package]]
@@ -937,25 +964,49 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
-name = "lock_api"
-version = "0.4.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
-dependencies = [
- "scopeguard",
-]
-
-[[package]]
 name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
+name = "maa-framework"
+version = "1.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32d92b50180861b9ae41012178bf17d8c215a1bd7f6f240fe7bf223a2e279452"
+dependencies = [
+ "bitflags",
+ "maa-framework-sys",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "maa-framework-sys"
+version = "5.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1b0282adffeac4ffddbc3c355a9a2ee8e257e1f8581382b81912fc24131dcf4"
+dependencies = [
+ "libloading",
+ "once_cell",
+]
 
 [[package]]
 name = "matchers"
@@ -1094,29 +1145,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "parking_lot"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
-dependencies = [
- "lock_api",
- "parking_lot_core",
-]
-
-[[package]]
-name = "parking_lot_core"
-version = "0.9.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
-dependencies = [
- "cfg-if",
- "libc",
- "redox_syscall",
- "smallvec",
- "windows-link",
-]
 
 [[package]]
 name = "pem"
@@ -1393,26 +1421,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rayon"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
-dependencies = [
- "either",
- "rayon-core",
-]
-
-[[package]]
-name = "rayon-core"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
-dependencies = [
- "crossbeam-deque",
- "crossbeam-utils",
-]
-
-[[package]]
 name = "rcgen"
 version = "0.14.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1425,15 +1433,6 @@ dependencies = [
  "time",
  "x509-parser",
  "yasna",
-]
-
-[[package]]
-name = "redox_syscall"
-version = "0.5.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
-dependencies = [
- "bitflags",
 ]
 
 [[package]]
@@ -1550,12 +1549,6 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "scopeguard"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "semver"
@@ -2172,19 +2165,6 @@ dependencies = [
  "windows-core",
  "windows-future",
  "windows-numerics",
-]
-
-[[package]]
-name = "windows-capture"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f9460c7b82f6b7d314d85b45610481f26a1159a42dadf1e13a329041553e060"
-dependencies = [
- "parking_lot",
- "rayon",
- "thiserror",
- "windows",
- "windows-future",
 ]
 
 [[package]]

@@ -44,7 +44,11 @@ fn valid_content() -> ProfileContent {
             actions: BTreeMap::from([
                 (
                     "move.forward".into(),
-                    ActionDefinition::Hold { scan_code: 0x11 },
+                    ActionDefinition::Hold {
+                        maa_virtual_key: 0x57,
+                        physical_scan_code: 0x11,
+                        extended: false,
+                    },
                 ),
                 (
                     "camera.delta".into(),
@@ -87,11 +91,12 @@ fn production_genshin_profile_matches_the_formal_root_and_target() {
     .unwrap();
 
     assert_eq!(profile.profile().id, "genshin-impact");
-    assert_eq!(profile.profile().version, "1.8.1");
+    assert_eq!(profile.profile().version, "2.0.0");
     assert!(matches!(
         profile.profile().actions.get("input.f"),
-        Some(ActionDefinition::PhysicalPulse {
-            scan_code: 33,
+        Some(ActionDefinition::Pulse {
+            maa_virtual_key: 0x46,
+            physical_scan_code: 33,
             extended: false,
         })
     ));

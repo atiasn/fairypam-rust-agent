@@ -8,6 +8,7 @@ use fairypam_agent_core::AgentError;
 #[derive(Clone, Debug, Default)]
 pub struct ProfileStore {
     profiles: BTreeMap<String, VerifiedProfile>,
+    root: Option<PathBuf>,
 }
 
 impl ProfileStore {
@@ -72,7 +73,10 @@ impl ProfileStore {
                 "Profile directory contains no installed profiles",
             ));
         }
-        Ok(Self { profiles })
+        Ok(Self {
+            profiles,
+            root: Some(root.to_path_buf()),
+        })
     }
 
     pub fn get(&self, profile_id: &str) -> Result<&VerifiedProfile, AgentError> {
@@ -90,6 +94,15 @@ impl ProfileStore {
 
     pub fn installed(&self) -> impl Iterator<Item = &VerifiedProfile> {
         self.profiles.values()
+    }
+
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    pub(crate) fn with_root(mut self, root: PathBuf) -> Self {
+        self.root = Some(root);
+        self
     }
 
     pub fn from_verified_profiles(
@@ -113,7 +126,15 @@ impl ProfileStore {
         }
         Ok(Self {
             profiles: installed,
+            root: None,
         })
+    }
+
+    pub fn from_verified_profiles_at(
+        profiles: impl IntoIterator<Item = VerifiedProfile>,
+        root: PathBuf,
+    ) -> Result<Self, AgentError> {
+        Ok(Self::from_verified_profiles(profiles)?.with_root(root))
     }
 }
 
@@ -173,7 +194,11 @@ mod tests {
                 }],
                 actions: BTreeMap::from([(
                     "move.forward".into(),
-                    ActionDefinition::Hold { scan_code: 17 },
+                    ActionDefinition::Hold {
+                        maa_virtual_key: 0x57,
+                        physical_scan_code: 17,
+                        extended: false,
+                    },
                 )]),
             },
             files: Vec::new(),

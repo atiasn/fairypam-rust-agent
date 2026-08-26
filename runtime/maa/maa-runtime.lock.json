@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "sdk_version": "5.12.3",
+  "maa_framework_rs_version": "1.20.0",
+  "maa_framework_sys_version": "5.12.1",
+  "architecture": "x86_64-pc-windows-msvc",
+  "release_tag": "v5.12.3",
+  "release_asset": "MAA-win-x86_64-v5.12.3.zip",
+  "release_url": "https://github.com/MaaXYZ/MaaFramework/releases/download/v5.12.3/MAA-win-x86_64-v5.12.3.zip",
+  "release_sha256": "e16ed971e41aadcbf7a767e7371784e6a2efd3a563da8826d61a2f724645e19f",
+  "compatibility_profile": "fairypam-win32-maa-5.12-v1",
+  "minimum_agent_version": "0.1.12",
+  "expected_maa_version": "5.12.3",
+  "files": [
+    {
+      "path": "LICENSE.md",
+      "sha256": "446e755fae55ff034bbb21be44670b5f116c2b2667947e7036f2bfe6632539a8"
+    },
+    {
+      "path": "bin/MaaFramework.dll",
+      "sha256": "5448a2d512bc9fd70a3192e275facda1fdf322e455caafe89b01661b03fc9a9b"
+    },
+    {
+      "path": "bin/MaaWin32ControlUnit.dll",
+      "sha256": "ba3d2e8c7bea1b610132b5d184a6b335dd0ddb4975c63a40f923c0a7bb645bb5"
+    },
+    {
+      "path": "bin/MaaUtils.dll",
+      "sha256": "9bc56180da076c526b840c3e305c5e52d14950b05ec1f6eb73c62bbfdbeb2262"
+    },
+    {
+      "path": "bin/fastdeploy_ppocr_maa.dll",
+      "sha256": "adac69446655d20b65cbcb207415ee6a14133585e25a0884053ba0a871b5559d"
+    },
+    {
+      "path": "bin/onnxruntime_maa.dll",
+      "sha256": "654c5d82dce491befdbedb57e1457f5af49f6fb3d967a8c74cb4ada545ed09f2"
+    },
+    {
+      "path": "bin/opencv_world4_maa.dll",
+      "sha256": "9f5564de8731520e6df80c662d1fd0b95c6b0783f09a6dfac75eae50afd16133"
+    }
+  ]
+}

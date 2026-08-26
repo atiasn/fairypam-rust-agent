@@ -3,8 +3,8 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    v1::AgentAttemptContractV1,
-    v2::{
+    internal_v1::AgentAttemptContractV1,
+    v3::{
         command_identity, hub_control_command, AttemptRef, CleanupPolicy, ExecutionCapability,
         ExecutionContract, HubControlCommand, TaskCommandRef,
     },
@@ -85,7 +85,7 @@ pub fn canonical_execution_contract(contract: &ExecutionContract) -> Result<Stri
         return Err(ContractError("task.contract_string_invalid"));
     }
     if !is_digest(&contract.profile_digest)
-        || contract.contract_version != 2
+        || contract.contract_version != 3
         || contract.deadline_unix_ms <= 0
         || contract.max_input_lease_ms == 0
         || contract.cleanup_policy != CleanupPolicy::ReleaseInputKeepManagedTarget as i32
@@ -166,6 +166,7 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
                 "encoding": value.encoding,
                 "fps": value.fps,
                 "quality": value.quality,
+                "target_generation": value.target_generation,
             }),
         ),
         Some(Payload::CaptureFrame(value)) => (
@@ -175,35 +176,49 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
                 "capture_source_id": value.capture_source_id,
                 "encoding": value.encoding,
                 "quality": value.quality,
+                "target_generation": value.target_generation,
             }),
         ),
         Some(Payload::StopCapture(value)) => (
             task(value.reference.as_ref())?,
             "StopCapture",
-            serde_json::json!({"capture_source_id": value.capture_source_id}),
-        ),
-        Some(Payload::StartMusicAutoplay(value)) => (
-            task(value.reference.as_ref())?,
-            "StartMusicAutoplay",
             serde_json::json!({
-                "maximum_duration_ms": value.maximum_duration_ms,
-                "supervision_lease_ms": value.supervision_lease_ms.ok_or(ContractError("command.payload_invalid"))?,
+                "capture_source_id": value.capture_source_id,
+                "target_generation": value.target_generation,
             }),
         ),
-        Some(Payload::StopMusicAutoplay(value)) => (
+        Some(Payload::StartRealtimeProgram(value)) => (
             task(value.reference.as_ref())?,
-            "StopMusicAutoplay",
-            serde_json::json!({}),
+            "StartRealtimeProgram",
+            serde_json::json!({
+                "program_id": value.program_id,
+                "program_schema_version": value.program_schema_version,
+                "program_digest": value.program_digest,
+                "maximum_duration_ms": value.maximum_duration_ms,
+                "supervision_lease_ms": value.supervision_lease_ms,
+                "target_generation": value.target_generation,
+            }),
+        ),
+        Some(Payload::RenewRealtimeProgram(value)) => (
+            task(value.reference.as_ref())?,
+            "RenewRealtimeProgram",
+            serde_json::json!({
+                "program_id": value.program_id,
+                "supervision_lease_ms": value.supervision_lease_ms,
+            }),
+        ),
+        Some(Payload::StopRealtimeProgram(value)) => (
+            task(value.reference.as_ref())?,
+            "StopRealtimeProgram",
+            serde_json::json!({"program_id": value.program_id}),
         ),
         Some(Payload::InputFrame(value)) => {
             let mut payload = serde_json::json!({
-                "held_keys": value.held_keys.iter().map(|key| serde_json::json!({
-                    "extended": key.extended,
-                    "scan_code": key.scan_code,
-                })).collect::<Vec<_>>(),
-                "held_mouse_buttons": value.held_mouse_buttons,
+                "held_action_ids": value.held_action_ids,
                 "input_sequence": value.input_sequence,
                 "lease_ms": value.lease_ms,
+                "target_generation": value.target_generation,
+                "wheel_action_id": value.wheel_action_id,
                 "wheel_delta": value.wheel_delta,
             });
             if let Some(source) = value.source_frame_sequence {
@@ -221,10 +236,11 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
             task(value.reference.as_ref())?,
             "ClientPointClick",
             serde_json::json!({
-                "button": value.button,
+                "action_id": value.action_id,
                 "input_sequence": value.input_sequence,
                 "lease_ms": value.lease_ms,
                 "source_frame_sequence": value.source_frame_sequence,
+                "target_generation": value.target_generation,
                 "x_ppm": value.x_ppm,
                 "y_ppm": value.y_ppm,
             }),
@@ -258,7 +274,7 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
         .ok_or(ContractError("command.identity_invalid"))?;
     let canonical = serde_json::to_vec(&serde_json::json!({
         "attempt": attempt_value(attempt),
-        "kind": format!("fairypam.agent.v2.{kind}"),
+        "kind": format!("fairypam.agent.v3.{kind}"),
         "payload": payload,
     }))
     .map_err(|_| ContractError("command.payload_invalid"))?;
@@ -272,12 +288,12 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
     Ok(())
 }
 
-fn task(identity: Option<&crate::v2::CommandIdentity>) -> Result<&TaskCommandRef, ContractError> {
+fn task(identity: Option<&crate::v3::CommandIdentity>) -> Result<&TaskCommandRef, ContractError> {
     task_optional(identity)?.ok_or(ContractError("command.identity_invalid"))
 }
 
 fn task_optional(
-    identity: Option<&crate::v2::CommandIdentity>,
+    identity: Option<&crate::v3::CommandIdentity>,
 ) -> Result<Option<&TaskCommandRef>, ContractError> {
     match identity.and_then(|identity| identity.value.as_ref()) {
         Some(command_identity::Value::Task(task)) => Ok(Some(task)),
@@ -340,10 +356,11 @@ mod tests {
     use super::*;
 
     const CANONICAL: &str = include_str!(
-        "../../../proto/fairypam/agent/v1/testdata/agent-attempt-contract-v1.canonical.json"
+        "../../../proto/fairypam/internal/v1/testdata/agent-attempt-contract-v1.canonical.json"
     );
-    const DIGEST: &str =
-        include_str!("../../../proto/fairypam/agent/v1/testdata/agent-attempt-contract-v1.sha256");
+    const DIGEST: &str = include_str!(
+        "../../../proto/fairypam/internal/v1/testdata/agent-attempt-contract-v1.sha256"
+    );
 
     fn contract() -> AgentAttemptContractV1 {
         AgentAttemptContractV1 {
@@ -388,20 +405,20 @@ mod tests {
     }
 
     #[test]
-    fn shared_v2_execution_contract_is_canonical_and_verified() {
+    fn shared_v3_execution_contract_is_canonical_and_verified() {
         let mut contract = ExecutionContract {
             task_run_id: "11111111-1111-4111-8111-111111111111".into(),
             attempt_id: "22222222-2222-4222-8222-222222222222".into(),
             agent_build_id: "build-2026.07.28".into(),
             profile_id: "genshin-impact".into(),
             profile_digest: "b".repeat(64),
-            allowed_capabilities: vec![1, 2, 3, 4],
+            allowed_capabilities: vec![1, 2, 3, 4, 5, 6, 7, 8],
             deadline_unix_ms: 1_785_258_000_000,
             max_input_lease_ms: 1_000,
             cleanup_policy: CleanupPolicy::ReleaseInputKeepManagedTarget as i32,
-            contract_version: 2,
+            contract_version: 3,
             contract_digest: include_str!(
-                "../../../proto/fairypam/agent/v2/testdata/execution-contract.sha256"
+                "../../../proto/fairypam/agent/v3/testdata/execution-contract.sha256"
             )
             .trim()
             .into(),
@@ -409,7 +426,7 @@ mod tests {
         assert_eq!(
             canonical_execution_contract(&contract).unwrap(),
             include_str!(
-                "../../../proto/fairypam/agent/v2/testdata/execution-contract.canonical.json"
+                "../../../proto/fairypam/agent/v3/testdata/execution-contract.canonical.json"
             )
             .trim()
         );
@@ -423,21 +440,25 @@ mod tests {
     }
 
     #[test]
-    fn shared_music_autoplay_vector_freezes_explicit_autonomous_mode() {
+    fn shared_realtime_program_vector_freezes_installed_program_identity() {
         let vectors: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../proto/fairypam/agent/v2/testdata/task-command-vectors.json"
+            "../../../proto/fairypam/agent/v3/testdata/task-command-vectors.json"
         ))
         .unwrap();
         let vector = vectors
             .as_array()
             .unwrap()
             .iter()
-            .find(|vector| vector["kind"] == "StartMusicAutoplay")
+            .find(|vector| vector["kind"] == "StartRealtimeProgram")
             .unwrap();
         let canonical = vector["canonical_json"].as_str().unwrap();
         let payload: serde_json::Value = serde_json::from_str(canonical).unwrap();
 
-        assert_eq!(payload["payload"]["supervision_lease_ms"], 0);
+        assert_eq!(
+            payload["payload"]["program_id"],
+            "genshin.music-autoplay.v1"
+        );
+        assert_eq!(payload["payload"]["program_schema_version"], 1);
         assert_eq!(
             format!("{:x}", Sha256::digest(canonical.as_bytes())),
             vector["sha256"].as_str().unwrap()

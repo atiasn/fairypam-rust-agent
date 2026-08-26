@@ -2,8 +2,8 @@
 
 该目录只定义固定公共镜像 `atiasn/fairypam-rust-agent` 的 Windows 产品 candidate。
 
-`windows-candidate.yml` 仅构建、安装验证并 attest GUI 内嵌 Core 的 NSIS 产品安装器。
-公共镜像不发布独立 Core、Dev CLI、Dev automation 或可直接部署的 runtime artifact。
+`windows-candidate.yml` 构建并验证独立 Agent、Guardian、Win32 Worker、原生 Shell 与固定
+MAA Runtime 的 NSIS 产品安装器。Tauri/WebView2、Dev CLI 和 Dev automation 不进入产品安装包。
 
 正式入口：
 

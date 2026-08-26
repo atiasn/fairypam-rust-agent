@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(any(windows, test))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use fairypam_agent_core::AgentError;
-use fairypam_agent_protocol::v2;
+use fairypam_agent_protocol::v3;
 use serde::{Deserialize, Serialize};
+#[cfg(any(windows, test))]
 use sha2::{Digest, Sha256};
 
 const MIN_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
@@ -22,8 +25,8 @@ struct PolicySnapshot {
     occupied: bool,
 }
 
-impl From<&v2::ConfigureIdleClose> for PolicySnapshot {
-    fn from(value: &v2::ConfigureIdleClose) -> Self {
+impl From<&v3::ConfigureIdleClose> for PolicySnapshot {
+    fn from(value: &v3::ConfigureIdleClose) -> Self {
         Self {
             game_id: value.game_id.clone(),
             game_session_id: value.game_session_id.clone(),
@@ -54,8 +57,8 @@ struct ClosingSnapshot {
 }
 
 impl PendingCloseReceipt {
-    fn to_proto(&self) -> v2::ManagedGameCloseReceipt {
-        v2::ManagedGameCloseReceipt {
+    fn to_proto(&self) -> v3::ManagedGameCloseReceipt {
+        v3::ManagedGameCloseReceipt {
             game_session_id: self.game_session_id.clone(),
             state_version: self.state_version,
             trigger: self.trigger,
@@ -103,6 +106,7 @@ impl ManagedGameLifecycle {
         }
     }
 
+    #[cfg(any(windows, test))]
     pub fn persistent(legacy_path: PathBuf, agent_id: &str) -> Self {
         let path = namespaced_path(&legacy_path, agent_id);
         let persisted = load(&path)
@@ -147,7 +151,7 @@ impl ManagedGameLifecycle {
 
     pub fn configure(
         &mut self,
-        value: &v2::ConfigureIdleClose,
+        value: &v3::ConfigureIdleClose,
         now: Instant,
         now_unix_ms: i64,
     ) -> Result<(), AgentError> {
@@ -234,34 +238,34 @@ impl ManagedGameLifecycle {
         })
     }
 
-    pub fn status(&self, now: Instant, now_unix_ms: i64) -> Option<v2::ManagedGameIdleStatus> {
+    pub fn status(&self, now: Instant, now_unix_ms: i64) -> Option<v3::ManagedGameIdleStatus> {
         let active = self.active.as_ref()?;
         let (state, expected_close_at_unix_ms, reason_code) = if active.close_failed {
             (
-                v2::ManagedGameIdleState::CloseFailed,
+                v3::ManagedGameIdleState::CloseFailed,
                 None,
                 Some("idle_close.close_failed".to_owned()),
             )
         } else if active.closing {
             (
-                v2::ManagedGameIdleState::Paused,
+                v3::ManagedGameIdleState::Paused,
                 None,
                 Some("target.closing".to_owned()),
             )
         } else if !active.policy.enabled {
-            (v2::ManagedGameIdleState::Disabled, None, None)
+            (v3::ManagedGameIdleState::Disabled, None, None)
         } else if active.policy.occupied {
-            (v2::ManagedGameIdleState::Occupied, None, None)
+            (v3::ManagedGameIdleState::Occupied, None, None)
         } else {
             let remaining = Duration::from_millis(active.policy.idle_timeout_ms)
                 .saturating_sub(now.duration_since(active.last_activity));
             (
-                v2::ManagedGameIdleState::Counting,
+                v3::ManagedGameIdleState::Counting,
                 Some(now_unix_ms.saturating_add(remaining.as_millis() as i64)),
                 None,
             )
         };
-        Some(v2::ManagedGameIdleStatus {
+        Some(v3::ManagedGameIdleStatus {
             session: None,
             game_session_id: active.policy.game_session_id.clone(),
             state_version: active.policy.state_version,
@@ -275,13 +279,13 @@ impl ManagedGameLifecycle {
 
     pub fn close_receipt(
         &mut self,
-        trigger: v2::ManagedGameCloseTrigger,
-        result: v2::ManagedGameCloseResult,
+        trigger: v3::ManagedGameCloseTrigger,
+        result: v3::ManagedGameCloseResult,
         occurred_at_unix_ms: i64,
         error_code: Option<String>,
-    ) -> Option<v2::ManagedGameCloseReceipt> {
+    ) -> Option<v3::ManagedGameCloseReceipt> {
         let active = self.active.as_mut()?;
-        let receipt = v2::ManagedGameCloseReceipt {
+        let receipt = v3::ManagedGameCloseReceipt {
             game_session_id: active.policy.game_session_id.clone(),
             state_version: active.policy.state_version,
             trigger: trigger as i32,
@@ -298,7 +302,7 @@ impl ManagedGameLifecycle {
             error_code: receipt.error_code.clone(),
         });
         self.pending_close_report = true;
-        if result == v2::ManagedGameCloseResult::Failed {
+        if result == v3::ManagedGameCloseResult::Failed {
             active.closing = true;
             active.close_failed = true;
             self.persisted.closing = Some(ClosingSnapshot {
@@ -339,7 +343,7 @@ impl ManagedGameLifecycle {
         &mut self,
         error_code: &str,
         occurred_at_unix_ms: i64,
-    ) -> Option<v2::ManagedGameCloseReceipt> {
+    ) -> Option<v3::ManagedGameCloseReceipt> {
         let active = self.active.as_mut()?;
         active.closing = true;
         active.close_failed = true;
@@ -352,11 +356,11 @@ impl ManagedGameLifecycle {
         });
         self.bump_sequence();
         let _ = self.persist();
-        Some(v2::ManagedGameCloseReceipt {
+        Some(v3::ManagedGameCloseReceipt {
             game_session_id,
             state_version,
-            trigger: v2::ManagedGameCloseTrigger::Manual as i32,
-            result: v2::ManagedGameCloseResult::Failed as i32,
+            trigger: v3::ManagedGameCloseTrigger::Manual as i32,
+            result: v3::ManagedGameCloseResult::Failed as i32,
             occurred_at_unix_ms,
             error_code: Some(error_code.to_owned()),
         })
@@ -364,14 +368,14 @@ impl ManagedGameLifecycle {
 
     pub fn manual_close_receipt(
         &mut self,
-        result: v2::ManagedGameCloseResult,
+        result: v3::ManagedGameCloseResult,
         occurred_at_unix_ms: i64,
-    ) -> Option<v2::ManagedGameCloseReceipt> {
+    ) -> Option<v3::ManagedGameCloseReceipt> {
         let active = self.active.as_ref()?;
-        let receipt = v2::ManagedGameCloseReceipt {
+        let receipt = v3::ManagedGameCloseReceipt {
             game_session_id: active.policy.game_session_id.clone(),
             state_version: active.policy.state_version,
-            trigger: v2::ManagedGameCloseTrigger::Manual as i32,
+            trigger: v3::ManagedGameCloseTrigger::Manual as i32,
             result: result as i32,
             occurred_at_unix_ms,
             error_code: None,
@@ -388,7 +392,7 @@ impl ManagedGameLifecycle {
         self.pending_close_report = self.persisted.pending_close_receipt.is_some();
     }
 
-    pub fn pending_close_receipt(&self) -> Option<v2::ManagedGameCloseReceipt> {
+    pub fn pending_close_receipt(&self) -> Option<v3::ManagedGameCloseReceipt> {
         if !self.pending_close_report {
             return None;
         }
@@ -479,7 +483,7 @@ impl ManagedGameLifecycle {
     }
 }
 
-pub fn close_event_id(receipt: &v2::ManagedGameCloseReceipt) -> String {
+pub fn close_event_id(receipt: &v3::ManagedGameCloseReceipt) -> String {
     format!(
         "{}:{}:{}:{}:{}:{}",
         receipt.game_session_id,
@@ -491,7 +495,7 @@ pub fn close_event_id(receipt: &v2::ManagedGameCloseReceipt) -> String {
     )
 }
 
-fn validate(value: &v2::ConfigureIdleClose) -> Result<(), AgentError> {
+fn validate(value: &v3::ConfigureIdleClose) -> Result<(), AgentError> {
     if value.game_id.is_empty()
         || value.game_session_id.is_empty()
         || value.profile_id.is_empty()
@@ -519,10 +523,12 @@ fn validate(value: &v2::ConfigureIdleClose) -> Result<(), AgentError> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
 fn load(path: &Path) -> Option<PersistedState> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
+#[cfg(any(windows, test))]
 fn namespaced_path(legacy_path: &Path, agent_id: &str) -> PathBuf {
     let digest = Sha256::digest(agent_id.as_bytes());
     legacy_path.with_file_name(format!("managed-game-lifecycle-{digest:x}.json"))
@@ -540,8 +546,8 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn config(version: u64, enabled: bool, occupied: bool) -> v2::ConfigureIdleClose {
-        v2::ConfigureIdleClose {
+    fn config(version: u64, enabled: bool, occupied: bool) -> v3::ConfigureIdleClose {
+        v3::ConfigureIdleClose {
             game_id: "game-1".into(),
             game_session_id: "game-session-1".into(),
             profile_id: "genshin-impact".into(),
@@ -549,7 +555,7 @@ mod tests {
             enabled,
             idle_timeout_ms: if enabled { MIN_IDLE_TIMEOUT_MS } else { 0 },
             occupied,
-            ..v2::ConfigureIdleClose::default()
+            ..v3::ConfigureIdleClose::default()
         }
     }
 
@@ -565,7 +571,7 @@ mod tests {
         assert!(!lifecycle.due(start + Duration::from_secs(24 * 60 * 60)));
         assert_eq!(
             lifecycle.status(start, 1_000).unwrap().state,
-            v2::ManagedGameIdleState::Occupied as i32
+            v3::ManagedGameIdleState::Occupied as i32
         );
     }
 
@@ -675,8 +681,8 @@ mod tests {
             .unwrap();
         let receipt = lifecycle
             .close_receipt(
-                v2::ManagedGameCloseTrigger::Idle,
-                v2::ManagedGameCloseResult::Graceful,
+                v3::ManagedGameCloseTrigger::Idle,
+                v3::ManagedGameCloseResult::Graceful,
                 2_000,
                 None,
             )
@@ -716,8 +722,8 @@ mod tests {
             .unwrap();
         old_agent
             .close_receipt(
-                v2::ManagedGameCloseTrigger::Idle,
-                v2::ManagedGameCloseResult::Failed,
+                v3::ManagedGameCloseTrigger::Idle,
+                v3::ManagedGameCloseResult::Failed,
                 2_000,
                 Some("target.close_failed".to_owned()),
             )

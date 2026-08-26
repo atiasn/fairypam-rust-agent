@@ -763,7 +763,11 @@ mod tests {
                 }],
                 actions: BTreeMap::from([(
                     "movement.forward".into(),
-                    ActionDefinition::Hold { scan_code: 17 },
+                    ActionDefinition::Hold {
+                        maa_virtual_key: 0x57,
+                        physical_scan_code: 17,
+                        extended: false,
+                    },
                 )]),
             },
             files: Vec::new(),

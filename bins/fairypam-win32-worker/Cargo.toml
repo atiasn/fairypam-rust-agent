@@ -1,0 +1,35 @@
+[package]
+name = "fairypam-win32-worker"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+fairypam-agent-core = { path = "../../crates/fairypam-agent-core", default-features = false }
+fairypam-agent-maa = { path = "../../crates/fairypam-agent-maa" }
+fairypam-agent-protocol = { path = "../../crates/fairypam-agent-protocol" }
+fairypam-agent-realtime = { path = "../../crates/fairypam-agent-realtime" }
+image.workspace = true
+prost = "0.14"
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[bin]]
+name = "fairypam-win32-worker"
+path = "src/main.rs"

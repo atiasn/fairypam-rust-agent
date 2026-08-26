@@ -1,17 +1,13 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use fairypam_agent_suite::{
     manifest_sha256, sha256_file, validate_manifest, MemberScope, SuiteManifest, SuiteMember,
     MANIFEST_KIND,
 };
-
-const TAURI_UNKNOWN_BUNDLE_TYPE: &[u8] = b"__TAURI_BUNDLE_TYPE_VAR_UNK";
-const TAURI_NSIS_BUNDLE_TYPE: &[u8] = b"__TAURI_BUNDLE_TYPE_VAR_NSS";
 
 fn main() {
     if let Err(error) = run() {
@@ -22,11 +18,6 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
-    if let [flag, path] = arguments.as_slice() {
-        if flag == "--patch-tauri-nsis" {
-            return patch_tauri_nsis(Path::new(path));
-        }
-    }
     let options = options(arguments.into_iter())?;
     let build_id = required(&options, "--build-id")?;
     let source_commit = required(&options, "--source-commit")?;
@@ -37,13 +28,23 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut members = vec![
         identity(
+            required_path(&options, "--agent")?,
+            "fairypam-agent.exe",
+            MemberScope::Versioned,
+        )?,
+        identity(
             required_path(&options, "--guardian")?,
             "fairypam-agent-guardian.exe",
             MemberScope::Versioned,
         )?,
         identity(
-            required_path(&options, "--gui")?,
-            "fairypam-agent-tauri-ui.exe",
+            required_path(&options, "--shell")?,
+            "fairypam-agent-shell.exe",
+            MemberScope::Versioned,
+        )?,
+        identity(
+            required_path(&options, "--worker")?,
+            "fairypam-win32-worker.exe",
             MemberScope::Versioned,
         )?,
         identity(
@@ -52,6 +53,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             MemberScope::Stable,
         )?,
     ];
+    members.extend(directory_identities(
+        required_path(&options, "--runtime-dir")?,
+        "runtime/maa",
+    )?);
     members.sort_by(|left, right| left.path.cmp(&right.path));
 
     let manifest = SuiteManifest {
@@ -79,32 +84,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         manifest.suite_version,
         manifest_sha256(&bytes)
     );
-    Ok(())
-}
-
-fn patch_tauri_nsis(path: &Path) -> Result<(), Box<dyn Error>> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() == 0 {
-        return Err("Tauri GUI is not a non-empty regular file".into());
-    }
-    let mut bytes = fs::read(path)?;
-    patch_tauri_nsis_bytes(&mut bytes)?;
-    let mut file = File::create(path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn patch_tauri_nsis_bytes(bytes: &mut [u8]) -> Result<(), String> {
-    let matches = bytes
-        .windows(TAURI_UNKNOWN_BUNDLE_TYPE.len())
-        .enumerate()
-        .filter_map(|(index, window)| (window == TAURI_UNKNOWN_BUNDLE_TYPE).then_some(index))
-        .collect::<Vec<_>>();
-    let [index] = matches.as_slice() else {
-        return Err("Tauri GUI must contain exactly one unknown bundle type token".to_owned());
-    };
-    bytes[*index..*index + TAURI_UNKNOWN_BUNDLE_TYPE.len()].copy_from_slice(TAURI_NSIS_BUNDLE_TYPE);
     Ok(())
 }
 
@@ -158,25 +137,30 @@ fn identity(path: &Path, logical: &str, scope: MemberScope) -> Result<SuiteMembe
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn patches_exactly_one_tauri_nsis_bundle_type() {
-        let mut bytes = [
-            b"prefix".as_slice(),
-            TAURI_UNKNOWN_BUNDLE_TYPE,
-            b"suffix".as_slice(),
-        ]
-        .concat();
-        patch_tauri_nsis_bytes(&mut bytes).unwrap();
-        assert!(bytes
-            .windows(TAURI_NSIS_BUNDLE_TYPE.len())
-            .any(|window| window == TAURI_NSIS_BUNDLE_TYPE));
-        assert!(patch_tauri_nsis_bytes(&mut bytes).is_err());
-
-        let mut duplicate = [TAURI_UNKNOWN_BUNDLE_TYPE, TAURI_UNKNOWN_BUNDLE_TYPE].concat();
-        assert!(patch_tauri_nsis_bytes(&mut duplicate).is_err());
+fn directory_identities(root: &Path, prefix: &str) -> Result<Vec<SuiteMember>, Box<dyn Error>> {
+    let mut members = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let metadata = entry.path().symlink_metadata()?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "runtime source contains a symlink: {}",
+                entry.path().display()
+            )
+            .into());
+        }
+        let logical = format!("{prefix}/{}", entry.file_name().to_string_lossy());
+        if metadata.is_dir() {
+            members.extend(directory_identities(&entry.path(), &logical)?);
+        } else if metadata.is_file() {
+            members.push(identity(&entry.path(), &logical, MemberScope::Versioned)?);
+        } else {
+            return Err(format!(
+                "runtime source is not a regular file: {}",
+                entry.path().display()
+            )
+            .into());
+        }
     }
+    Ok(members)
 }

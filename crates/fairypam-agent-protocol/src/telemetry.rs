@@ -4,7 +4,7 @@ use std::fmt;
 use prost::Message;
 use serde_json::{json, Value};
 
-use crate::v2::{
+use crate::v3::{
     agent_telemetry_record, telemetry_attribute, AgentTelemetryRecord, TelemetryAttribute,
     TelemetryEventSignal, TelemetryMetricSignal, TelemetrySpanSignal, W3cTraceContext,
 };
@@ -216,7 +216,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::v2::{agent_telemetry_record, AgentTelemetryRecord, TelemetrySeverity};
+    use crate::v3::{agent_telemetry_record, AgentTelemetryRecord, TelemetrySeverity};
 
     #[test]
     fn event_canonicalization_is_stable_and_normalizes_negative_zero() {
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn rust_matches_shared_canonical_vector() {
         let vector: Value = serde_json::from_str(include_str!(
-            "../../../proto/fairypam/agent/v2/testdata/telemetry-canonical-vectors.json"
+            "../../../proto/fairypam/agent/v3/testdata/telemetry-canonical-vectors.json"
         ))
         .unwrap();
         let expected = &vector[0];

@@ -1,4 +1,4 @@
-use fairypam_agent_protocol::v2::{
+use fairypam_agent_protocol::v3::{
     agent_telemetry_event, hub_telemetry_command, AgentTelemetryEvent, AgentTelemetryHello,
     HubTelemetryCommand, HubTelemetryHello, SessionRef,
 };
@@ -52,7 +52,7 @@ pub async fn open_telemetry_tunnel(
     connection: &TelemetryChannel,
     receiver: TelemetryReceiver,
 ) -> Result<PendingTelemetryTunnel, TransportError> {
-    let mut client = fairypam_agent_protocol::v2::agent_telemetry_service_client::AgentTelemetryServiceClient::new(
+    let mut client = fairypam_agent_protocol::v3::agent_telemetry_service_client::AgentTelemetryServiceClient::new(
         connection.channel.clone(),
     );
     let commands = client
@@ -137,7 +137,7 @@ pub fn hello_event(
                 generation: session.generation(),
             }),
             agent_process_generation_id: process_generation_id,
-            protocol_minor: 8,
+            protocol_minor: fairypam_agent_protocol::AGENT_PROTOCOL_MINOR,
             telemetry_schema_versions: vec![1],
         })),
     }

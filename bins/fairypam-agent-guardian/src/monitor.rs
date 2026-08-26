@@ -124,6 +124,15 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
     }
 
     pub fn release_all(&mut self, reason: ReleaseReason) -> Result<(), String> {
+        let releases = self.release_holds();
+        self.release_driver.release_all(&releases)?;
+        self.committed_holds.clear();
+        self.pending_intent = None;
+        self.last_release_reason = Some(reason);
+        Ok(())
+    }
+
+    pub fn release_holds(&self) -> Vec<PhysicalHold> {
         let mut releases: BTreeMap<_, _> = self
             .committed_holds
             .iter()
@@ -135,12 +144,11 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
                 releases.insert(hold.action_id().clone(), hold.clone());
             }
         }
-        self.release_driver
-            .release_all(&releases.into_values().collect::<Vec<_>>())?;
-        self.committed_holds.clear();
-        self.pending_intent = None;
-        self.last_release_reason = Some(reason);
-        Ok(())
+        releases.into_values().collect()
+    }
+
+    pub fn release_snapshot(&mut self, holds: &[PhysicalHold]) -> Result<(), String> {
+        self.release_driver.release_all(holds)
     }
 
     pub fn handle(&mut self, request: GuardianRequest, now: Instant) -> GuardianResponse {
@@ -156,7 +164,8 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
                 Duration::from_millis(u64::from(heartbeat_timeout_ms)),
                 now,
             ),
-            GuardianRequest::Heartbeat { sequence } => self.heartbeat(sequence, now),
+            GuardianRequest::Heartbeat { sequence, .. } => self.heartbeat(sequence, now),
+            GuardianRequest::WorkerHealth { .. } => Ok(()),
             GuardianRequest::RegisterIntent { sequence, holds } => {
                 self.register_intent(sequence, holds)
             }
@@ -173,6 +182,7 @@ impl<R: ReleaseDriver> GuardianMonitor<R> {
         match result {
             Ok(()) => GuardianResponse::Ack {
                 isolation_status: None,
+                activation_pending: false,
             },
             Err(message) => GuardianResponse::Error {
                 code: message.clone(),

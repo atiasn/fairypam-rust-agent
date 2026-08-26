@@ -10,7 +10,8 @@ test-support = []
 [dependencies]
 ed25519-dalek.workspace = true
 fairypam-agent-core = { path = "../../crates/fairypam-agent-core" }
-fairypam-agent-input = { path = "../../crates/fairypam-agent-input" }
+fairypam-agent-guardian-protocol = { path = "../../crates/fairypam-agent-guardian-protocol" }
+fairypam-agent-maa = { path = "../../crates/fairypam-agent-maa" }
 fairypam-agent-protocol = { path = "../../crates/fairypam-agent-protocol" }
 fairypam-agent-suite = { path = "../../crates/fairypam-agent-suite" }
 fairypam-agent-transport = { path = "../../crates/fairypam-agent-transport" }

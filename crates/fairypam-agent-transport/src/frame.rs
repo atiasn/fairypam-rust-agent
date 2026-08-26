@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use fairypam_agent_protocol::v2::agent_frame_service_client::AgentFrameServiceClient;
-use fairypam_agent_protocol::v2::{FrameDirective, FramePacket};
+use fairypam_agent_protocol::v3::agent_frame_service_client::AgentFrameServiceClient;
+use fairypam_agent_protocol::v3::{FrameDirective, FramePacket};
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::{Stream, StreamExt};
@@ -128,7 +128,7 @@ impl SessionFrameSlot {
 
     fn stream(&self) -> impl Stream<Item = FramePacket> + Send + use<> {
         let attach = FramePacket {
-            session: Some(fairypam_agent_protocol::v2::SessionRef {
+            session: Some(fairypam_agent_protocol::v3::SessionRef {
                 agent_id: self.session.agent_id().to_owned(),
                 session_id: self.session.session_id().to_owned(),
                 generation: self.session.generation(),
@@ -210,7 +210,7 @@ pub(crate) fn verify_frame_directive(
 
 #[cfg(test)]
 mod tests {
-    use fairypam_agent_protocol::v2::{HubHello, SessionRef};
+    use fairypam_agent_protocol::v3::{HubHello, SessionRef};
 
     use super::*;
     use crate::control::verify_hub_hello;
@@ -226,7 +226,7 @@ mod tests {
                 heartbeat_interval_ms: 1_000,
                 max_input_lease_ms: 500,
                 max_frame_bytes: 4,
-                accepted_protocol_minor: 8,
+                accepted_protocol_minor: fairypam_agent_protocol::AGENT_PROTOCOL_MINOR,
             },
             "agent-a",
         )

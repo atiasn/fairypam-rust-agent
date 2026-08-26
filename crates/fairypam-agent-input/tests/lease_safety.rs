@@ -257,11 +257,19 @@ fn verified_profile_with_actions(
     let mut actions = BTreeMap::from([
         (
             "movement.forward".into(),
-            ActionDefinition::Hold { scan_code: 17 },
+            ActionDefinition::Hold {
+                maa_virtual_key: 0x57,
+                physical_scan_code: 17,
+                extended: false,
+            },
         ),
         (
             "combat.attack".into(),
-            ActionDefinition::Pulse { scan_code: 30 },
+            ActionDefinition::Pulse {
+                maa_virtual_key: 0x41,
+                physical_scan_code: 30,
+                extended: false,
+            },
         ),
         (
             "camera.wheel".into(),
@@ -380,15 +388,17 @@ fn guarded_frame_rejects_pulse_collisions_before_arming() {
         BTreeMap::from([
             (
                 "alias.hold".into(),
-                ActionDefinition::PhysicalHold {
-                    scan_code: 40,
+                ActionDefinition::Hold {
+                    maa_virtual_key: 1,
+                    physical_scan_code: 40,
                     extended: false,
                 },
             ),
             (
                 "alias.pulse".into(),
-                ActionDefinition::PhysicalPulse {
-                    scan_code: 40,
+                ActionDefinition::Pulse {
+                    maa_virtual_key: 1,
+                    physical_scan_code: 40,
                     extended: false,
                 },
             ),
@@ -396,15 +406,17 @@ fn guarded_frame_rejects_pulse_collisions_before_arming() {
         BTreeMap::from([
             (
                 "pulse.first".into(),
-                ActionDefinition::PhysicalPulse {
-                    scan_code: 40,
+                ActionDefinition::Pulse {
+                    maa_virtual_key: 1,
+                    physical_scan_code: 40,
                     extended: false,
                 },
             ),
             (
                 "pulse.second".into(),
-                ActionDefinition::PhysicalPulse {
-                    scan_code: 40,
+                ActionDefinition::Pulse {
+                    maa_virtual_key: 1,
+                    physical_scan_code: 40,
                     extended: false,
                 },
             ),
@@ -445,22 +457,25 @@ fn guarded_frame_rejects_late_pulse_collision_without_local_transition() {
     let profile = verified_profile_with_actions(BTreeMap::from([
         (
             "guard.valid".into(),
-            ActionDefinition::PhysicalHold {
-                scan_code: 41,
+            ActionDefinition::Hold {
+                maa_virtual_key: 1,
+                physical_scan_code: 41,
                 extended: false,
             },
         ),
         (
             "alias.hold".into(),
-            ActionDefinition::PhysicalHold {
-                scan_code: 40,
+            ActionDefinition::Hold {
+                maa_virtual_key: 1,
+                physical_scan_code: 40,
                 extended: false,
             },
         ),
         (
             "alias.pulse".into(),
-            ActionDefinition::PhysicalPulse {
-                scan_code: 40,
+            ActionDefinition::Pulse {
+                maa_virtual_key: 1,
+                physical_scan_code: 40,
                 extended: false,
             },
         ),
@@ -1072,15 +1087,17 @@ fn physical_frame_rejects_pulse_hold_collision_before_side_effects() {
     let profile = verified_profile_with_actions(BTreeMap::from([
         (
             "alias.hold".into(),
-            ActionDefinition::PhysicalHold {
-                scan_code: 40,
+            ActionDefinition::Hold {
+                maa_virtual_key: 1,
+                physical_scan_code: 40,
                 extended: false,
             },
         ),
         (
             "alias.pulse".into(),
-            ActionDefinition::PhysicalPulse {
-                scan_code: 40,
+            ActionDefinition::Pulse {
+                maa_virtual_key: 1,
+                physical_scan_code: 40,
                 extended: false,
             },
         ),
@@ -1115,15 +1132,17 @@ fn physical_frame_rejects_duplicate_profile_pulses_before_side_effects() {
     let profile = verified_profile_with_actions(BTreeMap::from([
         (
             "pulse.first".into(),
-            ActionDefinition::PhysicalPulse {
-                scan_code: 40,
+            ActionDefinition::Pulse {
+                maa_virtual_key: 1,
+                physical_scan_code: 40,
                 extended: false,
             },
         ),
         (
             "pulse.second".into(),
-            ActionDefinition::PhysicalPulse {
-                scan_code: 40,
+            ActionDefinition::Pulse {
+                maa_virtual_key: 1,
+                physical_scan_code: 40,
                 extended: false,
             },
         ),

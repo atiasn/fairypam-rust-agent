@@ -1,0 +1,251 @@
+syntax = "proto3";
+
+package fairypam.worker.v1;
+
+message LocalEnvelope {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  oneof payload {
+    WorkerHello hello = 3;
+    WorkerReady ready = 4;
+    WorkerRequest request = 5;
+    WorkerResponse response = 6;
+    WorkerEvent event = 7;
+  }
+}
+
+message WorkerHello {
+  string worker_generation = 1;
+  uint32 process_id = 2;
+  string build_id = 3;
+}
+
+message WorkerReady {
+  string worker_generation = 1;
+  WorkerCapabilities capabilities = 2;
+  WorkerHealth health = 3;
+}
+
+message WorkerCommandIdentity {
+  string worker_generation = 1;
+  string local_command_id = 2;
+  int64 deadline_unix_ms = 3;
+  uint64 target_generation = 4;
+  uint64 input_owner_epoch = 5;
+  string request_digest = 6;
+}
+
+enum WorkerOutcome {
+  WORKER_OUTCOME_UNSPECIFIED = 0;
+  WORKER_OUTCOME_APPLIED = 1;
+  WORKER_OUTCOME_NOT_APPLIED = 2;
+  WORKER_OUTCOME_UNCERTAIN = 3;
+}
+
+enum WindowsIoMode {
+  WINDOWS_IO_MODE_UNSPECIFIED = 0;
+  WINDOWS_IO_MODE_DETACHED = 1;
+  WINDOWS_IO_MODE_GENERIC = 2;
+  WINDOWS_IO_MODE_GENERIC_DRAINING = 3;
+  WINDOWS_IO_MODE_REALTIME_STARTING = 4;
+  WINDOWS_IO_MODE_REALTIME = 5;
+  WINDOWS_IO_MODE_REALTIME_RELEASING = 6;
+  WINDOWS_IO_MODE_FAULTED = 7;
+}
+
+message WorkerRequest {
+  WorkerCommandIdentity identity = 1;
+  oneof payload {
+    AttachTarget attach_target = 2;
+    DetachTarget detach_target = 3;
+    GetCapabilities get_capabilities = 4;
+    GetHealth get_health = 5;
+    StartGenericCapture start_generic_capture = 6;
+    CaptureOnce capture_once = 7;
+    StopGenericCapture stop_generic_capture = 8;
+    GenericClick generic_click = 9;
+    GenericKeyDown generic_key_down = 10;
+    GenericKeyUp generic_key_up = 11;
+    GenericScroll generic_scroll = 12;
+    GenericRelativeMove generic_relative_move = 13;
+    GenericInactive generic_inactive = 14;
+    StartRealtimeProgram start_realtime_program = 15;
+    RenewRealtimeProgram renew_realtime_program = 16;
+    StopRealtimeProgram stop_realtime_program = 17;
+    ReleaseAll release_all = 18;
+    Shutdown shutdown = 19;
+  }
+}
+
+message WorkerResponse {
+  string local_command_id = 1;
+  WorkerOutcome outcome = 2;
+  optional string error_code = 3;
+  repeated string applied_action_ids = 4;
+  optional uint64 frame_sequence = 5;
+  WorkerCapabilities capabilities = 6;
+  WorkerHealth health = 7;
+}
+
+message WorkerEvent {
+  string worker_generation = 1;
+  oneof payload {
+    WorkerHealth health = 2;
+    RealtimeProgramEvent realtime_program = 3;
+  }
+}
+
+message WorkerCapabilities {
+  string maa_runtime_version = 1;
+  repeated string capture_backends = 2;
+  repeated string input_backends = 3;
+  repeated string realtime_program_ids = 4;
+}
+
+message WorkerHealth {
+  WindowsIoMode io_mode = 1;
+  string worker_generation = 2;
+  uint64 target_generation = 3;
+  bool target_valid = 4;
+  bool runtime_verified = 5;
+  optional string capture_backend = 6;
+  optional string input_backend = 7;
+  optional string error_code = 8;
+  uint64 input_owner_epoch = 9;
+  uint64 maa_event_count = 10;
+  optional string last_maa_event = 11;
+  repeated string held_action_ids = 12;
+}
+
+message AttachTarget {
+  uint64 hwnd = 1;
+  uint32 process_id = 2;
+  string profile_id = 3;
+  string profile_digest = 4;
+}
+
+message DetachTarget {}
+message GetCapabilities {}
+message GetHealth {}
+
+message StartGenericCapture {
+  string capture_source_id = 1;
+  uint32 fps = 2;
+  string encoding = 3;
+  uint32 quality = 4;
+}
+
+message CaptureOnce {
+  string capture_source_id = 1;
+  string encoding = 2;
+  uint32 quality = 3;
+}
+
+message StopGenericCapture { string capture_source_id = 1; }
+
+message GenericClick {
+  string action_id = 1;
+  uint32 x_ppm = 2;
+  uint32 y_ppm = 3;
+  uint64 source_frame_sequence = 4;
+}
+
+message GenericKeyDown { string action_id = 1; }
+message GenericKeyUp { string action_id = 1; }
+
+message GenericScroll {
+  string action_id = 1;
+  sint32 delta = 2;
+  optional uint32 x_ppm = 3;
+  optional uint32 y_ppm = 4;
+  optional uint64 source_frame_sequence = 5;
+}
+
+message GenericRelativeMove {
+  string action_id = 1;
+  sint32 dx = 2;
+  sint32 dy = 3;
+}
+
+message GenericInactive {}
+
+message StartRealtimeProgram {
+  string program_id = 1;
+  uint32 program_schema_version = 2;
+  string program_digest = 3;
+  uint32 maximum_duration_ms = 4;
+  optional uint32 supervision_lease_ms = 5;
+}
+
+message RenewRealtimeProgram {
+  string program_id = 1;
+  uint32 supervision_lease_ms = 2;
+}
+
+message StopRealtimeProgram { string program_id = 1; }
+message ReleaseAll { string reason_code = 1; }
+message Shutdown {}
+
+enum RealtimeProgramState {
+  REALTIME_PROGRAM_STATE_UNSPECIFIED = 0;
+  REALTIME_PROGRAM_STATE_STARTING = 1;
+  REALTIME_PROGRAM_STATE_RUNNING = 2;
+  REALTIME_PROGRAM_STATE_STOPPING = 3;
+  REALTIME_PROGRAM_STATE_COMPLETED = 4;
+  REALTIME_PROGRAM_STATE_FAILED = 5;
+  REALTIME_PROGRAM_STATE_CANCELLED = 6;
+  REALTIME_PROGRAM_STATE_RELEASE_UNCERTAIN = 7;
+}
+
+message RealtimeProgramEvent {
+  string program_id = 1;
+  RealtimeProgramState state = 2;
+  optional int64 started_at_unix_ms = 3;
+  optional int64 ended_at_unix_ms = 4;
+  optional string error_code = 5;
+  optional string metrics_digest = 6;
+  RealtimeProgramMetrics metrics = 7;
+}
+
+message RealtimeProgramMetrics {
+  uint64 sample_count = 1;
+  uint64 transition_count = 2;
+  uint64 missed_deadlines = 3;
+  uint64 stale_events = 4;
+  uint64 queue_overflows = 5;
+  uint64 sample_interval_p50_us = 6;
+  uint64 sample_interval_p95_us = 7;
+  uint64 sample_interval_p99_us = 8;
+  uint64 scheduler_lateness_p99_us = 9;
+  uint64 detection_to_input_p99_us = 10;
+  uint64 chord_skew_p99_us = 11;
+}
+
+enum PixelFormat {
+  PIXEL_FORMAT_UNSPECIFIED = 0;
+  PIXEL_FORMAT_BGRA8 = 1;
+  PIXEL_FORMAT_RGBA8 = 2;
+  PIXEL_FORMAT_BGR8 = 3;
+}
+
+enum FrameEncoding {
+  FRAME_ENCODING_UNSPECIFIED = 0;
+  FRAME_ENCODING_RAW = 1;
+  FRAME_ENCODING_JPEG = 2;
+  FRAME_ENCODING_PNG = 3;
+}
+
+message FrameDescriptor {
+  uint32 schema_version = 1;
+  string worker_generation = 2;
+  uint64 frame_sequence = 3;
+  int64 captured_at_unix_us = 4;
+  uint32 width = 5;
+  uint32 height = 6;
+  uint32 stride = 7;
+  PixelFormat pixel_format = 8;
+  FrameEncoding encoding = 9;
+  uint64 payload_size = 10;
+  string backend = 11;
+  uint64 health_flags = 12;
+}

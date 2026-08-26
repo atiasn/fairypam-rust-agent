@@ -54,7 +54,11 @@ fn verified_profile() -> VerifiedProfile {
             }],
             actions: BTreeMap::from([(
                 "move.forward".into(),
-                ActionDefinition::Hold { scan_code: 0x11 },
+                ActionDefinition::Hold {
+                    maa_virtual_key: 0x57,
+                    physical_scan_code: 0x11,
+                    extended: false,
+                },
             )]),
         },
         files: Vec::new(),

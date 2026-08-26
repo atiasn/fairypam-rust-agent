@@ -39,26 +39,20 @@ impl ActionMap {
                 let id = ActionId::new(id.clone())
                     .map_err(|error| SafetyError::new("input.action_invalid", error.to_string()))?;
                 let action = match definition {
-                    ActionDefinition::Hold { scan_code } => ResolvedAction::HoldKey {
-                        scan_code: *scan_code,
-                        extended: false,
-                    },
-                    ActionDefinition::Pulse { scan_code } => ResolvedAction::PulseKey {
-                        scan_code: *scan_code,
-                        extended: false,
-                    },
-                    ActionDefinition::PhysicalHold {
-                        scan_code,
+                    ActionDefinition::Hold {
+                        physical_scan_code,
                         extended,
+                        ..
                     } => ResolvedAction::HoldKey {
-                        scan_code: *scan_code,
+                        scan_code: *physical_scan_code,
                         extended: *extended,
                     },
-                    ActionDefinition::PhysicalPulse {
-                        scan_code,
+                    ActionDefinition::Pulse {
+                        physical_scan_code,
                         extended,
+                        ..
                     } => ResolvedAction::PulseKey {
-                        scan_code: *scan_code,
+                        scan_code: *physical_scan_code,
                         extended: *extended,
                     },
                     ActionDefinition::Wheel { maximum_delta } => ResolvedAction::Wheel {

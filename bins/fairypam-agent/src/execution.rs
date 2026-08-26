@@ -6,811 +6,31 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::managed_game::ManagedGameLifecycle;
 use crate::runtime_api::{InputProbeAction, RuntimeCommand as LocalCommand};
-#[cfg(any(windows, test))]
 use fairypam_agent_core::profile::ActionDefinition;
 use fairypam_agent_core::profile::{CaptureRegion, VerifiedProfile};
 use fairypam_agent_core::target::{TargetBinding, TargetCandidate, TargetSelector, TargetSnapshot};
 use fairypam_agent_core::AgentError;
-use fairypam_agent_protocol::v1::{
-    agent_control_event, hub_control_command, AgentControlEvent, AttemptRef, FramePacket,
-    HubControlCommand, SafetyEvent, SessionRef, TaskAttemptReceiptV1, TaskCommandOutcomeState,
-    TaskCommandOutcomeV1,
+use fairypam_agent_protocol::internal_v1::{
+    agent_control_event, hub_control_command, AgentControlEvent, AttemptRef, HubControlCommand,
+    SafetyEvent, SessionRef, TaskAttemptReceiptV1, TaskCommandOutcomeState, TaskCommandOutcomeV1,
 };
-use fairypam_agent_protocol::v2;
+use fairypam_agent_protocol::v3::{self, FramePacket};
 use fairypam_agent_transport::{SessionFrameSlot, VerifiedSession};
 use serde_json::json;
 
 use crate::profile_store::ProfileStore;
 use crate::task_attempt::{TaskAttemptRuntime, TaskCommandResult};
 
+#[cfg(windows)]
+#[path = "worker_platform.rs"]
+mod worker_platform;
+
 const MAX_CLOSE_TIMEOUT_MS: u32 = 5_000;
 const MAX_INPUT_LEASE_MS: u32 = 5_000;
 const CAPTURE_NO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const M1_ACTION_ID: &str = "gadget.quick_use";
-#[cfg(any(windows, test))]
-const MUSIC_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
-#[cfg(any(windows, test))]
-const MUSIC_EVENT_FRESHNESS: Duration = Duration::from_millis(80);
-#[cfg(any(windows, test))]
-const MUSIC_EVENT_QUEUE_CAPACITY: usize = 32;
-#[cfg(any(windows, test))]
-const MUSIC_INPUT_LEASE: Duration = Duration::from_millis(1_000);
-#[cfg(any(windows, test))]
-const MUSIC_INPUT_RENEW: Duration = Duration::from_millis(500);
-#[cfg(any(windows, test))]
-const MUSIC_TARGET_REVALIDATE: Duration = Duration::from_millis(250);
-#[cfg(any(windows, test))]
-const MUSIC_SUPERVISION_LEASE_MIN: Duration = Duration::from_millis(500);
-#[cfg(any(windows, test))]
-const MUSIC_SUPERVISION_LEASE_MAX: Duration = Duration::from_millis(5_000);
-#[cfg(any(windows, test))]
-const MUSIC_BLUE_THRESHOLD: u8 = 220;
-#[cfg(windows)]
-const MUSIC_CLIENT_SIZE: (u32, u32) = (1_920, 1_080);
-#[cfg(any(windows, test))]
-const MUSIC_LANES: [(&str, i32, i32); 6] = [
-    ("music.note.a", 417, 921),
-    ("music.note.s", 628, 921),
-    ("music.note.d", 844, 921),
-    ("music.note.j", 1_061, 921),
-    ("music.note.k", 1_277, 921),
-    ("music.note.l", 1_493, 921),
-];
 type CaptureFailure = (AgentError, Option<AttemptRef>);
-
-#[cfg(any(windows, test))]
-fn music_lane_keys(profile: &VerifiedProfile) -> Result<Vec<(u16, bool)>, AgentError> {
-    MUSIC_LANES
-        .iter()
-        .map(
-            |(action_id, _, _)| match profile.profile().actions.get(*action_id) {
-                Some(ActionDefinition::PhysicalHold {
-                    scan_code,
-                    extended,
-                }) => Ok((*scan_code, *extended)),
-                _ => Err(AgentError::new(
-                    "music.autoplay_profile_invalid",
-                    "signed Profile must declare six physical music hold actions",
-                )),
-            },
-        )
-        .collect()
-}
-
-#[cfg(any(windows, test))]
-fn music_held_state(blue: [u8; 6]) -> [bool; 6] {
-    blue.map(|value| value < MUSIC_BLUE_THRESHOLD)
-}
-
-#[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug)]
-struct MusicLaneEvent {
-    generation: u64,
-    recovery_epoch: u64,
-    lane: usize,
-    detected_at: Instant,
-    pressed: bool,
-}
-
-#[cfg(any(windows, test))]
-#[derive(Debug, Default, PartialEq, Eq)]
-struct MusicEventBatch {
-    transitions: Vec<(usize, bool)>,
-    detected_at: Vec<Instant>,
-    resample_required: bool,
-}
-
-#[cfg(any(windows, test))]
-fn prepare_music_event_batch(
-    mut events: Vec<MusicLaneEvent>,
-    generation: u64,
-    recovery_epoch: u64,
-    now: Instant,
-    stopped: bool,
-) -> Result<MusicEventBatch, AgentError> {
-    if stopped {
-        return Ok(MusicEventBatch::default());
-    }
-    events.sort_by_key(|event| (event.detected_at, event.lane));
-    let mut batch = MusicEventBatch {
-        transitions: Vec::with_capacity(events.len()),
-        detected_at: Vec::with_capacity(events.len()),
-        resample_required: false,
-    };
-    for event in events {
-        if event.generation != generation
-            || event.recovery_epoch > recovery_epoch
-            || event.lane >= MUSIC_LANES.len()
-        {
-            return Err(AgentError::new(
-                "music.autoplay_event_invalid",
-                "music autoplay event does not match the active input session",
-            ));
-        }
-        if event.recovery_epoch < recovery_epoch {
-            continue;
-        }
-        let Some(latency) = now.checked_duration_since(event.detected_at) else {
-            return Err(AgentError::new(
-                "music.autoplay_event_invalid",
-                "music autoplay event timestamp is in the future",
-            ));
-        };
-        if latency >= MUSIC_EVENT_FRESHNESS {
-            batch.resample_required = true;
-            continue;
-        }
-        batch.transitions.push((event.lane, event.pressed));
-        batch.detected_at.push(event.detected_at);
-    }
-    if batch.resample_required {
-        batch.transitions.clear();
-        batch.detected_at.clear();
-    }
-    Ok(batch)
-}
-
-#[cfg(any(windows, test))]
-#[derive(Default)]
-struct MusicAutoplayMetrics {
-    sample_count: u64,
-    sample_intervals_us: Vec<u64>,
-    scheduler_lateness_us: Vec<u64>,
-    input_latency_us: Vec<u64>,
-    supervision_check_us: Vec<u64>,
-    monitor_check_us: Vec<u64>,
-    target_revalidate_us: Vec<u64>,
-    guardian_us: Vec<u64>,
-    pixel_sample_us: Vec<u64>,
-    pixel_foreground_us: Vec<u64>,
-    pixel_bitblt_us: Vec<u64>,
-    pixel_gdi_flush_us: Vec<u64>,
-    pixel_buffer_read_us: Vec<u64>,
-    input_pipeline_us: Vec<u64>,
-    missed_sample_deadlines: u64,
-    stale_event_count: u64,
-    queue_overflow_count: u64,
-}
-
-#[cfg(any(windows, test))]
-impl MusicAutoplayMetrics {
-    fn with_capacity(maximum_duration: Duration) -> Self {
-        let samples = (maximum_duration.as_millis() / MUSIC_SAMPLE_INTERVAL.as_millis() + 1)
-            .min(120_001) as usize;
-        let target_checks = (maximum_duration.as_millis() / MUSIC_TARGET_REVALIDATE.as_millis() + 1)
-            .min(2_401) as usize;
-        let guardian_checks =
-            (maximum_duration.as_millis() / MUSIC_INPUT_RENEW.as_millis() + 1).min(1_201) as usize;
-        Self {
-            sample_intervals_us: Vec::with_capacity(samples),
-            scheduler_lateness_us: Vec::with_capacity(samples),
-            input_latency_us: Vec::with_capacity(samples.saturating_mul(MUSIC_LANES.len())),
-            supervision_check_us: Vec::with_capacity(samples),
-            monitor_check_us: Vec::with_capacity(samples),
-            target_revalidate_us: Vec::with_capacity(target_checks),
-            guardian_us: Vec::with_capacity(guardian_checks),
-            pixel_sample_us: Vec::with_capacity(samples),
-            pixel_foreground_us: Vec::with_capacity(samples),
-            pixel_bitblt_us: Vec::with_capacity(samples),
-            pixel_gdi_flush_us: Vec::with_capacity(samples),
-            pixel_buffer_read_us: Vec::with_capacity(samples),
-            input_pipeline_us: Vec::with_capacity(samples),
-            ..Self::default()
-        }
-    }
-
-    fn merge(&mut self, mut other: Self) {
-        self.sample_count += other.sample_count;
-        self.sample_intervals_us
-            .append(&mut other.sample_intervals_us);
-        self.scheduler_lateness_us
-            .append(&mut other.scheduler_lateness_us);
-        self.input_latency_us.append(&mut other.input_latency_us);
-        self.supervision_check_us
-            .append(&mut other.supervision_check_us);
-        self.monitor_check_us.append(&mut other.monitor_check_us);
-        self.target_revalidate_us
-            .append(&mut other.target_revalidate_us);
-        self.guardian_us.append(&mut other.guardian_us);
-        self.pixel_sample_us.append(&mut other.pixel_sample_us);
-        self.pixel_foreground_us
-            .append(&mut other.pixel_foreground_us);
-        self.pixel_bitblt_us.append(&mut other.pixel_bitblt_us);
-        self.pixel_gdi_flush_us
-            .append(&mut other.pixel_gdi_flush_us);
-        self.pixel_buffer_read_us
-            .append(&mut other.pixel_buffer_read_us);
-        self.input_pipeline_us.append(&mut other.input_pipeline_us);
-        self.missed_sample_deadlines += other.missed_sample_deadlines;
-        self.stale_event_count += other.stale_event_count;
-        self.queue_overflow_count += other.queue_overflow_count;
-    }
-}
-
-#[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, Default)]
-struct MusicRowSample {
-    blue: [u8; 6],
-    foreground: Duration,
-    bitblt: Duration,
-    gdi_flush: Duration,
-    buffer_read: Duration,
-}
-
-#[cfg(any(windows, test))]
-trait MusicRowSamplerIo {
-    fn sample(&mut self) -> Result<MusicRowSample, AgentError>;
-}
-
-#[cfg(any(windows, test))]
-#[allow(clippy::too_many_arguments)]
-fn run_music_row_sampler_loop<I, Now, Sleep, Send>(
-    io: &mut I,
-    start_at: Instant,
-    deadline: Instant,
-    generation: u64,
-    state: &MusicStopState,
-    metrics: &mut MusicAutoplayMetrics,
-    mut now: Now,
-    mut sleep: Sleep,
-    mut send: Send,
-) -> Result<(), AgentError>
-where
-    I: MusicRowSamplerIo,
-    Now: FnMut() -> Instant,
-    Sleep: FnMut(Duration),
-    Send: FnMut(MusicLaneEvent) -> Result<(), AgentError>,
-{
-    let before_start = now();
-    if before_start < start_at {
-        sleep(start_at - before_start);
-    }
-    let mut next_sample = start_at;
-    let mut previous_sample = None;
-    let mut held = [false; 6];
-    let mut held_epoch = state.recovery_epoch.load(Ordering::Acquire);
-    while !state.stopped.load(Ordering::Acquire) {
-        let loop_now = now();
-        if loop_now >= deadline {
-            return Err(AgentError::new(
-                "music.autoplay_timeout",
-                "local music autoplay exceeded its bounded duration",
-            ));
-        }
-        metrics.scheduler_lateness_us.push(
-            loop_now
-                .checked_duration_since(next_sample)
-                .unwrap_or_default()
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64,
-        );
-        metrics.sample_count += 1;
-        if let Some(previous) = previous_sample.replace(loop_now) {
-            if let Some(interval) = loop_now.checked_duration_since(previous) {
-                metrics
-                    .sample_intervals_us
-                    .push(interval.as_micros().min(u128::from(u64::MAX)) as u64);
-            }
-        }
-        let sample_epoch = state.recovery_epoch.load(Ordering::Acquire);
-        let sampled_at = Instant::now();
-        let sample = io.sample()?;
-        metrics
-            .pixel_sample_us
-            .push(sampled_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
-        for (values, duration) in [
-            (&mut metrics.pixel_foreground_us, sample.foreground),
-            (&mut metrics.pixel_bitblt_us, sample.bitblt),
-            (&mut metrics.pixel_gdi_flush_us, sample.gdi_flush),
-            (&mut metrics.pixel_buffer_read_us, sample.buffer_read),
-        ] {
-            values.push(duration.as_micros().min(u128::from(u64::MAX)) as u64);
-        }
-        let current_epoch = state.recovery_epoch.load(Ordering::Acquire);
-        if sample_epoch != current_epoch {
-            continue;
-        }
-        let desired = music_held_state(sample.blue);
-        let detected_at = now();
-        if held_epoch != current_epoch {
-            held = [false; 6];
-            held_epoch = current_epoch;
-        }
-        if !state.stopped.load(Ordering::Acquire) {
-            for lane in 0..MUSIC_LANES.len() {
-                if desired[lane] != held[lane] {
-                    send(MusicLaneEvent {
-                        generation,
-                        recovery_epoch: current_epoch,
-                        lane,
-                        detected_at,
-                        pressed: desired[lane],
-                    })?;
-                    held[lane] = desired[lane];
-                }
-            }
-        }
-        next_sample += MUSIC_SAMPLE_INTERVAL;
-        let after_work = now();
-        while next_sample < after_work {
-            next_sample += MUSIC_SAMPLE_INTERVAL;
-            metrics.missed_sample_deadlines += 1;
-        }
-        if next_sample > after_work {
-            sleep(next_sample - after_work);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(windows, test))]
-trait MusicSafetyIo {
-    fn check_supervision(&mut self) -> Result<(), AgentError>;
-    fn check_monitor(&mut self) -> Result<(), AgentError>;
-    fn validate_target(&mut self) -> Result<(), AgentError>;
-    fn renew_guard(&mut self, sequence: u64) -> Result<(), AgentError>;
-}
-
-#[cfg(any(windows, test))]
-fn advance_music_deadline(mut deadline: Instant, interval: Duration, now: Instant) -> Instant {
-    while deadline <= now {
-        deadline += interval;
-    }
-    deadline
-}
-
-#[cfg(any(windows, test))]
-#[allow(clippy::too_many_arguments)]
-fn run_music_safety_loop<I, Now, Sleep>(
-    io: &mut I,
-    start_at: Instant,
-    deadline: Instant,
-    stop: &AtomicBool,
-    metrics: &mut MusicAutoplayMetrics,
-    mut now: Now,
-    mut sleep: Sleep,
-) -> Result<(), AgentError>
-where
-    I: MusicSafetyIo,
-    Now: FnMut() -> Instant,
-    Sleep: FnMut(Duration),
-{
-    let before_start = now();
-    if before_start < start_at {
-        sleep(start_at - before_start);
-    }
-    let mut next_monitor = start_at;
-    let mut next_target = start_at + MUSIC_TARGET_REVALIDATE;
-    let mut next_guardian = start_at + MUSIC_INPUT_RENEW;
-    let mut sequence = 1_u64;
-    while !stop.load(Ordering::Acquire) {
-        let loop_now = now();
-        if loop_now >= deadline {
-            return Err(AgentError::new(
-                "music.autoplay_timeout",
-                "local music autoplay exceeded its bounded duration",
-            ));
-        }
-        timed_music_stage(&mut metrics.supervision_check_us, || io.check_supervision())?;
-        if loop_now >= next_monitor {
-            timed_music_stage(&mut metrics.monitor_check_us, || io.check_monitor())?;
-            next_monitor = advance_music_deadline(next_monitor, MUSIC_SAMPLE_INTERVAL, now());
-        }
-        if loop_now >= next_target {
-            timed_music_stage(&mut metrics.target_revalidate_us, || io.validate_target())?;
-            next_target = advance_music_deadline(next_target, MUSIC_TARGET_REVALIDATE, now());
-        }
-        if loop_now >= next_guardian {
-            sequence = sequence.checked_add(1).ok_or_else(|| {
-                AgentError::new(
-                    "input.sequence_exhausted",
-                    "local music input sequence exhausted",
-                )
-            })?;
-            timed_music_stage(&mut metrics.guardian_us, || io.renew_guard(sequence))?;
-            next_guardian = advance_music_deadline(next_guardian, MUSIC_INPUT_RENEW, now());
-        }
-        let after_work = now();
-        let next = next_monitor.min(next_target).min(next_guardian);
-        if next > after_work {
-            sleep(next - after_work);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(windows, test))]
-#[derive(Clone)]
-struct MusicStopState {
-    stopped: Arc<AtomicBool>,
-    recovery_epoch: Arc<AtomicU64>,
-    first_error: Arc<Mutex<Option<AgentError>>>,
-}
-
-#[cfg(any(windows, test))]
-impl MusicStopState {
-    fn new(stopped: Arc<AtomicBool>) -> Self {
-        Self {
-            stopped,
-            recovery_epoch: Arc::new(AtomicU64::new(0)),
-            first_error: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn fail(&self, error: AgentError) {
-        if let Ok(mut first_error) = self.first_error.lock() {
-            if first_error.is_none() {
-                *first_error = Some(error);
-            }
-        }
-        self.stopped.store(true, Ordering::Release);
-    }
-
-    fn error(&self) -> Option<AgentError> {
-        self.first_error.lock().ok().and_then(|value| value.clone())
-    }
-
-    fn advance_recovery_epoch(&self) -> Result<(), AgentError> {
-        self.recovery_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_add(1)
-            })
-            .map(|_| ())
-            .map_err(|_| {
-                AgentError::new(
-                    "music.autoplay_event_invalid",
-                    "music autoplay recovery epoch is exhausted",
-                )
-            })
-    }
-}
-
-#[cfg(any(windows, test))]
-trait MusicTransitionSender {
-    type Prepared;
-
-    fn prepare_transitions(
-        &mut self,
-        transitions: &[(usize, bool)],
-    ) -> Result<Self::Prepared, AgentError>;
-    fn send_prepared(
-        &mut self,
-        prepared: Self::Prepared,
-        detected_at: &[Instant],
-        input_deadline: Instant,
-    ) -> Result<Instant, AgentError>;
-    fn release_stale(&mut self) -> Result<(), AgentError>;
-}
-
-#[cfg(any(windows, test))]
-fn recover_music_sender<S: MusicTransitionSender>(
-    sender: &mut S,
-    state: &MusicStopState,
-    metrics: &mut MusicAutoplayMetrics,
-) -> Result<(), AgentError> {
-    metrics.stale_event_count += 1;
-    sender.release_stale()?;
-    state.advance_recovery_epoch()
-}
-
-#[cfg(any(windows, test))]
-#[allow(clippy::too_many_arguments)]
-fn run_music_sender_loop<S, Now, Lease>(
-    sender: &mut S,
-    receiver: &std::sync::mpsc::Receiver<MusicLaneEvent>,
-    generation: u64,
-    deadline: Instant,
-    state: &MusicStopState,
-    metrics: &mut MusicAutoplayMetrics,
-    mut now: Now,
-    mut input_deadline: Lease,
-) -> Result<(), AgentError>
-where
-    S: MusicTransitionSender,
-    Now: FnMut() -> Instant,
-    Lease: FnMut() -> Result<Instant, AgentError>,
-{
-    while !state.stopped.load(Ordering::Acquire) {
-        let loop_now = now();
-        if loop_now >= deadline {
-            return Err(AgentError::new(
-                "music.autoplay_timeout",
-                "local music autoplay exceeded its bounded duration",
-            ));
-        }
-        let wait = (deadline - loop_now).min(MUSIC_SAMPLE_INTERVAL);
-        let first = match receiver.recv_timeout(wait) {
-            Ok(event) => event,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
-                if state.stopped.load(Ordering::Acquire) =>
-            {
-                break;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(AgentError::new(
-                    "music.autoplay_sampler_failed",
-                    "music autoplay sampler stopped without a terminal signal",
-                ));
-            }
-        };
-        let mut events = Vec::with_capacity(MUSIC_EVENT_QUEUE_CAPACITY);
-        events.push(first);
-        events.extend(receiver.try_iter());
-        let send_now = now();
-        let batch = prepare_music_event_batch(
-            events,
-            generation,
-            state.recovery_epoch.load(Ordering::Acquire),
-            send_now,
-            state.stopped.load(Ordering::Acquire),
-        )?;
-        if batch.resample_required {
-            recover_music_sender(sender, state, metrics)?;
-            continue;
-        }
-        if batch.transitions.is_empty() || state.stopped.load(Ordering::Acquire) {
-            continue;
-        }
-        let started_at = Instant::now();
-        let prepared = sender.prepare_transitions(&batch.transitions)?;
-        if state.stopped.load(Ordering::Acquire) {
-            continue;
-        }
-        let input_deadline = input_deadline()?;
-        let send_at = match sender.send_prepared(prepared, &batch.detected_at, input_deadline) {
-            Ok(send_at) => send_at,
-            Err(error) if error.code() == "music.autoplay_event_stale" => {
-                recover_music_sender(sender, state, metrics)?;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        metrics
-            .input_pipeline_us
-            .push(started_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
-        for detected_at in batch.detected_at {
-            metrics.input_latency_us.push(
-                send_at
-                    .duration_since(detected_at)
-                    .as_micros()
-                    .min(u128::from(u64::MAX)) as u64,
-            );
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(windows, test))]
-fn music_metric_summary(values: &[u64]) -> [u64; 4] {
-    if values.is_empty() {
-        return [0; 4];
-    }
-    let mut values = values.to_vec();
-    values.sort_unstable();
-    let at = |percentile: usize| values[(values.len() - 1) * percentile / 100];
-    [at(50), at(95), at(99), *values.last().unwrap()]
-}
-
-#[cfg(any(windows, test))]
-fn timed_music_stage<T>(
-    values: &mut Vec<u64>,
-    operation: impl FnOnce() -> Result<T, AgentError>,
-) -> Result<T, AgentError> {
-    let started_at = Instant::now();
-    let result = operation();
-    values.push(started_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
-    result
-}
-
-#[cfg(any(windows, test))]
-fn music_metric_fragment(name: &str, values: &[u64]) -> String {
-    let summary = music_metric_summary(values);
-    format!(
-        " {name}_count={} {name}_p50_us={} {name}_p95_us={} {name}_p99_us={} {name}_max_us={}",
-        values.len(),
-        summary[0],
-        summary[1],
-        summary[2],
-        summary[3],
-    )
-}
-
-#[cfg(any(windows, test))]
-fn music_metric_log_line(metrics: &MusicAutoplayMetrics, attempt: &AttemptRef) -> String {
-    let sample = music_metric_summary(&metrics.sample_intervals_us);
-    let input = music_metric_summary(&metrics.input_latency_us);
-    format!(
-        "music autoplay timing summary task_run_id={} attempt_id={} sample_count={} sample_interval_p50_us={} sample_interval_p95_us={} sample_interval_p99_us={} sample_interval_max_us={} input_count={} input_latency_p50_us={} input_latency_p95_us={} input_latency_p99_us={} input_latency_max_us={} missed_sample_deadlines={} stale_event_count={} queue_overflow_count={}",
-        attempt.task_run_id,
-        attempt.attempt_id,
-        metrics.sample_count,
-        sample[0],
-        sample[1],
-        sample[2],
-        sample[3],
-        metrics.input_latency_us.len(),
-        input[0],
-        input[1],
-        input[2],
-        input[3],
-        metrics.missed_sample_deadlines,
-        metrics.stale_event_count,
-        metrics.queue_overflow_count,
-    )
-}
-
-#[cfg(any(windows, test))]
-fn music_stage_metric_log_lines(
-    metrics: &MusicAutoplayMetrics,
-    attempt: &AttemptRef,
-) -> [String; 11] {
-    [
-        ("scheduler_lateness", &metrics.scheduler_lateness_us),
-        ("supervision_check", &metrics.supervision_check_us),
-        ("monitor_check", &metrics.monitor_check_us),
-        ("target_revalidate", &metrics.target_revalidate_us),
-        ("guardian", &metrics.guardian_us),
-        ("pixel_sample", &metrics.pixel_sample_us),
-        ("pixel_foreground", &metrics.pixel_foreground_us),
-        ("pixel_bitblt", &metrics.pixel_bitblt_us),
-        ("pixel_gdi_flush", &metrics.pixel_gdi_flush_us),
-        ("pixel_buffer_read", &metrics.pixel_buffer_read_us),
-        ("input_pipeline", &metrics.input_pipeline_us),
-    ]
-    .map(|(name, values)| {
-        format!(
-            "music autoplay stage timing task_run_id={} attempt_id={}{}",
-            attempt.task_run_id,
-            attempt.attempt_id,
-            music_metric_fragment(name, values),
-        )
-    })
-}
-
-#[cfg(any(windows, test))]
-fn persist_music_metric_summary_with<Write>(
-    metrics: &MusicAutoplayMetrics,
-    attempt: &AttemptRef,
-    mut write: Write,
-) -> Result<(), AgentError>
-where
-    Write: FnMut(&str) -> Result<(), AgentError>,
-{
-    let lines = music_stage_metric_log_lines(metrics, attempt);
-    for line in std::iter::once(music_metric_log_line(metrics, attempt)).chain(lines) {
-        write(&line).map_err(|error| {
-            AgentError::new(
-                "music.autoplay_metrics_unavailable",
-                format!("music autoplay timing metrics cannot be persisted: {error}"),
-            )
-        })?;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn persist_music_metric_summary(
-    metrics: &MusicAutoplayMetrics,
-    attempt: &AttemptRef,
-) -> Result<(), AgentError> {
-    persist_music_metric_summary_with(metrics, attempt, |message| {
-        crate::observability::production_log()
-            .and_then(|log| log.append(crate::runtime_api::LogLevel::Info, message))
-    })
-}
-
-#[cfg(any(windows, test))]
-fn merge_music_autoplay_errors(
-    operation_error: Option<AgentError>,
-    metrics_error: Option<AgentError>,
-) -> Option<AgentError> {
-    match (operation_error, metrics_error) {
-        (Some(operation), Some(metrics)) => Some(AgentError::new(
-            operation.code(),
-            format!("{operation}; metrics result: {metrics}"),
-        )),
-        (operation, None) => operation,
-        (None, metrics) => metrics,
-    }
-}
-
-#[cfg(any(windows, test))]
-fn music_supervision_window(
-    maximum_duration: Duration,
-    supervision_lease: Duration,
-) -> Result<Duration, AgentError> {
-    if !(Duration::from_secs(1)..=Duration::from_secs(600)).contains(&maximum_duration)
-        || (!supervision_lease.is_zero()
-            && !(MUSIC_SUPERVISION_LEASE_MIN..=MUSIC_SUPERVISION_LEASE_MAX)
-                .contains(&supervision_lease))
-    {
-        return Err(AgentError::new(
-            "music.autoplay_command_invalid",
-            "music autoplay has an invalid duration or supervision mode",
-        ));
-    }
-    Ok(if supervision_lease.is_zero() {
-        maximum_duration
-    } else {
-        supervision_lease
-    })
-}
-
-#[cfg(any(windows, test))]
-fn music_autoplay_can_renew(
-    active_maximum_duration: Duration,
-    active_autonomous: bool,
-    finished: bool,
-    requested_maximum_duration: Duration,
-    requested_autonomous: bool,
-) -> bool {
-    active_maximum_duration == requested_maximum_duration
-        && !active_autonomous
-        && !requested_autonomous
-        && !finished
-}
-
-#[cfg(any(windows, test))]
-fn music_input_expiry(supervision_deadline: Instant, now: Instant) -> Result<Instant, AgentError> {
-    if now >= supervision_deadline {
-        return Err(AgentError::new(
-            "music.autoplay_supervision_expired",
-            "music autoplay supervision lease expired",
-        ));
-    }
-    Ok(std::cmp::min(supervision_deadline, now + MUSIC_INPUT_LEASE))
-}
-
-#[cfg(any(windows, test))]
-fn music_input_expiry_if_running(
-    supervision_deadline: Instant,
-    now: Instant,
-    stopped: bool,
-) -> Result<Option<Instant>, AgentError> {
-    if stopped {
-        return Ok(None);
-    }
-    let expires_at = music_input_expiry(supervision_deadline, now)?;
-    Ok(Some(expires_at))
-}
-
-#[cfg(any(windows, test))]
-fn finish_music_autoplay_worker<I, Operation, Release>(
-    mut input: I,
-    operation: Operation,
-    release: Release,
-) -> (I, Option<AgentError>, Result<(), AgentError>)
-where
-    Operation: FnOnce(&mut I) -> Result<(), AgentError>,
-    Release: FnOnce(&mut I) -> Result<(), AgentError>,
-{
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(&mut input)))
-        .unwrap_or_else(|_| {
-            Err(AgentError::new(
-                "music.autoplay_worker_failed",
-                "music autoplay worker panicked during the local input loop",
-            ))
-        });
-    let release = release(&mut input);
-    (input, result.err(), release)
-}
-
-#[cfg(any(windows, test))]
-fn retain_input_on_release_failure<I>(
-    slot: &mut Option<I>,
-    input: I,
-    release: Result<(), AgentError>,
-) -> Result<(), AgentError> {
-    match release {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            *slot = Some(input);
-            Err(error)
-        }
-    }
-}
 
 fn frame_sequence_key(source_id: &str, attempt: Option<&AttemptRef>) -> String {
     attempt.map_or_else(
@@ -911,6 +131,8 @@ pub struct RuntimeCapturedFrame {
     pub width: u32,
     pub height: u32,
     pub sequence: u64,
+    pub captured_at_unix_us: i64,
+    pub backend: String,
 }
 
 pub trait RuntimeCapture: Send {
@@ -931,7 +153,7 @@ pub trait FrameSink: Send + Sync {
 
 impl FrameSink for SessionFrameSlot {
     fn publish(&self, frame: FramePacket) -> Result<(), AgentError> {
-        SessionFrameSlot::publish(self, v2_frame(frame))
+        SessionFrameSlot::publish(self, frame)
             .map_err(|error| AgentError::new(error.code(), error.to_string()))
     }
 
@@ -940,7 +162,7 @@ impl FrameSink for SessionFrameSlot {
     }
 
     fn publish_required(&self, frame: FramePacket) -> Result<(), AgentError> {
-        match SessionFrameSlot::publish_if_accepting(self, v2_frame(frame)) {
+        match SessionFrameSlot::publish_if_accepting(self, frame) {
             Ok(true) => Ok(()),
             Ok(false) => Err(AgentError::new(
                 "transport.frame_paused",
@@ -948,33 +170,6 @@ impl FrameSink for SessionFrameSlot {
             )),
             Err(error) => Err(AgentError::new(error.code(), error.to_string())),
         }
-    }
-}
-
-fn v2_frame(frame: FramePacket) -> fairypam_agent_protocol::v2::FramePacket {
-    fairypam_agent_protocol::v2::FramePacket {
-        session: frame
-            .session
-            .map(|session| fairypam_agent_protocol::v2::SessionRef {
-                agent_id: session.agent_id,
-                session_id: session.session_id,
-                generation: session.generation,
-            }),
-        capture_source_id: frame.capture_source_id,
-        frame_sequence: frame.frame_sequence,
-        captured_at_unix_us: frame.captured_at_unix_us,
-        width: frame.width,
-        height: frame.height,
-        encoding: frame.encoding,
-        payload: frame.payload,
-        attempt: frame
-            .attempt
-            .map(|attempt| fairypam_agent_protocol::v2::AttemptRef {
-                task_run_id: attempt.task_run_id,
-                attempt_id: attempt.attempt_id,
-                contract_version: 2,
-                contract_digest: attempt.contract_digest,
-            }),
     }
 }
 
@@ -1006,7 +201,26 @@ impl ExecutionSession {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsIoRuntimeInfo {
+    pub maa_runtime_version: String,
+    pub capture_backend: String,
+    pub input_backend: String,
+}
+
 pub trait RuntimePlatform: Send {
+    fn configure_worker(
+        &mut self,
+        _profile_root: Option<&std::path::Path>,
+        _profile_root_public_key_hex: Option<&str>,
+    ) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    fn ensure_worker_ready(&mut self) -> Result<Option<WindowsIoRuntimeInfo>, AgentError> {
+        Ok(None)
+    }
+
     fn begin_attempt_monitor(&mut self) -> Result<bool, AgentError> {
         Ok(false)
     }
@@ -1016,6 +230,10 @@ pub trait RuntimePlatform: Send {
     }
 
     fn finish_attempt_monitor(&mut self) {}
+
+    fn tick_input_safety(&mut self, _now: Instant) -> Result<bool, AgentError> {
+        Ok(false)
+    }
 
     fn start_task_target(&mut self, profile: &VerifiedProfile)
         -> Result<TargetBinding, AgentError>;
@@ -1037,7 +255,9 @@ pub trait RuntimePlatform: Send {
     fn start_capture(
         &mut self,
         binding: &TargetBinding,
+        source_id: &str,
         region: CaptureRegion,
+        fps: u32,
         encoding: RuntimeCaptureEncoding,
     ) -> Result<Box<dyn RuntimeCapture>, AgentError>;
 
@@ -1056,9 +276,9 @@ pub trait RuntimePlatform: Send {
         &mut self,
         binding: &TargetBinding,
         timeout: Duration,
-    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
+    ) -> Result<v3::ManagedGameCloseResult, AgentError> {
         self.close(binding, timeout)?;
-        Ok(v2::ManagedGameCloseResult::Graceful)
+        Ok(v3::ManagedGameCloseResult::Graceful)
     }
 
     fn close_with_progress(
@@ -1066,7 +286,7 @@ pub trait RuntimePlatform: Send {
         binding: &TargetBinding,
         timeout: Duration,
         _on_force: &mut dyn FnMut(),
-    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
+    ) -> Result<v3::ManagedGameCloseResult, AgentError> {
         self.close_with_result(binding, timeout)
     }
 
@@ -1094,22 +314,26 @@ pub trait RuntimePlatform: Send {
         session: &SessionRef,
         input_sequence: u64,
         expires_at: Instant,
-        keys: &[v2::PhysicalKey],
-        mouse_buttons: &[i32],
+        held_action_ids: &[String],
+        wheel_action_id: &str,
         wheel_delta: i32,
         wheel_point: Option<(u32, u32)>,
         source_frame: Option<(&AtomicU64, u64)>,
-        client_point: Option<(i32, u32, u32)>,
+        client_point: Option<(&str, u32, u32)>,
     ) -> Result<bool, AgentError>;
 
     fn release_task_input(&mut self) -> Result<(), AgentError>;
 
-    fn start_music_autoplay(
+    #[allow(clippy::too_many_arguments)]
+    fn start_realtime_program(
         &mut self,
         _profile: &VerifiedProfile,
         _binding: &TargetBinding,
         _session: &SessionRef,
         _attempt: &AttemptRef,
+        _program_id: &str,
+        _program_schema_version: u32,
+        _program_digest: &str,
         _maximum_duration: Duration,
         _supervision_lease: Duration,
     ) -> Result<(), AgentError> {
@@ -1119,17 +343,35 @@ pub trait RuntimePlatform: Send {
         ))
     }
 
-    fn stop_music_autoplay(&mut self) -> Result<Option<AgentError>, AgentError> {
+    fn renew_realtime_program(
+        &mut self,
+        _program_id: &str,
+        _supervision_lease: Duration,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::new(
+            "realtime.program_not_running",
+            "realtime program is not running",
+        ))
+    }
+
+    fn stop_realtime_program(
+        &mut self,
+        _program_id: &str,
+    ) -> Result<Option<AgentError>, AgentError> {
         Ok(None)
+    }
+
+    fn poll_realtime_program_events(&mut self) -> Result<Vec<v3::AgentControlEvent>, AgentError> {
+        Ok(Vec::new())
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandOutcome {
     Ack(String),
-    CloseAck(v2::ManagedGameCloseReceipt),
+    CloseAck(v3::ManagedGameCloseReceipt),
     CloseNack {
-        receipt: v2::ManagedGameCloseReceipt,
+        receipt: v3::ManagedGameCloseReceipt,
         code: String,
         message: String,
     },
@@ -1207,6 +449,7 @@ struct CapturePlan {
     session: ExecutionSession,
     frames: Arc<dyn FrameSink>,
     attempt: Option<AttemptRef>,
+    target_generation: u64,
     no_frame_timeout: Duration,
     rediscovery_allowed: bool,
 }
@@ -1259,6 +502,7 @@ pub struct CommandExecutor {
     runtime_mode: &'static str,
     active_profile: Option<VerifiedProfile>,
     binding: Option<TargetBinding>,
+    target_generation: u64,
     capture: Option<CaptureWorker>,
     frame_sequences: BTreeMap<String, Arc<AtomicU64>>,
     task_attempt: TaskAttemptRuntime,
@@ -1269,10 +513,14 @@ pub struct CommandExecutor {
 }
 
 impl CommandExecutor {
-    pub fn production(profiles: ProfileStore, agent_id: &str) -> Self {
+    pub fn production(
+        profiles: ProfileStore,
+        agent_id: &str,
+        profile_root_public_key_hex: Option<&str>,
+    ) -> Self {
         let mut executor = Self::with_platform_and_attempts(
-            profiles,
-            production_platform(),
+            profiles.clone(),
+            production_platform(&profiles, profile_root_public_key_hex),
             TaskAttemptRuntime::production(),
             "production",
         );
@@ -1345,6 +593,7 @@ impl CommandExecutor {
             runtime_mode,
             active_profile: None,
             binding: None,
+            target_generation: 0,
             capture: None,
             frame_sequences: BTreeMap::new(),
             task_attempt,
@@ -1359,13 +608,105 @@ impl CommandExecutor {
         self.profile_update_blocked = blocked;
     }
 
+    fn set_binding(&mut self, binding: Option<TargetBinding>) -> Result<(), AgentError> {
+        if self.binding != binding {
+            self.target_generation = self.target_generation.checked_add(1).ok_or_else(|| {
+                AgentError::new("target.generation_exhausted", "target generation exhausted")
+            })?;
+            self.frame_sequences.clear();
+        }
+        self.binding = binding;
+        Ok(())
+    }
+
+    fn require_target_generation(&self, generation: u64) -> Result<(), AgentError> {
+        if generation == self.target_generation && generation != 0 {
+            Ok(())
+        } else {
+            Err(AgentError::new(
+                "target.generation_stale",
+                "command target generation does not match the active target",
+            ))
+        }
+    }
+
+    pub fn stamp_target_generation(&self, outcome: &mut CommandOutcome) {
+        if let CommandOutcome::TaskAck { receipt, .. } = outcome {
+            receipt.target_generation = self.target_generation;
+        }
+    }
+
     pub fn task_active(&mut self) -> Result<bool, AgentError> {
         self.task_attempt.is_active()
     }
 
-    pub fn execute_v2_configure_idle_close(
+    pub fn profile_activation_ready(&mut self) -> Result<bool, AgentError> {
+        Ok(!self.task_attempt.is_active()?
+            && self.managed_game_status().is_none()
+            && self.binding.is_none()
+            && self.capture.is_none())
+    }
+
+    pub fn ensure_worker_ready(&mut self) -> Result<Option<WindowsIoRuntimeInfo>, AgentError> {
+        match self.platform.ensure_worker_ready() {
+            Ok(info) => Ok(info),
+            Err(error) => {
+                let release_error = self.platform.release_task_input().err();
+                let error_code = release_error
+                    .as_ref()
+                    .map(AgentError::code)
+                    .unwrap_or_else(|| error.code());
+                self.task_attempt
+                    .mark_active_side_effect_uncertain(error_code, release_error.is_none())?;
+                Err(release_error.unwrap_or(error))
+            }
+        }
+    }
+
+    pub fn tick_safety(
         &mut self,
-        value: &v2::ConfigureIdleClose,
+        session: &ExecutionSession,
+    ) -> Result<Vec<AgentControlEvent>, AgentError> {
+        let mut events = Vec::new();
+        if self.platform.tick_input_safety(Instant::now())? {
+            let receipt = self
+                .task_attempt
+                .mark_input_released("input_lease_expired")?;
+            events.push(execution_safety_event(
+                session,
+                "input_lease_expired",
+                receipt.and_then(|value| value.attempt),
+            ));
+        }
+        if self
+            .task_attempt
+            .active_contract_expired(current_unix_ms())?
+        {
+            let release_error = self.platform.release_task_input().err();
+            let capture_stopped = self.stop_capture(None).is_ok();
+            self.platform.finish_attempt_monitor();
+            let error_code = release_error
+                .as_ref()
+                .map(AgentError::code)
+                .unwrap_or("task.contract_expired");
+            let receipt = self.task_attempt.emergency_finish(
+                release_error.is_none(),
+                capture_stopped,
+                self.binding.is_some(),
+                Some(error_code),
+            )?;
+            events.push(execution_safety_event(
+                session,
+                error_code,
+                receipt.and_then(|value| value.attempt),
+            ));
+        }
+        Ok(events)
+    }
+
+    pub fn execute_v3_configure_idle_close(
+        &mut self,
+        value: &v3::ConfigureIdleClose,
     ) -> CommandOutcome {
         if self.profile_update_blocked {
             match self.task_attempt.is_active() {
@@ -1385,14 +726,14 @@ impl CommandExecutor {
             .unwrap_or_else(CommandOutcome::from_error)
     }
 
-    pub fn execute_v2_close_target(&mut self, value: &v2::CloseTarget) -> CommandOutcome {
-        self.execute_v2_close_target_with_progress(value, &mut |_| {})
+    pub fn execute_v3_close_target(&mut self, value: &v3::CloseTarget) -> CommandOutcome {
+        self.execute_v3_close_target_with_progress(value, &mut |_| {})
     }
 
-    pub fn execute_v2_close_target_with_progress(
+    pub fn execute_v3_close_target_with_progress(
         &mut self,
-        value: &v2::CloseTarget,
-        on_progress: &mut dyn FnMut(v2::ManagedGameClosePhase),
+        value: &v3::CloseTarget,
+        on_progress: &mut dyn FnMut(v3::ManagedGameClosePhase),
     ) -> CommandOutcome {
         let result = (|| {
             if self.task_attempt.is_active()? {
@@ -1454,7 +795,7 @@ impl CommandExecutor {
         result.unwrap_or_else(CommandOutcome::from_error)
     }
 
-    pub fn managed_game_status(&self) -> Option<v2::ManagedGameIdleStatus> {
+    pub fn managed_game_status(&self) -> Option<v3::ManagedGameIdleStatus> {
         self.managed_game.status(Instant::now(), current_unix_ms())
     }
 
@@ -1462,7 +803,7 @@ impl CommandExecutor {
         self.managed_game.prepare_close_replay();
     }
 
-    pub fn pending_managed_game_close(&self) -> Option<v2::ManagedGameCloseReceipt> {
+    pub fn pending_managed_game_close(&self) -> Option<v3::ManagedGameCloseReceipt> {
         self.managed_game.pending_close_receipt()
     }
 
@@ -1472,7 +813,7 @@ impl CommandExecutor {
 
     pub fn acknowledge_managed_game_close(
         &mut self,
-        value: &v2::AcknowledgeManagedGameClose,
+        value: &v3::AcknowledgeManagedGameClose,
     ) -> Result<(), AgentError> {
         self.managed_game.acknowledge_close(
             &value.event_id,
@@ -1483,14 +824,14 @@ impl CommandExecutor {
 
     pub fn close_idle_game_if_due(
         &mut self,
-    ) -> Result<Option<v2::ManagedGameCloseReceipt>, AgentError> {
+    ) -> Result<Option<v3::ManagedGameCloseReceipt>, AgentError> {
         self.close_idle_game_if_due_with_progress(&mut |_, _, _| {})
     }
 
     pub fn close_idle_game_if_due_with_progress(
         &mut self,
-        on_progress: &mut dyn FnMut(&str, u64, v2::ManagedGameClosePhase),
-    ) -> Result<Option<v2::ManagedGameCloseReceipt>, AgentError> {
+        on_progress: &mut dyn FnMut(&str, u64, v3::ManagedGameClosePhase),
+    ) -> Result<Option<v3::ManagedGameCloseReceipt>, AgentError> {
         self.observe_local_foreground_activity()?;
         if !self.managed_game.due(Instant::now()) {
             return Ok(None);
@@ -1507,14 +848,14 @@ impl CommandExecutor {
         Ok(
             match self.close_current_target_with_progress(MAX_CLOSE_TIMEOUT_MS, &mut report) {
                 Ok(result) => self.managed_game.close_receipt(
-                    v2::ManagedGameCloseTrigger::Idle,
+                    v3::ManagedGameCloseTrigger::Idle,
                     result,
                     current_unix_ms(),
                     None,
                 ),
                 Err(error) => self.managed_game.close_receipt(
-                    v2::ManagedGameCloseTrigger::Idle,
-                    v2::ManagedGameCloseResult::Failed,
+                    v3::ManagedGameCloseTrigger::Idle,
+                    v3::ManagedGameCloseResult::Failed,
                     current_unix_ms(),
                     Some(error.code().to_owned()),
                 ),
@@ -1544,29 +885,29 @@ impl CommandExecutor {
     fn close_current_target(
         &mut self,
         timeout_ms: u32,
-    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
+    ) -> Result<v3::ManagedGameCloseResult, AgentError> {
         self.close_current_target_with_progress(timeout_ms, &mut |_| {})
     }
 
     fn close_current_target_with_progress(
         &mut self,
         timeout_ms: u32,
-        on_progress: &mut dyn FnMut(v2::ManagedGameClosePhase),
-    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
-        on_progress(v2::ManagedGameClosePhase::ReleasingInputCapture);
+        on_progress: &mut dyn FnMut(v3::ManagedGameClosePhase),
+    ) -> Result<v3::ManagedGameCloseResult, AgentError> {
+        on_progress(v3::ManagedGameClosePhase::ReleasingInputCapture);
         self.platform.release_task_input()?;
         self.stop_capture(None)?;
-        on_progress(v2::ManagedGameClosePhase::NormalClose);
+        on_progress(v3::ManagedGameClosePhase::NormalClose);
         let result = match self.binding.clone() {
             Some(binding) => self.platform.close_with_progress(
                 &binding,
                 Duration::from_millis(u64::from(timeout_ms)),
-                &mut || on_progress(v2::ManagedGameClosePhase::ForceClose),
+                &mut || on_progress(v3::ManagedGameClosePhase::ForceClose),
             )?,
-            None => v2::ManagedGameCloseResult::Graceful,
+            None => v3::ManagedGameCloseResult::Graceful,
         };
         self.active_profile = None;
-        self.binding = None;
+        self.set_binding(None)?;
         self.last_local_input_token = None;
         Ok(result)
     }
@@ -1587,10 +928,10 @@ impl CommandExecutor {
         outcome
     }
 
-    pub fn execute_v2_begin(
+    pub fn execute_v3_begin(
         &mut self,
-        task: &fairypam_agent_protocol::v1::TaskCommandRef,
-        contract: &v2::ExecutionContract,
+        task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
+        contract: &v3::ExecutionContract,
     ) -> CommandOutcome {
         let result = (|| {
             if self.profile_update_blocked {
@@ -1639,11 +980,11 @@ impl CommandExecutor {
         result.unwrap_or_else(CommandOutcome::from_error)
     }
 
-    pub fn execute_v2_input_frame(
+    pub fn execute_v3_input_frame(
         &mut self,
-        task: &fairypam_agent_protocol::v1::TaskCommandRef,
-        frame: &v2::InputFrame,
-        client_point: Option<(i32, u32, u32)>,
+        task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
+        frame: &v3::InputFrame,
+        client_point: Option<(&str, u32, u32)>,
     ) -> CommandOutcome {
         let result = (|| {
             if self.managed_game.is_closing() {
@@ -1688,21 +1029,25 @@ impl CommandExecutor {
                 .and_then(|command| command.session.as_ref())
                 .ok_or_else(task_reference_invalid)?;
             let expires_at = Instant::now() + Duration::from_millis(u64::from(frame.lease_ms));
-            let frame_result = self.platform.apply_task_input_frame(
-                &profile,
-                &binding,
-                session,
-                frame.input_sequence,
-                expires_at,
-                &frame.held_keys,
-                &frame.held_mouse_buttons,
-                frame.wheel_delta,
-                frame.wheel_x_ppm.zip(frame.wheel_y_ppm),
-                source_frame
-                    .as_ref()
-                    .map(|(current, expected)| (current.as_ref(), *expected)),
-                client_point,
-            );
+            let frame_result = self
+                .require_target_generation(frame.target_generation)
+                .and_then(|_| {
+                    self.platform.apply_task_input_frame(
+                        &profile,
+                        &binding,
+                        session,
+                        frame.input_sequence,
+                        expires_at,
+                        &frame.held_action_ids,
+                        &frame.wheel_action_id,
+                        frame.wheel_delta,
+                        frame.wheel_x_ppm.zip(frame.wheel_y_ppm),
+                        source_frame
+                            .as_ref()
+                            .map(|(current, expected)| (current.as_ref(), *expected)),
+                        client_point,
+                    )
+                });
             let holds_active = frame_result.as_ref().ok().copied().unwrap_or(false);
             let error = frame_result.err();
             let outcome = input_frame_outcome(error.as_ref());
@@ -1724,11 +1069,10 @@ impl CommandExecutor {
         outcome
     }
 
-    pub fn execute_v2_start_music_autoplay(
+    pub fn execute_v3_start_realtime_program(
         &mut self,
-        task: &fairypam_agent_protocol::v1::TaskCommandRef,
-        maximum_duration_ms: u32,
-        supervision_lease_ms: u32,
+        task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
+        value: &v3::StartRealtimeProgram,
     ) -> CommandOutcome {
         let result = (|| {
             if self.managed_game.is_closing() {
@@ -1756,15 +1100,22 @@ impl CommandExecutor {
                 .ok_or_else(task_reference_invalid)?;
             let attempt = task.attempt.as_ref().ok_or_else(task_reference_invalid)?;
             let error = self
-                .platform
-                .start_music_autoplay(
-                    &profile,
-                    &binding,
-                    session,
-                    attempt,
-                    Duration::from_millis(u64::from(maximum_duration_ms)),
-                    Duration::from_millis(u64::from(supervision_lease_ms)),
-                )
+                .require_target_generation(value.target_generation)
+                .and_then(|_| {
+                    self.platform.start_realtime_program(
+                        &profile,
+                        &binding,
+                        session,
+                        attempt,
+                        &value.program_id,
+                        value.program_schema_version,
+                        &value.program_digest,
+                        Duration::from_millis(u64::from(value.maximum_duration_ms)),
+                        Duration::from_millis(u64::from(
+                            value.supervision_lease_ms.unwrap_or_default(),
+                        )),
+                    )
+                })
                 .err();
             let outcome = input_frame_outcome(error.as_ref());
             Ok(CommandOutcome::task(
@@ -1785,9 +1136,43 @@ impl CommandExecutor {
         outcome
     }
 
-    pub fn execute_v2_stop_music_autoplay(
+    pub fn execute_v3_renew_realtime_program(
         &mut self,
-        task: &fairypam_agent_protocol::v1::TaskCommandRef,
+        task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
+        value: &v3::RenewRealtimeProgram,
+    ) -> CommandOutcome {
+        let result = (|| {
+            if let Some(result) = self.task_attempt.replay(task)? {
+                return Ok(CommandOutcome::task(result));
+            }
+            if let Some(result) = self.task_attempt.prepare(task, true)? {
+                return Ok(CommandOutcome::task(result));
+            }
+            let error = self
+                .platform
+                .renew_realtime_program(
+                    &value.program_id,
+                    Duration::from_millis(u64::from(value.supervision_lease_ms)),
+                )
+                .err();
+            let outcome = input_frame_outcome(error.as_ref());
+            Ok(CommandOutcome::task(
+                self.task_attempt.complete_input_frame(
+                    task,
+                    None,
+                    outcome,
+                    error.is_none(),
+                    error.as_ref().map(AgentError::code),
+                )?,
+            ))
+        })();
+        result.unwrap_or_else(CommandOutcome::from_error)
+    }
+
+    pub fn execute_v3_stop_realtime_program(
+        &mut self,
+        task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
+        value: &v3::StopRealtimeProgram,
     ) -> CommandOutcome {
         let result = (|| {
             if let Some(result) = self.task_attempt.replay(task)? {
@@ -1796,7 +1181,7 @@ impl CommandExecutor {
             if let Some(result) = self.task_attempt.prepare(task, false)? {
                 return Ok(CommandOutcome::task(result));
             }
-            let (error, released) = match self.platform.stop_music_autoplay() {
+            let (error, released) = match self.platform.stop_realtime_program(&value.program_id) {
                 Ok(operation_error) => (operation_error, true),
                 Err(release_error) => (Some(release_error), false),
             };
@@ -1809,9 +1194,9 @@ impl CommandExecutor {
         result.unwrap_or_else(CommandOutcome::from_error)
     }
 
-    pub fn v2_payload_digest_conflict(
+    pub fn v3_payload_digest_conflict(
         &mut self,
-        task: &fairypam_agent_protocol::v1::TaskCommandRef,
+        task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
     ) -> CommandOutcome {
         self.task_attempt
             .payload_digest_conflict(task)
@@ -1819,9 +1204,9 @@ impl CommandExecutor {
             .unwrap_or_else(CommandOutcome::from_error)
     }
 
-    pub fn reject_v2_task(
+    pub fn reject_v3_task(
         &mut self,
-        task: &fairypam_agent_protocol::v1::TaskCommandRef,
+        task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
         error_code: &str,
     ) -> CommandOutcome {
         self.task_attempt
@@ -1830,20 +1215,20 @@ impl CommandExecutor {
             .unwrap_or_else(CommandOutcome::from_error)
     }
 
-    pub fn runtime_state(&mut self) -> Result<v2::AgentRuntimeState, AgentError> {
+    pub fn runtime_state(&mut self) -> Result<v3::AgentRuntimeState, AgentError> {
         if self.task_attempt.emergency_stopped()? {
-            return Ok(v2::AgentRuntimeState::EmergencyStopped);
+            return Ok(v3::AgentRuntimeState::EmergencyStopped);
         }
         if self.task_attempt.recovery_blocked()? {
-            return Ok(v2::AgentRuntimeState::RecoveryBlocked);
+            return Ok(v3::AgentRuntimeState::RecoveryBlocked);
         }
         if self.task_attempt.is_active()? {
-            return Ok(v2::AgentRuntimeState::Executing);
+            return Ok(v3::AgentRuntimeState::Executing);
         }
         if self.profile_update_blocked {
-            return Ok(v2::AgentRuntimeState::ProfileUpdateBlocked);
+            return Ok(v3::AgentRuntimeState::ProfileUpdateBlocked);
         }
-        Ok(v2::AgentRuntimeState::ConnectedIdle)
+        Ok(v3::AgentRuntimeState::ConnectedIdle)
     }
 
     pub fn execute_local(
@@ -1944,7 +1329,7 @@ impl CommandExecutor {
                 let profile = self.profiles.get(profile_id)?.clone();
                 let binding = self.platform.start_task_target(&profile)?;
                 self.active_profile = Some(profile);
-                self.binding = Some(binding.clone());
+                self.set_binding(Some(binding.clone()))?;
                 Ok(
                     json!({"profile_id": binding.profile_id, "pid": binding.process_id, "state": "TargetLocked"}),
                 )
@@ -1971,8 +1356,8 @@ impl CommandExecutor {
                         })?;
                     return Ok(json!({
                         "closed": true,
-                        "close_result": v2::ManagedGameCloseResult::try_from(receipt.result)
-                            .unwrap_or(v2::ManagedGameCloseResult::Failed)
+                        "close_result": v3::ManagedGameCloseResult::try_from(receipt.result)
+                            .unwrap_or(v3::ManagedGameCloseResult::Failed)
                             .as_str_name(),
                         "state": "ConnectedIdle",
                     }));
@@ -1987,7 +1372,7 @@ impl CommandExecutor {
                     Duration::from_millis(u64::from(MAX_CLOSE_TIMEOUT_MS)),
                 )?;
                 self.active_profile = None;
-                self.binding = None;
+                self.set_binding(None)?;
                 Ok(
                     json!({"profile_id": binding.profile_id, "closed": true, "state": "ConnectedIdle"}),
                 )
@@ -2015,7 +1400,9 @@ impl CommandExecutor {
                     })?;
                 let mut capture = self.platform.start_capture(
                     &binding,
+                    &source.id,
                     source.region.clone(),
+                    source.maximum_fps.min(60),
                     RuntimeCaptureEncoding::Jpeg { quality: 80 },
                 )?;
                 let frame = capture.next_frame(Instant::now() + Duration::from_secs(5))?;
@@ -2024,28 +1411,19 @@ impl CommandExecutor {
                 )
             }
             LocalCommand::InputProbe { action } => match action {
-                InputProbeAction::MoveForward => self.local_input_pulse(
-                    &[v2::PhysicalKey {
-                        scan_code: 17,
-                        extended: false,
-                    }],
-                    &[],
-                ),
-                InputProbeAction::QuickUse => self.local_input_pulse(
-                    &[v2::PhysicalKey {
-                        scan_code: 44,
-                        extended: false,
-                    }],
-                    &[],
-                ),
-                InputProbeAction::MouseLeft => self.local_input_pulse(&[], &[1]),
+                InputProbeAction::MoveForward => self.local_input_pulse("move.forward"),
+                InputProbeAction::QuickUse => self.local_input_pulse(M1_ACTION_ID),
+                InputProbeAction::MouseLeft => Err(AgentError::new(
+                    "input.probe_not_supported",
+                    "point input probe requires a source frame and target-relative coordinates",
+                )),
             },
             LocalCommand::EnumerateTargets { profile_id } => {
                 self.stop_capture(None)?;
                 let profile = self.profiles.get(profile_id)?.clone();
                 let candidates = self.platform.enumerate(&profile)?;
                 self.active_profile = Some(profile);
-                self.binding = None;
+                self.set_binding(None)?;
                 Ok(
                     json!({"candidates": candidates.into_iter().map(|candidate| json!({
                     "candidate_id": candidate.selector.candidate_id,
@@ -2076,7 +1454,7 @@ impl CommandExecutor {
                     })?;
                 let binding = self.platform.lock(&profile, selector)?;
                 self.active_profile = Some(profile);
-                self.binding = Some(binding.clone());
+                self.set_binding(Some(binding.clone()))?;
                 Ok(
                     json!({"profile_id": binding.profile_id, "pid": binding.process_id, "state": "DryRun"}),
                 )
@@ -2086,7 +1464,7 @@ impl CommandExecutor {
                     AgentError::new("target.not_locked", "focus requires a locked target")
                 })?;
                 let snapshot = self.platform.focus(&binding)?;
-                self.binding = Some(snapshot.binding.clone());
+                self.set_binding(Some(snapshot.binding.clone()))?;
                 Ok(
                     json!({"profile_id": snapshot.binding.profile_id, "foreground": snapshot.foreground, "minimized": snapshot.minimized, "capturable": snapshot.capturable}),
                 )
@@ -2170,7 +1548,7 @@ impl CommandExecutor {
                 let profile = self.profiles.get(&value.profile_id)?.clone();
                 let binding = self.platform.start_task_target(&profile)?;
                 self.active_profile = Some(profile);
-                self.binding = Some(binding.clone());
+                self.set_binding(Some(binding.clone()))?;
                 self.last_local_input_token = None;
                 self.managed_game.bind_target(
                     &binding.profile_id,
@@ -2192,7 +1570,7 @@ impl CommandExecutor {
                 let profile = self.profiles.get(&value.profile_id)?.clone();
                 let candidates = self.platform.enumerate(&profile)?;
                 self.active_profile = Some(profile);
-                self.binding = None;
+                self.set_binding(None)?;
                 let candidates = candidates
                     .iter()
                     .map(|candidate| {
@@ -2227,7 +1605,7 @@ impl CommandExecutor {
                     })?;
                 let binding = self.platform.lock(&profile, selector)?;
                 self.active_profile = Some(profile);
-                self.binding = Some(binding.clone());
+                self.set_binding(Some(binding.clone()))?;
                 Ok(CommandOutcome::Ack(
                     json!({
                         "profile_id": binding.profile_id,
@@ -2243,7 +1621,7 @@ impl CommandExecutor {
                     AgentError::new("target.not_locked", "focus requires a locked target")
                 })?;
                 let snapshot = self.platform.focus(&binding)?;
-                self.binding = Some(snapshot.binding.clone());
+                self.set_binding(Some(snapshot.binding.clone()))?;
                 Ok(CommandOutcome::Ack(
                     json!({
                         "profile_id": snapshot.binding.profile_id,
@@ -2279,7 +1657,7 @@ impl CommandExecutor {
                 self.platform
                     .close(&binding, Duration::from_millis(u64::from(value.timeout_ms)))?;
                 self.active_profile = None;
-                self.binding = None;
+                self.set_binding(None)?;
                 Ok(CommandOutcome::Ack(
                     json!({
                         "profile_id": binding.profile_id,
@@ -2330,25 +1708,29 @@ impl CommandExecutor {
                     }
                 }
                 self.stop_capture(None)?;
-                let capture =
-                    match self
-                        .platform
-                        .start_capture(&binding, source.region.clone(), encoding)
-                    {
-                        Ok(capture) => capture,
-                        Err(error) => {
-                            if let Some(task) = task {
-                                return Ok(CommandOutcome::task(
-                                    self.task_attempt.complete_capture(
-                                        task,
-                                        false,
-                                        Some(error.code()),
-                                    )?,
-                                ));
-                            }
-                            return Err(error);
+                let capture = match self
+                    .require_target_generation(value.target_generation)
+                    .and_then(|_| {
+                        self.platform.start_capture(
+                            &binding,
+                            &value.source_id,
+                            source.region.clone(),
+                            value.fps,
+                            encoding,
+                        )
+                    }) {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        if let Some(task) = task {
+                            return Ok(CommandOutcome::task(self.task_attempt.complete_capture(
+                                task,
+                                false,
+                                Some(error.code()),
+                            )?));
                         }
-                    };
+                        return Err(error);
+                    }
+                };
                 let attempt = task
                     .map(|task| self.task_attempt.attempt_ref(task))
                     .transpose()?;
@@ -2366,6 +1748,7 @@ impl CommandExecutor {
                     session: session.clone(),
                     frames,
                     attempt,
+                    target_generation: self.target_generation,
                     no_frame_timeout: CAPTURE_NO_FRAME_TIMEOUT,
                     rediscovery_allowed: true,
                 };
@@ -2434,7 +1817,14 @@ impl CommandExecutor {
                 }
                 let attempt = self.task_attempt.attempt_ref(task)?;
                 let result: Result<u64, AgentError> = (|| {
-                    let mut capture = self.platform.start_capture(&binding, region, encoding)?;
+                    self.require_target_generation(value.target_generation)?;
+                    let mut capture = self.platform.start_capture(
+                        &binding,
+                        &value.source_id,
+                        region,
+                        source.maximum_fps.min(60),
+                        encoding,
+                    )?;
                     let frame = capture.next_frame(Instant::now() + CAPTURE_NO_FRAME_TIMEOUT)?;
                     let frame_sequence = Arc::clone(
                         self.frame_sequences
@@ -2443,10 +1833,14 @@ impl CommandExecutor {
                     );
                     let sequence = next_frame_sequence(&frame_sequence)?;
                     frames.publish_required(FramePacket {
-                        session: Some(session.reference.clone()),
+                        session: Some(v3::SessionRef {
+                            agent_id: session.reference.agent_id.clone(),
+                            session_id: session.reference.session_id.clone(),
+                            generation: session.reference.generation,
+                        }),
                         capture_source_id: value.source_id.clone(),
                         frame_sequence: sequence,
-                        captured_at_unix_us: now_unix_us(),
+                        captured_at_unix_us: frame.captured_at_unix_us,
                         width: frame.width,
                         height: frame.height,
                         encoding: match encoding {
@@ -2454,7 +1848,14 @@ impl CommandExecutor {
                             RuntimeCaptureEncoding::Png => "png".into(),
                         },
                         payload: frame.bytes,
-                        attempt: Some(attempt),
+                        attempt: Some(v3::AttemptRef {
+                            task_run_id: attempt.task_run_id,
+                            attempt_id: attempt.attempt_id,
+                            contract_version: attempt.contract_version,
+                            contract_digest: attempt.contract_digest,
+                        }),
+                        target_generation: self.target_generation,
+                        backend: frame.backend,
                     })?;
                     Ok(sequence)
                 })();
@@ -2490,6 +1891,13 @@ impl CommandExecutor {
                     if let Some(result) = self.task_attempt.prepare(task, false)? {
                         return Ok(CommandOutcome::task(result));
                     }
+                    if let Err(error) = self.require_target_generation(value.target_generation) {
+                        return Ok(CommandOutcome::task(self.task_attempt.complete_capture(
+                            task,
+                            true,
+                            Some(error.code()),
+                        )?));
+                    }
                     if let Err(error) = self.stop_capture(Some(&value.source_id)) {
                         return Ok(CommandOutcome::task(self.task_attempt.complete_capture(
                             task,
@@ -2501,6 +1909,7 @@ impl CommandExecutor {
                         self.task_attempt.complete_capture(task, false, None)?,
                     ));
                 }
+                self.require_target_generation(value.target_generation)?;
                 self.stop_capture(Some(&value.source_id))?;
                 Ok(CommandOutcome::Ack(
                     json!({"capture_source_id": value.source_id, "state": "stopped"}).to_string(),
@@ -2526,7 +1935,7 @@ impl CommandExecutor {
                 self.platform.release_task_input()?;
                 self.stop_capture(None)?;
                 self.active_profile = None;
-                self.binding = None;
+                self.set_binding(None)?;
                 Ok(CommandOutcome::Ack(
                     json!({"state": "ConnectedIdle"}).to_string(),
                 ))
@@ -2686,7 +2095,7 @@ impl CommandExecutor {
                 match started {
                     Ok(binding) => {
                         self.active_profile = Some(profile);
-                        self.binding = Some(binding.clone());
+                        self.set_binding(Some(binding.clone()))?;
                         self.managed_game.bind_target(
                             &binding.profile_id,
                             Instant::now(),
@@ -2762,8 +2171,22 @@ impl CommandExecutor {
         let frame_key = frame_sequence_key(&source_id, plan.attempt.as_ref());
         let release_error = self.platform.release_task_input().err();
         let _ = worker.stop();
+        let worker_state_uncertain = failure.code().starts_with("worker.")
+            || failure.code() == "capture.worker_failed"
+            || release_error.is_some();
+        let receipt = if worker_state_uncertain {
+            let error_code = release_error
+                .as_ref()
+                .map(AgentError::code)
+                .unwrap_or_else(|| failure.code());
+            self.task_attempt
+                .mark_active_side_effect_uncertain(error_code, release_error.is_none())?
+        } else {
+            self.task_attempt.mark_input_released(failure.code())?
+        };
+        let attempt = receipt.and_then(|value| value.attempt).or(attempt);
         if let Some(error) = release_error {
-            return Err(error);
+            failure = error;
         }
         if plan.rediscovery_allowed
             && matches!(
@@ -2795,6 +2218,45 @@ impl CommandExecutor {
         }))
     }
 
+    pub fn realtime_program_events(
+        &mut self,
+        session: &ExecutionSession,
+    ) -> Result<Vec<v3::AgentControlEvent>, AgentError> {
+        match self.platform.poll_realtime_program_events() {
+            Ok(events) => Ok(events),
+            Err(error) => {
+                let receipt = self.task_attempt.mark_active_side_effect_uncertain(
+                    error.code(),
+                    error.code() != "input.release_uncertain",
+                )?;
+                let attempt =
+                    receipt
+                        .and_then(|receipt| receipt.attempt)
+                        .map(|attempt| v3::AttemptRef {
+                            task_run_id: attempt.task_run_id,
+                            attempt_id: attempt.attempt_id,
+                            contract_version: attempt.contract_version,
+                            contract_digest: attempt.contract_digest,
+                        });
+                Ok(vec![v3::AgentControlEvent {
+                    payload: Some(v3::agent_control_event::Payload::SafetyEvent(
+                        v3::SafetyEvent {
+                            session: Some(v3::SessionRef {
+                                agent_id: session.reference.agent_id.clone(),
+                                session_id: session.reference.session_id.clone(),
+                                generation: session.reference.generation,
+                            }),
+                            reason_code: error.code().to_owned(),
+                            state: v3::AgentRuntimeState::RecoveryBlocked as i32,
+                            attempt,
+                            attempt_receipt: None,
+                        },
+                    )),
+                }])
+            }
+        }
+    }
+
     fn restart_capture_after_rediscovery(
         &mut self,
         mut plan: CapturePlan,
@@ -2816,10 +2278,15 @@ impl CommandExecutor {
             self.task_attempt
                 .refresh_owned_target(attempt, refreshed.clone())?;
         }
-        self.binding = Some(refreshed.clone());
-        let capture =
-            self.platform
-                .start_capture(&refreshed, plan.region.clone(), plan.encoding)?;
+        self.set_binding(Some(refreshed.clone()))?;
+        plan.target_generation = self.target_generation;
+        let capture = self.platform.start_capture(
+            &refreshed,
+            &plan.source_id,
+            plan.region.clone(),
+            plan.fps,
+            plan.encoding,
+        )?;
         let frame_key = frame_sequence_key(&plan.source_id, plan.attempt.as_ref());
         let frame_sequence = Arc::clone(
             self.frame_sequences
@@ -2830,11 +2297,7 @@ impl CommandExecutor {
         spawn_capture_worker(capture, frame_sequence, plan)
     }
 
-    fn local_input_pulse(
-        &mut self,
-        keys: &[v2::PhysicalKey],
-        mouse_buttons: &[i32],
-    ) -> Result<serde_json::Value, AgentError> {
+    fn local_input_pulse(&mut self, action_id: &str) -> Result<serde_json::Value, AgentError> {
         let profile = self.active_profile.clone().ok_or_else(|| {
             AgentError::new("profile.not_active", "input requires an active Profile")
         })?;
@@ -2850,44 +2313,68 @@ impl CommandExecutor {
         let expires_at = now + Duration::from_millis(500);
         self.platform
             .start_task_input(&profile, &binding, &session, expires_at)?;
-        let result = self
-            .platform
-            .apply_task_input_frame(
-                &profile,
-                &binding,
-                &session,
-                1,
-                expires_at,
-                keys,
-                mouse_buttons,
-                0,
-                None,
-                None,
-                None,
-            )
-            .and_then(|_| {
-                self.platform.apply_task_input_frame(
+        let action = profile.profile().actions.get(action_id).ok_or_else(|| {
+            AgentError::new("input.action_not_allowed", "probe action is not signed")
+        })?;
+        let result = match action {
+            ActionDefinition::Hold { .. } => self
+                .platform
+                .apply_task_input_frame(
                     &profile,
                     &binding,
                     &session,
-                    2,
+                    1,
                     expires_at,
-                    &[],
-                    &[],
+                    &[action_id.to_owned()],
+                    "",
                     0,
                     None,
                     None,
                     None,
                 )
-            });
+                .and_then(|_| {
+                    self.platform.apply_task_input_frame(
+                        &profile,
+                        &binding,
+                        &session,
+                        2,
+                        expires_at,
+                        &[],
+                        "",
+                        0,
+                        None,
+                        None,
+                        None,
+                    )
+                }),
+            ActionDefinition::Pulse { .. } => self
+                .platform
+                .pulse_task_action(&binding, &session, action_id, now)
+                .map(|_| false),
+            _ => Err(AgentError::new(
+                "input.action_kind_invalid",
+                "probe action must be a signed keyboard action",
+            )),
+        };
         let release = self.platform.release_task_input();
         result?;
         release?;
         Ok(json!({"state": "released"}))
     }
 
-    pub fn reload_profiles(&mut self, profiles: ProfileStore) {
+    pub fn reload_profiles(&mut self, profiles: ProfileStore) -> Result<(), AgentError> {
+        self.reload_profiles_with_key(profiles, None)
+    }
+
+    pub fn reload_profiles_with_key(
+        &mut self,
+        profiles: ProfileStore,
+        root_public_key: Option<&str>,
+    ) -> Result<(), AgentError> {
+        self.platform
+            .configure_worker(profiles.root(), root_public_key)?;
         self.profiles = profiles;
+        Ok(())
     }
 
     pub fn reset_session(&mut self) -> Result<(), AgentError> {
@@ -2910,7 +2397,7 @@ impl CommandExecutor {
             )?;
         }
         self.active_profile = None;
-        self.binding = None;
+        self.set_binding(None)?;
         self.frame_sequences.clear();
         Ok(())
     }
@@ -2960,10 +2447,30 @@ fn task_reference_invalid() -> AgentError {
     )
 }
 
+fn execution_safety_event(
+    session: &ExecutionSession,
+    reason: &str,
+    attempt: Option<AttemptRef>,
+) -> AgentControlEvent {
+    AgentControlEvent {
+        payload: Some(agent_control_event::Payload::SafetyEvent(SafetyEvent {
+            session: Some(session.reference.clone()),
+            reason: reason.to_owned(),
+            state: "recovery_blocked".to_owned(),
+            attempt,
+        })),
+    }
+}
+
 fn input_frame_outcome(error: Option<&AgentError>) -> TaskCommandOutcomeState {
     match error.map(AgentError::code) {
         None => TaskCommandOutcomeState::Applied,
-        Some("guardian.unavailable" | "input.frame_invalid") => TaskCommandOutcomeState::NotApplied,
+        Some(
+            "guardian.unavailable"
+            | "input.frame_invalid"
+            | "target.generation_stale"
+            | "worker.not_applied",
+        ) => TaskCommandOutcomeState::NotApplied,
         Some(_) => TaskCommandOutcomeState::Uncertain,
     }
 }
@@ -3056,10 +2563,14 @@ fn spawn_capture_worker(
                             }
                         };
                         let packet = FramePacket {
-                            session: Some(session.clone()),
+                            session: Some(v3::SessionRef {
+                                agent_id: session.agent_id.clone(),
+                                session_id: session.session_id.clone(),
+                                generation: session.generation,
+                            }),
                             capture_source_id: worker_source.clone(),
                             frame_sequence: sequence,
-                            captured_at_unix_us: now_unix_us(),
+                            captured_at_unix_us: frame.captured_at_unix_us,
                             width: frame.width,
                             height: frame.height,
                             encoding: match encoding {
@@ -3067,7 +2578,14 @@ fn spawn_capture_worker(
                                 RuntimeCaptureEncoding::Png => "png".into(),
                             },
                             payload: frame.bytes,
-                            attempt: attempt.clone(),
+                            attempt: attempt.as_ref().map(|attempt| v3::AttemptRef {
+                                task_run_id: attempt.task_run_id.clone(),
+                                attempt_id: attempt.attempt_id.clone(),
+                                contract_version: attempt.contract_version,
+                                contract_digest: attempt.contract_digest.clone(),
+                            }),
+                            target_generation: plan.target_generation,
+                            backend: frame.backend,
                         };
                         if let Err(error) = frames.publish(packet) {
                             tracing::error!(code = error.code(), %error, "frame publish failed");
@@ -3185,12 +2703,21 @@ fn managed_child_exited(child: Option<&mut std::process::Child>) -> Result<bool,
 }
 
 #[cfg(windows)]
-fn production_platform() -> Box<dyn RuntimePlatform> {
-    Box::new(WindowsRuntimePlatform::new())
+fn production_platform(
+    profiles: &ProfileStore,
+    profile_root_public_key_hex: Option<&str>,
+) -> Box<dyn RuntimePlatform> {
+    Box::new(worker_platform::WorkerRuntimePlatform::new(
+        profiles,
+        profile_root_public_key_hex,
+    ))
 }
 
 #[cfg(not(windows))]
-fn production_platform() -> Box<dyn RuntimePlatform> {
+fn production_platform(
+    _profiles: &ProfileStore,
+    _profile_root_public_key_hex: Option<&str>,
+) -> Box<dyn RuntimePlatform> {
     Box::new(UnsupportedPlatform)
 }
 
@@ -3216,12 +2743,12 @@ impl RuntimePlatform for UnsupportedPlatform {
         _session: &SessionRef,
         _input_sequence: u64,
         _expires_at: Instant,
-        _keys: &[v2::PhysicalKey],
-        _mouse_buttons: &[i32],
+        _held_action_ids: &[String],
+        _wheel_action_id: &str,
         _wheel_delta: i32,
         _wheel_point: Option<(u32, u32)>,
         _source_frame: Option<(&AtomicU64, u64)>,
-        _client_point: Option<(i32, u32, u32)>,
+        _client_point: Option<(&str, u32, u32)>,
     ) -> Result<bool, AgentError> {
         Err(AgentError::new(
             "input.platform_unsupported",
@@ -3264,7 +2791,9 @@ impl RuntimePlatform for UnsupportedPlatform {
     fn start_capture(
         &mut self,
         _binding: &TargetBinding,
+        _source_id: &str,
         _region: CaptureRegion,
+        _fps: u32,
         _encoding: RuntimeCaptureEncoding,
     ) -> Result<Box<dyn RuntimeCapture>, AgentError> {
         Err(AgentError::new(
@@ -3317,12 +2846,15 @@ impl RuntimePlatform for UnsupportedPlatform {
         Ok(())
     }
 
-    fn start_music_autoplay(
+    fn start_realtime_program(
         &mut self,
         _profile: &VerifiedProfile,
         _binding: &TargetBinding,
         _session: &SessionRef,
         _attempt: &AttemptRef,
+        _program_id: &str,
+        _program_schema_version: u32,
+        _program_digest: &str,
         _maximum_duration: Duration,
         _supervision_lease: Duration,
     ) -> Result<(), AgentError> {
@@ -3332,7 +2864,10 @@ impl RuntimePlatform for UnsupportedPlatform {
         ))
     }
 
-    fn stop_music_autoplay(&mut self) -> Result<Option<AgentError>, AgentError> {
+    fn stop_realtime_program(
+        &mut self,
+        _program_id: &str,
+    ) -> Result<Option<AgentError>, AgentError> {
         Ok(None)
     }
 }
@@ -3341,9 +2876,6 @@ impl RuntimePlatform for UnsupportedPlatform {
 struct WindowsRuntimePlatform {
     targets: fairypam_agent_windows::WindowsTargetPlatform<fairypam_agent_windows::NativeWindows>,
     managed: Option<ManagedGameProcess>,
-    task_input: Option<WindowsTaskInput>,
-    music_autoplay: Option<WindowsMusicAutoplayWorker>,
-    music_release_uncertain: bool,
     input_monitor: Option<fairypam_agent_windows::LocalInputMonitor>,
     rediscovery_used: bool,
 }
@@ -3391,59 +2923,6 @@ impl Drop for ManagedGameProcess {
 }
 
 #[cfg(windows)]
-struct WindowsTaskInput {
-    machine: fairypam_agent_core::state::Machine,
-    input: fairypam_agent_windows::WindowsInput<fairypam_agent_input::GuardianProcessClient>,
-    session: fairypam_agent_input::SessionKey,
-}
-
-#[cfg(windows)]
-struct WindowsMusicAutoplayWorker {
-    stop: Arc<AtomicBool>,
-    maximum_duration: Duration,
-    autonomous: bool,
-    supervision_deadline: Arc<Mutex<Instant>>,
-    thread: JoinHandle<(WindowsTaskInput, Option<AgentError>, Result<(), AgentError>)>,
-}
-
-#[cfg(windows)]
-struct TaskAuthorization {
-    expires_at: Instant,
-}
-
-#[cfg(windows)]
-fn semantic_mouse_button(
-    button: i32,
-) -> Result<fairypam_agent_input::SemanticMouseButton, AgentError> {
-    use fairypam_agent_input::SemanticMouseButton;
-
-    match v2::MouseButton::try_from(button) {
-        Ok(v2::MouseButton::Left) => Ok(SemanticMouseButton::Left),
-        Ok(v2::MouseButton::Right) => Ok(SemanticMouseButton::Right),
-        Ok(v2::MouseButton::Middle) => Ok(SemanticMouseButton::Middle),
-        Ok(v2::MouseButton::X1) => Ok(SemanticMouseButton::X1),
-        Ok(v2::MouseButton::X2) => Ok(SemanticMouseButton::X2),
-        _ => Err(AgentError::new(
-            "input.frame_invalid",
-            "input command contains an invalid mouse button",
-        )),
-    }
-}
-
-#[cfg(windows)]
-impl fairypam_agent_core::platform::LocalAuthorization for TaskAuthorization {
-    fn current(&self, now: Instant) -> fairypam_agent_core::platform::AuthorizationState {
-        if self.expires_at > now {
-            fairypam_agent_core::platform::AuthorizationState::Granted {
-                expires_at: self.expires_at,
-            }
-        } else {
-            fairypam_agent_core::platform::AuthorizationState::Denied
-        }
-    }
-}
-
-#[cfg(windows)]
 impl WindowsRuntimePlatform {
     fn new() -> Self {
         Self {
@@ -3451,95 +2930,9 @@ impl WindowsRuntimePlatform {
                 fairypam_agent_windows::NativeWindows,
             ),
             managed: None,
-            task_input: None,
-            music_autoplay: None,
-            music_release_uncertain: false,
             input_monitor: None,
             rediscovery_used: false,
         }
-    }
-
-    fn task_guardian_path() -> Result<std::path::PathBuf, AgentError> {
-        let executable = std::env::current_exe()
-            .map_err(|error| AgentError::new("guardian.unavailable", error.to_string()))?;
-        let guardian = executable
-            .parent()
-            .ok_or_else(|| AgentError::new("guardian.unavailable", "Agent path has no parent"))?
-            .join("fairypam-agent-guardian.exe");
-        if !guardian.is_file() {
-            return Err(AgentError::new(
-                "guardian.unavailable",
-                "Agent artifact is missing fairypam-agent-guardian.exe",
-            ));
-        }
-        Ok(guardian)
-    }
-
-    fn join_music_autoplay(&mut self) -> Result<Option<AgentError>, AgentError> {
-        let Some(worker) = self.music_autoplay.take() else {
-            if self.music_release_uncertain {
-                return Err(AgentError::new(
-                    "music.autoplay_release_uncertain",
-                    "music autoplay input release remains unverified",
-                ));
-            }
-            return Ok(None);
-        };
-        worker.stop.store(true, Ordering::Release);
-        let (input, operation_error, release) = match worker.thread.join() {
-            Ok(result) => result,
-            Err(_) => {
-                self.music_release_uncertain = true;
-                return Err(AgentError::new(
-                    "music.autoplay_worker_failed",
-                    "music autoplay worker panicked before releasing input",
-                ));
-            }
-        };
-        retain_input_on_release_failure(&mut self.task_input, input, release)?;
-        self.music_release_uncertain = false;
-        Ok(operation_error)
-    }
-
-    fn validate_task_input_session(&mut self, session: &SessionRef) -> Result<(), AgentError> {
-        let Some(input) = self.task_input.as_ref() else {
-            return Err(AgentError::new(
-                "input_lease_invalid",
-                "task input lease is not active",
-            ));
-        };
-        let matches = input.session.agent_id == session.agent_id
-            && input.session.session_id == session.session_id
-            && input.session.generation == session.generation;
-        if matches {
-            return Ok(());
-        }
-        let release_error = self.release_task_input().err();
-        Err(AgentError::new(
-            "input_lease_invalid",
-            match release_error {
-                Some(error) => format!(
-                    "task input lease belongs to another Control session; release failed: {error}"
-                ),
-                None => "task input lease belongs to another Control session".into(),
-            },
-        ))
-    }
-
-    fn focus_task_input_target(
-        &mut self,
-        binding: &TargetBinding,
-    ) -> Result<TargetSnapshot, AgentError> {
-        self.targets.focus(binding).map_err(|error| {
-            let release_error = self.release_task_input().err();
-            AgentError::new(
-                error.code(),
-                match release_error {
-                    Some(release) => format!("{error}; input release failed: {release}"),
-                    None => error.to_string(),
-                },
-            )
-        })
     }
 
     fn wait_for_process_window(
@@ -3574,518 +2967,6 @@ impl WindowsRuntimePlatform {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-}
-
-#[cfg(windows)]
-fn validate_music_target(snapshot: &TargetSnapshot) -> Result<(), AgentError> {
-    if !snapshot.foreground
-        || snapshot.minimized
-        || !snapshot.capturable
-        || (
-            snapshot.binding.client_rect.width,
-            snapshot.binding.client_rect.height,
-        ) != MUSIC_CLIENT_SIZE
-    {
-        return Err(AgentError::new(
-            "music.autoplay_target_invalid",
-            "music autoplay requires the foreground 1920x1080 signed target",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-struct WindowsMusicSafetyIo<'a> {
-    input: &'a mut WindowsTaskInput,
-    binding: TargetBinding,
-    snapshot: Option<TargetSnapshot>,
-    lane_keys: Vec<(u16, bool)>,
-    targets: fairypam_agent_windows::WindowsTargetPlatform<fairypam_agent_windows::NativeWindows>,
-    supervision_deadline: Arc<Mutex<Instant>>,
-    input_deadline: Arc<Mutex<Instant>>,
-    stop: &'a AtomicBool,
-}
-
-#[cfg(windows)]
-struct WindowsMusicRowSampler {
-    sampler: fairypam_agent_windows::ClientPixelSampler<6>,
-}
-
-#[cfg(windows)]
-impl MusicRowSamplerIo for WindowsMusicRowSampler {
-    fn sample(&mut self) -> Result<MusicRowSample, AgentError> {
-        let (blue, timing) = self.sampler.sample_blue_timed().map_err(AgentError::from)?;
-        Ok(MusicRowSample {
-            blue,
-            foreground: timing.foreground,
-            bitblt: timing.bitblt,
-            gdi_flush: timing.gdi_flush,
-            buffer_read: timing.buffer_read,
-        })
-    }
-}
-
-#[cfg(windows)]
-impl MusicTransitionSender for fairypam_agent_windows::MusicLaneSender {
-    type Prepared = fairypam_agent_windows::PreparedMusicLaneInput;
-
-    fn prepare_transitions(
-        &mut self,
-        transitions: &[(usize, bool)],
-    ) -> Result<Self::Prepared, AgentError> {
-        fairypam_agent_windows::MusicLaneSender::prepare_transitions(self, transitions)
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))
-    }
-
-    fn send_prepared(
-        &mut self,
-        prepared: Self::Prepared,
-        detected_at: &[Instant],
-        input_deadline: Instant,
-    ) -> Result<Instant, AgentError> {
-        fairypam_agent_windows::MusicLaneSender::send_prepared(
-            self,
-            prepared,
-            detected_at,
-            input_deadline,
-            MUSIC_EVENT_FRESHNESS,
-        )
-        .map_err(|error| AgentError::new(error.code(), error.to_string()))
-    }
-
-    fn release_stale(&mut self) -> Result<(), AgentError> {
-        fairypam_agent_windows::MusicLaneSender::release_all(self)
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))
-    }
-}
-
-#[cfg(windows)]
-impl WindowsMusicSafetyIo<'_> {
-    fn supervised_until(&self) -> Result<Instant, AgentError> {
-        self.supervision_deadline
-            .lock()
-            .map(|value| *value)
-            .map_err(|_| {
-                AgentError::new(
-                    "music.autoplay_supervision_failed",
-                    "music autoplay supervision lease is unavailable",
-                )
-            })
-    }
-
-    fn renewal_context(
-        &mut self,
-    ) -> Result<Option<(TargetSnapshot, Instant, Instant)>, AgentError> {
-        let snapshot = self.snapshot.clone().ok_or_else(|| {
-            AgentError::new(
-                "music.autoplay_target_invalid",
-                "music autoplay target has not been revalidated",
-            )
-        })?;
-        let authorization_now = Instant::now();
-        let expires_at = music_input_expiry(self.supervised_until()?, authorization_now)?;
-        let authorization = TaskAuthorization { expires_at };
-        self.input.machine.renew_control_authorization(
-            &authorization,
-            authorization_now,
-            expires_at,
-        )?;
-        let input_now = Instant::now();
-        let Some(final_expiry) = music_input_expiry_if_running(
-            self.supervised_until()?,
-            input_now,
-            self.stop.load(Ordering::Acquire),
-        )?
-        else {
-            return Ok(None);
-        };
-        Ok(Some((
-            snapshot,
-            input_now,
-            std::cmp::min(expires_at, final_expiry),
-        )))
-    }
-
-    fn arm_sender(
-        &mut self,
-        sequence: u64,
-    ) -> Result<fairypam_agent_windows::MusicLaneSender, AgentError> {
-        use fairypam_agent_input::InputPermit;
-
-        let Some((snapshot, input_now, expires_at)) = self.renewal_context()? else {
-            return Err(AgentError::new(
-                "music.autoplay_start_failed",
-                "music autoplay stopped before the input session was armed",
-            ));
-        };
-        let permit = InputPermit::from_capability(
-            self.input
-                .machine
-                .issue_input_capability(input_now, &snapshot, true)?,
-        );
-        let sender = self
-            .input
-            .input
-            .arm_music_lane_sender(
-                self.input.session.clone(),
-                sequence,
-                expires_at,
-                &self.lane_keys,
-                &permit,
-                input_now,
-            )
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
-        *self.input_deadline.lock().map_err(|_| {
-            AgentError::new(
-                "music.autoplay_supervision_failed",
-                "music autoplay input deadline is unavailable",
-            )
-        })? = expires_at;
-        Ok(sender)
-    }
-}
-
-#[cfg(windows)]
-impl MusicSafetyIo for WindowsMusicSafetyIo<'_> {
-    fn check_supervision(&mut self) -> Result<(), AgentError> {
-        music_input_expiry(self.supervised_until()?, Instant::now()).map(|_| ())
-    }
-
-    fn check_monitor(&mut self) -> Result<(), AgentError> {
-        fairypam_agent_windows::require_local_input_monitor()
-    }
-
-    fn validate_target(&mut self) -> Result<(), AgentError> {
-        use fairypam_agent_core::platform::TargetPlatform;
-
-        let snapshot = self.targets.revalidate(&self.binding)?;
-        validate_music_target(&snapshot)?;
-        self.snapshot = Some(snapshot);
-        Ok(())
-    }
-
-    fn renew_guard(&mut self, sequence: u64) -> Result<(), AgentError> {
-        use fairypam_agent_input::InputPermit;
-
-        let Some((snapshot, input_now, expires_at)) = self.renewal_context()? else {
-            return Ok(());
-        };
-        let permit = InputPermit::from_capability(
-            self.input
-                .machine
-                .issue_input_capability(input_now, &snapshot, true)?,
-        );
-        self.input
-            .input
-            .renew_guarded_physical_frame(
-                &self.input.session,
-                sequence,
-                expires_at,
-                &permit,
-                input_now,
-            )
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
-        *self.input_deadline.lock().map_err(|_| {
-            AgentError::new(
-                "music.autoplay_supervision_failed",
-                "music autoplay input deadline is unavailable",
-            )
-        })? = expires_at;
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-fn run_music_autoplay(
-    input: WindowsTaskInput,
-    binding: TargetBinding,
-    lane_keys: Vec<(u16, bool)>,
-    attempt: AttemptRef,
-    maximum_duration: Duration,
-    supervision_deadline: Arc<Mutex<Instant>>,
-    stop: Arc<AtomicBool>,
-) -> (WindowsTaskInput, Option<AgentError>, Result<(), AgentError>) {
-    use fairypam_agent_input::ReleaseReason;
-
-    let mut metrics = MusicAutoplayMetrics::with_capacity(maximum_duration);
-    let (input, operation_error, release) = finish_music_autoplay_worker(
-        input,
-        |input| {
-            let points = MUSIC_LANES.map(|(_, x, y)| (x, y));
-            let input_deadline = Arc::new(Mutex::new(Instant::now()));
-            let mut safety = WindowsMusicSafetyIo {
-                input,
-                binding: binding.clone(),
-                snapshot: None,
-                lane_keys: lane_keys.clone(),
-                targets: fairypam_agent_windows::WindowsTargetPlatform::new(
-                    fairypam_agent_windows::NativeWindows,
-                ),
-                supervision_deadline: Arc::clone(&supervision_deadline),
-                input_deadline: Arc::clone(&input_deadline),
-                stop: &stop,
-            };
-            safety.check_monitor()?;
-            safety.validate_target()?;
-            let mut lane_sender = safety.arm_sender(1)?;
-
-            let state = MusicStopState::new(Arc::clone(&stop));
-            let (event_sender, event_receiver) =
-                std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
-
-            let sampler_state = state.clone();
-            let sampler_binding = binding.clone();
-            let (sampler_ready_sender, sampler_ready_receiver) = std::sync::mpsc::sync_channel(1);
-            let (sampler_start_sender, sampler_start_receiver) = std::sync::mpsc::sync_channel(1);
-            let sampler_thread = match std::thread::Builder::new()
-                .name("fairypam-music-row-sampler".into())
-                .spawn(move || {
-                    let mut sampler_metrics = MusicAutoplayMetrics::with_capacity(maximum_duration);
-                    let mut queue_overflows = 0_u64;
-                    let sampler = match fairypam_agent_windows::ClientPixelSampler::new(
-                        &sampler_binding,
-                        &points,
-                    ) {
-                        Ok(sampler) => sampler,
-                        Err(error) => {
-                            let error = AgentError::from(error);
-                            let _ = sampler_ready_sender.send(Err(error.clone()));
-                            sampler_state.fail(error.clone());
-                            return (sampler_metrics, Err(error));
-                        }
-                    };
-                    if sampler_ready_sender.send(Ok(())).is_err() {
-                        let error = AgentError::new(
-                            "music.autoplay_start_failed",
-                            "music sampler startup receiver is unavailable",
-                        );
-                        sampler_state.fail(error.clone());
-                        return (sampler_metrics, Err(error));
-                    }
-                    let (start_at, deadline) = match sampler_start_receiver.recv() {
-                        Ok(value) => value,
-                        Err(_) => {
-                            let error = AgentError::new(
-                                "music.autoplay_start_failed",
-                                "music sampler did not receive the shared start deadline",
-                            );
-                            sampler_state.fail(error.clone());
-                            return (sampler_metrics, Err(error));
-                        }
-                    };
-                    let mut io = WindowsMusicRowSampler { sampler };
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_music_row_sampler_loop(
-                            &mut io,
-                            start_at,
-                            deadline,
-                            1,
-                            &sampler_state,
-                            &mut sampler_metrics,
-                            Instant::now,
-                            std::thread::sleep,
-                            |event| match event_sender.try_send(event) {
-                                Ok(()) => Ok(()),
-                                Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                                    queue_overflows += 1;
-                                    Err(AgentError::new(
-                                        "music.autoplay_queue_overflow",
-                                        "music autoplay event queue is full",
-                                    ))
-                                }
-                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                    Err(AgentError::new(
-                                        "music.autoplay_sender_failed",
-                                        "music autoplay sender is unavailable",
-                                    ))
-                                }
-                            },
-                        )
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err(AgentError::new(
-                            "music.autoplay_worker_failed",
-                            "music row sampler panicked",
-                        ))
-                    });
-                    if let Err(error) = &result {
-                        sampler_state.fail(error.clone());
-                    }
-                    sampler_metrics.queue_overflow_count = queue_overflows;
-                    (sampler_metrics, result)
-                }) {
-                Ok(thread) => thread,
-                Err(error) => {
-                    let _ = lane_sender.release_all();
-                    return Err(AgentError::new(
-                        "music.autoplay_start_failed",
-                        error.to_string(),
-                    ));
-                }
-            };
-            match sampler_ready_receiver.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    let _ = lane_sender.release_all();
-                    let _ = sampler_thread.join();
-                    return Err(error);
-                }
-                Err(_) => {
-                    let _ = lane_sender.release_all();
-                    let _ = sampler_thread.join();
-                    return Err(AgentError::new(
-                        "music.autoplay_start_failed",
-                        "music sampler stopped during startup",
-                    ));
-                }
-            }
-
-            let start_at = Instant::now() + MUSIC_SAMPLE_INTERVAL;
-            let deadline = start_at + maximum_duration;
-
-            let sender_state = state.clone();
-            let sender_input_deadline = Arc::clone(&input_deadline);
-            let (sender_start, sender_receive) =
-                std::sync::mpsc::sync_channel::<fairypam_agent_windows::MusicLaneSender>(1);
-            let sender_thread = std::thread::Builder::new()
-                .name("fairypam-music-sender".into())
-                .spawn(move || {
-                    let mut sender = sender_receive
-                        .recv()
-                        .expect("music sender handle lives until sender startup");
-                    let mut sender_metrics = MusicAutoplayMetrics::with_capacity(maximum_duration);
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_music_sender_loop(
-                            &mut sender,
-                            &event_receiver,
-                            1,
-                            deadline,
-                            &sender_state,
-                            &mut sender_metrics,
-                            Instant::now,
-                            || {
-                                sender_input_deadline
-                                    .lock()
-                                    .map(|value| *value)
-                                    .map_err(|_| {
-                                        AgentError::new(
-                                            "music.autoplay_supervision_failed",
-                                            "music autoplay input deadline is unavailable",
-                                        )
-                                    })
-                            },
-                        )
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err(AgentError::new(
-                            "music.autoplay_worker_failed",
-                            "music sender panicked",
-                        ))
-                    });
-                    if let Err(error) = &result {
-                        sender_state.fail(error.clone());
-                    }
-                    let release = sender
-                        .release_all()
-                        .map_err(|error| AgentError::new(error.code(), error.to_string()));
-                    (sender_metrics, result, release)
-                })
-                .map_err(|error| AgentError::new("music.autoplay_start_failed", error.to_string()));
-            let sender_thread = match sender_thread {
-                Ok(thread) => thread,
-                Err(error) => {
-                    state.fail(error.clone());
-                    let _ = sampler_start_sender.send((start_at, deadline));
-                    let _ = lane_sender.release_all();
-                    let _ = sampler_thread.join();
-                    return Err(error);
-                }
-            };
-            if let Err(error) = sender_start.send(lane_sender) {
-                let mut sender = error.0;
-                let _ = sender.release_all();
-                state.fail(AgentError::new(
-                    "music.autoplay_start_failed",
-                    "music sender stopped during startup",
-                ));
-                let _ = sampler_start_sender.send((start_at, deadline));
-                let _ = sender_thread.join();
-                let _ = sampler_thread.join();
-                return Err(AgentError::new(
-                    "music.autoplay_start_failed",
-                    "music sender stopped during startup",
-                ));
-            }
-            if sampler_start_sender.send((start_at, deadline)).is_err() {
-                let error = AgentError::new(
-                    "music.autoplay_start_failed",
-                    "music sampler stopped during startup",
-                );
-                state.fail(error.clone());
-                let _ = sampler_thread.join();
-                let (_, _, sender_release) = sender_thread.join().map_err(|_| {
-                    AgentError::new("music.autoplay_worker_failed", "music sender panicked")
-                })?;
-                sender_release?;
-                return Err(error);
-            }
-
-            let safety_result = run_music_safety_loop(
-                &mut safety,
-                start_at,
-                deadline,
-                &stop,
-                &mut metrics,
-                Instant::now,
-                std::thread::sleep,
-            );
-            if let Err(error) = &safety_result {
-                state.fail(error.clone());
-            }
-            stop.store(true, Ordering::Release);
-
-            let (sampler_metrics, sampler_result) = match sampler_thread.join() {
-                Ok(value) => value,
-                Err(_) => {
-                    state.fail(AgentError::new(
-                        "music.autoplay_worker_failed",
-                        "music row sampler panicked",
-                    ));
-                    (MusicAutoplayMetrics::default(), Ok(()))
-                }
-            };
-            metrics.merge(sampler_metrics);
-            let (sender_metrics, sender_result, sender_release) = match sender_thread.join() {
-                Ok(value) => value,
-                Err(_) => {
-                    state.fail(AgentError::new(
-                        "music.autoplay_worker_failed",
-                        "music sender panicked",
-                    ));
-                    (MusicAutoplayMetrics::default(), Ok(()), Ok(()))
-                }
-            };
-            metrics.merge(sender_metrics);
-            for result in [sender_release, safety_result, sampler_result, sender_result] {
-                if let Err(error) = result {
-                    state.fail(error);
-                }
-            }
-            if let Some(error) = state.error() {
-                return Err(error);
-            }
-            Ok(())
-        },
-        |input| {
-            input
-                .input
-                .release_all(ReleaseReason::SessionChanged)
-                .map_err(|error| AgentError::new(error.code(), error.to_string()))
-        },
-    );
-    let metrics_error = persist_music_metric_summary(&metrics, &attempt).err();
-    let operation_error = merge_music_autoplay_errors(operation_error, metrics_error);
-    (input, operation_error, release)
 }
 
 #[cfg(windows)]
@@ -4310,30 +3191,16 @@ impl RuntimePlatform for WindowsRuntimePlatform {
 
     fn start_capture(
         &mut self,
-        binding: &TargetBinding,
-        region: CaptureRegion,
-        encoding: RuntimeCaptureEncoding,
+        _binding: &TargetBinding,
+        _source_id: &str,
+        _region: CaptureRegion,
+        _fps: u32,
+        _encoding: RuntimeCaptureEncoding,
     ) -> Result<Box<dyn RuntimeCapture>, AgentError> {
-        use fairypam_agent_windows::CaptureEncoding;
-        self.check_attempt_environment()?;
-        let encoding = match encoding {
-            RuntimeCaptureEncoding::Jpeg { quality } => CaptureEncoding::Jpeg { quality },
-            RuntimeCaptureEncoding::Png => CaptureEncoding::Png,
-        };
-        let capture = self
-            .targets
-            .start_capture(binding, region, encoding)
-            .map_err(|error| {
-                let release_error = self.release_task_input().err();
-                AgentError::new(
-                    error.code(),
-                    match release_error {
-                        Some(release) => format!("{error}; input release failed: {release}"),
-                        None => error.to_string(),
-                    },
-                )
-            })?;
-        Ok(Box::new(WindowsCapture { capture }))
+        Err(AgentError::new(
+            "worker.required",
+            "normal Windows capture is owned by fairypam-win32-worker",
+        ))
     }
 
     fn focus(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError> {
@@ -4371,7 +3238,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         &mut self,
         binding: &TargetBinding,
         timeout: Duration,
-    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
+    ) -> Result<v3::ManagedGameCloseResult, AgentError> {
         self.close_with_progress(binding, timeout, &mut || {})
     }
 
@@ -4380,9 +3247,9 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         binding: &TargetBinding,
         _timeout: Duration,
         on_force: &mut dyn FnMut(),
-    ) -> Result<v2::ManagedGameCloseResult, AgentError> {
+    ) -> Result<v3::ManagedGameCloseResult, AgentError> {
         let Some(managed) = self.managed.as_ref() else {
-            return Ok(v2::ManagedGameCloseResult::Graceful);
+            return Ok(v3::ManagedGameCloseResult::Graceful);
         };
         if managed.binding.process_id != binding.process_id
             || managed.binding.process_started_at_unix_ms != binding.process_started_at_unix_ms
@@ -4399,7 +3266,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 .contains(&binding.process_id);
             if !still_running {
                 self.managed = None;
-                return Ok(v2::ManagedGameCloseResult::Graceful);
+                return Ok(v3::ManagedGameCloseResult::Graceful);
             }
             if error.code() == "target.stale" {
                 return Err(error);
@@ -4407,347 +3274,66 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             on_force();
             self.targets.terminate(binding, Duration::from_secs(5))?;
             self.managed = None;
-            return Ok(v2::ManagedGameCloseResult::Forced);
+            return Ok(v3::ManagedGameCloseResult::Forced);
         }
         self.managed = None;
-        Ok(v2::ManagedGameCloseResult::Graceful)
+        Ok(v3::ManagedGameCloseResult::Graceful)
     }
 
     fn start_task_input(
         &mut self,
-        profile: &VerifiedProfile,
-        binding: &TargetBinding,
-        session: &SessionRef,
-        expires_at: Instant,
+        _profile: &VerifiedProfile,
+        _binding: &TargetBinding,
+        _session: &SessionRef,
+        _expires_at: Instant,
     ) -> Result<(), AgentError> {
-        use fairypam_agent_core::state::{Machine, SessionIdentity};
-        use fairypam_agent_input::{ActionMap, GuardianProcessClient};
-
-        let lease_duration = expires_at.saturating_duration_since(Instant::now());
-        self.check_attempt_environment()?;
-        self.release_task_input()?;
-        let snapshot = self.targets.focus(binding)?;
-        self.check_attempt_environment()?;
-        let now = Instant::now();
-        let expires_at = now + lease_duration;
-        let session = SessionIdentity {
-            agent_id: session.agent_id.clone(),
-            session_id: session.session_id.clone(),
-            generation: session.generation,
-        };
-        let authorization = TaskAuthorization { expires_at };
-        let mut machine = Machine::new();
-        machine.start_completed()?;
-        machine.control_connected(session.clone())?;
-        machine.activate_profile(profile)?;
-        machine.lock_target(binding.clone())?;
-        machine.preflight_passed(snapshot.clone())?;
-        machine.enter_dry_run()?;
-        machine.request_arm(&authorization, now, expires_at)?;
-        machine.begin_control(now)?;
-        let action_map = ActionMap::from_verified_profile(profile)
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
-        let guardian = GuardianProcessClient::spawn(
-            &Self::task_guardian_path()?,
-            action_map.physical_holds(),
-            Duration::from_millis(1_500),
-            None,
-        )
-        .map_err(|error| AgentError::new("guardian.unavailable", error.to_string()))?;
-        let input = self
-            .targets
-            .start_input(profile, binding.clone(), guardian)
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
-        self.task_input = Some(WindowsTaskInput {
-            machine,
-            input,
-            session,
-        });
-        Ok(())
-    }
-
-    fn apply_task_input_frame(
-        &mut self,
-        profile: &VerifiedProfile,
-        binding: &TargetBinding,
-        session: &SessionRef,
-        input_sequence: u64,
-        expires_at: Instant,
-        keys: &[v2::PhysicalKey],
-        mouse_buttons: &[i32],
-        wheel_delta: i32,
-        wheel_point: Option<(u32, u32)>,
-        source_frame: Option<(&AtomicU64, u64)>,
-        client_point: Option<(i32, u32, u32)>,
-    ) -> Result<bool, AgentError> {
-        use fairypam_agent_input::InputPermit;
-
-        let lease_duration = expires_at.saturating_duration_since(Instant::now());
-        self.check_attempt_environment()?;
-        if self.task_input.is_none() {
-            self.start_task_input(profile, binding, session, Instant::now() + lease_duration)?;
-        }
-        self.validate_task_input_session(session)?;
-        let snapshot = self.focus_task_input_target(binding)?;
-        self.check_attempt_environment()?;
-        if !snapshot.foreground || snapshot.minimized || !snapshot.capturable {
-            let _ = self.release_task_input();
-            return Err(AgentError::new(
-                "local_authorization_denied",
-                "task target lost foreground or capture eligibility",
-            ));
-        }
-        let buttons = mouse_buttons
-            .iter()
-            .map(|button| semantic_mouse_button(*button))
-            .collect::<Result<Vec<_>, _>>()?;
-        let keys = keys
-            .iter()
-            .map(|key| (key.scan_code as u16, key.extended))
-            .collect::<Vec<_>>();
-        let input = self.task_input.as_mut().ok_or_else(|| {
-            AgentError::new("input_lease_invalid", "task input lease is not active")
-        })?;
-        let now = Instant::now();
-        let expires_at = now + lease_duration;
-        let authorization = TaskAuthorization { expires_at };
-        input
-            .machine
-            .renew_control_authorization(&authorization, now, expires_at)?;
-        let permit = InputPermit::from_capability(
-            input.machine.issue_input_capability(now, &snapshot, true)?,
-        );
-        ensure_current_source_frame(source_frame)?;
-        input
-            .input
-            .apply_physical_frame(
-                input.session.clone(),
-                input_sequence,
-                expires_at,
-                &keys,
-                &buttons,
-                wheel_delta,
-                wheel_point,
-                &permit,
-                now,
-            )
-            .and_then(|holds_active| {
-                let Some((button, x_ppm, y_ppm)) = client_point else {
-                    return Ok(holds_active);
-                };
-                ensure_current_source_frame(source_frame).map_err(|error| {
-                    fairypam_agent_input::SafetyError::new(error.code(), error.to_string())
-                })?;
-                input.input.execute_client_point(
-                    semantic_mouse_button(button).map_err(|error| {
-                        fairypam_agent_input::SafetyError::new(error.code(), error.to_string())
-                    })?,
-                    x_ppm,
-                    y_ppm,
-                    &input.session,
-                    &permit,
-                    now,
-                )?;
-                Ok(holds_active)
-            })
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))
+        Err(AgentError::new(
+            "worker.required",
+            "normal Windows input is owned by fairypam-win32-worker",
+        ))
     }
 
     fn pulse_task_action(
         &mut self,
-        binding: &TargetBinding,
-        session: &SessionRef,
-        action_id: &str,
-        now: Instant,
+        _binding: &TargetBinding,
+        _session: &SessionRef,
+        _action_id: &str,
+        _now: Instant,
     ) -> Result<(), AgentError> {
-        use fairypam_agent_input::{ActionId, InputPermit};
+        Err(AgentError::new(
+            "worker.required",
+            "normal Windows input is owned by fairypam-win32-worker",
+        ))
+    }
 
-        self.check_attempt_environment()?;
-        self.validate_task_input_session(session)?;
-        let snapshot = self.focus_task_input_target(binding)?;
-        self.check_attempt_environment()?;
-        if !snapshot.foreground || snapshot.minimized || !snapshot.capturable {
-            let _ = self.release_task_input();
-            return Err(AgentError::new(
-                "local_authorization_denied",
-                "task target lost foreground or capture eligibility",
-            ));
-        }
-        let input = self.task_input.as_mut().ok_or_else(|| {
-            AgentError::new("input_lease_invalid", "task input lease is not active")
-        })?;
-        let permit = InputPermit::from_capability(
-            input.machine.issue_input_capability(now, &snapshot, true)?,
-        );
-        let action = ActionId::new(action_id.to_owned())
-            .map_err(|error| AgentError::new("task_command_not_allowed", error.to_string()))?;
-        input
-            .input
-            .execute_pulse(&action, &input.session, &permit, now)
-            .map_err(|error| AgentError::new(error.code(), error.to_string()))
+    #[allow(clippy::too_many_arguments)]
+    fn apply_task_input_frame(
+        &mut self,
+        _profile: &VerifiedProfile,
+        _binding: &TargetBinding,
+        _session: &SessionRef,
+        _input_sequence: u64,
+        _expires_at: Instant,
+        _held_action_ids: &[String],
+        _wheel_action_id: &str,
+        _wheel_delta: i32,
+        _wheel_point: Option<(u32, u32)>,
+        _source_frame: Option<(&AtomicU64, u64)>,
+        _client_point: Option<(&str, u32, u32)>,
+    ) -> Result<bool, AgentError> {
+        Err(AgentError::new(
+            "worker.required",
+            "normal Windows input is owned by fairypam-win32-worker",
+        ))
     }
 
     fn release_task_input(&mut self) -> Result<(), AgentError> {
-        use fairypam_agent_input::ReleaseReason;
-
-        self.join_music_autoplay()?;
-        let Some(mut input) = self.task_input.take() else {
-            return Ok(());
-        };
-        let release = input
-            .input
-            .release_all(ReleaseReason::SessionChanged)
-            .map_err(|error| AgentError::new(error.code(), error.to_string()));
-        retain_input_on_release_failure(&mut self.task_input, input, release)
-    }
-
-    fn start_music_autoplay(
-        &mut self,
-        profile: &VerifiedProfile,
-        binding: &TargetBinding,
-        session: &SessionRef,
-        attempt: &AttemptRef,
-        maximum_duration: Duration,
-        supervision_lease: Duration,
-    ) -> Result<(), AgentError> {
-        use fairypam_agent_core::platform::TargetPlatform;
-
-        let supervision_window = music_supervision_window(maximum_duration, supervision_lease)?;
-        let autonomous = supervision_lease.is_zero();
-        if self.music_release_uncertain {
-            return Err(AgentError::new(
-                "music.autoplay_command_invalid",
-                "music autoplay has an invalid release state",
-            ));
-        }
-        if let Some(worker) = self.music_autoplay.as_ref() {
-            if !music_autoplay_can_renew(
-                worker.maximum_duration,
-                worker.autonomous,
-                worker.thread.is_finished(),
-                maximum_duration,
-                autonomous,
-            ) {
-                return Err(AgentError::new(
-                    "music.autoplay_command_invalid",
-                    "music autoplay renewal does not match an active worker",
-                ));
-            }
-            *worker.supervision_deadline.lock().map_err(|_| {
-                AgentError::new(
-                    "music.autoplay_supervision_failed",
-                    "music autoplay supervision lease is unavailable",
-                )
-            })? = Instant::now() + supervision_lease;
-            return Ok(());
-        }
-        let lane_keys = music_lane_keys(profile)?;
-        self.check_attempt_environment()?;
-        validate_music_target(&self.targets.revalidate(binding)?)?;
-        self.start_task_input(
-            profile,
-            binding,
-            session,
-            Instant::now() + MUSIC_INPUT_LEASE,
-        )?;
-        let input = self.task_input.take().ok_or_else(|| {
-            AgentError::new(
-                "music.autoplay_start_failed",
-                "music autoplay input lease was not created",
-            )
-        })?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let supervision_deadline = Arc::new(Mutex::new(Instant::now() + supervision_window));
-        let worker_supervision_deadline = Arc::clone(&supervision_deadline);
-        let worker_binding = binding.clone();
-        let worker_attempt = attempt.clone();
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let thread = match std::thread::Builder::new()
-            .name("fairypam-music-autoplay".into())
-            .spawn(move || {
-                let input = receiver
-                    .recv()
-                    .expect("music input sender lives until worker startup");
-                run_music_autoplay(
-                    input,
-                    worker_binding,
-                    lane_keys,
-                    worker_attempt,
-                    maximum_duration,
-                    worker_supervision_deadline,
-                    worker_stop,
-                )
-            }) {
-            Ok(thread) => thread,
-            Err(error) => {
-                self.task_input = Some(input);
-                let release = self.release_task_input().err();
-                return Err(AgentError::new(
-                    "music.autoplay_start_failed",
-                    release.map_or_else(
-                        || error.to_string(),
-                        |release| format!("{error}; input release failed: {release}"),
-                    ),
-                ));
-            }
-        };
-        if let Err(error) = sender.send(input) {
-            let _ = thread.join();
-            self.task_input = Some(error.0);
-            let release = self.release_task_input().err();
-            return Err(AgentError::new(
-                "music.autoplay_start_failed",
-                release.map_or_else(
-                    || "music autoplay worker stopped during startup".into(),
-                    |error| {
-                        format!(
-                            "music autoplay worker stopped during startup; release failed: {error}"
-                        )
-                    },
-                ),
-            ));
-        }
-        self.music_autoplay = Some(WindowsMusicAutoplayWorker {
-            stop,
-            maximum_duration,
-            autonomous,
-            supervision_deadline,
-            thread,
-        });
         Ok(())
-    }
-
-    fn stop_music_autoplay(&mut self) -> Result<Option<AgentError>, AgentError> {
-        self.join_music_autoplay()
-    }
-}
-
-#[cfg(windows)]
-struct WindowsCapture {
-    capture: fairypam_agent_windows::WindowsTargetCapture,
-}
-
-#[cfg(windows)]
-impl RuntimeCapture for WindowsCapture {
-    fn next_frame(&mut self, deadline: Instant) -> Result<RuntimeCapturedFrame, AgentError> {
-        use fairypam_agent_windows::CaptureSession;
-        let frame = self
-            .capture
-            .next_frame(deadline)
-            .map_err(AgentError::from)?;
-        Ok(RuntimeCapturedFrame {
-            bytes: frame.bytes,
-            width: frame.width,
-            height: frame.height,
-            sequence: frame.sequence,
-        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
 
@@ -4757,7 +3343,7 @@ mod tests {
         Ed25519SignatureVerifier, Profile, ProfileContent, ProfileEnvelope, TargetRules,
     };
     use fairypam_agent_core::target::{ClientRect, IntegrityLevel, TargetSnapshot};
-    use fairypam_agent_protocol::v1::{
+    use fairypam_agent_protocol::internal_v1::{
         AgentAttemptContractV1, AttemptRef, BeginTaskAttempt, CaptureFrame, CloseTarget,
         CommandRef, EnumerateTargets, FinishTaskAttempt, FocusTarget, InputLease,
         InspectTaskAttempt, LaunchTarget, LockTarget, PulseAction, SessionRef, StartCapture,
@@ -4848,16 +3434,25 @@ mod tests {
                 actions: BTreeMap::from([
                     (
                         "move.forward".into(),
-                        ActionDefinition::Hold { scan_code: 17 },
+                        ActionDefinition::Hold {
+                            maa_virtual_key: 0x57,
+                            physical_scan_code: 17,
+                            extended: false,
+                        },
                     ),
                     (
                         M1_ACTION_ID.into(),
-                        ActionDefinition::Pulse { scan_code: 44 },
+                        ActionDefinition::Pulse {
+                            maa_virtual_key: 0x5a,
+                            physical_scan_code: 44,
+                            extended: false,
+                        },
                     ),
                     (
                         "input.f".into(),
-                        ActionDefinition::PhysicalPulse {
-                            scan_code: 33,
+                        ActionDefinition::Pulse {
+                            maa_virtual_key: 0x46,
+                            physical_scan_code: 33,
                             extended: false,
                         },
                     ),
@@ -4869,43 +3464,49 @@ mod tests {
                     ),
                     (
                         "music.note.a".into(),
-                        ActionDefinition::PhysicalHold {
-                            scan_code: 30,
+                        ActionDefinition::Hold {
+                            maa_virtual_key: 0x41,
+                            physical_scan_code: 30,
                             extended: false,
                         },
                     ),
                     (
                         "music.note.s".into(),
-                        ActionDefinition::PhysicalHold {
-                            scan_code: 31,
+                        ActionDefinition::Hold {
+                            maa_virtual_key: 0x53,
+                            physical_scan_code: 31,
                             extended: false,
                         },
                     ),
                     (
                         "music.note.d".into(),
-                        ActionDefinition::PhysicalHold {
-                            scan_code: 32,
+                        ActionDefinition::Hold {
+                            maa_virtual_key: 0x44,
+                            physical_scan_code: 32,
                             extended: false,
                         },
                     ),
                     (
                         "music.note.j".into(),
-                        ActionDefinition::PhysicalHold {
-                            scan_code: 36,
+                        ActionDefinition::Hold {
+                            maa_virtual_key: 0x4a,
+                            physical_scan_code: 36,
                             extended: false,
                         },
                     ),
                     (
                         "music.note.k".into(),
-                        ActionDefinition::PhysicalHold {
-                            scan_code: 37,
+                        ActionDefinition::Hold {
+                            maa_virtual_key: 0x4b,
+                            physical_scan_code: 37,
                             extended: false,
                         },
                     ),
                     (
                         "music.note.l".into(),
-                        ActionDefinition::PhysicalHold {
-                            scan_code: 38,
+                        ActionDefinition::Hold {
+                            maa_virtual_key: 0x4c,
+                            physical_scan_code: 38,
                             extended: false,
                         },
                     ),
@@ -4941,771 +3542,6 @@ mod tests {
             &Ed25519SignatureVerifier::from_public_key_hex(&public).unwrap(),
         )
         .unwrap()
-    }
-
-    #[test]
-    fn music_autoplay_uses_signed_lane_keys_and_better_gi_threshold() {
-        assert_eq!(
-            music_lane_keys(&verified_profile()).unwrap(),
-            vec![
-                (30, false),
-                (31, false),
-                (32, false),
-                (36, false),
-                (37, false),
-                (38, false),
-            ]
-        );
-        assert_eq!(
-            music_held_state([219, 220, 0, 255, 221, 218]),
-            [true, false, true, false, false, true]
-        );
-        assert_eq!(
-            music_metric_summary(&(1..=100).collect::<Vec<_>>()),
-            [50, 95, 99, 100]
-        );
-        let attempt = AttemptRef {
-            task_run_id: "task-1".into(),
-            attempt_id: "attempt-1".into(),
-            contract_version: 2,
-            contract_digest: "11".repeat(32),
-        };
-        let metrics = MusicAutoplayMetrics {
-            sample_count: 3,
-            sample_intervals_us: vec![4_900, 5_000],
-            scheduler_lateness_us: vec![1_000, 2_000],
-            input_latency_us: vec![100, 300],
-            supervision_check_us: vec![10, 20],
-            monitor_check_us: vec![30, 40],
-            target_revalidate_us: vec![50],
-            guardian_us: vec![60],
-            pixel_sample_us: vec![70, 80],
-            pixel_foreground_us: vec![11],
-            pixel_bitblt_us: vec![22],
-            pixel_gdi_flush_us: vec![33],
-            pixel_buffer_read_us: vec![44],
-            input_pipeline_us: vec![90, 100],
-            missed_sample_deadlines: 1,
-            stale_event_count: 0,
-            queue_overflow_count: 0,
-        };
-        let line = music_metric_log_line(&metrics, &attempt);
-        assert_eq!(
-            line,
-            "music autoplay timing summary task_run_id=task-1 attempt_id=attempt-1 sample_count=3 sample_interval_p50_us=4900 sample_interval_p95_us=4900 sample_interval_p99_us=4900 sample_interval_max_us=5000 input_count=2 input_latency_p50_us=100 input_latency_p95_us=100 input_latency_p99_us=100 input_latency_max_us=300 missed_sample_deadlines=1 stale_event_count=0 queue_overflow_count=0"
-        );
-        let stage_lines = music_stage_metric_log_lines(&metrics, &attempt);
-        assert_eq!(
-            stage_lines[0],
-            "music autoplay stage timing task_run_id=task-1 attempt_id=attempt-1 scheduler_lateness_count=2 scheduler_lateness_p50_us=1000 scheduler_lateness_p95_us=1000 scheduler_lateness_p99_us=1000 scheduler_lateness_max_us=2000"
-        );
-        assert_eq!(
-            stage_lines[1],
-            "music autoplay stage timing task_run_id=task-1 attempt_id=attempt-1 supervision_check_count=2 supervision_check_p50_us=10 supervision_check_p95_us=10 supervision_check_p99_us=10 supervision_check_max_us=20"
-        );
-        assert_eq!(
-            stage_lines[10],
-            "music autoplay stage timing task_run_id=task-1 attempt_id=attempt-1 input_pipeline_count=2 input_pipeline_p50_us=90 input_pipeline_p95_us=90 input_pipeline_p99_us=90 input_pipeline_max_us=100"
-        );
-
-        let root = std::env::temp_dir().join(format!(
-            "fairypam-music-metrics-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let log = crate::observability::FixedLog::open(&root).unwrap();
-        persist_music_metric_summary_with(&metrics, &attempt, |message| {
-            log.append(crate::runtime_api::LogLevel::Info, message)
-        })
-        .unwrap();
-        let entries = log.tail(12, &crate::runtime_api::LogLevel::Info).unwrap();
-        let entries = entries["entries"].as_array().unwrap();
-        for (entry, stage) in entries.iter().take(11).zip(stage_lines.iter().rev()) {
-            assert_eq!(entry["message"], *stage);
-        }
-        assert_eq!(entries[11]["message"], line);
-        std::fs::remove_dir_all(root).unwrap();
-
-        let write_error = persist_music_metric_summary_with(&metrics, &attempt, |_| {
-            Err(AgentError::new("local.log_write_failed", "test failure"))
-        })
-        .unwrap_err();
-        assert_eq!(write_error.code(), "music.autoplay_metrics_unavailable");
-        let combined = merge_music_autoplay_errors(
-            Some(AgentError::new("target_invalid", "test target failure")),
-            Some(write_error),
-        )
-        .unwrap();
-        assert_eq!(combined.code(), "target_invalid");
-        assert!(combined
-            .to_string()
-            .contains("music.autoplay_metrics_unavailable"));
-    }
-
-    #[test]
-    fn music_supervision_caps_input_lease_and_rejects_the_deadline() {
-        let start = Instant::now();
-        let deadline = start + Duration::from_secs(2);
-        assert_eq!(
-            music_supervision_window(Duration::from_secs(600), Duration::ZERO).unwrap(),
-            Duration::from_secs(600)
-        );
-        assert_eq!(
-            music_supervision_window(Duration::from_secs(600), Duration::from_secs(2)).unwrap(),
-            Duration::from_secs(2)
-        );
-        for lease in [Duration::from_millis(1), Duration::from_millis(5_001)] {
-            assert_eq!(
-                music_supervision_window(Duration::from_secs(600), lease)
-                    .unwrap_err()
-                    .code(),
-                "music.autoplay_command_invalid"
-            );
-        }
-        assert_eq!(
-            music_input_expiry(deadline, start + Duration::from_millis(1_900)).unwrap(),
-            deadline
-        );
-        assert_eq!(
-            music_input_expiry(deadline, deadline).unwrap_err().code(),
-            "music.autoplay_supervision_expired"
-        );
-        assert_eq!(
-            music_input_expiry_if_running(deadline, start, true).unwrap(),
-            None
-        );
-        assert_eq!(
-            music_input_expiry_if_running(deadline, deadline, true).unwrap(),
-            None
-        );
-        assert!(!music_autoplay_can_renew(
-            Duration::from_secs(600),
-            true,
-            false,
-            Duration::from_secs(600),
-            true,
-        ));
-        assert!(music_autoplay_can_renew(
-            Duration::from_secs(600),
-            false,
-            false,
-            Duration::from_secs(600),
-            false,
-        ));
-    }
-
-    #[test]
-    fn music_event_batch_preserves_same_lane_edges_and_orders_ties_by_lane() {
-        let now = Instant::now();
-        let events = vec![
-            MusicLaneEvent {
-                generation: 7,
-                recovery_epoch: 0,
-                lane: 2,
-                detected_at: now - Duration::from_millis(2),
-                pressed: true,
-            },
-            MusicLaneEvent {
-                generation: 7,
-                recovery_epoch: 0,
-                lane: 0,
-                detected_at: now - Duration::from_millis(2),
-                pressed: true,
-            },
-            MusicLaneEvent {
-                generation: 7,
-                recovery_epoch: 0,
-                lane: 2,
-                detected_at: now - Duration::from_millis(1),
-                pressed: false,
-            },
-        ];
-
-        let batch = prepare_music_event_batch(events, 7, 0, now, false).unwrap();
-
-        assert_eq!(batch.transitions, [(0, true), (2, true), (2, false)]);
-        assert_eq!(
-            batch.detected_at,
-            [
-                now - Duration::from_millis(2),
-                now - Duration::from_millis(2),
-                now - Duration::from_millis(1),
-            ]
-        );
-    }
-
-    #[test]
-    fn music_event_batch_marks_stale_for_resample_and_rejects_wrong_generation() {
-        let now = Instant::now();
-        assert_eq!(MUSIC_EVENT_FRESHNESS, Duration::from_millis(80));
-        let event = MusicLaneEvent {
-            generation: 4,
-            recovery_epoch: 0,
-            lane: 1,
-            detected_at: now - MUSIC_EVENT_FRESHNESS,
-            pressed: true,
-        };
-        let stale = prepare_music_event_batch(vec![event], 4, 0, now, false).unwrap();
-        assert!(stale.resample_required);
-        assert!(stale.transitions.is_empty());
-        assert_eq!(
-            prepare_music_event_batch(
-                vec![MusicLaneEvent {
-                    detected_at: now,
-                    ..event
-                }],
-                5,
-                0,
-                now,
-                false,
-            )
-            .unwrap_err()
-            .code(),
-            "music.autoplay_event_invalid"
-        );
-        assert!(prepare_music_event_batch(vec![event], 4, 0, now, true)
-            .unwrap()
-            .transitions
-            .is_empty());
-    }
-
-    struct FakeMusicSender {
-        stop: Arc<AtomicBool>,
-        send_at: Instant,
-        batches: Vec<Vec<(usize, bool)>>,
-        stale_releases: usize,
-        fail_stale_release: bool,
-        force_stale_once: bool,
-        stop_on_release: bool,
-    }
-
-    impl MusicTransitionSender for FakeMusicSender {
-        type Prepared = Vec<(usize, bool)>;
-
-        fn prepare_transitions(
-            &mut self,
-            transitions: &[(usize, bool)],
-        ) -> Result<Self::Prepared, AgentError> {
-            Ok(transitions.to_vec())
-        }
-
-        fn send_prepared(
-            &mut self,
-            prepared: Self::Prepared,
-            detected_at: &[Instant],
-            input_deadline: Instant,
-        ) -> Result<Instant, AgentError> {
-            if self.force_stale_once {
-                self.force_stale_once = false;
-                return Err(AgentError::new(
-                    "music.autoplay_event_stale",
-                    "test event exceeded freshness at the send boundary",
-                ));
-            }
-            if input_deadline <= self.send_at {
-                return Err(AgentError::new(
-                    "input.lease_expired",
-                    "test input lease expired",
-                ));
-            }
-            for detected_at in detected_at {
-                if self
-                    .send_at
-                    .checked_duration_since(*detected_at)
-                    .is_none_or(|latency| latency >= MUSIC_EVENT_FRESHNESS)
-                {
-                    return Err(AgentError::new(
-                        "music.autoplay_event_stale",
-                        "test event exceeded freshness",
-                    ));
-                }
-            }
-            self.batches.push(prepared);
-            self.stop.store(true, Ordering::Release);
-            Ok(self.send_at)
-        }
-
-        fn release_stale(&mut self) -> Result<(), AgentError> {
-            self.stale_releases += 1;
-            if self.fail_stale_release {
-                return Err(AgentError::new(
-                    "input.release_failed",
-                    "test stale release failed",
-                ));
-            }
-            if self.stop_on_release {
-                self.stop.store(true, Ordering::Release);
-            }
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn music_sender_batches_available_edges_once_and_stops_before_more_input() {
-        let now = Instant::now();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let state = MusicStopState::new(Arc::clone(&stopped));
-        let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
-        for pressed in [true, false] {
-            send.send(MusicLaneEvent {
-                generation: 1,
-                recovery_epoch: 0,
-                lane: 0,
-                detected_at: now - Duration::from_millis(1),
-                pressed,
-            })
-            .unwrap();
-        }
-        let mut sender = FakeMusicSender {
-            stop: Arc::clone(&stopped),
-            send_at: now,
-            batches: Vec::new(),
-            stale_releases: 0,
-            fail_stale_release: false,
-            force_stale_once: false,
-            stop_on_release: false,
-        };
-
-        run_music_sender_loop(
-            &mut sender,
-            &receive,
-            1,
-            now + Duration::from_secs(1),
-            &state,
-            &mut MusicAutoplayMetrics::default(),
-            || now,
-            || Ok(now + Duration::from_secs(1)),
-        )
-        .unwrap();
-
-        assert_eq!(sender.batches, [vec![(0, true), (0, false)]]);
-    }
-
-    #[test]
-    fn music_sender_tolerates_observed_windows_pipeline_stall() {
-        let now = Instant::now();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let state = MusicStopState::new(Arc::clone(&stopped));
-        let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
-        send.send(MusicLaneEvent {
-            generation: 1,
-            recovery_epoch: 0,
-            lane: 0,
-            detected_at: now,
-            pressed: true,
-        })
-        .unwrap();
-        let mut sender = FakeMusicSender {
-            stop: Arc::clone(&stopped),
-            send_at: now + Duration::from_millis(50),
-            batches: Vec::new(),
-            stale_releases: 0,
-            fail_stale_release: false,
-            force_stale_once: false,
-            stop_on_release: false,
-        };
-        let mut metrics = MusicAutoplayMetrics::default();
-        run_music_sender_loop(
-            &mut sender,
-            &receive,
-            1,
-            now + Duration::from_secs(1),
-            &state,
-            &mut metrics,
-            || now,
-            || Ok(now + Duration::from_secs(1)),
-        )
-        .unwrap();
-
-        assert_eq!(sender.batches, [vec![(0, true)]]);
-        assert_eq!(metrics.stale_event_count, 0);
-    }
-
-    #[test]
-    fn music_sender_releases_and_resamples_instead_of_replaying_stale_edges() {
-        let now = Instant::now();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let state = MusicStopState::new(Arc::clone(&stopped));
-        let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
-        send.send(MusicLaneEvent {
-            generation: 1,
-            recovery_epoch: 0,
-            lane: 0,
-            detected_at: now - MUSIC_EVENT_FRESHNESS,
-            pressed: true,
-        })
-        .unwrap();
-        let mut sender = FakeMusicSender {
-            stop: Arc::clone(&stopped),
-            send_at: now,
-            batches: Vec::new(),
-            stale_releases: 0,
-            fail_stale_release: false,
-            force_stale_once: false,
-            stop_on_release: false,
-        };
-        let mut metrics = MusicAutoplayMetrics::default();
-        let injected = Cell::new(false);
-        let recovery_send = send.clone();
-
-        run_music_sender_loop(
-            &mut sender,
-            &receive,
-            1,
-            now + Duration::from_secs(1),
-            &state,
-            &mut metrics,
-            || {
-                if state.recovery_epoch.load(Ordering::Acquire) == 1 && !injected.replace(true) {
-                    for event in [
-                        MusicLaneEvent {
-                            generation: 1,
-                            recovery_epoch: 0,
-                            lane: 0,
-                            detected_at: now,
-                            pressed: false,
-                        },
-                        MusicLaneEvent {
-                            generation: 1,
-                            recovery_epoch: 1,
-                            lane: 0,
-                            detected_at: now,
-                            pressed: true,
-                        },
-                    ] {
-                        recovery_send.send(event).unwrap();
-                    }
-                }
-                now
-            },
-            || Ok(now + Duration::from_secs(1)),
-        )
-        .unwrap();
-
-        assert_eq!(sender.batches, [vec![(0, true)]]);
-        assert_eq!(sender.stale_releases, 1);
-        assert_eq!(state.recovery_epoch.load(Ordering::Acquire), 1);
-        assert_eq!(metrics.stale_event_count, 1);
-    }
-
-    #[test]
-    fn music_sender_recovers_when_edge_expires_at_send_boundary() {
-        let now = Instant::now();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let state = MusicStopState::new(Arc::clone(&stopped));
-        let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
-        send.send(MusicLaneEvent {
-            generation: 1,
-            recovery_epoch: 0,
-            lane: 0,
-            detected_at: now,
-            pressed: true,
-        })
-        .unwrap();
-        let mut sender = FakeMusicSender {
-            stop: Arc::clone(&stopped),
-            send_at: now,
-            batches: Vec::new(),
-            stale_releases: 0,
-            fail_stale_release: false,
-            force_stale_once: true,
-            stop_on_release: false,
-        };
-        let mut metrics = MusicAutoplayMetrics::default();
-        let injected = Cell::new(false);
-        let recovery_send = send.clone();
-
-        run_music_sender_loop(
-            &mut sender,
-            &receive,
-            1,
-            now + Duration::from_secs(1),
-            &state,
-            &mut metrics,
-            || {
-                if state.recovery_epoch.load(Ordering::Acquire) == 1 && !injected.replace(true) {
-                    for event in [
-                        MusicLaneEvent {
-                            generation: 1,
-                            recovery_epoch: 0,
-                            lane: 0,
-                            detected_at: now,
-                            pressed: false,
-                        },
-                        MusicLaneEvent {
-                            generation: 1,
-                            recovery_epoch: 1,
-                            lane: 0,
-                            detected_at: now,
-                            pressed: true,
-                        },
-                    ] {
-                        recovery_send.send(event).unwrap();
-                    }
-                }
-                now
-            },
-            || Ok(now + Duration::from_secs(1)),
-        )
-        .unwrap();
-
-        assert_eq!(sender.batches, [vec![(0, true)]]);
-        assert_eq!(sender.stale_releases, 1);
-        assert_eq!(state.recovery_epoch.load(Ordering::Acquire), 1);
-        assert_eq!(metrics.stale_event_count, 1);
-    }
-
-    #[test]
-    fn music_sender_fails_closed_when_stale_release_fails() {
-        let now = Instant::now();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let state = MusicStopState::new(Arc::clone(&stopped));
-        let (send, receive) = std::sync::mpsc::sync_channel(MUSIC_EVENT_QUEUE_CAPACITY);
-        send.send(MusicLaneEvent {
-            generation: 1,
-            recovery_epoch: 0,
-            lane: 0,
-            detected_at: now - MUSIC_EVENT_FRESHNESS,
-            pressed: true,
-        })
-        .unwrap();
-        let mut sender = FakeMusicSender {
-            stop: stopped,
-            send_at: now,
-            batches: Vec::new(),
-            stale_releases: 0,
-            fail_stale_release: true,
-            force_stale_once: false,
-            stop_on_release: false,
-        };
-
-        let error = run_music_sender_loop(
-            &mut sender,
-            &receive,
-            1,
-            now + Duration::from_secs(1),
-            &state,
-            &mut MusicAutoplayMetrics::default(),
-            || now,
-            || Ok(now + Duration::from_secs(1)),
-        )
-        .unwrap_err();
-
-        assert_eq!(error.code(), "input.release_failed");
-        assert_eq!(sender.stale_releases, 1);
-        assert_eq!(state.recovery_epoch.load(Ordering::Acquire), 0);
-    }
-
-    struct FakeMusicRowSampler;
-
-    impl MusicRowSamplerIo for FakeMusicRowSampler {
-        fn sample(&mut self) -> Result<MusicRowSample, AgentError> {
-            Ok(MusicRowSample {
-                blue: [219, 255, 255, 255, 255, 255],
-                ..MusicRowSample::default()
-            })
-        }
-    }
-
-    #[test]
-    fn music_row_sampler_emits_only_detected_edges() {
-        let start = Instant::now();
-        let stop = Arc::new(AtomicBool::new(false));
-        let state = MusicStopState::new(Arc::clone(&stop));
-        let mut events = Vec::new();
-        let mut metrics = MusicAutoplayMetrics::default();
-
-        run_music_row_sampler_loop(
-            &mut FakeMusicRowSampler,
-            start,
-            start + Duration::from_secs(1),
-            3,
-            &state,
-            &mut metrics,
-            || start,
-            |_| {},
-            |event| {
-                events.push(event);
-                stop.store(true, Ordering::Release);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].generation, 3);
-        assert_eq!(events[0].lane, 0);
-        assert!(events[0].pressed);
-        assert_eq!(metrics.sample_count, 1);
-    }
-
-    #[test]
-    fn music_row_sampler_discards_inflight_sample_and_reemits_after_recovery_epoch() {
-        let start = Instant::now();
-        let clock = Cell::new(start);
-        let stop = Arc::new(AtomicBool::new(false));
-        let state = MusicStopState::new(Arc::clone(&stop));
-        let mut events = Vec::new();
-        struct RecoverDuringFirstSample {
-            state: MusicStopState,
-            samples: usize,
-        }
-        impl MusicRowSamplerIo for RecoverDuringFirstSample {
-            fn sample(&mut self) -> Result<MusicRowSample, AgentError> {
-                self.samples += 1;
-                if self.samples == 1 {
-                    self.state.advance_recovery_epoch()?;
-                }
-                Ok(MusicRowSample {
-                    blue: [219, 255, 255, 255, 255, 255],
-                    ..MusicRowSample::default()
-                })
-            }
-        }
-        let mut sampler = RecoverDuringFirstSample {
-            state: state.clone(),
-            samples: 0,
-        };
-
-        run_music_row_sampler_loop(
-            &mut sampler,
-            start,
-            start + Duration::from_secs(1),
-            3,
-            &state,
-            &mut MusicAutoplayMetrics::default(),
-            || clock.get(),
-            |duration| clock.set(clock.get() + duration),
-            |event| {
-                events.push(event);
-                stop.store(true, Ordering::Release);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(sampler.samples, 2);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].recovery_epoch, 1);
-        assert_eq!(events[0].lane, 0);
-        assert!(events[0].pressed);
-    }
-
-    struct FakeMusicSafety {
-        stop: Arc<AtomicBool>,
-        monitor_checks: usize,
-        target_checks: usize,
-        guardian_sequences: Vec<u64>,
-    }
-
-    impl MusicSafetyIo for FakeMusicSafety {
-        fn check_supervision(&mut self) -> Result<(), AgentError> {
-            Ok(())
-        }
-
-        fn check_monitor(&mut self) -> Result<(), AgentError> {
-            self.monitor_checks += 1;
-            Ok(())
-        }
-
-        fn validate_target(&mut self) -> Result<(), AgentError> {
-            self.target_checks += 1;
-            Ok(())
-        }
-
-        fn renew_guard(&mut self, sequence: u64) -> Result<(), AgentError> {
-            self.guardian_sequences.push(sequence);
-            self.stop.store(true, Ordering::Release);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn music_safety_uses_one_background_schedule_without_catchup() {
-        let start = Instant::now();
-        let clock = Cell::new(start);
-        let stop = Arc::new(AtomicBool::new(false));
-        let mut io = FakeMusicSafety {
-            stop: Arc::clone(&stop),
-            monitor_checks: 0,
-            target_checks: 0,
-            guardian_sequences: Vec::new(),
-        };
-
-        run_music_safety_loop(
-            &mut io,
-            start,
-            start + Duration::from_secs(1),
-            &stop,
-            &mut MusicAutoplayMetrics::default(),
-            || clock.get(),
-            |duration| clock.set(clock.get() + duration),
-        )
-        .unwrap();
-
-        assert_eq!(io.monitor_checks, 101);
-        assert_eq!(io.target_checks, 2);
-        assert_eq!(io.guardian_sequences, [2]);
-    }
-
-    #[test]
-    fn music_state_keeps_the_first_error_and_metrics_are_preallocated() {
-        let state = MusicStopState::new(Arc::new(AtomicBool::new(false)));
-        state.fail(AgentError::new("first", "first failure"));
-        state.fail(AgentError::new("second", "second failure"));
-        assert_eq!(state.error().unwrap().code(), "first");
-
-        let mut metrics = MusicAutoplayMetrics::with_capacity(Duration::from_secs(1));
-        assert!(metrics.sample_intervals_us.capacity() >= 201);
-        assert!(metrics.input_latency_us.capacity() >= 201 * MUSIC_LANES.len());
-        let other = MusicAutoplayMetrics {
-            sample_count: 1,
-            ..MusicAutoplayMetrics::default()
-        };
-        metrics.merge(other);
-        assert_eq!(metrics.sample_count, 1);
-    }
-
-    #[test]
-    fn music_worker_panic_still_releases_and_failed_release_is_retained() {
-        let (released, operation_error, release) = finish_music_autoplay_worker(
-            true,
-            |_| panic!("test worker panic"),
-            |input| {
-                *input = false;
-                Ok(())
-            },
-        );
-        assert!(!released);
-        assert_eq!(
-            operation_error.unwrap().code(),
-            "music.autoplay_worker_failed"
-        );
-        assert!(release.is_ok());
-
-        let (input, operation_error, release) = finish_music_autoplay_worker(
-            7_u8,
-            |_| Err(AgentError::new("target_invalid", "test target failure")),
-            |_| {
-                Err(AgentError::new(
-                    "input.release_failed",
-                    "test release failure",
-                ))
-            },
-        );
-        assert_eq!(operation_error.unwrap().code(), "target_invalid");
-        let mut retry = None;
-        assert_eq!(
-            retain_input_on_release_failure(&mut retry, input, release)
-                .unwrap_err()
-                .code(),
-            "input.release_failed"
-        );
-        assert_eq!(retry, Some(7));
     }
 
     fn candidate() -> TargetCandidate {
@@ -5768,6 +3604,8 @@ mod tests {
                     width: 1280,
                     height: 720,
                     sequence: 1,
+                    captured_at_unix_us: now_unix_us(),
+                    backend: "test".into(),
                 }),
                 _ => Err(AgentError::new("capture.deadline", "test frame gap")),
             }
@@ -5779,6 +3617,14 @@ mod tests {
     impl RuntimeCapture for DeadlineCapture {
         fn next_frame(&mut self, _deadline: Instant) -> Result<RuntimeCapturedFrame, AgentError> {
             Err(AgentError::new("capture.deadline", "no frame"))
+        }
+    }
+
+    struct CrashedCapture;
+
+    impl RuntimeCapture for CrashedCapture {
+        fn next_frame(&mut self, _deadline: Instant) -> Result<RuntimeCapturedFrame, AgentError> {
+            Err(AgentError::new("worker.crashed", "test Worker crash"))
         }
     }
 
@@ -5800,7 +3646,9 @@ mod tests {
         fail_close: bool,
         capture_error: Option<AgentError>,
         input_frame_error: Option<AgentError>,
+        worker_ready_error: Option<AgentError>,
         music_autoplay_starts: usize,
+        music_autoplay_renews: usize,
         music_autoplay_stops: usize,
         music_autoplay_error: Option<AgentError>,
     }
@@ -5811,6 +3659,13 @@ mod tests {
     }
 
     impl RuntimePlatform for FakePlatform {
+        fn ensure_worker_ready(&mut self) -> Result<Option<WindowsIoRuntimeInfo>, AgentError> {
+            match self.state.lock().unwrap().worker_ready_error.take() {
+                Some(error) => Err(error),
+                None => Ok(None),
+            }
+        }
+
         fn begin_attempt_monitor(&mut self) -> Result<bool, AgentError> {
             let mut state = self.state.lock().unwrap();
             state.begin_monitor_calls += 1;
@@ -5876,7 +3731,9 @@ mod tests {
         fn start_capture(
             &mut self,
             _binding: &TargetBinding,
+            _source_id: &str,
             _region: CaptureRegion,
+            _fps: u32,
             _encoding: RuntimeCaptureEncoding,
         ) -> Result<Box<dyn RuntimeCapture>, AgentError> {
             if let Some(error) = self.state.lock().unwrap().capture_error.clone() {
@@ -5888,6 +3745,8 @@ mod tests {
                     width: 1280,
                     height: 720,
                     sequence: 1,
+                    captured_at_unix_us: now_unix_us(),
+                    backend: "test".into(),
                 }]),
             }))
         }
@@ -5954,34 +3813,24 @@ mod tests {
             _session: &SessionRef,
             _sequence: u64,
             _expires_at: Instant,
-            keys: &[v2::PhysicalKey],
-            buttons: &[i32],
+            held_action_ids: &[String],
+            _wheel_action_id: &str,
             _wheel_delta: i32,
             _wheel_point: Option<(u32, u32)>,
             source_frame: Option<(&AtomicU64, u64)>,
-            client_point: Option<(i32, u32, u32)>,
+            client_point: Option<(&str, u32, u32)>,
         ) -> Result<bool, AgentError> {
             let mut state = self.state.lock().unwrap();
             if let Some(error) = state.input_frame_error.take() {
                 return Err(error);
             }
             ensure_current_source_frame(source_frame)?;
-            let holds_active = keys.iter().any(|key| {
-                profile
-                    .profile()
-                    .actions
-                    .values()
-                    .any(|action| match action {
-                        ActionDefinition::Hold { scan_code } => {
-                            *scan_code == key.scan_code as u16 && !key.extended
-                        }
-                        ActionDefinition::PhysicalHold {
-                            scan_code,
-                            extended,
-                        } => *scan_code == key.scan_code as u16 && *extended == key.extended,
-                        _ => false,
-                    })
-            }) || !buttons.is_empty();
+            let holds_active = held_action_ids.iter().any(|action_id| {
+                matches!(
+                    profile.profile().actions.get(action_id),
+                    Some(ActionDefinition::Hold { .. })
+                )
+            });
             state.input_active = holds_active;
             if client_point.is_some() && state.advance_source_before_click {
                 if let Some((current, _)) = source_frame {
@@ -5998,15 +3847,21 @@ mod tests {
             Ok(())
         }
 
-        fn start_music_autoplay(
+        fn start_realtime_program(
             &mut self,
             _profile: &VerifiedProfile,
             _binding: &TargetBinding,
             _session: &SessionRef,
             _attempt: &AttemptRef,
+            program_id: &str,
+            program_schema_version: u32,
+            program_digest: &str,
             maximum_duration: Duration,
             supervision_lease: Duration,
         ) -> Result<(), AgentError> {
+            assert_eq!(program_id, "genshin.music-autoplay.v1");
+            assert_eq!(program_schema_version, 1);
+            assert_eq!(program_digest, "aa");
             assert_eq!(maximum_duration, Duration::from_secs(600));
             assert_eq!(supervision_lease, Duration::from_secs(2));
             let mut state = self.state.lock().unwrap();
@@ -6015,11 +3870,26 @@ mod tests {
             Ok(())
         }
 
-        fn stop_music_autoplay(&mut self) -> Result<Option<AgentError>, AgentError> {
+        fn stop_realtime_program(
+            &mut self,
+            program_id: &str,
+        ) -> Result<Option<AgentError>, AgentError> {
+            assert_eq!(program_id, "genshin.music-autoplay.v1");
             let mut state = self.state.lock().unwrap();
             state.music_autoplay_stops += 1;
             state.input_active = false;
             Ok(state.music_autoplay_error.take())
+        }
+
+        fn renew_realtime_program(
+            &mut self,
+            program_id: &str,
+            supervision_lease: Duration,
+        ) -> Result<(), AgentError> {
+            assert_eq!(program_id, "genshin.music-autoplay.v1");
+            assert_eq!(supervision_lease, Duration::from_secs(2));
+            self.state.lock().unwrap().music_autoplay_renews += 1;
+            Ok(())
         }
     }
 
@@ -6061,6 +3931,7 @@ mod tests {
             session: ExecutionSession::test(),
             frames,
             attempt: None,
+            target_generation: 1,
             no_frame_timeout,
             rediscovery_allowed,
         }
@@ -6146,11 +4017,167 @@ mod tests {
     }
 
     #[test]
+    fn worker_capture_crash_persists_uncertain_attempt_without_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-worker-crash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = verified_profile();
+        let contract = task_contract(&profile);
+        let state = Arc::new(Mutex::new(FakePlatformState::default()));
+        let mut executor = CommandExecutor::with_platform_and_attempts(
+            ProfileStore::from_verified_profiles([profile]).unwrap(),
+            Box::new(FakePlatform {
+                state: Arc::clone(&state),
+            }),
+            TaskAttemptRuntime::at(root.clone()),
+            "test",
+        );
+        let sink = Arc::new(CollectFrames::default());
+        let begin = task_ref(&contract, "begin-worker-crash");
+        assert!(matches!(
+            executor.execute(
+                &HubControlCommand {
+                    payload: Some(hub_control_command::Payload::BeginTaskAttempt(
+                        BeginTaskAttempt {
+                            task: Some(begin.clone()),
+                            contract: Some(contract.clone()),
+                        },
+                    )),
+                },
+                &ExecutionSession::test(),
+                sink.clone(),
+            ),
+            CommandOutcome::TaskAck { .. }
+        ));
+        assert!(matches!(
+            executor.execute(
+                &HubControlCommand {
+                    payload: Some(hub_control_command::Payload::StartTaskTarget(
+                        StartTaskTarget {
+                            task: Some(task_ref(&contract, "target-worker-crash")),
+                        },
+                    )),
+                },
+                &ExecutionSession::test(),
+                sink,
+            ),
+            CommandOutcome::TaskAck { .. }
+        ));
+        let mut plan = capture_plan(
+            Arc::new(CollectFrames::default()),
+            Duration::from_secs(1),
+            false,
+        );
+        plan.attempt = begin.attempt.clone();
+        executor.capture = Some(
+            spawn_capture_worker(Box::new(CrashedCapture), Arc::new(AtomicU64::new(0)), plan)
+                .unwrap(),
+        );
+        state.lock().unwrap().input_active = true;
+        std::thread::sleep(Duration::from_millis(100));
+
+        let event = executor
+            .capture_failure_event(&ExecutionSession::test())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event.payload,
+            Some(agent_control_event::Payload::SafetyEvent(SafetyEvent {
+                ref reason,
+                ref state,
+                ..
+            })) if reason == "worker.crashed" && state == "capture_failed"
+        ));
+        assert!(!state.lock().unwrap().input_active);
+
+        let receipt = TaskAttemptRuntime::at(root.clone())
+            .inspect(&task_ref(&contract, "inspect-worker-crash"))
+            .unwrap();
+        assert_eq!(
+            receipt.side_effect_state,
+            TaskSideEffectState::Uncertain as i32
+        );
+        assert_eq!(receipt.input_state, TaskInputState::Released as i32);
+        assert_eq!(receipt.error_code.as_deref(), Some("worker.crashed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_health_failure_releases_input_and_persists_uncertainty() {
+        let root = std::env::temp_dir().join(format!(
+            "fairypam-worker-health-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = verified_profile();
+        let contract = task_contract(&profile);
+        let state = Arc::new(Mutex::new(FakePlatformState::default()));
+        let mut executor = CommandExecutor::with_platform_and_attempts(
+            ProfileStore::from_verified_profiles([profile]).unwrap(),
+            Box::new(FakePlatform {
+                state: Arc::clone(&state),
+            }),
+            TaskAttemptRuntime::at(root.clone()),
+            "test",
+        );
+        let sink = Arc::new(CollectFrames::default());
+        for payload in [
+            hub_control_command::Payload::BeginTaskAttempt(BeginTaskAttempt {
+                task: Some(task_ref(&contract, "begin-worker-health")),
+                contract: Some(contract.clone()),
+            }),
+            hub_control_command::Payload::StartTaskTarget(StartTaskTarget {
+                task: Some(task_ref(&contract, "target-worker-health")),
+            }),
+        ] {
+            assert!(matches!(
+                executor.execute(
+                    &HubControlCommand {
+                        payload: Some(payload),
+                    },
+                    &ExecutionSession::test(),
+                    sink.clone(),
+                ),
+                CommandOutcome::TaskAck { .. }
+            ));
+        }
+        {
+            let mut state = state.lock().unwrap();
+            state.input_active = true;
+            state.worker_ready_error = Some(AgentError::new("worker.crashed", "test crash"));
+        }
+
+        assert_eq!(
+            executor.ensure_worker_ready().unwrap_err().code(),
+            "worker.crashed"
+        );
+        assert!(!state.lock().unwrap().input_active);
+        let receipt = TaskAttemptRuntime::at(root.clone())
+            .inspect(&task_ref(&contract, "inspect-worker-health"))
+            .unwrap();
+        assert_eq!(
+            receipt.side_effect_state,
+            TaskSideEffectState::Uncertain as i32
+        );
+        assert_eq!(receipt.input_state, TaskInputState::Released as i32);
+        assert_eq!(receipt.error_code.as_deref(), Some("worker.crashed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn capture_failure_rediscovery_rebuilds_once_then_fails_closed() {
         let (mut executor, state) = executor_with_state();
         let sequence = Arc::new(AtomicU64::new(0));
         executor.active_profile = Some(verified_profile());
-        executor.binding = Some(binding());
+        executor.set_binding(Some(binding())).unwrap();
         executor
             .frame_sequences
             .insert("client".into(), sequence.clone());
@@ -6173,6 +4200,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(executor.binding.as_ref().unwrap().window_handle, 200);
+        assert_eq!(executor.target_generation, 2);
         assert_eq!(state.lock().unwrap().rediscovery_calls, 1);
 
         std::thread::sleep(Duration::from_millis(100));
@@ -6208,7 +4236,7 @@ mod tests {
 
     #[test]
     fn production_executor_reports_production_runtime_mode() {
-        let executor = CommandExecutor::production(ProfileStore::default(), "agent-a");
+        let executor = CommandExecutor::production(ProfileStore::default(), "agent-a", None);
 
         assert_eq!(executor.runtime_mode, "production");
     }
@@ -6217,7 +4245,7 @@ mod tests {
     fn session_reset_keeps_the_managed_target_until_agent_shutdown() {
         let (mut executor, state) = executor_with_state();
         executor.active_profile = Some(verified_profile());
-        executor.binding = Some(binding());
+        executor.set_binding(Some(binding())).unwrap();
         state.lock().unwrap().target_owned = true;
 
         executor.reset_session().unwrap();
@@ -6230,22 +4258,22 @@ mod tests {
     }
 
     #[test]
-    fn v2_client_point_click_reaches_the_device_path() {
+    fn v3_client_point_click_reaches_the_device_path() {
         let profile = verified_profile();
-        let (contract, reference) = v2_task_contract(&profile);
+        let (contract, reference) = v3_task_contract(&profile);
         let (mut executor, state) = executor_with_state();
         state.lock().unwrap().fail_begin_monitor = true;
         assert!(matches!(
-            executor.execute_v2_begin(&task_ref(&reference, "begin"), &contract),
+            executor.execute_v3_begin(&task_ref(&reference, "begin"), &contract),
             CommandOutcome::Nack { ref code, .. } if code == "environment.monitor_failed"
         ));
         state.lock().unwrap().fail_begin_monitor = false;
         assert!(matches!(
-            executor.execute_v2_begin(&task_ref(&reference, "begin"), &contract),
+            executor.execute_v3_begin(&task_ref(&reference, "begin"), &contract),
             CommandOutcome::TaskAck { .. }
         ));
         assert_eq!(state.lock().unwrap().begin_monitor_calls, 2);
-        executor.binding = Some(binding());
+        executor.set_binding(Some(binding())).unwrap();
         let click = task_ref(&reference, "click");
         let attempt = click.attempt.as_ref().unwrap();
         executor.frame_sequences.insert(
@@ -6254,15 +4282,16 @@ mod tests {
         );
 
         assert!(matches!(
-            executor.execute_v2_input_frame(
+            executor.execute_v3_input_frame(
                 &click,
-                &v2::InputFrame {
+                &v3::InputFrame {
                     input_sequence: 1,
                     lease_ms: 500,
                     source_frame_sequence: Some(7),
-                    ..v2::InputFrame::default()
+                    target_generation: 1,
+                    ..v3::InputFrame::default()
                 },
-                Some((v2::MouseButton::Left as i32, 500_000, 583_333)),
+                Some(("combat.normal_attack", 500_000, 583_333)),
             ),
             CommandOutcome::TaskAck { .. }
         ));
@@ -6270,10 +4299,10 @@ mod tests {
 
         let (mut stale_executor, stale_state) = executor_with_state();
         assert!(matches!(
-            stale_executor.execute_v2_begin(&task_ref(&reference, "stale-begin"), &contract),
+            stale_executor.execute_v3_begin(&task_ref(&reference, "stale-begin"), &contract),
             CommandOutcome::TaskAck { .. }
         ));
-        stale_executor.binding = Some(binding());
+        stale_executor.set_binding(Some(binding())).unwrap();
         let stale_click = task_ref(&reference, "stale-click");
         let stale_attempt = stale_click.attempt.as_ref().unwrap();
         stale_executor.frame_sequences.insert(
@@ -6281,15 +4310,16 @@ mod tests {
             Arc::new(AtomicU64::new(7)),
         );
         stale_state.lock().unwrap().advance_source_before_click = true;
-        let outcome = stale_executor.execute_v2_input_frame(
+        let outcome = stale_executor.execute_v3_input_frame(
             &stale_click,
-            &v2::InputFrame {
+            &v3::InputFrame {
                 input_sequence: 1,
                 lease_ms: 500,
                 source_frame_sequence: Some(7),
-                ..v2::InputFrame::default()
+                target_generation: 1,
+                ..v3::InputFrame::default()
             },
-            Some((v2::MouseButton::Left as i32, 500_000, 583_333)),
+            Some(("combat.normal_attack", 500_000, 583_333)),
         );
 
         assert!(matches!(
@@ -6303,27 +4333,25 @@ mod tests {
     }
 
     #[test]
-    fn v2_physical_pulse_receipt_confirms_released_input() {
+    fn v3_semantic_pulse_receipt_confirms_released_input() {
         let profile = verified_profile();
-        let (contract, reference) = v2_task_contract(&profile);
+        let (contract, reference) = v3_task_contract(&profile);
         let (mut executor, state) = executor_with_state();
         assert!(matches!(
-            executor.execute_v2_begin(&task_ref(&reference, "pulse-begin"), &contract),
+            executor.execute_v3_begin(&task_ref(&reference, "pulse-begin"), &contract),
             CommandOutcome::TaskAck { .. }
         ));
-        executor.binding = Some(binding());
+        executor.set_binding(Some(binding())).unwrap();
 
         assert!(matches!(
-            executor.execute_v2_input_frame(
+            executor.execute_v3_input_frame(
                 &task_ref(&reference, "pulse-frame"),
-                &v2::InputFrame {
+                &v3::InputFrame {
                     input_sequence: 1,
                     lease_ms: 500,
-                    held_keys: vec![v2::PhysicalKey {
-                        scan_code: 33,
-                        extended: false,
-                    }],
-                    ..v2::InputFrame::default()
+                    held_action_ids: vec!["input.f".into()],
+                    target_generation: 1,
+                    ..v3::InputFrame::default()
                 },
                 None,
             ),
@@ -6335,31 +4363,29 @@ mod tests {
     }
 
     #[test]
-    fn v2_rejected_mixed_pulse_receipt_is_definitely_not_applied() {
+    fn v3_rejected_mixed_pulse_receipt_is_definitely_not_applied() {
         let profile = verified_profile();
-        let (contract, reference) = v2_task_contract(&profile);
+        let (contract, reference) = v3_task_contract(&profile);
         let (mut executor, state) = executor_with_state();
         assert!(matches!(
-            executor.execute_v2_begin(&task_ref(&reference, "mixed-begin"), &contract),
+            executor.execute_v3_begin(&task_ref(&reference, "mixed-begin"), &contract),
             CommandOutcome::TaskAck { .. }
         ));
-        executor.binding = Some(binding());
+        executor.set_binding(Some(binding())).unwrap();
         state.lock().unwrap().input_frame_error = Some(AgentError::new(
             "input.frame_invalid",
             "a physical pulse must be the only side effect in its input frame",
         ));
 
         assert!(matches!(
-            executor.execute_v2_input_frame(
+            executor.execute_v3_input_frame(
                 &task_ref(&reference, "mixed-frame"),
-                &v2::InputFrame {
+                &v3::InputFrame {
                     input_sequence: 1,
                     lease_ms: 500,
-                    held_keys: vec![
-                        v2::PhysicalKey { scan_code: 33, extended: false },
-                        v2::PhysicalKey { scan_code: 30, extended: false },
-                    ],
-                    ..v2::InputFrame::default()
+                    held_action_ids: vec!["input.f".into(), "music.note.a".into()],
+                    target_generation: 1,
+                    ..v3::InputFrame::default()
                 },
                 None,
             ),
@@ -6372,20 +4398,60 @@ mod tests {
     }
 
     #[test]
-    fn v2_music_autoplay_is_attempt_bound_idempotent_and_released() {
+    fn stale_target_generation_is_not_applied() {
         let profile = verified_profile();
-        let (contract, reference) = v2_task_contract(&profile);
+        let (contract, reference) = v3_task_contract(&profile);
         let (mut executor, state) = executor_with_state();
         assert!(matches!(
-            executor.execute_v2_begin(&task_ref(&reference, "music-begin"), &contract),
+            executor.execute_v3_begin(&task_ref(&reference, "stale-target-begin"), &contract),
             CommandOutcome::TaskAck { .. }
         ));
-        executor.binding = Some(binding());
+        executor.set_binding(Some(binding())).unwrap();
+
+        assert!(matches!(
+            executor.execute_v3_input_frame(
+                &task_ref(&reference, "stale-target-input"),
+                &v3::InputFrame {
+                    input_sequence: 1,
+                    lease_ms: 500,
+                    held_action_ids: vec!["music.note.a".into()],
+                    target_generation: 2,
+                    ..v3::InputFrame::default()
+                },
+                None,
+            ),
+            CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
+                if outcome.outcome == TaskCommandOutcomeState::NotApplied as i32
+                    && receipt.input_state == TaskInputState::Released as i32
+                    && receipt.error_code.as_deref() == Some("target.generation_stale")
+        ));
+        assert!(!state.lock().unwrap().input_active);
+    }
+
+    #[test]
+    fn v3_realtime_program_is_attempt_bound_idempotent_and_released() {
+        let profile = verified_profile();
+        let (contract, reference) = v3_task_contract(&profile);
+        let (mut executor, state) = executor_with_state();
+        assert!(matches!(
+            executor.execute_v3_begin(&task_ref(&reference, "music-begin"), &contract),
+            CommandOutcome::TaskAck { .. }
+        ));
+        executor.set_binding(Some(binding())).unwrap();
+        let start_value = v3::StartRealtimeProgram {
+            program_id: "genshin.music-autoplay.v1".into(),
+            program_schema_version: 1,
+            program_digest: "aa".into(),
+            maximum_duration_ms: 600_000,
+            supervision_lease_ms: Some(2_000),
+            target_generation: 1,
+            ..v3::StartRealtimeProgram::default()
+        };
 
         let start = task_ref(&reference, "music-start");
         for _ in 0..2 {
             assert!(matches!(
-                executor.execute_v2_start_music_autoplay(&start, 600_000, 2_000),
+                executor.execute_v3_start_realtime_program(&start, &start_value),
                 CommandOutcome::TaskAck {
                     ref outcome,
                     ref receipt,
@@ -6397,10 +4463,13 @@ mod tests {
         assert_eq!(state.lock().unwrap().music_autoplay_starts, 1);
 
         assert!(matches!(
-            executor.execute_v2_start_music_autoplay(
+            executor.execute_v3_renew_realtime_program(
                 &task_ref(&reference, "music-renew"),
-                600_000,
-                2_000,
+                &v3::RenewRealtimeProgram {
+                    program_id: "genshin.music-autoplay.v1".into(),
+                    supervision_lease_ms: 2_000,
+                    ..v3::RenewRealtimeProgram::default()
+                },
             ),
             CommandOutcome::TaskAck {
                 ref outcome,
@@ -6409,10 +4478,16 @@ mod tests {
             } if outcome.as_ref().unwrap().outcome == TaskCommandOutcomeState::Applied as i32
                 && receipt.input_state == TaskInputState::Active as i32
         ));
-        assert_eq!(state.lock().unwrap().music_autoplay_starts, 2);
+        assert_eq!(state.lock().unwrap().music_autoplay_renews, 1);
 
         assert!(matches!(
-            executor.execute_v2_stop_music_autoplay(&task_ref(&reference, "music-stop")),
+            executor.execute_v3_stop_realtime_program(
+                &task_ref(&reference, "music-stop"),
+                &v3::StopRealtimeProgram {
+                    program_id: "genshin.music-autoplay.v1".into(),
+                    ..v3::StopRealtimeProgram::default()
+                },
+            ),
             CommandOutcome::TaskAck {
                 ref outcome,
                 ref receipt,
@@ -6426,20 +4501,27 @@ mod tests {
     }
 
     #[test]
-    fn v2_music_autoplay_worker_failure_keeps_confirmed_release() {
+    fn v3_realtime_program_worker_failure_keeps_confirmed_release() {
         let profile = verified_profile();
-        let (contract, reference) = v2_task_contract(&profile);
+        let (contract, reference) = v3_task_contract(&profile);
         let (mut executor, state) = executor_with_state();
         assert!(matches!(
-            executor.execute_v2_begin(&task_ref(&reference, "music-begin"), &contract),
+            executor.execute_v3_begin(&task_ref(&reference, "music-begin"), &contract),
             CommandOutcome::TaskAck { .. }
         ));
-        executor.binding = Some(binding());
+        executor.set_binding(Some(binding())).unwrap();
         assert!(matches!(
-            executor.execute_v2_start_music_autoplay(
+            executor.execute_v3_start_realtime_program(
                 &task_ref(&reference, "music-start"),
-                600_000,
-                2_000,
+                &v3::StartRealtimeProgram {
+                    program_id: "genshin.music-autoplay.v1".into(),
+                    program_schema_version: 1,
+                    program_digest: "aa".into(),
+                    maximum_duration_ms: 600_000,
+                    supervision_lease_ms: Some(2_000),
+                    target_generation: 1,
+                    ..v3::StartRealtimeProgram::default()
+                },
             ),
             CommandOutcome::TaskAck { .. }
         ));
@@ -6449,7 +4531,13 @@ mod tests {
         ));
 
         assert!(matches!(
-            executor.execute_v2_stop_music_autoplay(&task_ref(&reference, "music-stop")),
+            executor.execute_v3_stop_realtime_program(
+                &task_ref(&reference, "music-stop"),
+                &v3::StopRealtimeProgram {
+                    program_id: "genshin.music-autoplay.v1".into(),
+                    ..v3::StopRealtimeProgram::default()
+                },
+            ),
             CommandOutcome::TaskAck {
                 ref outcome,
                 ref receipt,
@@ -6507,20 +4595,20 @@ mod tests {
         contract
     }
 
-    fn v2_task_contract(
+    fn v3_task_contract(
         profile: &VerifiedProfile,
-    ) -> (v2::ExecutionContract, AgentAttemptContractV1) {
-        let mut contract = v2::ExecutionContract {
+    ) -> (v3::ExecutionContract, AgentAttemptContractV1) {
+        let mut contract = v3::ExecutionContract {
             task_run_id: "11111111-1111-4111-8111-111111111111".into(),
             attempt_id: "22222222-2222-4222-8222-222222222222".into(),
             agent_build_id: option_env!("FAIRYPAM_BUILD_ID").unwrap_or("unknown").into(),
             profile_id: profile.profile().id.clone(),
             profile_digest: profile.content_sha256().into(),
-            allowed_capabilities: vec![1, 2, 3, 4, 5],
+            allowed_capabilities: vec![1, 2, 3, 4, 5, 6, 7, 8],
             deadline_unix_ms: i64::MAX,
             max_input_lease_ms: 1_000,
-            cleanup_policy: v2::CleanupPolicy::ReleaseInputKeepManagedTarget as i32,
-            contract_version: 2,
+            cleanup_policy: v3::CleanupPolicy::ReleaseInputKeepManagedTarget as i32,
+            contract_version: 3,
             contract_digest: String::new(),
         };
         contract.contract_digest = format!(
@@ -6716,7 +4804,7 @@ mod tests {
         );
         let sink = Arc::new(CollectFrames::default());
         assert!(matches!(
-            executor.execute_v2_configure_idle_close(&v2::ConfigureIdleClose {
+            executor.execute_v3_configure_idle_close(&v3::ConfigureIdleClose {
                 game_id: "game-1".into(),
                 game_session_id: "game-session-1".into(),
                 profile_id: "testbed".into(),
@@ -6724,7 +4812,7 @@ mod tests {
                 enabled: true,
                 idle_timeout_ms: 300_000,
                 occupied: true,
-                ..v2::ConfigureIdleClose::default()
+                ..v3::ConfigureIdleClose::default()
             }),
             CommandOutcome::Ack(_)
         ));
@@ -6765,6 +4853,7 @@ mod tests {
                 encoding: "jpeg".into(),
                 quality: 80,
                 task: Some(task_ref(&contract, "capture-1")),
+                target_generation: 1,
                 ..StartCapture::default()
             })),
         };
@@ -6921,7 +5010,7 @@ mod tests {
         );
         assert_eq!(
             executor.runtime_state().unwrap(),
-            v2::AgentRuntimeState::Executing
+            v3::AgentRuntimeState::Executing
         );
 
         for command in [
@@ -6939,6 +5028,7 @@ mod tests {
                     encoding: "jpeg".into(),
                     quality: 80,
                     task: Some(task_ref(&contract, "capture-emergency")),
+                    target_generation: 1,
                     ..StartCapture::default()
                 })),
             },
@@ -6984,7 +5074,7 @@ mod tests {
         );
         assert_eq!(
             executor.runtime_state().unwrap(),
-            v2::AgentRuntimeState::EmergencyStopped
+            v3::AgentRuntimeState::EmergencyStopped
         );
         assert_eq!(
             executor.execute_local(&LocalCommand::Doctor).unwrap()["runtime"],
@@ -7019,7 +5109,7 @@ mod tests {
         );
         assert_eq!(
             executor.runtime_state().unwrap(),
-            v2::AgentRuntimeState::ConnectedIdle
+            v3::AgentRuntimeState::ConnectedIdle
         );
     }
 
@@ -7045,6 +5135,7 @@ mod tests {
                 fps: 10,
                 encoding: "jpeg".into(),
                 quality: 80,
+                target_generation: 1,
                 ..StartCapture::default()
             })),
         };
@@ -7056,6 +5147,7 @@ mod tests {
         let stop = HubControlCommand {
             payload: Some(hub_control_command::Payload::StopCapture(StopCapture {
                 source_id: "client".into(),
+                target_generation: 1,
                 ..StopCapture::default()
             })),
         };
@@ -7078,6 +5170,9 @@ mod tests {
         assert_eq!(frames[0].session.as_ref().unwrap().generation, 1);
         assert_eq!(frames[0].frame_sequence, 1);
         assert_eq!(frames[1].frame_sequence, 2);
+        assert_eq!(frames[0].target_generation, 1);
+        assert_eq!(frames[0].backend, "test");
+        assert!(frames[0].captured_at_unix_us > 0);
         assert_eq!(frames[0].payload, vec![1, 2, 3]);
     }
 
@@ -7116,6 +5211,7 @@ mod tests {
                 encoding: "jpeg".into(),
                 quality: 85,
                 task: Some(task_ref(&contract, "capture-frame-1")),
+                target_generation: 1,
                 ..CaptureFrame::default()
             })),
         };
@@ -7123,7 +5219,8 @@ mod tests {
             executor.execute(&capture, &ExecutionSession::test(), sink.clone()),
             CommandOutcome::TaskAck { ref outcome, ref receipt, .. }
                 if outcome.as_ref().unwrap().source_frame_sequence == Some(1)
-                    && receipt.capture_state == fairypam_agent_protocol::v1::TaskCaptureState::Stopped as i32
+                    && receipt.capture_state
+                        == fairypam_agent_protocol::internal_v1::TaskCaptureState::Stopped as i32
         ));
         assert!(executor.capture.is_none());
         let frames = sink.0.lock().unwrap();
@@ -7142,6 +5239,7 @@ mod tests {
                 encoding: "jpeg".into(),
                 quality: 85,
                 task: Some(task_ref(&contract, "capture-frame-paused")),
+                target_generation: 1,
                 ..CaptureFrame::default()
             })),
         };
@@ -7172,6 +5270,7 @@ mod tests {
                 encoding: "jpeg".into(),
                 quality: 85,
                 task: Some(task_ref(&contract, "capture-frame-focus-failed")),
+                target_generation: 1,
                 ..CaptureFrame::default()
             })),
         };
@@ -7284,6 +5383,7 @@ mod tests {
                 fps: 1,
                 encoding: "jpeg".into(),
                 quality: 80,
+                target_generation: 1,
                 ..StartCapture::default()
             })),
         };
@@ -7333,7 +5433,7 @@ mod tests {
             .profile()
             .id
             .clone();
-        let config = v2::ConfigureIdleClose {
+        let config = v3::ConfigureIdleClose {
             game_id: "22222222-2222-4222-8222-222222222222".into(),
             game_session_id: "33333333-3333-4333-8333-333333333333".into(),
             profile_id,
@@ -7341,20 +5441,20 @@ mod tests {
             enabled: true,
             idle_timeout_ms: 5 * 60 * 1_000,
             occupied: false,
-            ..v2::ConfigureIdleClose::default()
+            ..v3::ConfigureIdleClose::default()
         };
         assert!(matches!(
-            executor.execute_v2_configure_idle_close(&config),
+            executor.execute_v3_configure_idle_close(&config),
             CommandOutcome::Ack(_)
         ));
 
         let mut phases = Vec::new();
-        let outcome = executor.execute_v2_close_target_with_progress(
-            &v2::CloseTarget {
+        let outcome = executor.execute_v3_close_target_with_progress(
+            &v3::CloseTarget {
                 game_session_id: config.game_session_id.clone(),
                 state_version: config.state_version,
                 timeout_ms: 5_000,
-                ..v2::CloseTarget::default()
+                ..v3::CloseTarget::default()
             },
             &mut |phase| phases.push(phase),
         );
@@ -7363,7 +5463,7 @@ mod tests {
                 outcome,
                 CommandOutcome::CloseNack { ref code, ref receipt, .. }
                     if code == "target.close_failed"
-                        && receipt.result == v2::ManagedGameCloseResult::Failed as i32
+                        && receipt.result == v3::ManagedGameCloseResult::Failed as i32
                         && receipt.error_code.as_deref() == Some("target.close_failed")
             ),
             "unexpected outcome: {outcome:?}"
@@ -7371,15 +5471,15 @@ mod tests {
         assert_eq!(
             phases,
             [
-                v2::ManagedGameClosePhase::ReleasingInputCapture,
-                v2::ManagedGameClosePhase::NormalClose,
+                v3::ManagedGameClosePhase::ReleasingInputCapture,
+                v3::ManagedGameClosePhase::NormalClose,
             ]
         );
 
         assert!(executor.pending_managed_game_close().is_none());
         assert_eq!(
             executor.managed_game_status().unwrap().state,
-            v2::ManagedGameIdleState::CloseFailed as i32
+            v3::ManagedGameIdleState::CloseFailed as i32
         );
         assert!(executor.close_idle_game_if_due().unwrap().is_none());
         assert!(matches!(
@@ -7457,6 +5557,7 @@ mod tests {
     fn guardian_start_failure_is_definitely_not_applied() {
         let guardian = AgentError::new("guardian.unavailable", "guardian did not start");
         let invalid = AgentError::new("input.frame_invalid", "input frame was rejected");
+        let worker_not_applied = AgentError::new("worker.not_applied", "worker rejected input");
         let other = AgentError::new("input.failed", "input result is unknown");
 
         assert_eq!(input_frame_outcome(None), TaskCommandOutcomeState::Applied);
@@ -7466,6 +5567,10 @@ mod tests {
         );
         assert_eq!(
             input_frame_outcome(Some(&invalid)),
+            TaskCommandOutcomeState::NotApplied
+        );
+        assert_eq!(
+            input_frame_outcome(Some(&worker_not_applied)),
             TaskCommandOutcomeState::NotApplied
         );
         assert_eq!(

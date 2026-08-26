@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
-use fairypam_agent_protocol::v2::agent_control_service_client::AgentControlServiceClient;
-use fairypam_agent_protocol::v2::{
+use fairypam_agent_protocol::v3::agent_control_service_client::AgentControlServiceClient;
+use fairypam_agent_protocol::v3::{
     command_identity, hub_control_command, AgentControlEvent, CommandIdentity, CommandRef,
     HubControlCommand, HubHello,
 };
@@ -200,7 +200,7 @@ pub(crate) fn verify_hub_hello(
         || hello.heartbeat_interval_ms == 0
         || hello.max_input_lease_ms == 0
         || hello.max_frame_bytes == 0
-        || hello.accepted_protocol_minor != 8
+        || hello.accepted_protocol_minor != fairypam_agent_protocol::AGENT_PROTOCOL_MINOR
     {
         return Err(TransportError::new(
             "transport.session_invalid",
@@ -277,8 +277,9 @@ fn command_ref(command: &HubControlCommand) -> Option<&CommandRef> {
         Payload::StartCapture(value) => task_ref(value.reference.as_ref()),
         Payload::CaptureFrame(value) => task_ref(value.reference.as_ref()),
         Payload::StopCapture(value) => task_ref(value.reference.as_ref()),
-        Payload::StartMusicAutoplay(value) => task_ref(value.reference.as_ref()),
-        Payload::StopMusicAutoplay(value) => task_ref(value.reference.as_ref()),
+        Payload::StartRealtimeProgram(value) => task_ref(value.reference.as_ref()),
+        Payload::RenewRealtimeProgram(value) => task_ref(value.reference.as_ref()),
+        Payload::StopRealtimeProgram(value) => task_ref(value.reference.as_ref()),
         Payload::InputFrame(value) => task_ref(value.reference.as_ref()),
         Payload::ClientPointClick(value) => task_ref(value.reference.as_ref()),
         Payload::ReleaseAll(value) => identity_ref(value.reference.as_ref()),
@@ -301,8 +302,9 @@ fn command_ref_mut(command: &mut HubControlCommand) -> Option<&mut CommandRef> {
         Payload::StartCapture(value) => value.reference.as_mut(),
         Payload::CaptureFrame(value) => value.reference.as_mut(),
         Payload::StopCapture(value) => value.reference.as_mut(),
-        Payload::StartMusicAutoplay(value) => value.reference.as_mut(),
-        Payload::StopMusicAutoplay(value) => value.reference.as_mut(),
+        Payload::StartRealtimeProgram(value) => value.reference.as_mut(),
+        Payload::RenewRealtimeProgram(value) => value.reference.as_mut(),
+        Payload::StopRealtimeProgram(value) => value.reference.as_mut(),
         Payload::InputFrame(value) => value.reference.as_mut(),
         Payload::ClientPointClick(value) => value.reference.as_mut(),
         Payload::ReleaseAll(value) => value.reference.as_mut(),
@@ -311,12 +313,12 @@ fn command_ref_mut(command: &mut HubControlCommand) -> Option<&mut CommandRef> {
         Payload::StopSession(value) => value.reference.as_mut(),
     }?;
     match identity.value.as_mut()? {
-        fairypam_agent_protocol::v2::command_identity::Value::Command(reference) => Some(reference),
-        fairypam_agent_protocol::v2::command_identity::Value::Task(task) => task.command.as_mut(),
+        fairypam_agent_protocol::v3::command_identity::Value::Command(reference) => Some(reference),
+        fairypam_agent_protocol::v3::command_identity::Value::Task(task) => task.command.as_mut(),
     }
 }
 
-fn valid_trace_context(context: &fairypam_agent_protocol::v2::W3cTraceContext) -> bool {
+fn valid_trace_context(context: &fairypam_agent_protocol::v3::W3cTraceContext) -> bool {
     let parts = context.traceparent.split('-').collect::<Vec<_>>();
     parts.len() == 4
         && parts[0] == "00"
@@ -426,8 +428,9 @@ fn task_identity(command: &HubControlCommand) -> bool {
         Some(Payload::StartCapture(value)) => value.reference.as_ref(),
         Some(Payload::CaptureFrame(value)) => value.reference.as_ref(),
         Some(Payload::StopCapture(value)) => value.reference.as_ref(),
-        Some(Payload::StartMusicAutoplay(value)) => value.reference.as_ref(),
-        Some(Payload::StopMusicAutoplay(value)) => value.reference.as_ref(),
+        Some(Payload::StartRealtimeProgram(value)) => value.reference.as_ref(),
+        Some(Payload::RenewRealtimeProgram(value)) => value.reference.as_ref(),
+        Some(Payload::StopRealtimeProgram(value)) => value.reference.as_ref(),
         Some(Payload::InputFrame(value)) => value.reference.as_ref(),
         Some(Payload::ClientPointClick(value)) => value.reference.as_ref(),
         Some(Payload::ReleaseAll(value)) => value.reference.as_ref(),
@@ -465,8 +468,8 @@ fn verify_command_freshness(
 }
 
 #[cfg(test)]
-mod v2_tests {
-    use fairypam_agent_protocol::v2::{
+mod v3_tests {
+    use fairypam_agent_protocol::v3::{
         command_identity, hub_control_command, AcknowledgeManagedGameClose, CommandIdentity,
         CommandRef, HubControlCommand, HubHello, InputFrame, SessionRef, TaskCommandRef,
         W3cTraceContext,
@@ -485,7 +488,7 @@ mod v2_tests {
                 heartbeat_interval_ms: 1_000,
                 max_input_lease_ms: 500,
                 max_frame_bytes: 1_024,
-                accepted_protocol_minor: 8,
+                accepted_protocol_minor: fairypam_agent_protocol::AGENT_PROTOCOL_MINOR,
             },
             "agent-a",
         )
@@ -517,7 +520,7 @@ mod v2_tests {
             heartbeat_interval_ms: 1_000,
             max_input_lease_ms: 500,
             max_frame_bytes: 1_024,
-            accepted_protocol_minor: 0,
+            accepted_protocol_minor: 1,
         };
 
         assert_eq!(
