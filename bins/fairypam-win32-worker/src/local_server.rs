@@ -827,6 +827,7 @@ mod windows_impl {
             )
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn realtime_event(
             &self,
             program_id: &str,
