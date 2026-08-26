@@ -10,8 +10,9 @@ use fairypam_agent_core::AgentError;
 use fairypam_agent_maa::worker_client::windows::{WorkerProcess, WorkerProcessConfig};
 use fairypam_agent_protocol::internal_v1::{AttemptRef, SessionRef};
 use fairypam_agent_protocol::v3::{
-    agent_control_event, AgentControlEvent, RealtimeProgramEvent, RealtimeProgramMetrics,
-    RealtimeProgramState as AgentRealtimeProgramState,
+    agent_control_event, AgentControlEvent, AttemptRef as AgentAttemptRef, RealtimeProgramEvent,
+    RealtimeProgramMetrics, RealtimeProgramState as AgentRealtimeProgramState,
+    SessionRef as AgentSessionRef,
 };
 use fairypam_agent_protocol::worker_realtime_metrics_digest;
 use fairypam_agent_protocol::worker_v1::{
@@ -279,18 +280,29 @@ impl WorkerRuntimePlatform {
             let Some(worker_event::Payload::RealtimeProgram(program)) = event.payload else {
                 continue;
             };
-            let session = self.session.clone().ok_or_else(|| {
+            let session = self.session.as_ref().ok_or_else(|| {
                 AgentError::new(
                     "worker.event_invalid",
                     "Realtime Program event has no active input session",
                 )
             })?;
-            let attempt = self.realtime_attempt.clone().ok_or_else(|| {
+            let session = AgentSessionRef {
+                agent_id: session.agent_id.clone(),
+                session_id: session.session_id.clone(),
+                generation: session.generation,
+            };
+            let attempt = self.realtime_attempt.as_ref().ok_or_else(|| {
                 AgentError::new(
                     "worker.event_invalid",
                     "Realtime Program event has no active attempt",
                 )
             })?;
+            let attempt = AgentAttemptRef {
+                task_run_id: attempt.task_run_id.clone(),
+                attempt_id: attempt.attempt_id.clone(),
+                contract_version: attempt.contract_version,
+                contract_digest: attempt.contract_digest.clone(),
+            };
             let state = RealtimeProgramState::try_from(program.state).map_err(|_| {
                 AgentError::new(
                     "worker.event_invalid",
@@ -423,9 +435,7 @@ impl WorkerRuntimePlatform {
 }
 
 impl RuntimePlatform for WorkerRuntimePlatform {
-    fn ensure_worker_ready(
-        &mut self,
-    ) -> Result<Option<super::execution::WindowsIoRuntimeInfo>, AgentError> {
+    fn ensure_worker_ready(&mut self) -> Result<Option<super::WindowsIoRuntimeInfo>, AgentError> {
         let mut state = self.lock_worker()?;
         let result = ensure_process(&mut state).and_then(|process| {
             request_applied(
@@ -434,7 +444,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                 WORKER_TIMEOUT,
             )?;
             let info = process.runtime_info();
-            Ok(super::execution::WindowsIoRuntimeInfo {
+            Ok(super::WindowsIoRuntimeInfo {
                 maa_runtime_version: info.maa_runtime_version.clone(),
                 capture_backend: info.capture_backend.clone(),
                 input_backend: info.input_backend.clone(),

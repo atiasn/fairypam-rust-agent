@@ -74,18 +74,14 @@ pub struct TargetIdentity {
 #[cfg(any(windows, test))]
 #[derive(Debug)]
 pub struct LockedInputTarget {
-    identity: TargetIdentity,
+    _identity: TargetIdentity,
 }
 
 #[cfg(any(windows, test))]
 impl LockedInputTarget {
+    #[cfg(test)]
     pub(crate) const fn identity(&self) -> &TargetIdentity {
-        &self.identity
-    }
-
-    #[cfg(all(test, windows))]
-    pub(crate) const fn test(identity: TargetIdentity) -> Self {
-        Self { identity }
+        &self._identity
     }
 }
 
@@ -482,7 +478,7 @@ fn locked_input_target(current: WindowsTargetCandidate) -> Result<LockedInputTar
         .into());
     }
     Ok(LockedInputTarget {
-        identity: current.identity,
+        _identity: current.identity,
     })
 }
 

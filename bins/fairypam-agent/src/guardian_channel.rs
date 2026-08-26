@@ -116,7 +116,7 @@ fn run(
             Ok(worker_ready) => {
                 health_probe_running = false;
                 if activation_pending {
-                    activation_pending = exchange(
+                    exchange(
                         &mut pipe,
                         &GuardianRequest::WorkerHealth {
                             ready: worker_ready,

@@ -238,6 +238,11 @@ pub mod windows {
         command_sequence: u64,
     }
 
+    const _: fn() = || {
+        fn assert_send<T: Send>() {}
+        assert_send::<WorkerProcess>();
+    };
+
     impl WorkerProcess {
         pub fn spawn(config: &WorkerProcessConfig) -> Result<Self, MaaRuntimeError> {
             let generation = generation_id();
@@ -456,18 +461,18 @@ pub mod windows {
         }
     }
 
-    struct OwnedJob(HANDLE);
+    struct OwnedJob(usize);
 
     impl Drop for OwnedJob {
         fn drop(&mut self) {
-            let _ = unsafe { CloseHandle(self.0) };
+            let _ = unsafe { CloseHandle(HANDLE(self.0 as _)) };
         }
     }
 
     fn assign_kill_on_close_job(child: &mut Child) -> Result<OwnedJob, MaaRuntimeError> {
         let job = unsafe { CreateJobObjectW(None, None) }
             .map_err(|error| MaaRuntimeError::new("worker.job_create_failed", error.to_string()))?;
-        let owned = OwnedJob(job);
+        let owned = OwnedJob(job.0 as usize);
         let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         unsafe {
@@ -589,7 +594,7 @@ pub mod windows {
                         "worker frame deadline expired",
                     ));
                 }
-                let wait_ms = remaining.as_millis().min(100).max(1) as u32;
+                let wait_ms = remaining.as_millis().clamp(1, 100) as u32;
                 match unsafe { WaitForSingleObject(self.event, wait_ms) } {
                     WAIT_OBJECT_0 | WAIT_TIMEOUT => {}
                     _ => {
