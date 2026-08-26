@@ -471,15 +471,17 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         if let Some(key) = root_public_key {
             self.root_public_key = Some(key.to_owned());
         }
-        let config = worker_config(profile_root, self.root_public_key.as_deref())?;
+        let config = profile_root
+            .map(|_| worker_config(profile_root, self.root_public_key.as_deref()))
+            .transpose()?;
         let mut state = self.lock_worker()?;
-        if state.config.as_ref().is_some_and(|current| {
-            current.profile_dir == config.profile_dir
-                && current.profile_root_public_key == config.profile_root_public_key
-                && current.runtime_root_public_key == config.runtime_root_public_key
-                && current.runtime_root == config.runtime_root
-                && current.executable == config.executable
-        }) {
+        if matches!((&state.config, &config), (Some(current), Some(next)) if
+            current.profile_dir == next.profile_dir
+                && current.profile_root_public_key == next.profile_root_public_key
+                && current.runtime_root_public_key == next.runtime_root_public_key
+                && current.runtime_root == next.runtime_root
+                && current.executable == next.executable)
+        {
             return Ok(());
         }
         if let Some(process) = state.process.as_mut() {
@@ -487,7 +489,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         }
         state.process = None;
         state.attached_generation = None;
-        state.config = Some(config);
+        state.config = config;
         drop(state);
         self.profile = None;
         self.binding = None;
@@ -1099,7 +1101,34 @@ fn worker_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{attachment_decision, AttachmentDecision};
+    use super::{attachment_decision, AttachmentDecision, RuntimePlatform, WorkerRuntimePlatform};
+    use crate::profile_store::ProfileStore;
+
+    #[test]
+    fn empty_profile_store_keeps_worker_detached() {
+        let mut platform = WorkerRuntimePlatform::new(&ProfileStore::default(), None);
+
+        RuntimePlatform::configure_worker(&mut platform, None, Some("profile-root-key")).unwrap();
+
+        let state = platform.worker.lock().unwrap();
+        assert!(state.config.is_none());
+        assert!(state.process.is_none());
+        assert!(state.attached_generation.is_none());
+    }
+
+    #[test]
+    fn configured_profile_root_still_requires_its_signing_key() {
+        let mut platform = WorkerRuntimePlatform::new(&ProfileStore::default(), None);
+
+        let error = RuntimePlatform::configure_worker(
+            &mut platform,
+            Some(std::path::Path::new("profiles")),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "profile.root_key_unavailable");
+    }
 
     #[test]
     fn new_worker_requires_attach_for_the_same_target() {
