@@ -97,10 +97,13 @@ mod tests {
 
     #[test]
     fn generated_manifest_verifies_with_the_exported_public_key() {
-        let lock = RuntimeLock::from_slice(include_bytes!(
-            "../../../../../runtime/maa/maa-runtime.lock.json"
-        ))
-        .unwrap();
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(manifest_dir.join("../../../runtime/maa/maa-runtime.lock.json"))
+            .or_else(|_| {
+                std::fs::read(manifest_dir.join("../../runtime/maa/maa-runtime.lock.json"))
+            })
+            .unwrap();
+        let lock = RuntimeLock::from_slice(&bytes).unwrap();
         let signing = SigningKey::from_bytes(&[7; 32]);
         let bytes = signed_bytes(lock.clone(), &signing).unwrap();
         let verifier = Ed25519SignatureVerifier::from_public_key_hex(&hex(&signing
