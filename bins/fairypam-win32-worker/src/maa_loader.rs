@@ -57,7 +57,12 @@ mod windows_impl {
                 )
             }
             .map_err(|error| MaaRuntimeError::new("maa.dll_search_failed", error.to_string()))?;
-            let bin = runtime.root.join("bin");
+            let bin = runtime.root.join("bin").canonicalize().map_err(|error| {
+                MaaRuntimeError::new("maa.dll_search_failed", error.to_string())
+            })?;
+            let framework_dll = runtime.framework_dll.canonicalize().map_err(|error| {
+                MaaRuntimeError::new("maa.runtime_load_failed", error.to_string())
+            })?;
             let bin_wide = wide(&bin);
             let cookie = unsafe { AddDllDirectory(PCWSTR(bin_wide.as_ptr())) };
             if cookie.is_null() {
@@ -70,7 +75,7 @@ mod windows_impl {
                 dll_directory_cookie: cookie,
             };
             verify_win32_control_unit_version(&bin.join("MaaWin32ControlUnit.dll"))?;
-            MaaWindowsController::load_library(&runtime.framework_dll)?;
+            MaaWindowsController::load_library(&framework_dll)?;
             Ok(loaded)
         }
     }
