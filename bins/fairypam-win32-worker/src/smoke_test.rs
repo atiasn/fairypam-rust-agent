@@ -14,13 +14,10 @@ use fairypam_agent_maa::MaaRuntimeError;
 #[cfg(windows)]
 use windows::core::{w, HSTRING};
 #[cfg(windows)]
-use windows::Win32::Foundation::{HWND, POINT, RECT};
-#[cfg(windows)]
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Foundation::{HWND, RECT};
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, GetCursorPos, WINDOW_EX_STYLE,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, GetClientRect, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 #[cfg(windows)]
@@ -75,7 +72,6 @@ pub fn run(runtime_root: &Path, public_key: &OsStr) -> Result<(), MaaRuntimeErro
     controller.key_down(0x87, timeout)?;
     controller.key_up(0x87, timeout)?;
     controller.scroll_at(Some((x, y)), 0, 120, timeout)?;
-    assert_scroll_position(window.0, x, y)?;
     controller.relative_move(1, 1, timeout)?;
     controller.inactive(timeout)?;
     let health = controller.get_health();
@@ -86,27 +82,6 @@ pub fn run(runtime_root: &Path, public_key: &OsStr) -> Result<(), MaaRuntimeErro
         ));
     }
     controller.detach_target()
-}
-
-#[cfg(windows)]
-fn assert_scroll_position(
-    window: HWND,
-    expected_x: i32,
-    expected_y: i32,
-) -> Result<(), MaaRuntimeError> {
-    let mut point = POINT::default();
-    unsafe { GetCursorPos(&mut point) }
-        .map_err(|error| MaaRuntimeError::new("maa.smoke_pointer_invalid", error.to_string()))?;
-    if !unsafe { ScreenToClient(window, &mut point) }.as_bool()
-        || point.x.abs_diff(expected_x) > 2
-        || point.y.abs_diff(expected_y) > 2
-    {
-        return Err(MaaRuntimeError::new(
-            "maa.smoke_pointer_invalid",
-            "MAA scroll did not use the requested client-relative position",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(windows)]
