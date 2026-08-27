@@ -167,8 +167,14 @@ fn stop_shell(install_root: &std::path::Path) -> Result<(), ProvisionFailure> {
     let executable = std::env::current_exe().map_err(|_| ProvisionFailure::InstallRoots)?;
     let bootstrap = install_root
         .join(INSTALL_BOOTSTRAP_DIRECTORY)
-        .join("payload/resources/runtime/fairypam-agent-installer.exe");
-    let installed = install_root.join("resources/runtime/fairypam-agent-installer.exe");
+        .join("payload")
+        .join("resources")
+        .join("runtime")
+        .join("fairypam-agent-installer.exe");
+    let installed = install_root
+        .join("resources")
+        .join("runtime")
+        .join("fairypam-agent-installer.exe");
     if !same_windows_path(&executable, &bootstrap) && !same_windows_path(&executable, &installed) {
         return Err(ProvisionFailure::InstallRoots);
     }
