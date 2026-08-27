@@ -55,9 +55,12 @@ mod windows_impl {
 
     pub fn run() -> Result<(), MaaRuntimeError> {
         let config = Config::parse(std::env::args_os().skip(1))?;
-        let profile_verifier =
-            Ed25519SignatureVerifier::from_public_key_hex(&config.profile_root_public_key)
-                .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))?;
+        let profile_verifier = config
+            .profile_root_public_key
+            .as_deref()
+            .map(Ed25519SignatureVerifier::from_public_key_hex)
+            .transpose()
+            .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))?;
         let loaded_runtime =
             LoadedMaaRuntime::load_active(&config.runtime_root, &config.runtime_root_public_key)?;
         let controller = Arc::new(Mutex::new(GenericController::new()?));
@@ -77,8 +80,8 @@ mod windows_impl {
     struct Config {
         pipe_name: String,
         runtime_root: PathBuf,
-        profile_dir: PathBuf,
-        profile_root_public_key: String,
+        profile_dir: Option<PathBuf>,
+        profile_root_public_key: Option<String>,
         runtime_root_public_key: String,
         worker_generation: String,
         frame_mapping_name: String,
@@ -106,11 +109,24 @@ mod windows_impl {
                     .into_string()
                     .map_err(|_| config_error(&format!("{name} must be Unicode")))
             };
+            let optional_value = |name: &str| {
+                values
+                    .chunks_exact(2)
+                    .find(|pair| pair[0] == name)
+                    .map(|pair| pair[1].clone())
+            };
             let pipe_name = text("--pipe-name", value("--pipe-name")?)?;
-            let profile_root_public_key = text(
-                "--profile-root-public-key",
-                value("--profile-root-public-key")?,
-            )?;
+            let (profile_dir, profile_root_public_key) = match (
+                optional_value("--profile-dir"),
+                optional_value("--profile-root-public-key"),
+            ) {
+                (None, None) => (None, None),
+                (Some(profile_dir), Some(profile_root_public_key)) => (
+                    Some(PathBuf::from(profile_dir)),
+                    Some(text("--profile-root-public-key", profile_root_public_key)?),
+                ),
+                _ => return Err(config_error("profile arguments must be provided together")),
+            };
             let runtime_root_public_key = text(
                 "--runtime-root-public-key",
                 value("--runtime-root-public-key")?,
@@ -138,7 +154,7 @@ mod windows_impl {
             Ok(Self {
                 pipe_name,
                 runtime_root: PathBuf::from(value("--runtime-root")?),
-                profile_dir: PathBuf::from(value("--profile-dir")?),
+                profile_dir,
                 profile_root_public_key,
                 runtime_root_public_key,
                 worker_generation,
@@ -158,7 +174,7 @@ mod windows_impl {
 
     struct Server {
         config: Config,
-        verifier: Ed25519SignatureVerifier,
+        verifier: Option<Ed25519SignatureVerifier>,
         _loaded_runtime: LoadedMaaRuntime,
         controller: Arc<Mutex<GenericController>>,
         ring: Arc<Mutex<FrameRing>>,
@@ -175,7 +191,7 @@ mod windows_impl {
     impl Server {
         fn new(
             config: Config,
-            verifier: Ed25519SignatureVerifier,
+            verifier: Option<Ed25519SignatureVerifier>,
             loaded_runtime: LoadedMaaRuntime,
             controller: Arc<Mutex<GenericController>>,
             ring: Arc<Mutex<FrameRing>>,
@@ -309,13 +325,14 @@ mod windows_impl {
                     if self.arbiter.mode() != WindowsIoMode::Detached {
                         return Err(io_error("worker.io_mode_invalid"));
                     }
+                    let (profile_dir, verifier) = self.profile_config()?;
                     self.lock_controller()?.attach(
                         value.hwnd,
                         value.process_id,
                         &value.profile_id,
                         &value.profile_digest,
-                        &self.config.profile_dir,
-                        &self.verifier,
+                        profile_dir,
+                        verifier,
                     )?;
                     if let Err(code) = self.arbiter.attach() {
                         let _ = self.lock_controller()?.detach();
@@ -770,17 +787,30 @@ mod windows_impl {
                 ));
             }
             let profile_id = self.lock_controller()?.profile()?.profile().id.clone();
+            let (profile_dir, verifier) = self.profile_config()?;
             VerifiedRealtimeSpec::verify(
                 &fs::read(
-                    self.config
-                        .profile_dir
+                    profile_dir
                         .join(profile_id)
                         .join("realtime")
                         .join(format!("{program_id}.json")),
                 )?,
-                &self.verifier,
+                verifier,
             )
             .map_err(realtime_error)
+        }
+
+        fn profile_config(&self) -> Result<(&Path, &Ed25519SignatureVerifier), MaaRuntimeError> {
+            self.config
+                .profile_dir
+                .as_deref()
+                .zip(self.verifier.as_ref())
+                .ok_or_else(|| {
+                    MaaRuntimeError::new(
+                        "profile.store_unavailable",
+                        "signed Profile Catalog is not configured",
+                    )
+                })
         }
 
         fn result_event(
@@ -1244,6 +1274,45 @@ mod windows_impl {
 
     fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
         value.as_ref().encode_wide().chain(Some(0)).collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Config;
+
+        fn base_arguments() -> Vec<std::ffi::OsString> {
+            [
+                "--pipe-name",
+                r"\\.\pipe\FairyPam-idle-test",
+                "--runtime-root",
+                "runtime",
+                "--runtime-root-public-key",
+                "00",
+                "--worker-generation",
+                "idle-test",
+                "--frame-mapping-name",
+                "Local\\FairyPam.Frame.Test",
+                "--frame-event-name",
+                "Local\\FairyPam.FrameEvent.Test",
+                "--frame-slot-bytes",
+                "1048576",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect()
+        }
+
+        #[test]
+        fn idle_worker_rejects_partial_profile_authority() {
+            let idle = Config::parse(base_arguments().into_iter()).unwrap();
+            assert!(idle.profile_dir.is_none());
+            assert!(idle.profile_root_public_key.is_none());
+
+            let mut partial = base_arguments();
+            partial.extend(["--profile-dir", "profiles"].map(std::ffi::OsString::from));
+            let error = Config::parse(partial.into_iter()).err().unwrap();
+            assert_eq!(error.code(), "worker.config_invalid");
+        }
     }
 }
 

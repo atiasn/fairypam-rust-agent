@@ -212,8 +212,8 @@ pub mod windows {
     pub struct WorkerProcessConfig {
         pub executable: PathBuf,
         pub runtime_root: PathBuf,
-        pub profile_dir: PathBuf,
-        pub profile_root_public_key: String,
+        pub profile_dir: Option<PathBuf>,
+        pub profile_root_public_key: Option<String>,
         pub runtime_root_public_key: String,
         pub frame_slot_bytes: usize,
     }
@@ -251,30 +251,35 @@ pub mod windows {
             let mapping_name = format!(r"Local\FairyPam.Win32.Frame.{suffix}");
             let event_name = format!(r"Local\FairyPam.Win32.FrameEvent.{suffix}");
             let runtime_root = config.runtime_root.to_string_lossy().into_owned();
-            let profile_dir = config.profile_dir.to_string_lossy().into_owned();
             let frame_slot_bytes = config.frame_slot_bytes.to_string();
             let mut command = Command::new(&config.executable);
-            command
-                .args([
-                    "--pipe-name",
-                    &pipe_name,
-                    "--runtime-root",
-                    &runtime_root,
+            command.args([
+                "--pipe-name",
+                &pipe_name,
+                "--runtime-root",
+                &runtime_root,
+                "--runtime-root-public-key",
+                &config.runtime_root_public_key,
+                "--worker-generation",
+                &generation,
+                "--frame-mapping-name",
+                &mapping_name,
+                "--frame-event-name",
+                &event_name,
+                "--frame-slot-bytes",
+                &frame_slot_bytes,
+            ]);
+            if let (Some(profile_dir), Some(profile_root_public_key)) =
+                (&config.profile_dir, &config.profile_root_public_key)
+            {
+                command.args([
                     "--profile-dir",
-                    &profile_dir,
+                    profile_dir.to_string_lossy().as_ref(),
                     "--profile-root-public-key",
-                    &config.profile_root_public_key,
-                    "--runtime-root-public-key",
-                    &config.runtime_root_public_key,
-                    "--worker-generation",
-                    &generation,
-                    "--frame-mapping-name",
-                    &mapping_name,
-                    "--frame-event-name",
-                    &event_name,
-                    "--frame-slot-bytes",
-                    &frame_slot_bytes,
-                ])
+                    profile_root_public_key,
+                ]);
+            }
+            command
                 .env_clear()
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

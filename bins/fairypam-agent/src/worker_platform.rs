@@ -471,9 +471,10 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         if let Some(key) = root_public_key {
             self.root_public_key = Some(key.to_owned());
         }
-        let config = profile_root
-            .map(|_| worker_config(profile_root, self.root_public_key.as_deref()))
-            .transpose()?;
+        let config = Some(worker_config(
+            profile_root,
+            self.root_public_key.as_deref(),
+        )?);
         let mut state = self.lock_worker()?;
         if matches!((&state.config, &config), (Some(current), Some(next)) if
             current.profile_dir == next.profile_dir
@@ -1061,17 +1062,21 @@ fn worker_config(
     profile_root: Option<&Path>,
     root_public_key: Option<&str>,
 ) -> Result<WorkerProcessConfig, AgentError> {
-    let profile_dir = profile_root.map(Path::to_path_buf).ok_or_else(|| {
-        AgentError::new("profile.store_unavailable", "Profile root is unavailable")
-    })?;
-    let profile_root_public_key = root_public_key
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            AgentError::new(
-                "profile.root_key_unavailable",
-                "Profile Root key is unavailable",
-            )
-        })?;
+    let profile_dir = profile_root.map(Path::to_path_buf);
+    let profile_root_public_key = match &profile_dir {
+        Some(_) => Some(
+            root_public_key
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AgentError::new(
+                        "profile.root_key_unavailable",
+                        "Profile Root key is unavailable",
+                    )
+                })?
+                .to_owned(),
+        ),
+        None => None,
+    };
     let executable = std::env::current_exe()
         .map_err(|error| AgentError::new("worker.start_failed", error.to_string()))?;
     let install_root = executable
@@ -1093,7 +1098,7 @@ fn worker_config(
         executable: worker_executable,
         runtime_root,
         profile_dir,
-        profile_root_public_key: profile_root_public_key.to_owned(),
+        profile_root_public_key,
         runtime_root_public_key: runtime_root_public_key.to_owned(),
         frame_slot_bytes: FRAME_SLOT_BYTES,
     })
@@ -1110,13 +1115,15 @@ mod tests {
     use crate::profile_store::ProfileStore;
 
     #[test]
-    fn empty_profile_store_keeps_worker_detached() {
+    fn empty_profile_store_configures_an_idle_worker() {
         let mut platform = WorkerRuntimePlatform::new(&ProfileStore::default(), None);
 
         RuntimePlatform::configure_worker(&mut platform, None, Some("profile-root-key")).unwrap();
 
         let state = platform.worker.lock().unwrap();
-        assert!(state.config.is_none());
+        let config = state.config.as_ref().unwrap();
+        assert!(config.profile_dir.is_none());
+        assert!(config.profile_root_public_key.is_none());
         assert!(state.process.is_none());
         assert!(state.attached_generation.is_none());
     }
