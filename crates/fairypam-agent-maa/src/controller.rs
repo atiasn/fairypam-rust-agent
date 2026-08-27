@@ -199,18 +199,9 @@ pub mod windows {
     impl Default for MaaBackendSelection {
         fn default() -> Self {
             Self {
-                screencap_method: sys::MaaWin32ScreencapMethod_All as _,
+                screencap_method: sys::MaaWin32ScreencapMethod_ScreenDC as _,
                 mouse_method: sys::MaaWin32InputMethod_Seize as _,
                 keyboard_method: sys::MaaWin32InputMethod_Seize as _,
-            }
-        }
-    }
-
-    impl MaaBackendSelection {
-        pub fn compatibility_smoke() -> Self {
-            Self {
-                screencap_method: sys::MaaWin32ScreencapMethod_ScreenDC as _,
-                ..Self::default()
             }
         }
     }

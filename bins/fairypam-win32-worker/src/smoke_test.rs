@@ -50,7 +50,7 @@ pub fn run(runtime_root: &Path, public_key: &OsStr) -> Result<(), MaaRuntimeErro
     let hwnd = window.0 .0 as usize;
     let smoke = std::thread::spawn(move || {
         let timeout = Duration::from_secs(10);
-        let mut controller = MaaWindowsController::new(MaaBackendSelection::compatibility_smoke())?;
+        let mut controller = MaaWindowsController::new(MaaBackendSelection::default())?;
         controller.attach_target(hwnd, geometry)?;
         controller.start_capture()?;
         let frame = controller.capture_once(timeout)?;
