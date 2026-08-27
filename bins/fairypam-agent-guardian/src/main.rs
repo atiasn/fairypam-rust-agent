@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 #[cfg(any(windows, test))]
 use std::io::Write;
 #[cfg(windows)]
