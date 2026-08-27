@@ -200,12 +200,17 @@ pub mod windows {
         fn default() -> Self {
             Self {
                 screencap_method: sys::MaaWin32ScreencapMethod_All as _,
-                mouse_method: (sys::MaaWin32InputMethod_Seize
-                    | sys::MaaWin32InputMethod_SendMessage
-                    | sys::MaaWin32InputMethod_PostMessage) as _,
-                keyboard_method: (sys::MaaWin32InputMethod_Seize
-                    | sys::MaaWin32InputMethod_SendMessage
-                    | sys::MaaWin32InputMethod_PostMessage) as _,
+                mouse_method: sys::MaaWin32InputMethod_Seize as _,
+                keyboard_method: sys::MaaWin32InputMethod_Seize as _,
+            }
+        }
+    }
+
+    impl MaaBackendSelection {
+        pub fn compatibility_smoke() -> Self {
+            Self {
+                screencap_method: sys::MaaWin32ScreencapMethod_ScreenDC as _,
+                ..Self::default()
             }
         }
     }

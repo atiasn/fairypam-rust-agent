@@ -50,7 +50,7 @@ pub fn run(runtime_root: &Path, public_key: &OsStr) -> Result<(), MaaRuntimeErro
             .map_err(|_| MaaRuntimeError::new("maa.smoke_window_failed", "invalid height"))?,
     };
     let timeout = Duration::from_secs(10);
-    let mut controller = MaaWindowsController::new(MaaBackendSelection::default())?;
+    let mut controller = MaaWindowsController::new(MaaBackendSelection::compatibility_smoke())?;
     controller.attach_target(window.0 .0 as usize, geometry)?;
     controller.start_capture()?;
     let frame = controller.capture_once(timeout)?;
