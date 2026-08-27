@@ -72,6 +72,11 @@ jobs:
           rustup toolchain install $toolchain --profile minimal
           rustup override set $toolchain
           choco install nsis --yes --no-progress
+          $nsisRoot = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
+          if (-not (Test-Path (Join-Path $nsisRoot 'makensis.exe') -PathType Leaf)) {
+            throw 'Chocolatey did not install makensis.exe in the expected NSIS directory'
+          }
+          $nsisRoot | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
