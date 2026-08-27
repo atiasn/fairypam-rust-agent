@@ -47,38 +47,46 @@ pub fn run(runtime_root: &Path, public_key: &OsStr) -> Result<(), MaaRuntimeErro
         height: u32::try_from(rect.bottom - rect.top)
             .map_err(|_| MaaRuntimeError::new("maa.smoke_window_failed", "invalid height"))?,
     };
-    let timeout = Duration::from_secs(10);
-    let mut controller = MaaWindowsController::new(MaaBackendSelection::compatibility_smoke())?;
-    controller.attach_target(window.0 .0 as usize, geometry)?;
-    controller.start_capture()?;
-    let frame = controller.capture_once(timeout)?;
-    controller.stop_capture()?;
-    if frame.width == 0 || frame.height == 0 || frame.bgr.is_empty() {
-        return Err(MaaRuntimeError::new(
-            "maa.smoke_capture_invalid",
-            "MAA returned an empty smoke-test capture",
-        ));
-    }
-    let x = i32::try_from(geometry.width / 2).unwrap_or(1);
-    let y = i32::try_from(geometry.height / 2).unwrap_or(1);
-    for button in [
-        MouseButton::Left,
-        MouseButton::Right,
-        MouseButton::Middle,
-        MouseButton::X1,
-        MouseButton::X2,
-    ] {
-        controller.click(button, x, y, timeout)?;
-    }
-    controller.key_down(0x87, timeout)?;
-    controller.key_up(0x87, timeout)?;
-    controller.scroll_at(Some((x, y)), 0, 120, timeout)?;
-    controller.relative_move(1, 1, timeout)?;
-    let inactive = std::thread::spawn(move || {
+    let hwnd = window.0 .0 as usize;
+    let smoke = std::thread::spawn(move || {
+        let timeout = Duration::from_secs(10);
+        let mut controller = MaaWindowsController::new(MaaBackendSelection::compatibility_smoke())?;
+        controller.attach_target(hwnd, geometry)?;
+        controller.start_capture()?;
+        let frame = controller.capture_once(timeout)?;
+        controller.stop_capture()?;
+        if frame.width == 0 || frame.height == 0 || frame.bgr.is_empty() {
+            return Err(MaaRuntimeError::new(
+                "maa.smoke_capture_invalid",
+                "MAA returned an empty smoke-test capture",
+            ));
+        }
+        let x = i32::try_from(geometry.width / 2).unwrap_or(1);
+        let y = i32::try_from(geometry.height / 2).unwrap_or(1);
+        for button in [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::X1,
+            MouseButton::X2,
+        ] {
+            controller.click(button, x, y, timeout)?;
+        }
+        controller.key_down(0x87, timeout)?;
+        controller.key_up(0x87, timeout)?;
+        controller.scroll_at(Some((x, y)), 0, 120, timeout)?;
+        controller.relative_move(1, 1, timeout)?;
         controller.inactive(timeout)?;
-        Ok::<_, MaaRuntimeError>(controller)
+        let health = controller.get_health();
+        if health.runtime_version != "5.12.3" || !health.connected || health.event_count == 0 {
+            return Err(MaaRuntimeError::new(
+                "maa.smoke_health_invalid",
+                "MAA controller health did not remain connected",
+            ));
+        }
+        controller.detach_target()
     });
-    while !inactive.is_finished() {
+    while !smoke.is_finished() {
         let mut message = MSG::default();
         while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
             let _ = unsafe { TranslateMessage(&message) };
@@ -86,17 +94,9 @@ pub fn run(runtime_root: &Path, public_key: &OsStr) -> Result<(), MaaRuntimeErro
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    let mut controller = inactive.join().map_err(|_| {
-        MaaRuntimeError::new("maa.smoke_thread_failed", "inactive thread panicked")
-    })??;
-    let health = controller.get_health();
-    if health.runtime_version != "5.12.3" || !health.connected || health.event_count == 0 {
-        return Err(MaaRuntimeError::new(
-            "maa.smoke_health_invalid",
-            "MAA controller health did not remain connected",
-        ));
-    }
-    controller.detach_target()
+    smoke
+        .join()
+        .map_err(|_| MaaRuntimeError::new("maa.smoke_thread_failed", "smoke thread panicked"))?
 }
 
 #[cfg(windows)]
