@@ -2467,6 +2467,7 @@ fn input_frame_outcome(error: Option<&AgentError>) -> TaskCommandOutcomeState {
         None => TaskCommandOutcomeState::Applied,
         Some(
             "guardian.unavailable"
+            | "environment.local_input_detected"
             | "input.frame_invalid"
             | "target.generation_stale"
             | "worker.not_applied",
@@ -3020,17 +3021,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         let Some(monitor) = self.input_monitor.as_ref() else {
             return Ok(());
         };
-        if let Err(error) = monitor.check() {
-            let release_error = self.release_task_input().err();
-            return Err(AgentError::new(
-                error.code(),
-                match release_error {
-                    Some(release) => format!("{error}; input release failed: {release}"),
-                    None => error.to_string(),
-                },
-            ));
-        }
-        Ok(())
+        monitor.check()
     }
 
     fn finish_attempt_monitor(&mut self) {
@@ -5556,6 +5547,10 @@ mod tests {
     #[test]
     fn guardian_start_failure_is_definitely_not_applied() {
         let guardian = AgentError::new("guardian.unavailable", "guardian did not start");
+        let local_input_detected = AgentError::new(
+            "environment.local_input_detected",
+            "physical input was detected",
+        );
         let invalid = AgentError::new("input.frame_invalid", "input frame was rejected");
         let worker_not_applied = AgentError::new("worker.not_applied", "worker rejected input");
         let other = AgentError::new("input.failed", "input result is unknown");
@@ -5563,6 +5558,10 @@ mod tests {
         assert_eq!(input_frame_outcome(None), TaskCommandOutcomeState::Applied);
         assert_eq!(
             input_frame_outcome(Some(&guardian)),
+            TaskCommandOutcomeState::NotApplied
+        );
+        assert_eq!(
+            input_frame_outcome(Some(&local_input_detected)),
             TaskCommandOutcomeState::NotApplied
         );
         assert_eq!(

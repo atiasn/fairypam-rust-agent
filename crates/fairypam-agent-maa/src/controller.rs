@@ -72,14 +72,40 @@ pub trait GenericWindowsController {
     fn get_health(&self) -> RuntimeHealth;
 }
 
+pub fn run_compatibility_input_smoke(
+    controller: &mut impl GenericWindowsController,
+    point: (i32, i32),
+    timeout: Duration,
+) -> Result<(), MaaRuntimeError> {
+    for button in [
+        MouseButton::Left,
+        MouseButton::Right,
+        MouseButton::Middle,
+        MouseButton::X1,
+        MouseButton::X2,
+    ] {
+        controller.click(button, point.0, point.1, timeout)?;
+    }
+    controller.key_down(0x87, timeout)?;
+    controller.key_up(0x87, timeout)?;
+    controller.scroll_at(Some(point), 0, 120, timeout)?;
+    controller.relative_move(1, 1, timeout)?;
+    controller.inactive(timeout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[derive(Debug, PartialEq, Eq)]
     enum Call {
+        Click(MouseButton),
+        KeyDown(i32),
+        KeyUp(i32),
         MoveTo(i32, i32),
         Scroll(i32, i32),
+        RelativeMove(i32, i32),
+        Inactive,
     }
 
     #[derive(Default)]
@@ -112,23 +138,26 @@ mod tests {
 
         fn click(
             &mut self,
-            _button: MouseButton,
+            button: MouseButton,
             _x: i32,
             _y: i32,
             _timeout: Duration,
         ) -> Result<(), MaaRuntimeError> {
+            self.0.push(Call::Click(button));
             Ok(())
         }
 
         fn key_down(
             &mut self,
-            _virtual_key: i32,
+            virtual_key: i32,
             _timeout: Duration,
         ) -> Result<(), MaaRuntimeError> {
+            self.0.push(Call::KeyDown(virtual_key));
             Ok(())
         }
 
-        fn key_up(&mut self, _virtual_key: i32, _timeout: Duration) -> Result<(), MaaRuntimeError> {
+        fn key_up(&mut self, virtual_key: i32, _timeout: Duration) -> Result<(), MaaRuntimeError> {
+            self.0.push(Call::KeyUp(virtual_key));
             Ok(())
         }
 
@@ -144,14 +173,16 @@ mod tests {
 
         fn relative_move(
             &mut self,
-            _dx: i32,
-            _dy: i32,
+            dx: i32,
+            dy: i32,
             _timeout: Duration,
         ) -> Result<(), MaaRuntimeError> {
+            self.0.push(Call::RelativeMove(dx, dy));
             Ok(())
         }
 
         fn inactive(&mut self, _timeout: Duration) -> Result<(), MaaRuntimeError> {
+            self.0.push(Call::Inactive);
             Ok(())
         }
 
@@ -169,6 +200,28 @@ mod tests {
         assert_eq!(
             controller.0,
             [Call::MoveTo(960, 540), Call::Scroll(0, -120)]
+        );
+    }
+
+    #[test]
+    fn compatibility_smoke_calls_every_input_method() {
+        let mut controller = RecordingController::default();
+        run_compatibility_input_smoke(&mut controller, (320, 240), Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            controller.0,
+            [
+                Call::Click(MouseButton::Left),
+                Call::Click(MouseButton::Right),
+                Call::Click(MouseButton::Middle),
+                Call::Click(MouseButton::X1),
+                Call::Click(MouseButton::X2),
+                Call::KeyDown(0x87),
+                Call::KeyUp(0x87),
+                Call::MoveTo(320, 240),
+                Call::Scroll(0, 120),
+                Call::RelativeMove(1, 1),
+                Call::Inactive,
+            ]
         );
     }
 }

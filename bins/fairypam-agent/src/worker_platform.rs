@@ -409,6 +409,18 @@ impl WorkerRuntimePlatform {
         }
     }
 
+    fn guard_local_input(&mut self) -> Result<(), AgentError> {
+        match <WindowsRuntimePlatform as RuntimePlatform>::check_attempt_environment(
+            &mut self.target,
+        ) {
+            Err(error) if error.code() == "environment.local_input_detected" => {
+                self.release_emergency("local-input-pause")?;
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
     fn lock_worker(&self) -> Result<std::sync::MutexGuard<'_, WorkerState>, AgentError> {
         self.worker
             .lock()
@@ -654,7 +666,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         session: &SessionRef,
         expires_at: Instant,
     ) -> Result<(), AgentError> {
-        self.check_attempt_environment()?;
+        self.guard_local_input()?;
         if self.faulted.load(Ordering::Acquire) {
             return Err(AgentError::new(
                 "worker.reobservation_required",
@@ -680,11 +692,19 @@ impl RuntimePlatform for WorkerRuntimePlatform {
 
     fn pulse_task_action(
         &mut self,
-        _binding: &TargetBinding,
+        binding: &TargetBinding,
         session: &SessionRef,
         action_id: &str,
-        _now: Instant,
+        now: Instant,
     ) -> Result<(), AgentError> {
+        let deadline = self.input_expires_at.unwrap_or(now + WORKER_TIMEOUT);
+        self.guard_local_input()?;
+        if self.session.is_none() {
+            let profile = self.profile.clone().ok_or_else(|| {
+                AgentError::new("worker.not_attached", "worker input profile is unavailable")
+            })?;
+            self.start_task_input(&profile, binding, session, deadline)?;
+        }
         self.require_session(session)?;
         let mut applied_any = false;
         self.request_in_sequence(
@@ -723,6 +743,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                 "input lease expired",
             ));
         }
+        self.guard_local_input()?;
         if self.session.is_none() {
             self.start_task_input(profile, binding, session, expires_at)?;
         }
