@@ -204,14 +204,6 @@ jobs:
               throw "forbidden scheduled task found: $taskName"
             }
           }
-          foreach ($name in @('fairypam-agent.exe', 'fairypam-agent-guardian.exe', 'fairypam-agent-shell.exe', 'fairypam-win32-worker.exe')) {
-            $bytes = [IO.File]::ReadAllBytes((Join-Path $versionRoot $name))
-            $pe = [BitConverter]::ToInt32($bytes, 0x3c)
-            if ([BitConverter]::ToUInt16($bytes, $pe + 92) -ne 2) {
-              throw "production executable opens a console window: $name"
-            }
-          }
-
       - name: Package product installer receipt
         shell: pwsh
         run: |

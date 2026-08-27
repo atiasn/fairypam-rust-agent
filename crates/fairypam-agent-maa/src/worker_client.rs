@@ -177,6 +177,7 @@ pub mod windows {
     use std::io::{Read, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{fence, AtomicU64, Ordering};
@@ -199,7 +200,8 @@ pub mod windows {
     };
     use windows::Win32::System::Pipes::PeekNamedPipe;
     use windows::Win32::System::Threading::{
-        OpenEventW, WaitForSingleObject, EVENT_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
+        OpenEventW, WaitForSingleObject, CREATE_NO_WINDOW, EVENT_MODIFY_STATE,
+        SYNCHRONIZATION_SYNCHRONIZE,
     };
 
     use super::{read_envelope, WorkerClient};
@@ -284,6 +286,7 @@ pub mod windows {
             command
                 .env_clear()
                 .env("SystemDrive", r"C:")
+                .creation_flags(CREATE_NO_WINDOW.0)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());

@@ -4,6 +4,7 @@
 mod windows_shell {
     use std::fs::{self, OpenOptions};
     use std::io::Write;
+    use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -26,7 +27,7 @@ mod windows_shell {
     };
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::System::Threading::{CreateMutexW, CREATE_NO_WINDOW};
     use windows::Win32::UI::Shell::{
         FOLDERID_Documents, SHGetKnownFolderPath, ShellExecuteW, Shell_NotifyIconW,
         KF_FLAG_DEFAULT, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -85,6 +86,7 @@ mod windows_shell {
                 .arg("--supervise")
                 .env_clear()
                 .env("SystemDrive", r"C:")
+                .creation_flags(CREATE_NO_WINDOW.0)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
