@@ -17,7 +17,8 @@ use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{HWND, RECT};
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, DispatchMessageW, GetClientRect, PeekMessageW,
+    TranslateMessage, MSG, PM_REMOVE, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 #[cfg(windows)]
@@ -73,7 +74,21 @@ pub fn run(runtime_root: &Path, public_key: &OsStr) -> Result<(), MaaRuntimeErro
     controller.key_up(0x87, timeout)?;
     controller.scroll_at(Some((x, y)), 0, 120, timeout)?;
     controller.relative_move(1, 1, timeout)?;
-    controller.inactive(timeout)?;
+    let inactive = std::thread::spawn(move || {
+        controller.inactive(timeout)?;
+        Ok::<_, MaaRuntimeError>(controller)
+    });
+    while !inactive.is_finished() {
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+            let _ = unsafe { TranslateMessage(&message) };
+            unsafe { DispatchMessageW(&message) };
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut controller = inactive.join().map_err(|_| {
+        MaaRuntimeError::new("maa.smoke_thread_failed", "inactive thread panicked")
+    })??;
     let health = controller.get_health();
     if health.runtime_version != "5.12.3" || !health.connected || health.event_count == 0 {
         return Err(MaaRuntimeError::new(
