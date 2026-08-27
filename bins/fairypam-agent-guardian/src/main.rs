@@ -510,6 +510,7 @@ fn spawn_agent(path: &std::path::Path, pipe_name: &str) -> Result<std::process::
         .arg("--guardian-pipe")
         .arg(pipe_name)
         .env_clear()
+        .env("SystemDrive", r"C:")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

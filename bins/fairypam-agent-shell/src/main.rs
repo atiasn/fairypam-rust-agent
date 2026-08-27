@@ -84,6 +84,7 @@ mod windows_shell {
             command
                 .arg("--supervise")
                 .env_clear()
+                .env("SystemDrive", r"C:")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -723,6 +724,7 @@ mod windows_shell {
             .arg("--launch-shell")
             .arg(&install_root)
             .env_clear()
+            .env("SystemDrive", r"C:")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

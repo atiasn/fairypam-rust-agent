@@ -452,6 +452,7 @@ fn compatibility_smoke(version_root: &std::path::Path) -> Result<(), ProvisionFa
         .arg("--runtime-root-public-key")
         .arg(public_key)
         .env_clear()
+        .env("SystemDrive", r"C:")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

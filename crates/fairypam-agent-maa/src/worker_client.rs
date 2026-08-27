@@ -283,6 +283,7 @@ pub mod windows {
             }
             command
                 .env_clear()
+                .env("SystemDrive", r"C:")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
