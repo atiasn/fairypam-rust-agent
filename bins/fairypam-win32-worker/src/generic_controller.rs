@@ -1,17 +1,57 @@
 use fairypam_agent_maa::MaaRuntimeError;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+const SOURCE_FRAME_MAX_AGE: Duration = Duration::from_secs(2);
+const SOURCE_FRAME_WINDOW_CAPACITY: usize = 256;
+
+#[derive(Default)]
+struct SourceFrameWindow {
+    frames: VecDeque<(u64, Instant)>,
+}
+
+impl SourceFrameWindow {
+    fn record(&mut self, sequence: u64, captured_at: Instant) {
+        while self.frames.front().is_some_and(|(_, timestamp)| {
+            captured_at.saturating_duration_since(*timestamp) > SOURCE_FRAME_MAX_AGE
+        }) || self.frames.len() >= SOURCE_FRAME_WINDOW_CAPACITY
+        {
+            self.frames.pop_front();
+        }
+        self.frames.push_back((sequence, captured_at));
+    }
+
+    fn require(&self, sequence: u64, now: Instant) -> Result<(), MaaRuntimeError> {
+        if sequence == 0
+            || !self.frames.iter().any(|(known, captured_at)| {
+                *known == sequence
+                    && now.saturating_duration_since(*captured_at) <= SOURCE_FRAME_MAX_AGE
+            })
+        {
+            return Err(MaaRuntimeError::new(
+                "worker.source_frame_stale",
+                "Generic coordinates are not bound to a recent captured frame",
+            ));
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+}
 
 fn bind_optional_client_point(
     x_ppm: Option<u32>,
     y_ppm: Option<u32>,
     source_frame_sequence: Option<u64>,
-    current_frame_sequence: u64,
     width: u32,
     height: u32,
 ) -> Result<Option<(i32, i32)>, MaaRuntimeError> {
-    if source_frame_sequence.is_some_and(|source| source == 0 || source != current_frame_sequence) {
+    if source_frame_sequence == Some(0) {
         return Err(MaaRuntimeError::new(
             "worker.source_frame_stale",
-            "Generic coordinates are not bound to the latest frame",
+            "Generic coordinates are not bound to a recent captured frame",
         ));
     }
     match (x_ppm, y_ppm) {
@@ -40,23 +80,71 @@ fn ppm_coordinate(value: u32, extent: u32) -> Result<i32, MaaRuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::bind_optional_client_point;
+    use std::time::{Duration, Instant};
+
+    use super::{bind_optional_client_point, SourceFrameWindow};
 
     #[test]
-    fn scroll_point_requires_current_frame_and_converts_ppm() {
+    fn scroll_point_accepts_a_known_recent_frame_and_converts_ppm() {
         assert_eq!(
-            bind_optional_client_point(Some(500_000), Some(500_000), Some(7), 7, 1920, 1080)
-                .unwrap(),
+            bind_optional_client_point(Some(500_000), Some(500_000), Some(7), 1920, 1080).unwrap(),
             Some((960, 540))
         );
 
-        let stale =
-            bind_optional_client_point(Some(1), Some(1), Some(6), 7, 1920, 1080).unwrap_err();
-        assert_eq!(stale.code(), "worker.source_frame_stale");
+        assert_eq!(
+            bind_optional_client_point(Some(500_000), Some(500_000), Some(6), 1920, 1080).unwrap(),
+            Some((960, 540))
+        );
 
-        let partial =
-            bind_optional_client_point(Some(1), None, Some(7), 7, 1920, 1080).unwrap_err();
+        let partial = bind_optional_client_point(Some(1), None, Some(7), 1920, 1080).unwrap_err();
         assert_eq!(partial.code(), "input.coordinate_invalid");
+    }
+
+    #[test]
+    fn source_frame_window_accepts_recent_known_frames_only() {
+        let started = Instant::now();
+        let mut frames = SourceFrameWindow::default();
+        frames.record(6, started);
+        frames.record(7, started + Duration::from_millis(500));
+
+        frames
+            .require(6, started + Duration::from_millis(1_500))
+            .unwrap();
+        assert_eq!(
+            frames
+                .require(6, started + Duration::from_millis(2_001))
+                .unwrap_err()
+                .code(),
+            "worker.source_frame_stale"
+        );
+        assert_eq!(
+            frames.require(8, started).unwrap_err().code(),
+            "worker.source_frame_stale"
+        );
+        frames.clear();
+        assert_eq!(
+            frames.require(7, started).unwrap_err().code(),
+            "worker.source_frame_stale"
+        );
+    }
+
+    #[test]
+    fn release_rejects_a_pre_release_frame_mapped_after_cleanup() {
+        let started = Instant::now();
+        let mut frames = SourceFrameWindow::default();
+        let worker_sequence = 3;
+        frames.record(worker_sequence, started);
+
+        frames.clear();
+        let delayed_public_mapping = (2, worker_sequence);
+
+        assert_eq!(
+            frames
+                .require(delayed_public_mapping.1, started)
+                .unwrap_err()
+                .code(),
+            "worker.source_frame_stale"
+        );
     }
 }
 
@@ -65,7 +153,7 @@ mod windows_impl {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use fairypam_agent_core::profile::{
         verify_profile, ActionDefinition, CaptureRegion, ClientPointButton,
@@ -83,7 +171,7 @@ mod windows_impl {
         GetClientRect, GetWindowThreadProcessId, IsWindow,
     };
 
-    use super::{bind_optional_client_point, ppm_coordinate};
+    use super::{bind_optional_client_point, ppm_coordinate, SourceFrameWindow};
 
     const OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -94,6 +182,7 @@ mod windows_impl {
         process_id: u32,
         geometry: Option<VerifiedGeometry>,
         frame_sequence: u64,
+        source_frames: SourceFrameWindow,
         held_actions: BTreeSet<String>,
     }
 
@@ -113,6 +202,7 @@ mod windows_impl {
                 process_id: 0,
                 geometry: None,
                 frame_sequence: 0,
+                source_frames: SourceFrameWindow::default(),
                 held_actions: BTreeSet::new(),
             })
         }
@@ -156,6 +246,7 @@ mod windows_impl {
             self.process_id = process_id;
             self.geometry = Some(geometry);
             self.frame_sequence = 0;
+            self.source_frames.clear();
             self.held_actions.clear();
             Ok(())
         }
@@ -168,6 +259,7 @@ mod windows_impl {
             self.process_id = 0;
             self.geometry = None;
             self.frame_sequence = 0;
+            self.source_frames.clear();
             Ok(())
         }
 
@@ -189,6 +281,8 @@ mod windows_impl {
                     "frame sequence exhausted",
                 )
             })?;
+            self.source_frames
+                .record(self.frame_sequence, Instant::now());
             Ok((self.frame_sequence, frame))
         }
 
@@ -301,11 +395,13 @@ mod windows_impl {
             source_frame_sequence: Option<u64>,
         ) -> Result<(), MaaRuntimeError> {
             let geometry = self.revalidate()?;
+            if let Some(source) = source_frame_sequence {
+                self.require_source_frame(source)?;
+            }
             let bound_point = bind_optional_client_point(
                 x_ppm,
                 y_ppm,
                 source_frame_sequence,
-                self.frame_sequence,
                 geometry.width,
                 geometry.height,
             )?;
@@ -340,6 +436,7 @@ mod windows_impl {
         }
 
         pub fn release_all(&mut self) -> Result<(), MaaRuntimeError> {
+            self.source_frames.clear();
             let held = std::mem::take(&mut self.held_actions);
             let mut first_error = None;
             for action_id in held {
@@ -414,13 +511,7 @@ mod windows_impl {
         }
 
         fn require_source_frame(&self, source: u64) -> Result<(), MaaRuntimeError> {
-            if source == 0 || source != self.frame_sequence {
-                return Err(MaaRuntimeError::new(
-                    "worker.source_frame_stale",
-                    "Generic coordinates are not bound to the latest frame",
-                ));
-            }
-            Ok(())
+            self.source_frames.require(source, Instant::now())
         }
 
         fn action(&self, action_id: &str) -> Result<&ActionDefinition, MaaRuntimeError> {

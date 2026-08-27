@@ -1,6 +1,6 @@
 #[cfg(windows)]
 mod frame_ring;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod generic_controller;
 #[cfg(windows)]
 mod local_server;
