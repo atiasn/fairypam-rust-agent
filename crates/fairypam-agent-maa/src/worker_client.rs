@@ -214,7 +214,7 @@ pub mod windows {
         pub runtime_root: PathBuf,
         pub profile_dir: Option<PathBuf>,
         pub profile_root_public_key: Option<String>,
-        pub runtime_root_public_key: String,
+        pub runtime_root_public_key: Option<String>,
         pub frame_slot_bytes: usize,
     }
 
@@ -245,6 +245,8 @@ pub mod windows {
 
     impl WorkerProcess {
         pub fn spawn(config: &WorkerProcessConfig) -> Result<Self, MaaRuntimeError> {
+            let runtime_root_public_key =
+                required_runtime_root_public_key(config.runtime_root_public_key.as_deref())?;
             let generation = generation_id();
             let suffix = format!("{}-{generation}", std::process::id());
             let pipe_name = format!(r"\\.\pipe\FairyPam-Win32-{suffix}");
@@ -259,7 +261,7 @@ pub mod windows {
                 "--runtime-root",
                 &runtime_root,
                 "--runtime-root-public-key",
-                &config.runtime_root_public_key,
+                runtime_root_public_key,
                 "--worker-generation",
                 &generation,
                 "--frame-mapping-name",
@@ -801,7 +803,39 @@ pub mod windows {
             .map_err(|_| invalid("worker frame string is invalid"))
     }
 
+    fn required_runtime_root_public_key(value: Option<&str>) -> Result<&str, MaaRuntimeError> {
+        value.filter(|value| !value.is_empty()).ok_or_else(|| {
+            MaaRuntimeError::new(
+                "maa.runtime_root_key_unavailable",
+                "MAA Runtime release public key is not embedded in the Agent build",
+            )
+        })
+    }
+
     fn invalid(message: &str) -> MaaRuntimeError {
         MaaRuntimeError::new("worker.response_invalid", message)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::path::PathBuf;
+
+        use super::{WorkerProcess, WorkerProcessConfig};
+
+        #[test]
+        fn worker_spawn_requires_runtime_root_public_key() {
+            let error = WorkerProcess::spawn(&WorkerProcessConfig {
+                executable: PathBuf::from(r"Z:\__fairypam_missing_worker__.exe"),
+                runtime_root: PathBuf::from(r"Z:\__fairypam_missing_runtime__"),
+                profile_dir: None,
+                profile_root_public_key: None,
+                runtime_root_public_key: None,
+                frame_slot_bytes: 1024 * 1024,
+            })
+            .err()
+            .unwrap();
+
+            assert_eq!(error.code(), "maa.runtime_root_key_unavailable");
+        }
     }
 }

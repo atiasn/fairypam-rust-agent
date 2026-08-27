@@ -1088,18 +1088,13 @@ fn worker_config(
         .unwrap_or_else(|| install_root.join("runtime").join("maa"));
     let runtime_root_public_key = option_env!("FAIRYPAM_MAA_RUNTIME_ROOT_PUBLIC_KEY_HEX")
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            AgentError::new(
-                "maa.runtime_root_key_unavailable",
-                "MAA Runtime release public key is not embedded in the Agent build",
-            )
-        })?;
+        .map(str::to_owned);
     Ok(WorkerProcessConfig {
         executable: worker_executable,
         runtime_root,
         profile_dir,
         profile_root_public_key,
-        runtime_root_public_key: runtime_root_public_key.to_owned(),
+        runtime_root_public_key,
         frame_slot_bytes: FRAME_SLOT_BYTES,
     })
 }
@@ -1124,6 +1119,7 @@ mod tests {
         let config = state.config.as_ref().unwrap();
         assert!(config.profile_dir.is_none());
         assert!(config.profile_root_public_key.is_none());
+        assert!(config.runtime_root_public_key.is_none());
         assert!(state.process.is_none());
         assert!(state.attached_generation.is_none());
     }
