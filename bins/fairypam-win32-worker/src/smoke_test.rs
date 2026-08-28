@@ -68,6 +68,7 @@ pub fn run(runtime_root: &Path, public_key: &OsStr) -> Result<(), MaaRuntimeErro
                 "MAA controller health did not remain connected",
             ));
         }
+        controller.inactive()?;
         controller.detach_target()
     });
     while !smoke.is_finished() {

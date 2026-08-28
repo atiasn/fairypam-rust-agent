@@ -684,19 +684,20 @@ impl ReleaseDriver for SystemReleaseDriver {
     fn release_all(&mut self, holds: &[PhysicalHold]) -> Result<(), String> {
         use fairypam_agent_guardian_protocol::MouseButton;
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+            GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
             KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTUP,
             MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+            VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
         };
 
         let inputs: Vec<INPUT> = holds
             .iter()
-            .map(|hold| match hold {
+            .filter_map(|hold| match hold {
                 PhysicalHold::ScanCode {
                     scan_code,
                     extended,
                     ..
-                } => INPUT {
+                } => Some(INPUT {
                     r#type: INPUT_KEYBOARD,
                     Anonymous: INPUT_0 {
                         ki: KEYBDINPUT {
@@ -713,29 +714,43 @@ impl ReleaseDriver for SystemReleaseDriver {
                             dwExtraInfo: 0x4650_414D,
                         },
                     },
-                },
-                PhysicalHold::MouseButton { button, .. } => INPUT {
-                    r#type: INPUT_MOUSE,
-                    Anonymous: INPUT_0 {
-                        mi: MOUSEINPUT {
-                            dx: 0,
-                            dy: 0,
-                            mouseData: match button {
-                                MouseButton::X1 => 1,
-                                MouseButton::X2 => 2,
-                                _ => 0,
+                }),
+                PhysicalHold::MouseButton { button, .. } => {
+                    let virtual_key = match button {
+                        MouseButton::Left => VK_LBUTTON,
+                        MouseButton::Right => VK_RBUTTON,
+                        MouseButton::Middle => VK_MBUTTON,
+                        MouseButton::X1 => VK_XBUTTON1,
+                        MouseButton::X2 => VK_XBUTTON2,
+                    };
+                    if (unsafe { GetAsyncKeyState(i32::from(virtual_key.0)) }) as u16 & 0x8000 == 0
+                    {
+                        None
+                    } else {
+                        Some(INPUT {
+                            r#type: INPUT_MOUSE,
+                            Anonymous: INPUT_0 {
+                                mi: MOUSEINPUT {
+                                    dx: 0,
+                                    dy: 0,
+                                    mouseData: match button {
+                                        MouseButton::X1 => 1,
+                                        MouseButton::X2 => 2,
+                                        _ => 0,
+                                    },
+                                    dwFlags: match button {
+                                        MouseButton::Left => MOUSEEVENTF_LEFTUP,
+                                        MouseButton::Right => MOUSEEVENTF_RIGHTUP,
+                                        MouseButton::Middle => MOUSEEVENTF_MIDDLEUP,
+                                        MouseButton::X1 | MouseButton::X2 => MOUSEEVENTF_XUP,
+                                    },
+                                    time: 0,
+                                    dwExtraInfo: 0x4650_414D,
+                                },
                             },
-                            dwFlags: match button {
-                                MouseButton::Left => MOUSEEVENTF_LEFTUP,
-                                MouseButton::Right => MOUSEEVENTF_RIGHTUP,
-                                MouseButton::Middle => MOUSEEVENTF_MIDDLEUP,
-                                MouseButton::X1 | MouseButton::X2 => MOUSEEVENTF_XUP,
-                            },
-                            time: 0,
-                            dwExtraInfo: 0x4650_414D,
-                        },
-                    },
-                },
+                        })
+                    }
+                }
             })
             .collect();
         if inputs.is_empty() {

@@ -3,9 +3,10 @@ use std::collections::BTreeSet;
 use fairypam_agent_core::profile::{ActionDefinition, VerifiedProfile};
 use fairypam_agent_core::AgentError;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
+    VIRTUAL_KEY, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
 };
 
 pub(crate) const SEND_INPUT_MARKER: usize = 0x4650_414D;
@@ -31,14 +32,23 @@ pub fn emergency_release_profile(profile: &VerifiedProfile) -> Result<(), AgentE
         .into_iter()
         .map(|(scan_code, extended)| keyboard_release(scan_code, extended))
         .collect::<Vec<_>>();
-    inputs.extend([
-        mouse_release(MOUSEEVENTF_LEFTUP, 0),
-        mouse_release(MOUSEEVENTF_RIGHTUP, 0),
-        mouse_release(MOUSEEVENTF_MIDDLEUP, 0),
-        mouse_release(MOUSEEVENTF_XUP, 1),
-        mouse_release(MOUSEEVENTF_XUP, 2),
-    ]);
+    inputs.extend(
+        [
+            (VK_LBUTTON, MOUSEEVENTF_LEFTUP, 0),
+            (VK_RBUTTON, MOUSEEVENTF_RIGHTUP, 0),
+            (VK_MBUTTON, MOUSEEVENTF_MIDDLEUP, 0),
+            (VK_XBUTTON1, MOUSEEVENTF_XUP, 1),
+            (VK_XBUTTON2, MOUSEEVENTF_XUP, 2),
+        ]
+        .into_iter()
+        .filter(|(button, _, _)| is_down(*button))
+        .map(|(_, flags, data)| mouse_release(flags, data)),
+    );
     send(&inputs)
+}
+
+fn is_down(key: VIRTUAL_KEY) -> bool {
+    (unsafe { GetAsyncKeyState(i32::from(key.0)) }) as u16 & 0x8000 != 0
 }
 
 fn keyboard_release(scan_code: u16, extended: bool) -> INPUT {

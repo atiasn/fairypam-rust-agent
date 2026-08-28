@@ -486,7 +486,7 @@ dependencies = [
 name = "fairypam-agent-installer"
 version = "0.1.12"
 dependencies = [
- "fairypam-agent-realtime",
+ "fairypam-agent-maa",
  "fairypam-agent-suite",
  "serde",
  "serde_json",
