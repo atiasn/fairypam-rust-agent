@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(any(windows, test))]
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -29,8 +31,37 @@ const MAX_CLOSE_TIMEOUT_MS: u32 = 5_000;
 const MAX_INPUT_LEASE_MS: u32 = 5_000;
 const CAPTURE_NO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(windows, test))]
+const SOURCE_FRAME_MAP_CAPACITY: usize = 256;
 const M1_ACTION_ID: &str = "gadget.quick_use";
 type CaptureFailure = (AgentError, Option<AttemptRef>);
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct SourceFrameMap {
+    frames: VecDeque<(u64, u64)>,
+}
+
+#[cfg(any(windows, test))]
+impl SourceFrameMap {
+    fn record(&mut self, public_sequence: u64, runtime_sequence: u64) {
+        if self.frames.len() >= SOURCE_FRAME_MAP_CAPACITY {
+            self.frames.pop_front();
+        }
+        self.frames.push_back((public_sequence, runtime_sequence));
+    }
+
+    fn runtime_sequence(&self, public_sequence: u64) -> Option<u64> {
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|(public, runtime)| (*public == public_sequence).then_some(*runtime))
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+}
 
 fn frame_sequence_key(source_id: &str, attempt: Option<&AttemptRef>) -> String {
     attempt.map_or_else(
@@ -149,6 +180,14 @@ pub struct RuntimeCapturedFrame {
 
 pub trait RuntimeCapture: Send {
     fn next_frame(&mut self, deadline: Instant) -> Result<RuntimeCapturedFrame, AgentError>;
+
+    fn bind_frame_sequence(
+        &mut self,
+        _runtime_sequence: u64,
+        _public_sequence: u64,
+    ) -> Result<(), AgentError> {
+        Ok(())
+    }
 }
 
 pub trait FrameSink: Send + Sync {
@@ -2492,6 +2531,7 @@ fn input_frame_outcome(error: Option<&AgentError>) -> TaskCommandOutcomeState {
         None => TaskCommandOutcomeState::Applied,
         Some(
             "guardian.unavailable"
+            | "environment.local_input_detected"
             | "input.frame_invalid"
             | "target.generation_stale"
             | "worker.not_applied",
@@ -2587,6 +2627,10 @@ fn spawn_capture_worker(
                                 break;
                             }
                         };
+                        if let Err(error) = capture.bind_frame_sequence(frame.sequence, sequence) {
+                            record_capture_failure(&worker_failure, error, attempt.clone());
+                            break;
+                        }
                         let packet = FramePacket {
                             session: Some(v3::SessionRef {
                                 agent_id: session.agent_id.clone(),
@@ -3045,17 +3089,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         let Some(monitor) = self.input_monitor.as_ref() else {
             return Ok(());
         };
-        if let Err(error) = monitor.check() {
-            let release_error = self.release_task_input().err();
-            return Err(AgentError::new(
-                error.code(),
-                match release_error {
-                    Some(release) => format!("{error}; input release failed: {release}"),
-                    None => error.to_string(),
-                },
-            ));
-        }
-        Ok(())
+        monitor.check()
     }
 
     fn finish_attempt_monitor(&mut self) {
@@ -3378,6 +3412,18 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    #[test]
+    fn source_frame_map_preserves_worker_identity_when_ring_frames_are_skipped() {
+        let mut frames = SourceFrameMap::default();
+        frames.record(1, 1);
+        frames.record(2, 3);
+
+        assert_eq!(frames.runtime_sequence(2), Some(3));
+        assert_ne!(frames.runtime_sequence(2), Some(2));
+        frames.clear();
+        assert_eq!(frames.runtime_sequence(2), None);
+    }
 
     #[test]
     fn startup_identity_retry_recovers_without_masking_other_errors() {
@@ -5615,6 +5661,10 @@ mod tests {
     #[test]
     fn guardian_start_failure_is_definitely_not_applied() {
         let guardian = AgentError::new("guardian.unavailable", "guardian did not start");
+        let local_input_detected = AgentError::new(
+            "environment.local_input_detected",
+            "physical input was detected",
+        );
         let invalid = AgentError::new("input.frame_invalid", "input frame was rejected");
         let worker_not_applied = AgentError::new("worker.not_applied", "worker rejected input");
         let other = AgentError::new("input.failed", "input result is unknown");
@@ -5622,6 +5672,10 @@ mod tests {
         assert_eq!(input_frame_outcome(None), TaskCommandOutcomeState::Applied);
         assert_eq!(
             input_frame_outcome(Some(&guardian)),
+            TaskCommandOutcomeState::NotApplied
+        );
+        assert_eq!(
+            input_frame_outcome(Some(&local_input_detected)),
             TaskCommandOutcomeState::NotApplied
         );
         assert_eq!(

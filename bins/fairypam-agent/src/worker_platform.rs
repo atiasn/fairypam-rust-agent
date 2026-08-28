@@ -24,7 +24,7 @@ use fairypam_agent_protocol::worker_v1::{
 
 use super::{
     ensure_current_source_frame, RuntimeCapture, RuntimeCaptureEncoding, RuntimeCapturedFrame,
-    RuntimePlatform, WindowsRuntimePlatform,
+    RuntimePlatform, SourceFrameMap, WindowsRuntimePlatform,
 };
 use crate::profile_store::ProfileStore;
 
@@ -45,6 +45,7 @@ pub(super) struct WorkerRuntimePlatform {
     realtime_terminal: Option<RealtimeProgramState>,
     realtime_events: VecDeque<AgentControlEvent>,
     root_public_key: Option<String>,
+    source_frames: Arc<Mutex<SourceFrameMap>>,
 }
 
 struct WorkerState {
@@ -96,7 +97,29 @@ impl WorkerRuntimePlatform {
             realtime_terminal: None,
             realtime_events: VecDeque::new(),
             root_public_key,
+            source_frames: Arc::new(Mutex::new(SourceFrameMap::default())),
         }
+    }
+
+    fn clear_source_frames(&self) -> Result<(), AgentError> {
+        self.source_frames
+            .lock()
+            .map_err(|error| AgentError::new("worker.state_poisoned", error.to_string()))?
+            .clear();
+        Ok(())
+    }
+
+    fn runtime_source_frame(&self, public_sequence: u64) -> Result<u64, AgentError> {
+        self.source_frames
+            .lock()
+            .map_err(|error| AgentError::new("worker.state_poisoned", error.to_string()))?
+            .runtime_sequence(public_sequence)
+            .ok_or_else(|| {
+                AgentError::new(
+                    "input.frame_invalid",
+                    "published source frame is no longer mapped to the Win32 Worker",
+                )
+            })
     }
 
     fn attach(
@@ -120,6 +143,7 @@ impl WorkerRuntimePlatform {
         if decision == AttachmentDecision::Reuse {
             return Ok(());
         }
+        self.clear_source_frames()?;
         if decision == AttachmentDecision::Replace {
             if let Some(process) = state.process.as_mut() {
                 let _ = request_applied(
@@ -191,13 +215,21 @@ impl WorkerRuntimePlatform {
         self.realtime_attempt = None;
         self.realtime_terminal = None;
         self.realtime_events.clear();
-        match (worker_error, rust_release.err()) {
+        let release = match (worker_error, rust_release.err()) {
             (None, None) => Ok(()),
             (Some(worker), None) => Err(worker),
             (None, Some(release)) => Err(release),
             (Some(worker), Some(release)) => Err(AgentError::new(
                 "input.release_uncertain",
                 format!("{worker}; Rust emergency release failed: {release}"),
+            )),
+        };
+        match (release, self.clear_source_frames()) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(release), Err(frames)) => Err(AgentError::new(
+                "input.release_uncertain",
+                format!("{release}; source frame cleanup failed: {frames}"),
             )),
         }
     }
@@ -410,6 +442,18 @@ impl WorkerRuntimePlatform {
         }
     }
 
+    fn guard_local_input(&mut self) -> Result<(), AgentError> {
+        match <WindowsRuntimePlatform as RuntimePlatform>::check_attempt_environment(
+            &mut self.target,
+        ) {
+            Err(error) if error.code() == "environment.local_input_detected" => {
+                self.release_emergency("local-input-pause")?;
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
     fn lock_worker(&self) -> Result<std::sync::MutexGuard<'_, WorkerState>, AgentError> {
         self.worker
             .lock()
@@ -432,6 +476,9 @@ impl WorkerRuntimePlatform {
         self.profile = None;
         self.binding = None;
         self.faulted.store(false, Ordering::Release);
+        if self.clear_source_frames().is_err() {
+            self.faulted.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -502,6 +549,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         self.realtime_attempt = None;
         self.realtime_terminal = None;
         self.realtime_events.clear();
+        self.clear_source_frames()?;
         Ok(())
     }
 
@@ -606,6 +654,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             profile,
             source_id: None,
             last_sequence: sequence.saturating_sub(1),
+            source_frames: Arc::clone(&self.source_frames),
         };
         let frame = capture.next_frame(deadline)?;
         if frame.sequence != sequence {
@@ -614,6 +663,10 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                 "Worker CaptureOnce frame does not match its response",
             ));
         }
+        self.source_frames
+            .lock()
+            .map_err(|error| AgentError::new("worker.state_poisoned", error.to_string()))?
+            .record(frame.sequence, frame.sequence);
         Ok(frame)
     }
 
@@ -641,6 +694,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             RuntimeCaptureEncoding::Png => ("png", 0),
         };
         {
+            self.clear_source_frames()?;
             let mut state = self.lock_worker()?;
             request_applied(
                 ensure_process(&mut state)?,
@@ -659,6 +713,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             profile,
             source_id: Some(source_id.to_owned()),
             last_sequence: 0,
+            source_frames: Arc::clone(&self.source_frames),
         }))
     }
 
@@ -714,7 +769,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         session: &SessionRef,
         expires_at: Instant,
     ) -> Result<(), AgentError> {
-        self.check_attempt_environment()?;
+        self.guard_local_input()?;
         if self.faulted.load(Ordering::Acquire) {
             return Err(AgentError::new(
                 "worker.reobservation_required",
@@ -740,11 +795,19 @@ impl RuntimePlatform for WorkerRuntimePlatform {
 
     fn pulse_task_action(
         &mut self,
-        _binding: &TargetBinding,
+        binding: &TargetBinding,
         session: &SessionRef,
         action_id: &str,
-        _now: Instant,
+        now: Instant,
     ) -> Result<(), AgentError> {
+        let deadline = self.input_expires_at.unwrap_or(now + WORKER_TIMEOUT);
+        self.guard_local_input()?;
+        if self.session.is_none() {
+            let profile = self.profile.clone().ok_or_else(|| {
+                AgentError::new("worker.not_attached", "worker input profile is unavailable")
+            })?;
+            self.start_task_input(&profile, binding, session, deadline)?;
+        }
         self.require_session(session)?;
         let mut applied_any = false;
         self.request_in_sequence(
@@ -783,12 +846,20 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                 "input lease expired",
             ));
         }
+        self.guard_local_input()?;
         if self.session.is_none() {
             self.start_task_input(profile, binding, session, expires_at)?;
         }
         self.require_session(session)?;
         self.input_expires_at = Some(expires_at);
         ensure_current_source_frame(source_frame)?;
+        let runtime_source_frame = if wheel_delta != 0 || client_point.is_some() {
+            source_frame
+                .map(|(_, sequence)| self.runtime_source_frame(sequence))
+                .transpose()?
+        } else {
+            None
+        };
         let requested = held_action_ids.iter().cloned().collect::<BTreeSet<_>>();
         let mut applied_any = false;
         for action_id in self
@@ -825,13 +896,13 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                     delta: wheel_delta,
                     x_ppm: wheel_point.map(|value| value.0),
                     y_ppm: wheel_point.map(|value| value.1),
-                    source_frame_sequence: source_frame.map(|value| value.1),
+                    source_frame_sequence: runtime_source_frame,
                 }),
                 &mut applied_any,
             )?;
         }
         if let Some((action_id, x_ppm, y_ppm)) = client_point {
-            let source_frame_sequence = source_frame.map(|value| value.1).ok_or_else(|| {
+            let source_frame_sequence = runtime_source_frame.ok_or_else(|| {
                 AgentError::new("input.frame_invalid", "click requires a source frame")
             })?;
             self.request_in_sequence(
@@ -996,6 +1067,7 @@ struct WorkerCapture {
     profile: VerifiedProfile,
     source_id: Option<String>,
     last_sequence: u64,
+    source_frames: Arc<Mutex<SourceFrameMap>>,
 }
 
 impl RuntimeCapture for WorkerCapture {
@@ -1042,6 +1114,18 @@ impl RuntimeCapture for WorkerCapture {
                 ))
             }
         }
+    }
+
+    fn bind_frame_sequence(
+        &mut self,
+        runtime_sequence: u64,
+        public_sequence: u64,
+    ) -> Result<(), AgentError> {
+        self.source_frames
+            .lock()
+            .map_err(|error| AgentError::new("worker.state_poisoned", error.to_string()))?
+            .record(public_sequence, runtime_sequence);
+        Ok(())
     }
 }
 
