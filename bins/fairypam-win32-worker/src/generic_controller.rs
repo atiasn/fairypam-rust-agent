@@ -338,10 +338,8 @@ mod windows_impl {
         pub fn swipe(
             &mut self,
             action_id: &str,
-            start_x_ppm: u32,
-            start_y_ppm: u32,
-            end_x_ppm: u32,
-            end_y_ppm: u32,
+            start_ppm: (u32, u32),
+            end_ppm: (u32, u32),
             duration_ms: u32,
             source_frame_sequence: u64,
         ) -> Result<(), MaaRuntimeError> {
@@ -355,6 +353,8 @@ mod windows_impl {
                 } => (*maximum_distance_ppm, *maximum_duration_ms),
                 _ => return Err(action_kind_invalid()),
             };
+            let (start_x_ppm, start_y_ppm) = start_ppm;
+            let (end_x_ppm, end_y_ppm) = end_ppm;
             let dx = start_x_ppm.abs_diff(end_x_ppm);
             let dy = start_y_ppm.abs_diff(end_y_ppm);
             if duration_ms == 0

@@ -402,10 +402,8 @@ mod windows_impl {
                         .map_err(io_error)?;
                     self.lock_controller()?.swipe(
                         &value.action_id,
-                        value.start_x_ppm,
-                        value.start_y_ppm,
-                        value.end_x_ppm,
-                        value.end_y_ppm,
+                        (value.start_x_ppm, value.start_y_ppm),
+                        (value.end_x_ppm, value.end_y_ppm),
                         value.duration_ms,
                         value.source_frame_sequence,
                     )?;
