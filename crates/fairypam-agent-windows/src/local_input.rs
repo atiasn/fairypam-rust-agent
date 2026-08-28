@@ -8,10 +8,11 @@ use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS,
-    LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_MOUSEMOVE,
-    WM_QUIT,
+    TranslateMessage, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_MOUSEMOVE, WM_QUIT,
 };
+
+use crate::send_input::SEND_INPUT_MARKER;
 
 static ACTIVE: OnceLock<Mutex<Option<Arc<MonitorState>>>> = OnceLock::new();
 
@@ -161,7 +162,7 @@ fn check_state(state: &MonitorState) -> Result<(), AgentError> {
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        if physical_keyboard_input(event.flags) {
+        if event.dwExtraInfo != SEND_INPUT_MARKER {
             if let Some(state) = active_state() {
                 state.interfered.store(true, Ordering::Release);
             }
@@ -173,7 +174,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let event = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-        if physical_mouse_input(event.flags) {
+        if event.dwExtraInfo != SEND_INPUT_MARKER {
             if let Some(state) = active_state() {
                 if wparam.0 as u32 == WM_MOUSEMOVE {
                     record_motion(&state, event.pt);
@@ -184,14 +185,6 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
-}
-
-fn physical_keyboard_input(flags: KBDLLHOOKSTRUCT_FLAGS) -> bool {
-    !flags.contains(LLKHF_INJECTED)
-}
-
-fn physical_mouse_input(flags: u32) -> bool {
-    flags & LLMHF_INJECTED == 0
 }
 
 fn record_motion(state: &MonitorState, point: POINT) {
@@ -244,13 +237,5 @@ mod tests {
             require_local_input_monitor().unwrap_err().code(),
             "environment.monitor_failed"
         );
-    }
-
-    #[test]
-    fn injected_events_are_not_physical_input() {
-        assert!(physical_keyboard_input(Default::default()));
-        assert!(!physical_keyboard_input(LLKHF_INJECTED));
-        assert!(physical_mouse_input(0));
-        assert!(!physical_mouse_input(LLMHF_INJECTED));
     }
 }

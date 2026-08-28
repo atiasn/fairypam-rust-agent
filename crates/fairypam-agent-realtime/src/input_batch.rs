@@ -23,8 +23,9 @@ pub mod windows {
     use std::collections::{BTreeMap, BTreeSet};
 
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VIRTUAL_KEY,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
     };
 
     use super::{KeyTransition, PhysicalInputBatch, PhysicalKey};
@@ -92,6 +93,23 @@ pub mod windows {
             }
             Ok(())
         }
+
+        fn mouse_release(
+            flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+            data: u32,
+        ) -> INPUT {
+            INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        mouseData: data,
+                        dwFlags: flags,
+                        dwExtraInfo: SEND_INPUT_MARKER,
+                        ..Default::default()
+                    },
+                },
+            }
+        }
     }
 
     impl PhysicalInputBatch for WindowsPhysicalInputBatch {
@@ -124,11 +142,18 @@ pub mod windows {
         }
 
         fn release_all(&mut self) -> Result<(), RealtimeError> {
-            let inputs = self
+            let mut inputs = self
                 .keys
                 .values()
                 .map(|key| Self::input(key, false))
                 .collect::<Vec<_>>();
+            inputs.extend([
+                Self::mouse_release(MOUSEEVENTF_LEFTUP, 0),
+                Self::mouse_release(MOUSEEVENTF_RIGHTUP, 0),
+                Self::mouse_release(MOUSEEVENTF_MIDDLEUP, 0),
+                Self::mouse_release(MOUSEEVENTF_XUP, 1),
+                Self::mouse_release(MOUSEEVENTF_XUP, 2),
+            ]);
             Self::send(&inputs)?;
             self.held.clear();
             Ok(())

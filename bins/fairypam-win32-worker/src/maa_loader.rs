@@ -1,11 +1,16 @@
 #[cfg(windows)]
 mod windows_impl {
     use std::ffi::{c_char, c_void, CStr};
+    use std::fs;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
+    use fairypam_agent_core::profile::Ed25519SignatureVerifier;
     use fairypam_agent_maa::controller::windows::MaaWindowsController;
-    use fairypam_agent_maa::runtime_verify::{verify_active_runtime, VerifiedRuntime};
+    use fairypam_agent_maa::runtime_discovery::discover_active;
+    use fairypam_agent_maa::runtime_manifest::{RuntimeLock, SignedRuntimeManifest};
+    use fairypam_agent_maa::runtime_verify::verify_runtime;
+    use fairypam_agent_maa::runtime_verify::VerifiedRuntime;
     use fairypam_agent_maa::MaaRuntimeError;
     use windows::core::{PCSTR, PCWSTR};
     use windows::Win32::Foundation::{FreeLibrary, HMODULE};
@@ -22,7 +27,27 @@ mod windows_impl {
 
     impl LoadedMaaRuntime {
         pub fn load_active(root: &Path, public_key: &str) -> Result<Self, MaaRuntimeError> {
-            Self::load(&verify_active_runtime(root, public_key)?)
+            let verifier = Ed25519SignatureVerifier::from_public_key_hex(public_key)
+                .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))?;
+            let lock = RuntimeLock::from_slice(&fs::read(root.join("maa-runtime.lock.json"))?)?;
+            let signed = SignedRuntimeManifest::verify(
+                &fs::read(root.join("maa-runtime.manifest.json"))?,
+                &verifier,
+            )?;
+            if signed != lock {
+                return Err(MaaRuntimeError::new(
+                    "maa.manifest_lock_mismatch",
+                    "signed runtime manifest does not match the installed lock",
+                ));
+            }
+            let (active, version_root) = discover_active(root)?;
+            if active.active_version != signed.sdk_version {
+                return Err(MaaRuntimeError::new(
+                    "maa.active_version_mismatch",
+                    "active runtime does not match the signed manifest",
+                ));
+            }
+            Self::load(&verify_runtime(&version_root, &signed)?)
         }
 
         pub fn load(runtime: &VerifiedRuntime) -> Result<Self, MaaRuntimeError> {

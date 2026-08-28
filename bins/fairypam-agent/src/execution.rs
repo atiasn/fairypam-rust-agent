@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-#[cfg(any(windows, test))]
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -31,37 +29,8 @@ const MAX_CLOSE_TIMEOUT_MS: u32 = 5_000;
 const MAX_INPUT_LEASE_MS: u32 = 5_000;
 const CAPTURE_NO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(any(windows, test))]
-const SOURCE_FRAME_MAP_CAPACITY: usize = 256;
 const M1_ACTION_ID: &str = "gadget.quick_use";
 type CaptureFailure = (AgentError, Option<AttemptRef>);
-
-#[cfg(any(windows, test))]
-#[derive(Default)]
-struct SourceFrameMap {
-    frames: VecDeque<(u64, u64)>,
-}
-
-#[cfg(any(windows, test))]
-impl SourceFrameMap {
-    fn record(&mut self, public_sequence: u64, runtime_sequence: u64) {
-        if self.frames.len() >= SOURCE_FRAME_MAP_CAPACITY {
-            self.frames.pop_front();
-        }
-        self.frames.push_back((public_sequence, runtime_sequence));
-    }
-
-    fn runtime_sequence(&self, public_sequence: u64) -> Option<u64> {
-        self.frames
-            .iter()
-            .rev()
-            .find_map(|(public, runtime)| (*public == public_sequence).then_some(*runtime))
-    }
-
-    fn clear(&mut self) {
-        self.frames.clear();
-    }
-}
 
 fn frame_sequence_key(source_id: &str, attempt: Option<&AttemptRef>) -> String {
     attempt.map_or_else(
@@ -137,6 +106,18 @@ fn outcome_applied(outcome: &CommandOutcome) -> bool {
     }
 }
 
+fn record_frame_sequence(sequence: &AtomicU64, captured: u64) -> Result<u64, AgentError> {
+    let previous = sequence.load(Ordering::Acquire);
+    if captured == 0 || captured <= previous {
+        return Err(AgentError::new(
+            "capture.sequence_invalid",
+            "capture backend returned a non-monotonic frame sequence",
+        ));
+    }
+    sequence.store(captured, Ordering::Release);
+    Ok(captured)
+}
+
 fn next_frame_sequence(sequence: &AtomicU64) -> Result<u64, AgentError> {
     sequence
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -168,14 +149,6 @@ pub struct RuntimeCapturedFrame {
 
 pub trait RuntimeCapture: Send {
     fn next_frame(&mut self, deadline: Instant) -> Result<RuntimeCapturedFrame, AgentError>;
-
-    fn bind_frame_sequence(
-        &mut self,
-        _runtime_sequence: u64,
-        _public_sequence: u64,
-    ) -> Result<(), AgentError> {
-        Ok(())
-    }
 }
 
 pub trait FrameSink: Send + Sync {
@@ -299,6 +272,19 @@ pub trait RuntimePlatform: Send {
         fps: u32,
         encoding: RuntimeCaptureEncoding,
     ) -> Result<Box<dyn RuntimeCapture>, AgentError>;
+
+    fn capture_once(
+        &mut self,
+        binding: &TargetBinding,
+        source_id: &str,
+        region: CaptureRegion,
+        fps: u32,
+        encoding: RuntimeCaptureEncoding,
+        deadline: Instant,
+    ) -> Result<RuntimeCapturedFrame, AgentError> {
+        self.start_capture(binding, source_id, region, fps, encoding)?
+            .next_frame(deadline)
+    }
 
     fn focus(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError>;
 
@@ -1857,21 +1843,20 @@ impl CommandExecutor {
                 let attempt = self.task_attempt.attempt_ref(task)?;
                 let result: Result<u64, AgentError> = (|| {
                     self.require_target_generation(value.target_generation)?;
-                    let mut capture = self.platform.start_capture(
+                    let frame = self.platform.capture_once(
                         &binding,
                         &value.source_id,
                         region,
                         source.maximum_fps.min(60),
                         encoding,
+                        Instant::now() + CAPTURE_NO_FRAME_TIMEOUT,
                     )?;
-                    let frame = capture.next_frame(Instant::now() + CAPTURE_NO_FRAME_TIMEOUT)?;
                     let frame_sequence = Arc::clone(
                         self.frame_sequences
                             .entry(frame_sequence_key(&value.source_id, Some(&attempt)))
                             .or_insert_with(|| Arc::new(AtomicU64::new(0))),
                     );
-                    let sequence = next_frame_sequence(&frame_sequence)?;
-                    capture.bind_frame_sequence(frame.sequence, sequence)?;
+                    let sequence = record_frame_sequence(&frame_sequence, frame.sequence)?;
                     frames.publish_required(FramePacket {
                         session: Some(v3::SessionRef {
                             agent_id: session.reference.agent_id.clone(),
@@ -2507,7 +2492,6 @@ fn input_frame_outcome(error: Option<&AgentError>) -> TaskCommandOutcomeState {
         None => TaskCommandOutcomeState::Applied,
         Some(
             "guardian.unavailable"
-            | "environment.local_input_detected"
             | "input.frame_invalid"
             | "target.generation_stale"
             | "worker.not_applied",
@@ -2603,10 +2587,6 @@ fn spawn_capture_worker(
                                 break;
                             }
                         };
-                        if let Err(error) = capture.bind_frame_sequence(frame.sequence, sequence) {
-                            record_capture_failure(&worker_failure, error, attempt.clone());
-                            break;
-                        }
                         let packet = FramePacket {
                             session: Some(v3::SessionRef {
                                 agent_id: session.agent_id.clone(),
@@ -3065,7 +3045,17 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         let Some(monitor) = self.input_monitor.as_ref() else {
             return Ok(());
         };
-        monitor.check()
+        if let Err(error) = monitor.check() {
+            let release_error = self.release_task_input().err();
+            return Err(AgentError::new(
+                error.code(),
+                match release_error {
+                    Some(release) => format!("{error}; input release failed: {release}"),
+                    None => error.to_string(),
+                },
+            ));
+        }
+        Ok(())
     }
 
     fn finish_attempt_monitor(&mut self) {
@@ -3390,18 +3380,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_frame_map_preserves_worker_identity_when_ring_frames_are_skipped() {
-        let mut frames = SourceFrameMap::default();
-        frames.record(1, 1);
-        frames.record(2, 3);
-
-        assert_eq!(frames.runtime_sequence(2), Some(3));
-        assert_ne!(frames.runtime_sequence(2), Some(2));
-        frames.clear();
-        assert_eq!(frames.runtime_sequence(2), None);
-    }
-
-    #[test]
     fn startup_identity_retry_recovers_without_masking_other_errors() {
         let mut attempts = 0;
         let recovered = retry_startup_identity(
@@ -3691,6 +3669,8 @@ mod tests {
         monitor_active: bool,
         fail_begin_monitor: bool,
         fail_close: bool,
+        next_capture_sequence: u64,
+        single_capture_calls: usize,
         capture_error: Option<AgentError>,
         input_frame_error: Option<AgentError>,
         worker_ready_error: Option<AgentError>,
@@ -3783,19 +3763,48 @@ mod tests {
             _fps: u32,
             _encoding: RuntimeCaptureEncoding,
         ) -> Result<Box<dyn RuntimeCapture>, AgentError> {
-            if let Some(error) = self.state.lock().unwrap().capture_error.clone() {
+            let mut state = self.state.lock().unwrap();
+            if let Some(error) = state.capture_error.clone() {
                 return Err(error);
             }
+            state.next_capture_sequence += 1;
+            let sequence = state.next_capture_sequence;
+            drop(state);
             Ok(Box::new(FakeCapture {
                 frames: VecDeque::from([RuntimeCapturedFrame {
                     bytes: vec![1, 2, 3],
                     width: 1280,
                     height: 720,
-                    sequence: 1,
+                    sequence,
                     captured_at_unix_us: now_unix_us(),
                     backend: "test".into(),
                 }]),
             }))
+        }
+
+        fn capture_once(
+            &mut self,
+            _binding: &TargetBinding,
+            _source_id: &str,
+            _region: CaptureRegion,
+            _fps: u32,
+            _encoding: RuntimeCaptureEncoding,
+            _deadline: Instant,
+        ) -> Result<RuntimeCapturedFrame, AgentError> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(error) = state.capture_error.clone() {
+                return Err(error);
+            }
+            state.single_capture_calls += 1;
+            state.next_capture_sequence += 1;
+            Ok(RuntimeCapturedFrame {
+                bytes: vec![1, 2, 3],
+                width: 1280,
+                height: 720,
+                sequence: state.next_capture_sequence,
+                captured_at_unix_us: now_unix_us(),
+                backend: "test".into(),
+            })
         }
 
         fn focus(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError> {
@@ -5252,6 +5261,8 @@ mod tests {
             ));
         }
 
+        state.lock().unwrap().next_capture_sequence = 40;
+
         let capture = HubControlCommand {
             payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {
                 source_id: "client".into(),
@@ -5265,20 +5276,21 @@ mod tests {
         assert!(matches!(
             executor.execute(&capture, &ExecutionSession::test(), sink.clone()),
             CommandOutcome::TaskAck { ref outcome, ref receipt, .. }
-                if outcome.as_ref().unwrap().source_frame_sequence == Some(1)
+                if outcome.as_ref().unwrap().source_frame_sequence == Some(41)
                     && receipt.capture_state
                         == fairypam_agent_protocol::internal_v1::TaskCaptureState::Stopped as i32
         ));
         assert!(executor.capture.is_none());
         let frames = sink.0.lock().unwrap();
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].frame_sequence, 1);
+        assert_eq!(frames[0].frame_sequence, 41);
         assert_eq!(frames[0].payload, vec![1, 2, 3]);
         assert_eq!(
             frames[0].attempt.as_ref().unwrap().attempt_id,
             contract.attempt_id
         );
         drop(frames);
+        assert_eq!(state.lock().unwrap().single_capture_calls, 1);
 
         let paused_capture = HubControlCommand {
             payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {
@@ -5603,10 +5615,6 @@ mod tests {
     #[test]
     fn guardian_start_failure_is_definitely_not_applied() {
         let guardian = AgentError::new("guardian.unavailable", "guardian did not start");
-        let local_input_detected = AgentError::new(
-            "environment.local_input_detected",
-            "physical input was detected",
-        );
         let invalid = AgentError::new("input.frame_invalid", "input frame was rejected");
         let worker_not_applied = AgentError::new("worker.not_applied", "worker rejected input");
         let other = AgentError::new("input.failed", "input result is unknown");
@@ -5614,10 +5622,6 @@ mod tests {
         assert_eq!(input_frame_outcome(None), TaskCommandOutcomeState::Applied);
         assert_eq!(
             input_frame_outcome(Some(&guardian)),
-            TaskCommandOutcomeState::NotApplied
-        );
-        assert_eq!(
-            input_frame_outcome(Some(&local_input_detected)),
             TaskCommandOutcomeState::NotApplied
         );
         assert_eq!(

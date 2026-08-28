@@ -8,7 +8,7 @@ use std::time::Duration;
 #[cfg(windows)]
 use fairypam_agent_maa::controller::windows::{MaaBackendSelection, MaaWindowsController};
 #[cfg(windows)]
-use fairypam_agent_maa::controller::{GenericWindowsController, TargetGeometry};
+use fairypam_agent_maa::controller::{GenericWindowsController, MouseButton, TargetGeometry};
 #[cfg(windows)]
 use fairypam_agent_maa::MaaRuntimeError;
 #[cfg(windows)]
@@ -61,6 +61,22 @@ pub fn run(runtime_root: &Path, public_key: &OsStr) -> Result<(), MaaRuntimeErro
                 "MAA returned an empty smoke-test capture",
             ));
         }
+        let x = i32::try_from(geometry.width / 2).unwrap_or(1);
+        let y = i32::try_from(geometry.height / 2).unwrap_or(1);
+        for button in [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::X1,
+            MouseButton::X2,
+        ] {
+            controller.click(button, x, y, timeout)?;
+        }
+        controller.key_down(0x87, timeout)?;
+        controller.key_up(0x87, timeout)?;
+        controller.scroll_at(Some((x, y)), 0, 120, timeout)?;
+        controller.relative_move(1, 1, timeout)?;
+        controller.inactive(timeout)?;
         let health = controller.get_health();
         if health.runtime_version != "5.12.3" || !health.connected || health.event_count == 0 {
             return Err(MaaRuntimeError::new(
@@ -68,7 +84,6 @@ pub fn run(runtime_root: &Path, public_key: &OsStr) -> Result<(), MaaRuntimeErro
                 "MAA controller health did not remain connected",
             ));
         }
-        controller.inactive(timeout)?;
         controller.detach_target()
     });
     while !smoke.is_finished() {
