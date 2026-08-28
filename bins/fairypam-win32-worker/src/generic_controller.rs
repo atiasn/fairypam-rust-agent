@@ -2,6 +2,7 @@ use fairypam_agent_maa::MaaRuntimeError;
 use std::collections::VecDeque;
 
 const SOURCE_FRAME_WINDOW_CAPACITY: usize = 256;
+const WHEEL_DELTA: i32 = 120;
 
 #[derive(Default)]
 struct SourceFrameWindow {
@@ -68,9 +69,22 @@ fn ppm_coordinate(value: u32, extent: u32) -> Result<i32, MaaRuntimeError> {
         .map_err(|_| MaaRuntimeError::new("input.coordinate_invalid", "coordinate overflow"))
 }
 
+fn wheel_notches(delta: i32) -> impl Iterator<Item = i32> {
+    std::iter::repeat_n(
+        delta.signum() * WHEEL_DELTA,
+        delta.unsigned_abs() as usize / WHEEL_DELTA as usize,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{bind_optional_client_point, SourceFrameWindow};
+    use super::{bind_optional_client_point, wheel_notches, SourceFrameWindow};
+
+    #[test]
+    fn wheel_delta_is_emitted_as_standard_notches() {
+        assert_eq!(wheel_notches(-1_200).collect::<Vec<_>>(), vec![-120; 10]);
+        assert_eq!(wheel_notches(120).collect::<Vec<_>>(), vec![120]);
+    }
 
     #[test]
     fn scroll_point_accepts_a_known_frame_and_converts_ppm() {
@@ -127,7 +141,7 @@ mod windows_impl {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use fairypam_agent_core::profile::{
         verify_profile, ActionDefinition, CaptureRegion, ClientPointButton,
@@ -145,7 +159,7 @@ mod windows_impl {
         GetClientRect, GetWindowThreadProcessId, IsWindow,
     };
 
-    use super::{bind_optional_client_point, ppm_coordinate, SourceFrameWindow};
+    use super::{bind_optional_client_point, ppm_coordinate, wheel_notches, SourceFrameWindow};
 
     const OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -385,7 +399,19 @@ mod windows_impl {
                         && delta.unsigned_abs() <= *maximum_delta as u32 => {}
                 _ => return Err(action_kind_invalid()),
             }
-            self.maa.scroll_at(bound_point, 0, delta, OPERATION_TIMEOUT)
+            let deadline = Instant::now() + OPERATION_TIMEOUT;
+            let mut point = bound_point;
+            for notch in wheel_notches(delta) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(MaaRuntimeError::new(
+                        "maa.operation_timeout",
+                        "MAA scroll deadline expired",
+                    ));
+                }
+                self.maa.scroll_at(point.take(), 0, notch, remaining)?;
+            }
+            Ok(())
         }
 
         pub fn relative_move(
