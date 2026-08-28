@@ -668,6 +668,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                 "MAA Generic capture only exposes the full client frame",
             ));
         }
+        self.tick_input_safety(Instant::now())?;
         let profile = self
             .profile
             .clone()
