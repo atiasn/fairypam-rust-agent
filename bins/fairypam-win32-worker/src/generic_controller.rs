@@ -127,7 +127,7 @@ mod windows_impl {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use fairypam_agent_core::profile::{
         verify_profile, ActionDefinition, CaptureRegion, ClientPointButton,
