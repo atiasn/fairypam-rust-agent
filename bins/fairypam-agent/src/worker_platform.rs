@@ -75,6 +75,17 @@ fn attachment_decision(
     }
 }
 
+fn retain_input_lease_for_holds(
+    held_actions: &BTreeSet<String>,
+    input_expires_at: &mut Option<Instant>,
+) -> bool {
+    let holds_active = !held_actions.is_empty();
+    if !holds_active {
+        *input_expires_at = None;
+    }
+    holds_active
+}
+
 impl WorkerRuntimePlatform {
     pub(super) fn new(profiles: &ProfileStore, root_public_key: Option<&str>) -> Self {
         let root_public_key = root_public_key.map(str::to_owned);
@@ -963,7 +974,10 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                 &mut applied_any,
             )?;
         }
-        Ok(!self.held_actions.is_empty())
+        Ok(retain_input_lease_for_holds(
+            &self.held_actions,
+            &mut self.input_expires_at,
+        ))
     }
 
     fn release_task_input(&mut self) -> Result<(), AgentError> {
@@ -1309,11 +1323,14 @@ fn map_worker_error(error: fairypam_agent_maa::MaaRuntimeError) -> AgentError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+
     use fairypam_agent_protocol::worker_v1::{WindowsIoMode, WorkerHealth};
 
     use super::{
-        attachment_decision, verify_release_health, AttachmentDecision, RuntimePlatform,
-        WorkerRuntimePlatform,
+        attachment_decision, retain_input_lease_for_holds, verify_release_health,
+        AttachmentDecision, RuntimePlatform, WorkerRuntimePlatform,
     };
     use crate::profile_store::ProfileStore;
 
@@ -1364,6 +1381,25 @@ mod tests {
             attachment_decision(false, Some("worker-2"), Some("worker-2")),
             AttachmentDecision::Replace
         );
+    }
+
+    #[test]
+    fn transient_input_does_not_leave_an_expiring_lease() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut expires_at = Some(deadline);
+
+        assert!(!retain_input_lease_for_holds(
+            &BTreeSet::new(),
+            &mut expires_at
+        ));
+        assert_eq!(expires_at, None);
+
+        expires_at = Some(deadline);
+        assert!(retain_input_lease_for_holds(
+            &BTreeSet::from(["movement.forward".to_owned()]),
+            &mut expires_at,
+        ));
+        assert_eq!(expires_at, Some(deadline));
     }
 
     #[test]
