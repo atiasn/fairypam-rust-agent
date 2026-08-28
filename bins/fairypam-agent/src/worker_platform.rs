@@ -17,8 +17,8 @@ use fairypam_agent_protocol::v3::{
 use fairypam_agent_protocol::worker_realtime_metrics_digest;
 use fairypam_agent_protocol::worker_v1::{
     worker_event, worker_request, AttachTarget, CaptureOnce, DetachTarget, GenericClick,
-    GenericKeyDown, GenericKeyUp, GenericScroll, GetHealth, RealtimeProgramState, ReleaseAll,
-    StartGenericCapture, StartRealtimeProgram, StopGenericCapture, StopRealtimeProgram,
+    GenericKeyDown, GenericKeyUp, GenericScroll, GenericSwipe, GetHealth, RealtimeProgramState,
+    ReleaseAll, StartGenericCapture, StartRealtimeProgram, StopGenericCapture, StopRealtimeProgram,
     WindowsIoMode, WorkerEvent, WorkerOutcome, WorkerResponse,
 };
 
@@ -898,6 +898,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         wheel_point: Option<(u32, u32)>,
         source_frame: Option<(&AtomicU64, u64)>,
         client_point: Option<(&str, u32, u32)>,
+        client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
     ) -> Result<bool, AgentError> {
         if expires_at <= Instant::now() {
             return Err(AgentError::new(
@@ -912,13 +913,14 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         self.require_session(session)?;
         self.input_expires_at = Some(expires_at);
         ensure_current_source_frame(source_frame)?;
-        let runtime_source_frame = if wheel_delta != 0 || client_point.is_some() {
-            source_frame
-                .map(|(_, sequence)| self.runtime_source_frame(sequence))
-                .transpose()?
-        } else {
-            None
-        };
+        let runtime_source_frame =
+            if wheel_delta != 0 || client_point.is_some() || client_swipe.is_some() {
+                source_frame
+                    .map(|(_, sequence)| self.runtime_source_frame(sequence))
+                    .transpose()?
+            } else {
+                None
+            };
         let requested = held_action_ids.iter().cloned().collect::<BTreeSet<_>>();
         let mut applied_any = false;
         for action_id in self
@@ -969,6 +971,25 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                     action_id: action_id.to_owned(),
                     x_ppm,
                     y_ppm,
+                    source_frame_sequence,
+                }),
+                &mut applied_any,
+            )?;
+        }
+        if let Some((action_id, start_x_ppm, start_y_ppm, end_x_ppm, end_y_ppm, duration_ms)) =
+            client_swipe
+        {
+            let source_frame_sequence = runtime_source_frame.ok_or_else(|| {
+                AgentError::new("input.frame_invalid", "swipe requires a source frame")
+            })?;
+            self.request_in_sequence(
+                worker_request::Payload::GenericSwipe(GenericSwipe {
+                    action_id: action_id.to_owned(),
+                    start_x_ppm,
+                    start_y_ppm,
+                    end_x_ppm,
+                    end_y_ppm,
+                    duration_ms,
                     source_frame_sequence,
                 }),
                 &mut applied_any,
@@ -1239,6 +1260,7 @@ fn request_applied_response(
 ) -> Result<WorkerResponse, AgentError> {
     let expected_action = match &payload {
         worker_request::Payload::GenericClick(value) => Some(value.action_id.clone()),
+        worker_request::Payload::GenericSwipe(value) => Some(value.action_id.clone()),
         worker_request::Payload::GenericKeyDown(value) => Some(value.action_id.clone()),
         worker_request::Payload::GenericKeyUp(value) => Some(value.action_id.clone()),
         worker_request::Payload::GenericScroll(value) => Some(value.action_id.clone()),

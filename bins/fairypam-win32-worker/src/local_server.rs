@@ -396,6 +396,21 @@ mod windows_impl {
                     )?;
                     Ok(CommandResult::applied().action(&value.action_id))
                 }
+                worker_request::Payload::GenericSwipe(value) => {
+                    self.arbiter
+                        .allow_generic_input(identity.input_owner_epoch)
+                        .map_err(io_error)?;
+                    self.lock_controller()?.swipe(
+                        &value.action_id,
+                        value.start_x_ppm,
+                        value.start_y_ppm,
+                        value.end_x_ppm,
+                        value.end_y_ppm,
+                        value.duration_ms,
+                        value.source_frame_sequence,
+                    )?;
+                    Ok(CommandResult::applied().action(&value.action_id))
+                }
                 worker_request::Payload::GenericKeyDown(value) => {
                     self.arbiter
                         .allow_generic_input(identity.input_owner_epoch)
@@ -1223,6 +1238,7 @@ mod windows_impl {
             request.payload.as_ref(),
             Some(
                 worker_request::Payload::GenericClick(_)
+                    | worker_request::Payload::GenericSwipe(_)
                     | worker_request::Payload::GenericKeyDown(_)
                     | worker_request::Payload::GenericKeyUp(_)
                     | worker_request::Payload::GenericScroll(_)

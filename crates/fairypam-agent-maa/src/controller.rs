@@ -42,6 +42,13 @@ pub trait GenericWindowsController {
         y: i32,
         timeout: Duration,
     ) -> Result<(), MaaRuntimeError>;
+    fn swipe(
+        &mut self,
+        start: (i32, i32),
+        end: (i32, i32),
+        duration: Duration,
+        timeout: Duration,
+    ) -> Result<(), MaaRuntimeError>;
     fn key_down(&mut self, virtual_key: i32, timeout: Duration) -> Result<(), MaaRuntimeError>;
     fn key_up(&mut self, virtual_key: i32, timeout: Duration) -> Result<(), MaaRuntimeError>;
     fn move_to(&mut self, x: i32, y: i32, timeout: Duration) -> Result<(), MaaRuntimeError>;
@@ -100,6 +107,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum Call {
         Click(MouseButton),
+        Swipe((i32, i32), (i32, i32), Duration),
         KeyDown(i32),
         KeyUp(i32),
         MoveTo(i32, i32),
@@ -144,6 +152,17 @@ mod tests {
             _timeout: Duration,
         ) -> Result<(), MaaRuntimeError> {
             self.0.push(Call::Click(button));
+            Ok(())
+        }
+
+        fn swipe(
+            &mut self,
+            start: (i32, i32),
+            end: (i32, i32),
+            duration: Duration,
+            _timeout: Duration,
+        ) -> Result<(), MaaRuntimeError> {
+            self.0.push(Call::Swipe(start, end, duration));
             Ok(())
         }
 
@@ -447,6 +466,25 @@ pub mod windows {
             timeout: Duration,
         ) -> Result<(), MaaRuntimeError> {
             let id = self.controller()?.post_click_v2(x, y, button as i32, 1);
+            self.run(id, timeout)
+        }
+
+        fn swipe(
+            &mut self,
+            start: (i32, i32),
+            end: (i32, i32),
+            duration: Duration,
+            timeout: Duration,
+        ) -> Result<(), MaaRuntimeError> {
+            let duration_ms = i32::try_from(duration.as_millis()).map_err(|_| {
+                self.fail_message(
+                    "maa.operation_invalid",
+                    "swipe duration is too large".into(),
+                )
+            })?;
+            let id =
+                self.controller()?
+                    .post_swipe_v2(start.0, start.1, end.0, end.1, duration_ms, 0, 1);
             self.run(id, timeout)
         }
 

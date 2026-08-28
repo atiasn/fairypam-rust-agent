@@ -91,13 +91,21 @@ fn production_genshin_profile_matches_the_formal_root_and_target() {
     .unwrap();
 
     assert_eq!(profile.profile().id, "genshin-impact");
-    assert_eq!(profile.profile().version, "2.0.0");
+    assert_eq!(profile.profile().version, "2.0.1");
     assert!(matches!(
         profile.profile().actions.get("input.f"),
         Some(ActionDefinition::Pulse {
             maa_virtual_key: 0x46,
             physical_scan_code: 33,
             extended: false,
+        })
+    ));
+    assert!(matches!(
+        profile.profile().actions.get("inventory.scrollbar_drag"),
+        Some(ActionDefinition::ClientPointSwipe {
+            button: ClientPointButton::Left,
+            maximum_distance_ppm: 100_000,
+            maximum_duration_ms: 1_000,
         })
     ));
     assert!(profile

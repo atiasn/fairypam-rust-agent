@@ -17,11 +17,28 @@ pub enum SemanticMouseButton {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolvedAction {
-    HoldKey { scan_code: u16, extended: bool },
-    PulseKey { scan_code: u16, extended: bool },
-    Wheel { maximum_delta: i32 },
-    RelativeMouse { maximum_delta: i32 },
-    ClientPointClick { button: SemanticMouseButton },
+    HoldKey {
+        scan_code: u16,
+        extended: bool,
+    },
+    PulseKey {
+        scan_code: u16,
+        extended: bool,
+    },
+    Wheel {
+        maximum_delta: i32,
+    },
+    RelativeMouse {
+        maximum_delta: i32,
+    },
+    ClientPointClick {
+        button: SemanticMouseButton,
+    },
+    ClientPointSwipe {
+        button: SemanticMouseButton,
+        maximum_distance_ppm: u32,
+        maximum_duration_ms: u32,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -74,6 +91,21 @@ impl ActionMap {
                             },
                         }
                     }
+                    ActionDefinition::ClientPointSwipe {
+                        button,
+                        maximum_distance_ppm,
+                        maximum_duration_ms,
+                    } => ResolvedAction::ClientPointSwipe {
+                        button: match button {
+                            ClientPointButton::Left => SemanticMouseButton::Left,
+                            ClientPointButton::Right => SemanticMouseButton::Right,
+                            ClientPointButton::Middle => SemanticMouseButton::Middle,
+                            ClientPointButton::X1 => SemanticMouseButton::X1,
+                            ClientPointButton::X2 => SemanticMouseButton::X2,
+                        },
+                        maximum_distance_ppm: *maximum_distance_ppm,
+                        maximum_duration_ms: *maximum_duration_ms,
+                    },
                 };
                 Ok((id, action))
             })
@@ -260,7 +292,8 @@ impl ActionMap {
                 | ResolvedAction::PulseKey { scan_code, .. } => Some(*scan_code),
                 ResolvedAction::Wheel { .. }
                 | ResolvedAction::RelativeMouse { .. }
-                | ResolvedAction::ClientPointClick { .. } => None,
+                | ResolvedAction::ClientPointClick { .. }
+                | ResolvedAction::ClientPointSwipe { .. } => None,
             })
             .collect::<BTreeSet<_>>()
             .into_iter()

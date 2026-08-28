@@ -103,6 +103,11 @@ pub enum ActionDefinition {
     ClientPointClick {
         button: ClientPointButton,
     },
+    ClientPointSwipe {
+        button: ClientPointButton,
+        maximum_distance_ppm: u32,
+        maximum_duration_ms: u32,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -356,6 +361,15 @@ fn validate_actions(actions: &BTreeMap<String, ActionDefinition>) -> Result<(), 
                     (1..=2_000).contains(maximum_delta)
                 }
                 ActionDefinition::ClientPointClick { .. } => true,
+                ActionDefinition::ClientPointSwipe {
+                    button,
+                    maximum_distance_ppm,
+                    maximum_duration_ms,
+                } => {
+                    *button == ClientPointButton::Left
+                        && (1..=NORMALIZED_SCALE_PPM).contains(maximum_distance_ppm)
+                        && (1..=3_000).contains(maximum_duration_ms)
+                }
             };
             id_is_valid && definition_is_valid
         });

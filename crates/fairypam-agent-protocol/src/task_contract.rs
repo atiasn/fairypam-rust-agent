@@ -245,6 +245,22 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
                 "y_ppm": value.y_ppm,
             }),
         ),
+        Some(Payload::ClientPointSwipe(value)) => (
+            task(value.reference.as_ref())?,
+            "ClientPointSwipe",
+            serde_json::json!({
+                "action_id": value.action_id,
+                "duration_ms": value.duration_ms,
+                "end_x_ppm": value.end_x_ppm,
+                "end_y_ppm": value.end_y_ppm,
+                "input_sequence": value.input_sequence,
+                "lease_ms": value.lease_ms,
+                "source_frame_sequence": value.source_frame_sequence,
+                "start_x_ppm": value.start_x_ppm,
+                "start_y_ppm": value.start_y_ppm,
+                "target_generation": value.target_generation,
+            }),
+        ),
         Some(Payload::ReleaseAll(value)) => match task_optional(value.reference.as_ref())? {
             Some(task) => (
                 task,

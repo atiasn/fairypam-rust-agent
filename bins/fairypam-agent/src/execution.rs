@@ -384,6 +384,7 @@ pub trait RuntimePlatform: Send {
         wheel_point: Option<(u32, u32)>,
         source_frame: Option<(&AtomicU64, u64)>,
         client_point: Option<(&str, u32, u32)>,
+        client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
     ) -> Result<bool, AgentError>;
 
     fn release_task_input(&mut self) -> Result<(), AgentError>;
@@ -1049,6 +1050,7 @@ impl CommandExecutor {
         task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
         frame: &v3::InputFrame,
         client_point: Option<(&str, u32, u32)>,
+        client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
     ) -> CommandOutcome {
         let result = (|| {
             if self.managed_game.is_closing() {
@@ -1110,6 +1112,7 @@ impl CommandExecutor {
                             .as_ref()
                             .map(|(current, expected)| (current.as_ref(), *expected)),
                         client_point,
+                        client_swipe,
                     )
                 });
             let holds_active = frame_result.as_ref().ok().copied().unwrap_or(false);
@@ -2395,6 +2398,7 @@ impl CommandExecutor {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .and_then(|_| {
                     self.platform.apply_task_input_frame(
@@ -2406,6 +2410,7 @@ impl CommandExecutor {
                         &[],
                         "",
                         0,
+                        None,
                         None,
                         None,
                         None,
@@ -2842,6 +2847,7 @@ impl RuntimePlatform for UnsupportedPlatform {
         _wheel_point: Option<(u32, u32)>,
         _source_frame: Option<(&AtomicU64, u64)>,
         _client_point: Option<(&str, u32, u32)>,
+        _client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
     ) -> Result<bool, AgentError> {
         Err(AgentError::new(
             "input.platform_unsupported",
@@ -3403,6 +3409,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         _wheel_point: Option<(u32, u32)>,
         _source_frame: Option<(&AtomicU64, u64)>,
         _client_point: Option<(&str, u32, u32)>,
+        _client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
     ) -> Result<bool, AgentError> {
         Err(AgentError::new(
             "worker.required",
@@ -3946,6 +3953,7 @@ mod tests {
             _wheel_point: Option<(u32, u32)>,
             source_frame: Option<(&AtomicU64, u64)>,
             client_point: Option<(&str, u32, u32)>,
+            client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
         ) -> Result<bool, AgentError> {
             let mut state = self.state.lock().unwrap();
             if let Some(error) = state.input_frame_error.take() {
@@ -3966,6 +3974,7 @@ mod tests {
             }
             ensure_current_source_frame(source_frame)?;
             state.point_clicks += usize::from(client_point.is_some());
+            state.point_clicks += usize::from(client_swipe.is_some());
             Ok(holds_active)
         }
 
@@ -4423,6 +4432,7 @@ mod tests {
                     ..v3::InputFrame::default()
                 },
                 Some(("combat.normal_attack", 500_000, 583_333)),
+                None,
             ),
             CommandOutcome::TaskAck { .. }
         ));
@@ -4451,6 +4461,7 @@ mod tests {
                 ..v3::InputFrame::default()
             },
             Some(("combat.normal_attack", 500_000, 583_333)),
+            None,
         );
 
         assert!(matches!(
@@ -4484,6 +4495,7 @@ mod tests {
                     target_generation: 1,
                     ..v3::InputFrame::default()
                 },
+                None,
                 None,
             ),
             CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
@@ -4519,6 +4531,7 @@ mod tests {
                     ..v3::InputFrame::default()
                 },
                 None,
+                None,
             ),
             CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
                 if outcome.outcome == TaskCommandOutcomeState::NotApplied as i32
@@ -4549,6 +4562,7 @@ mod tests {
                     target_generation: 2,
                     ..v3::InputFrame::default()
                 },
+                None,
                 None,
             ),
             CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }

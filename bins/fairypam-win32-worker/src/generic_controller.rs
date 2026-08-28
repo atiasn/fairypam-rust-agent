@@ -335,6 +335,50 @@ mod windows_impl {
             self.maa.click(button, x, y, OPERATION_TIMEOUT)
         }
 
+        pub fn swipe(
+            &mut self,
+            action_id: &str,
+            start_x_ppm: u32,
+            start_y_ppm: u32,
+            end_x_ppm: u32,
+            end_y_ppm: u32,
+            duration_ms: u32,
+            source_frame_sequence: u64,
+        ) -> Result<(), MaaRuntimeError> {
+            self.require_source_frame(source_frame_sequence)?;
+            let geometry = self.revalidate()?;
+            let (maximum_distance_ppm, maximum_duration_ms) = match self.action(action_id)? {
+                ActionDefinition::ClientPointSwipe {
+                    button: ClientPointButton::Left,
+                    maximum_distance_ppm,
+                    maximum_duration_ms,
+                } => (*maximum_distance_ppm, *maximum_duration_ms),
+                _ => return Err(action_kind_invalid()),
+            };
+            let dx = start_x_ppm.abs_diff(end_x_ppm);
+            let dy = start_y_ppm.abs_diff(end_y_ppm);
+            if duration_ms == 0
+                || duration_ms > maximum_duration_ms
+                || dx.max(dy) > maximum_distance_ppm
+            {
+                return Err(action_kind_invalid());
+            }
+            let start = (
+                ppm_coordinate(start_x_ppm, geometry.width)?,
+                ppm_coordinate(start_y_ppm, geometry.height)?,
+            );
+            let end = (
+                ppm_coordinate(end_x_ppm, geometry.width)?,
+                ppm_coordinate(end_y_ppm, geometry.height)?,
+            );
+            self.maa.swipe(
+                start,
+                end,
+                Duration::from_millis(u64::from(duration_ms)),
+                OPERATION_TIMEOUT,
+            )
+        }
+
         pub fn key_down(&mut self, action_id: &str) -> Result<(), MaaRuntimeError> {
             self.revalidate()?;
             let virtual_key = match self.action(action_id)? {

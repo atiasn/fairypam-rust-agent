@@ -41,6 +41,10 @@ pub enum TranslatedCommand {
         task: internal::TaskCommandRef,
         value: wire::ClientPointClick,
     },
+    ClientPointSwipe {
+        task: internal::TaskCommandRef,
+        value: wire::ClientPointSwipe,
+    },
     StartRealtimeProgram {
         task: internal::TaskCommandRef,
         value: wire::StartRealtimeProgram,
@@ -310,6 +314,7 @@ pub fn identity(command: &wire::HubControlCommand) -> Option<wire::CommandIdenti
         Payload::StopRealtimeProgram(value) => value.reference.clone(),
         Payload::InputFrame(value) => value.reference.clone(),
         Payload::ClientPointClick(value) => value.reference.clone(),
+        Payload::ClientPointSwipe(value) => value.reference.clone(),
         Payload::ReleaseAll(value) => value.reference.clone(),
         Payload::FinishAttempt(value) => value.reference.clone(),
         Payload::InspectAttempt(value) => value.reference.clone(),
@@ -333,6 +338,7 @@ pub fn command_name(command: &wire::HubControlCommand) -> &'static str {
         Some(Payload::StopRealtimeProgram(_)) => "stop_realtime_program",
         Some(Payload::InputFrame(_)) => "input_frame",
         Some(Payload::ClientPointClick(_)) => "client_point_click",
+        Some(Payload::ClientPointSwipe(_)) => "client_point_swipe",
         Some(Payload::ReleaseAll(_)) => "release_all",
         Some(Payload::FinishAttempt(_)) => "finish_attempt",
         Some(Payload::InspectAttempt(_)) => "inspect_attempt",
@@ -567,6 +573,43 @@ fn translate(
             }
             translator.last_input_sequence = value.input_sequence;
             return Ok(TranslatedCommand::ClientPointClick {
+                task: internal_task(wire_task(value.reference.as_ref())?)?,
+                value: value.clone(),
+            });
+        }
+        Some(Payload::ClientPointSwipe(value)) => {
+            translator.require_capability(value.reference.as_ref(), 5)?;
+            if value.input_sequence == 0
+                || value.input_sequence <= translator.last_input_sequence
+                || value.lease_ms == 0
+                || value.lease_ms
+                    > translator
+                        .active_contract
+                        .as_ref()
+                        .ok_or_else(|| {
+                            AgentError::new(
+                                "task.contract_missing",
+                                "execution contract has not been accepted",
+                            )
+                        })?
+                        .max_input_lease_ms
+                        .min(translator.hub_max_input_lease_ms)
+                || value.action_id.is_empty()
+                || value.start_x_ppm > 1_000_000
+                || value.start_y_ppm > 1_000_000
+                || value.end_x_ppm > 1_000_000
+                || value.end_y_ppm > 1_000_000
+                || value.duration_ms == 0
+                || value.source_frame_sequence == 0
+                || value.target_generation == 0
+            {
+                return Err(AgentError::new(
+                    "input.frame_invalid",
+                    "client point swipe is outside the v3 fixed bounds",
+                ));
+            }
+            translator.last_input_sequence = value.input_sequence;
+            return Ok(TranslatedCommand::ClientPointSwipe {
                 task: internal_task(wire_task(value.reference.as_ref())?)?,
                 value: value.clone(),
             });
@@ -1173,6 +1216,22 @@ mod tests {
                     "y_ppm": value.y_ppm,
                 }),
             ),
+            hub_control_command::Payload::ClientPointSwipe(value) => (
+                value.reference.as_ref().unwrap(),
+                "ClientPointSwipe",
+                serde_json::json!({
+                    "action_id": value.action_id,
+                    "duration_ms": value.duration_ms,
+                    "end_x_ppm": value.end_x_ppm,
+                    "end_y_ppm": value.end_y_ppm,
+                    "input_sequence": value.input_sequence,
+                    "lease_ms": value.lease_ms,
+                    "source_frame_sequence": value.source_frame_sequence,
+                    "start_x_ppm": value.start_x_ppm,
+                    "start_y_ppm": value.start_y_ppm,
+                    "target_generation": value.target_generation,
+                }),
+            ),
             hub_control_command::Payload::StartCapture(value) => (
                 value.reference.as_ref().unwrap(),
                 "StartCapture",
@@ -1243,6 +1302,9 @@ mod tests {
             hub_control_command::Payload::BeginAttempt(value) => value.reference.as_mut().unwrap(),
             hub_control_command::Payload::InputFrame(value) => value.reference.as_mut().unwrap(),
             hub_control_command::Payload::ClientPointClick(value) => {
+                value.reference.as_mut().unwrap()
+            }
+            hub_control_command::Payload::ClientPointSwipe(value) => {
                 value.reference.as_mut().unwrap()
             }
             hub_control_command::Payload::StartCapture(value) => value.reference.as_mut().unwrap(),
@@ -1511,6 +1573,39 @@ mod tests {
         assert_eq!(value.action_id, "combat.normal_attack");
         assert_eq!(value.source_frame_sequence, 7);
         assert_eq!(value.target_generation, 1);
+    }
+
+    #[test]
+    fn translator_preserves_action_bound_client_point_swipe() {
+        let contract = contract(vec![1, 5]);
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract);
+        let command = with_digest(wire::HubControlCommand {
+            payload: Some(hub_control_command::Payload::ClientPointSwipe(
+                wire::ClientPointSwipe {
+                    reference: Some(task_identity(&contract, 2)),
+                    input_sequence: 1,
+                    lease_ms: 500,
+                    action_id: "inventory.scrollbar_drag".into(),
+                    start_x_ppm: 671_354,
+                    start_y_ppm: 175_925,
+                    end_x_ppm: 671_354,
+                    end_y_ppm: 203_703,
+                    duration_ms: 300,
+                    source_frame_sequence: 7,
+                    target_generation: 1,
+                },
+            )),
+        });
+
+        let TranslatedCommand::ClientPointSwipe { value, .. } =
+            translator.translate(&command).unwrap()
+        else {
+            panic!("ClientPointSwipe was not preserved");
+        };
+        assert_eq!(value.action_id, "inventory.scrollbar_drag");
+        assert_eq!(value.source_frame_sequence, 7);
+        assert_eq!(value.duration_ms, 300);
     }
 
     #[test]

@@ -74,6 +74,7 @@ message WorkerRequest {
     StopRealtimeProgram stop_realtime_program = 17;
     ReleaseAll release_all = 18;
     Shutdown shutdown = 19;
+    GenericSwipe generic_swipe = 20;
   }
 }
 
@@ -148,6 +149,16 @@ message GenericClick {
   uint32 x_ppm = 2;
   uint32 y_ppm = 3;
   uint64 source_frame_sequence = 4;
+}
+
+message GenericSwipe {
+  string action_id = 1;
+  uint32 start_x_ppm = 2;
+  uint32 start_y_ppm = 3;
+  uint32 end_x_ppm = 4;
+  uint32 end_y_ppm = 5;
+  uint32 duration_ms = 6;
+  uint64 source_frame_sequence = 7;
 }
 
 message GenericKeyDown { string action_id = 1; }

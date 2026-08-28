@@ -1394,7 +1394,7 @@ impl SessionDriver for GrpcSessionDriver {
                             outcome
                         }
                         v3_adapter::TranslatedCommand::InputFrame { task, frame } => {
-                            execution.execute_v3_input_frame(&task, &frame, None)
+                            execution.execute_v3_input_frame(&task, &frame, None, None)
                         }
                         v3_adapter::TranslatedCommand::ClientPointClick { task, value } => {
                             execution.execute_v3_input_frame(
@@ -1407,6 +1407,28 @@ impl SessionDriver for GrpcSessionDriver {
                                     ..v3::InputFrame::default()
                                 },
                                 Some((&value.action_id, value.x_ppm, value.y_ppm)),
+                                None,
+                            )
+                        }
+                        v3_adapter::TranslatedCommand::ClientPointSwipe { task, value } => {
+                            execution.execute_v3_input_frame(
+                                &task,
+                                &v3::InputFrame {
+                                    input_sequence: value.input_sequence,
+                                    lease_ms: value.lease_ms,
+                                    source_frame_sequence: Some(value.source_frame_sequence),
+                                    target_generation: value.target_generation,
+                                    ..v3::InputFrame::default()
+                                },
+                                None,
+                                Some((
+                                    &value.action_id,
+                                    value.start_x_ppm,
+                                    value.start_y_ppm,
+                                    value.end_x_ppm,
+                                    value.end_y_ppm,
+                                    value.duration_ms,
+                                )),
                             )
                         }
                         v3_adapter::TranslatedCommand::StartRealtimeProgram { task, value } => {
