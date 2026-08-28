@@ -1,36 +1,26 @@
 use fairypam_agent_maa::MaaRuntimeError;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
 
-const SOURCE_FRAME_MAX_AGE: Duration = Duration::from_secs(2);
 const SOURCE_FRAME_WINDOW_CAPACITY: usize = 256;
 
 #[derive(Default)]
 struct SourceFrameWindow {
-    frames: VecDeque<(u64, Instant)>,
+    frames: VecDeque<u64>,
 }
 
 impl SourceFrameWindow {
-    fn record(&mut self, sequence: u64, captured_at: Instant) {
-        while self.frames.front().is_some_and(|(_, timestamp)| {
-            captured_at.saturating_duration_since(*timestamp) > SOURCE_FRAME_MAX_AGE
-        }) || self.frames.len() >= SOURCE_FRAME_WINDOW_CAPACITY
-        {
+    fn record(&mut self, sequence: u64) {
+        while self.frames.len() >= SOURCE_FRAME_WINDOW_CAPACITY {
             self.frames.pop_front();
         }
-        self.frames.push_back((sequence, captured_at));
+        self.frames.push_back(sequence);
     }
 
-    fn require(&self, sequence: u64, now: Instant) -> Result<(), MaaRuntimeError> {
-        if sequence == 0
-            || !self.frames.iter().any(|(known, captured_at)| {
-                *known == sequence
-                    && now.saturating_duration_since(*captured_at) <= SOURCE_FRAME_MAX_AGE
-            })
-        {
+    fn require(&self, sequence: u64) -> Result<(), MaaRuntimeError> {
+        if sequence == 0 || !self.frames.contains(&sequence) {
             return Err(MaaRuntimeError::new(
                 "worker.source_frame_stale",
-                "Generic coordinates are not bound to a recent captured frame",
+                "Generic coordinates are not bound to a known captured frame",
             ));
         }
         Ok(())
@@ -51,7 +41,7 @@ fn bind_optional_client_point(
     if source_frame_sequence == Some(0) {
         return Err(MaaRuntimeError::new(
             "worker.source_frame_stale",
-            "Generic coordinates are not bound to a recent captured frame",
+            "Generic coordinates are not bound to a known captured frame",
         ));
     }
     match (x_ppm, y_ppm) {
@@ -80,12 +70,10 @@ fn ppm_coordinate(value: u32, extent: u32) -> Result<i32, MaaRuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use super::{bind_optional_client_point, SourceFrameWindow};
 
     #[test]
-    fn scroll_point_accepts_a_known_recent_frame_and_converts_ppm() {
+    fn scroll_point_accepts_a_known_frame_and_converts_ppm() {
         assert_eq!(
             bind_optional_client_point(Some(500_000), Some(500_000), Some(7), 1920, 1080).unwrap(),
             Some((960, 540))
@@ -101,48 +89,34 @@ mod tests {
     }
 
     #[test]
-    fn source_frame_window_accepts_recent_known_frames_only() {
-        let started = Instant::now();
+    fn source_frame_window_accepts_known_frames_without_inferring_page_change_from_age() {
         let mut frames = SourceFrameWindow::default();
-        frames.record(6, started);
-        frames.record(7, started + Duration::from_millis(500));
+        frames.record(6);
+        frames.record(7);
 
-        frames
-            .require(6, started + Duration::from_millis(1_500))
-            .unwrap();
+        frames.require(6).unwrap();
         assert_eq!(
-            frames
-                .require(6, started + Duration::from_millis(2_001))
-                .unwrap_err()
-                .code(),
-            "worker.source_frame_stale"
-        );
-        assert_eq!(
-            frames.require(8, started).unwrap_err().code(),
+            frames.require(8).unwrap_err().code(),
             "worker.source_frame_stale"
         );
         frames.clear();
         assert_eq!(
-            frames.require(7, started).unwrap_err().code(),
+            frames.require(7).unwrap_err().code(),
             "worker.source_frame_stale"
         );
     }
 
     #[test]
     fn release_rejects_a_pre_release_frame_mapped_after_cleanup() {
-        let started = Instant::now();
         let mut frames = SourceFrameWindow::default();
         let worker_sequence = 3;
-        frames.record(worker_sequence, started);
+        frames.record(worker_sequence);
 
         frames.clear();
         let delayed_public_mapping = (2, worker_sequence);
 
         assert_eq!(
-            frames
-                .require(delayed_public_mapping.1, started)
-                .unwrap_err()
-                .code(),
+            frames.require(delayed_public_mapping.1).unwrap_err().code(),
             "worker.source_frame_stale"
         );
     }
@@ -281,8 +255,7 @@ mod windows_impl {
                     "frame sequence exhausted",
                 )
             })?;
-            self.source_frames
-                .record(self.frame_sequence, Instant::now());
+            self.source_frames.record(self.frame_sequence);
             Ok((self.frame_sequence, frame))
         }
 
@@ -511,7 +484,7 @@ mod windows_impl {
         }
 
         fn require_source_frame(&self, source: u64) -> Result<(), MaaRuntimeError> {
-            self.source_frames.require(source, Instant::now())
+            self.source_frames.require(source)
         }
 
         fn action(&self, action_id: &str) -> Result<&ActionDefinition, MaaRuntimeError> {
