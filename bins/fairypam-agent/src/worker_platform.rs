@@ -19,7 +19,7 @@ use fairypam_agent_protocol::worker_v1::{
     worker_event, worker_request, AttachTarget, CaptureOnce, DetachTarget, GenericClick,
     GenericKeyDown, GenericKeyUp, GenericScroll, GetHealth, RealtimeProgramState, ReleaseAll,
     StartGenericCapture, StartRealtimeProgram, StopGenericCapture, StopRealtimeProgram,
-    WorkerEvent, WorkerOutcome, WorkerResponse,
+    WindowsIoMode, WorkerEvent, WorkerOutcome, WorkerResponse,
 };
 
 use super::{
@@ -182,39 +182,50 @@ impl WorkerRuntimePlatform {
     }
 
     fn release_emergency(&mut self, reason: &'static str) -> Result<(), AgentError> {
-        let mut worker_error = None;
-        match self.worker.try_lock() {
-            Ok(mut state) => {
-                if let Some(process) = state.process.as_mut() {
-                    if let Err(error) = request_applied(
+        let worker_error = match self.worker.try_lock() {
+            Ok(mut state) => match state.process.as_mut() {
+                Some(process) => {
+                    let expected_generation = process.generation().to_owned();
+                    let expected_target_generation = process.target_generation();
+                    let minimum_input_owner_epoch = process.input_owner_epoch();
+                    let result = request_applied_response(
                         process,
                         worker_request::Payload::ReleaseAll(ReleaseAll {
                             reason_code: reason.to_owned(),
                         }),
                         Duration::from_secs(2),
-                    ) {
-                        worker_error = Some(error);
+                    )
+                    .and_then(|response| {
+                        verify_release_health(
+                            response.health.as_ref(),
+                            &expected_generation,
+                            expected_target_generation,
+                            minimum_input_owner_epoch,
+                        )
+                    });
+                    if let Err(error) = result {
                         process.terminate();
                         state.process = None;
+                        Some(error)
+                    } else {
+                        process.take_events();
+                        None
                     }
                 }
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {}
+                None => None,
+            },
+            Err(std::sync::TryLockError::WouldBlock) => Some(AgentError::new(
+                "input.release_uncertain",
+                "Win32 Worker is busy while ReleaseAll is required",
+            )),
             Err(std::sync::TryLockError::Poisoned(error)) => {
-                worker_error = Some(AgentError::new("worker.state_poisoned", error.to_string()));
+                Some(AgentError::new("worker.state_poisoned", error.to_string()))
             }
-        }
+        };
         let rust_release = self.profile.as_ref().map_or(Ok(()), |profile| {
             fairypam_agent_windows::emergency_release_profile(profile)
                 .map_err(|error| AgentError::new(error.code(), error.to_string()))
         });
-        self.held_actions.clear();
-        self.session = None;
-        self.input_expires_at = None;
-        self.realtime_program = None;
-        self.realtime_attempt = None;
-        self.realtime_terminal = None;
-        self.realtime_events.clear();
         let release = match (worker_error, rust_release.err()) {
             (None, None) => Ok(()),
             (Some(worker), None) => Err(worker),
@@ -225,7 +236,16 @@ impl WorkerRuntimePlatform {
             )),
         };
         match (release, self.clear_source_frames()) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Ok(())) => {
+                self.held_actions.clear();
+                self.session = None;
+                self.input_expires_at = None;
+                self.realtime_program = None;
+                self.realtime_attempt = None;
+                self.realtime_terminal = None;
+                self.realtime_events.clear();
+                Ok(())
+            }
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(release), Err(frames)) => Err(AgentError::new(
                 "input.release_uncertain",
@@ -480,6 +500,33 @@ impl WorkerRuntimePlatform {
             self.faulted.store(true, Ordering::Release);
         }
     }
+}
+
+fn verify_release_health(
+    health: Option<&fairypam_agent_protocol::worker_v1::WorkerHealth>,
+    expected_generation: &str,
+    expected_target_generation: u64,
+    minimum_input_owner_epoch: u64,
+) -> Result<(), AgentError> {
+    let health = health.ok_or_else(|| {
+        AgentError::new(
+            "input.release_uncertain",
+            "Worker ReleaseAll response has no health proof",
+        )
+    })?;
+    let mode = WindowsIoMode::try_from(health.io_mode).unwrap_or(WindowsIoMode::Unspecified);
+    if health.worker_generation != expected_generation
+        || health.target_generation != expected_target_generation
+        || health.input_owner_epoch < minimum_input_owner_epoch
+        || !matches!(mode, WindowsIoMode::Detached | WindowsIoMode::Generic)
+        || !health.held_action_ids.is_empty()
+    {
+        return Err(AgentError::new(
+            "input.release_uncertain",
+            "Worker still reports active or uncertain input after ReleaseAll",
+        ));
+    }
+    Ok(())
 }
 
 impl RuntimePlatform for WorkerRuntimePlatform {
@@ -1261,7 +1308,12 @@ fn map_worker_error(error: fairypam_agent_maa::MaaRuntimeError) -> AgentError {
 
 #[cfg(test)]
 mod tests {
-    use super::{attachment_decision, AttachmentDecision, RuntimePlatform, WorkerRuntimePlatform};
+    use fairypam_agent_protocol::worker_v1::{WindowsIoMode, WorkerHealth};
+
+    use super::{
+        attachment_decision, verify_release_health, AttachmentDecision, RuntimePlatform,
+        WorkerRuntimePlatform,
+    };
     use crate::profile_store::ProfileStore;
 
     #[test]
@@ -1311,5 +1363,56 @@ mod tests {
             attachment_decision(false, Some("worker-2"), Some("worker-2")),
             AttachmentDecision::Replace
         );
+    }
+
+    #[test]
+    fn release_health_requires_a_non_realtime_worker_with_no_holds() {
+        let clean = WorkerHealth {
+            io_mode: WindowsIoMode::Generic as i32,
+            worker_generation: "worker-1".into(),
+            target_generation: 7,
+            input_owner_epoch: 2,
+            ..WorkerHealth::default()
+        };
+        assert!(verify_release_health(Some(&clean), "worker-1", 7, 1).is_ok());
+
+        let mut realtime = clean.clone();
+        realtime.io_mode = WindowsIoMode::Realtime as i32;
+        assert_eq!(
+            verify_release_health(Some(&realtime), "worker-1", 7, 1)
+                .unwrap_err()
+                .code(),
+            "input.release_uncertain"
+        );
+
+        let mut held = clean;
+        held.held_action_ids.push("movement.forward".into());
+        assert_eq!(
+            verify_release_health(Some(&held), "worker-1", 7, 1)
+                .unwrap_err()
+                .code(),
+            "input.release_uncertain"
+        );
+        assert_eq!(
+            verify_release_health(None, "worker-1", 7, 1)
+                .unwrap_err()
+                .code(),
+            "input.release_uncertain"
+        );
+
+        let mut stale = WorkerHealth {
+            io_mode: WindowsIoMode::Generic as i32,
+            worker_generation: "worker-0".into(),
+            target_generation: 7,
+            input_owner_epoch: 2,
+            ..WorkerHealth::default()
+        };
+        assert!(verify_release_health(Some(&stale), "worker-1", 7, 1).is_err());
+        stale.worker_generation = "worker-1".into();
+        stale.target_generation = 6;
+        assert!(verify_release_health(Some(&stale), "worker-1", 7, 1).is_err());
+        stale.target_generation = 7;
+        stale.input_owner_epoch = 0;
+        assert!(verify_release_health(Some(&stale), "worker-1", 7, 1).is_err());
     }
 }

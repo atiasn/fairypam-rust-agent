@@ -2144,7 +2144,7 @@ impl CommandExecutor {
                 Ok(CommandOutcome::TaskAck {
                     result: "{}".into(),
                     outcome: None,
-                    receipt: Box::new(self.task_attempt.inspect(task)?),
+                    receipt: Box::new(self.inspect_task_attempt(task)?),
                     local_diagnostic: None,
                 })
             }
@@ -2497,6 +2497,30 @@ impl CommandExecutor {
             "cleanup_complete": cleanup_complete,
             "error_code": response_error_code,
         }))
+    }
+
+    fn inspect_task_attempt(
+        &mut self,
+        task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
+    ) -> Result<fairypam_agent_protocol::internal_v1::TaskAttemptReceiptV1, AgentError> {
+        if !self.task_attempt.emergency_stopped()? {
+            return self.task_attempt.inspect(task);
+        }
+
+        let receipt = self.task_attempt.inspect(task)?;
+        if receipt.cleanup_complete != Some(true) {
+            return Ok(receipt);
+        }
+        let release_error = self.platform.release_task_input().err();
+        let capture_error = self.stop_capture(None).err();
+        self.platform.finish_attempt_monitor();
+        self.frame_sequences.clear();
+        if let Some(error) = release_error.or(capture_error) {
+            return Err(error);
+        }
+
+        self.task_attempt.reset_emergency()?;
+        Ok(receipt)
     }
 
     pub fn emergency_release_input(&mut self) -> Result<(), AgentError> {
@@ -3719,6 +3743,7 @@ mod tests {
         single_capture_calls: usize,
         capture_error: Option<AgentError>,
         input_frame_error: Option<AgentError>,
+        release_error: Option<AgentError>,
         worker_ready_error: Option<AgentError>,
         music_autoplay_starts: usize,
         music_autoplay_renews: usize,
@@ -3945,7 +3970,11 @@ mod tests {
         }
 
         fn release_task_input(&mut self) -> Result<(), AgentError> {
-            self.state.lock().unwrap().input_active = false;
+            let mut state = self.state.lock().unwrap();
+            if let Some(error) = state.release_error.clone() {
+                return Err(error);
+            }
+            state.input_active = false;
             Ok(())
         }
 
@@ -5079,7 +5108,7 @@ mod tests {
     }
 
     #[test]
-    fn local_emergency_stop_cleans_active_attempt_and_requires_local_reset() {
+    fn current_session_inspect_rechecks_cleanup_before_resetting_emergency_stop() {
         let profile = verified_profile();
         let contract = task_contract(&profile);
         let state = Arc::new(Mutex::new(FakePlatformState::default()));
@@ -5187,20 +5216,52 @@ mod tests {
             payload: Some(hub_control_command::Payload::BeginTaskAttempt(
                 BeginTaskAttempt {
                     task: Some(task_ref(&contract, "begin-after-emergency")),
-                    contract: Some(contract),
+                    contract: Some(contract.clone()),
                 },
             )),
         };
         assert!(matches!(
-            executor.execute(&new_attempt, &ExecutionSession::test(), sink),
+            executor.execute(&new_attempt, &ExecutionSession::test(), sink.clone()),
             CommandOutcome::Nack { ref code, .. } if code == "emergency_stopped"
         ));
+
+        state.lock().unwrap().release_error = Some(AgentError::new(
+            "input.release_uncertain",
+            "simulated Worker release failure",
+        ));
+        let failed_inspect = HubControlCommand {
+            payload: Some(hub_control_command::Payload::InspectTaskAttempt(
+                InspectTaskAttempt {
+                    task: Some(task_ref(&contract, "inspect-emergency-failed")),
+                },
+            )),
+        };
+        assert!(matches!(
+            executor.execute(
+                &failed_inspect,
+                &ExecutionSession::test(),
+                sink.clone(),
+            ),
+            CommandOutcome::Nack { ref code, .. } if code == "input.release_uncertain"
+        ));
         assert_eq!(
-            executor
-                .execute_local(&LocalCommand::ResetEmergencyStop)
-                .unwrap()["state"],
-            "ConnectedIdle"
+            executor.runtime_state().unwrap(),
+            v3::AgentRuntimeState::EmergencyStopped
         );
+
+        state.lock().unwrap().release_error = None;
+        let inspect = HubControlCommand {
+            payload: Some(hub_control_command::Payload::InspectTaskAttempt(
+                InspectTaskAttempt {
+                    task: Some(task_ref(&contract, "inspect-emergency-recovered")),
+                },
+            )),
+        };
+        assert!(matches!(
+            executor.execute(&inspect, &ExecutionSession::test(), sink),
+            CommandOutcome::TaskAck { ref receipt, .. }
+                if receipt.cleanup_complete == Some(true)
+        ));
         assert_eq!(
             executor.execute_local(&LocalCommand::Status).unwrap()["state"],
             "TargetLocked"
