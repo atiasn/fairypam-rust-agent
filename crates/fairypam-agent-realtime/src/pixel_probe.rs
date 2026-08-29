@@ -233,27 +233,24 @@ pub mod windows {
                             Some(sample_error("SelectObject failed while releasing sampler"));
                     }
                 }
-                if self.bitmap != 0 {
-                    if !DeleteObject(HGDIOBJ(self.bitmap as *mut std::ffi::c_void)).as_bool() {
-                        first_error
-                            .get_or_insert_with(|| sample_error("DeleteObject failed for sampler"));
-                    }
+                if self.bitmap != 0
+                    && !DeleteObject(HGDIOBJ(self.bitmap as *mut std::ffi::c_void)).as_bool()
+                {
+                    first_error
+                        .get_or_insert_with(|| sample_error("DeleteObject failed for sampler"));
                 }
-                if self.target_dc != 0 {
-                    if !DeleteDC(HDC(self.target_dc as *mut std::ffi::c_void)).as_bool() {
-                        first_error
-                            .get_or_insert_with(|| sample_error("DeleteDC failed for sampler"));
-                    }
+                if self.target_dc != 0
+                    && !DeleteDC(HDC(self.target_dc as *mut std::ffi::c_void)).as_bool()
+                {
+                    first_error.get_or_insert_with(|| sample_error("DeleteDC failed for sampler"));
                 }
-                if self.source_dc != 0 {
-                    if ReleaseDC(
+                if self.source_dc != 0
+                    && ReleaseDC(
                         Some(HWND(self.hwnd as *mut std::ffi::c_void)),
                         HDC(self.source_dc as *mut std::ffi::c_void),
                     ) == 0
-                    {
-                        first_error
-                            .get_or_insert_with(|| sample_error("ReleaseDC failed for sampler"));
-                    }
+                {
+                    first_error.get_or_insert_with(|| sample_error("ReleaseDC failed for sampler"));
                 }
             }
             self.source_dc = 0;
