@@ -91,7 +91,7 @@ fn production_genshin_profile_matches_the_formal_root_and_target() {
     .unwrap();
 
     assert_eq!(profile.profile().id, "genshin-impact");
-    assert_eq!(profile.profile().version, "2.0.1");
+    assert_eq!(profile.profile().version, "2.0.2");
     assert!(matches!(
         profile.profile().actions.get("input.f"),
         Some(ActionDefinition::Pulse {
