@@ -234,14 +234,15 @@ pub mod windows {
                     }
                 }
                 if self.bitmap != 0 {
-                    if let Err(error) = DeleteObject(HGDIOBJ(self.bitmap as *mut std::ffi::c_void))
-                    {
-                        first_error.get_or_insert_with(|| sample_error(error.to_string()));
+                    if !DeleteObject(HGDIOBJ(self.bitmap as *mut std::ffi::c_void)).as_bool() {
+                        first_error
+                            .get_or_insert_with(|| sample_error("DeleteObject failed for sampler"));
                     }
                 }
                 if self.target_dc != 0 {
-                    if let Err(error) = DeleteDC(HDC(self.target_dc as *mut std::ffi::c_void)) {
-                        first_error.get_or_insert_with(|| sample_error(error.to_string()));
+                    if !DeleteDC(HDC(self.target_dc as *mut std::ffi::c_void)).as_bool() {
+                        first_error
+                            .get_or_insert_with(|| sample_error("DeleteDC failed for sampler"));
                     }
                 }
                 if self.source_dc != 0 {
