@@ -39,8 +39,7 @@ pub mod windows {
     use crate::local_input_monitor::windows::WindowsLocalInputMonitor;
     use crate::local_input_monitor::LocalInputMonitor;
     use crate::metrics::RealtimeMetrics;
-    use crate::pixel_probe::windows::GdiPixelProbe;
-    use crate::pixel_probe::PixelProbe;
+    use crate::pixel_probe::windows::GdiPixelRowProbe;
     use crate::scheduler::wait_until;
     use crate::spec::VerifiedRealtimeSpec;
     use crate::RealtimeError;
@@ -53,7 +52,7 @@ pub mod windows {
     }
 
     #[derive(Default)]
-    struct LaneMetrics {
+    struct SamplerMetrics {
         samples: u64,
         missed_deadlines: u64,
         queue_overflows: u64,
@@ -67,14 +66,14 @@ pub mod windows {
         pub release_uncertain: bool,
     }
 
-    pub struct IndependentMusicProgram {
+    pub struct GenshinMusicProgram {
         stop: Arc<AtomicBool>,
         supervision_deadline: Arc<Mutex<Option<Instant>>>,
         held_action_ids: Arc<Mutex<BTreeSet<String>>>,
         thread: Option<JoinHandle<MusicProgramResult>>,
     }
 
-    impl IndependentMusicProgram {
+    impl GenshinMusicProgram {
         pub fn start(
             hwnd: usize,
             spec: &VerifiedRealtimeSpec,
@@ -101,16 +100,31 @@ pub mod windows {
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let probes = spec
+            let points: [(i32, i32); 6] = spec
                 .spec()
                 .lanes
                 .iter()
                 .map(|lane| {
                     let x = ppm(lane.x_ppm, spec.spec().required_client_size.width)?;
                     let y = ppm(lane.y_ppm, spec.spec().required_client_size.height)?;
-                    GdiPixelProbe::new(hwnd, x, y)
+                    Ok((x, y))
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, RealtimeError>>()?
+                .try_into()
+                .map_err(|_| {
+                    RealtimeError::new(
+                        "realtime.spec_invalid",
+                        "music program requires exactly six lanes",
+                    )
+                })?;
+            let probe = GdiPixelRowProbe::new(
+                hwnd,
+                &points,
+                (
+                    spec.spec().required_client_size.width,
+                    spec.spec().required_client_size.height,
+                ),
+            )?;
             let stop = Arc::new(AtomicBool::new(false));
             let supervision_deadline = Arc::new(Mutex::new(
                 supervision_lease.map(|value| Instant::now() + value),
@@ -123,11 +137,11 @@ pub mod windows {
             let thread = std::thread::Builder::new()
                 .name("fairypam-realtime-music".into())
                 .spawn(move || {
-                    run(
+                    run_genshin_music(
                         hwnd_value,
                         content,
                         lane_keys,
-                        probes,
+                        probe,
                         maximum_duration,
                         worker_supervision,
                         worker_stop,
@@ -203,11 +217,11 @@ pub mod windows {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run(
+    fn run_genshin_music(
         hwnd: usize,
         spec: crate::spec::RealtimeProgramSpec,
         keys: Vec<PhysicalKey>,
-        probes: Vec<GdiPixelProbe>,
+        probe: GdiPixelRowProbe<6>,
         maximum_duration: Duration,
         supervision_deadline: Arc<Mutex<Option<Instant>>>,
         stop: Arc<AtomicBool>,
@@ -215,29 +229,23 @@ pub mod windows {
     ) -> MusicProgramResult {
         let hwnd = HWND(hwnd as *mut std::ffi::c_void);
         let (sender, receiver) = mpsc::sync_channel(spec.safety.maximum_queue_depth as usize);
-        let lane_error = Arc::new(Mutex::new(None));
-        let mut lanes = Vec::with_capacity(6);
-        for (lane, (probe, lane_spec)) in probes.into_iter().zip(spec.lanes.iter()).enumerate() {
-            let sender = sender.clone();
-            let lane_stop = Arc::clone(&stop);
-            let lane_first_error = Arc::clone(&lane_error);
+        let sampler_error = Arc::new(Mutex::new(None));
+        let sampler = std::thread::spawn({
+            let sampler_stop = Arc::clone(&stop);
+            let sampler_first_error = Arc::clone(&sampler_error);
+            let lanes = spec.lanes.clone();
             let interval = Duration::from_micros(u64::from(spec.sample_interval_us));
-            let press_below = lane_spec.press_below;
-            let release_at_or_above = lane_spec.release_at_or_above;
-            lanes.push(std::thread::spawn(move || {
-                lane_loop(
-                    lane,
+            move || {
+                row_loop(
                     probe,
-                    press_below,
-                    release_at_or_above,
+                    lanes,
                     interval,
                     sender,
-                    lane_first_error,
-                    lane_stop,
+                    sampler_first_error,
+                    sampler_stop,
                 )
-            }));
-        }
-        drop(sender);
+            }
+        });
 
         let started = Instant::now();
         let maximum_deadline = started + maximum_duration;
@@ -365,28 +373,28 @@ pub mod windows {
                 }));
         }
         stop.store(true, Ordering::Release);
-        for lane in lanes {
-            match lane.join() {
-                Ok(lane) => {
-                    metrics.sample_count += lane.samples;
-                    metrics.missed_deadlines += lane.missed_deadlines;
-                    metrics.queue_overflows += lane.queue_overflows;
-                    metrics.sample_intervals_us.extend(lane.sample_intervals_us);
-                    metrics
-                        .scheduler_lateness_us
-                        .extend(lane.scheduler_lateness_us);
-                }
-                Err(_) if first_error.is_none() => {
-                    first_error = Some(RealtimeError::new(
-                        "realtime.lane_panicked",
-                        "realtime lane worker panicked",
-                    ));
-                }
-                Err(_) => {}
+        match sampler.join() {
+            Ok(sampler) => {
+                metrics.sample_count += sampler.samples;
+                metrics.missed_deadlines += sampler.missed_deadlines;
+                metrics.queue_overflows += sampler.queue_overflows;
+                metrics
+                    .sample_intervals_us
+                    .extend(sampler.sample_intervals_us);
+                metrics
+                    .scheduler_lateness_us
+                    .extend(sampler.scheduler_lateness_us);
             }
+            Err(_) if first_error.is_none() => {
+                first_error = Some(RealtimeError::new(
+                    "realtime.sampler_panicked",
+                    "realtime row sampler panicked",
+                ));
+            }
+            Err(_) => {}
         }
         if first_error.is_none() {
-            first_error = lane_error.lock().ok().and_then(|mut value| value.take());
+            first_error = sampler_error.lock().ok().and_then(|mut value| value.take());
         }
         let release = input.as_mut().ok().map(PhysicalInputBatch::release_all);
         let release_uncertain = release.as_ref().is_some_and(|result| result.is_err());
@@ -406,20 +414,18 @@ pub mod windows {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn lane_loop(
-        lane: usize,
-        mut probe: GdiPixelProbe,
-        press_below: u8,
-        release_at_or_above: u8,
+    fn row_loop(
+        probe: GdiPixelRowProbe<6>,
+        lanes: Vec<crate::spec::LaneSpec>,
         interval: Duration,
         sender: mpsc::SyncSender<DetectedTransition>,
         first_error: Arc<Mutex<Option<RealtimeError>>>,
         stop: Arc<AtomicBool>,
-    ) -> LaneMetrics {
-        let mut state = LaneState::default();
+    ) -> SamplerMetrics {
+        let mut state = [LaneState::default(); 6];
         let mut deadline = Instant::now();
         let mut previous = deadline;
-        let mut metrics = LaneMetrics::default();
+        let mut metrics = SamplerMetrics::default();
         while !stop.load(Ordering::Acquire) {
             let lateness = wait_until(deadline);
             let now = Instant::now();
@@ -437,24 +443,32 @@ pub mod windows {
             match probe.sample_blue() {
                 Ok(blue) => {
                     metrics.samples += 1;
-                    if let Some(pressed) = state.observe(blue, press_below, release_at_or_above) {
-                        if let Err(error) = sender.try_send(DetectedTransition {
-                            lane,
-                            pressed,
-                            detected_at: now,
-                        }) {
-                            if matches!(error, mpsc::TrySendError::Full(_)) {
-                                metrics.queue_overflows += 1;
-                                record_error(
-                                    &first_error,
-                                    RealtimeError::new(
-                                        "realtime.queue_overflow",
-                                        "realtime transition queue overflowed",
-                                    ),
-                                );
+                    for (lane, ((state, blue), lane_spec)) in
+                        state.iter_mut().zip(blue).zip(lanes.iter()).enumerate()
+                    {
+                        if let Some(pressed) = state.observe(
+                            blue,
+                            lane_spec.press_below,
+                            lane_spec.release_at_or_above,
+                        ) {
+                            if let Err(error) = sender.try_send(DetectedTransition {
+                                lane,
+                                pressed,
+                                detected_at: now,
+                            }) {
+                                if matches!(error, mpsc::TrySendError::Full(_)) {
+                                    metrics.queue_overflows += 1;
+                                    record_error(
+                                        &first_error,
+                                        RealtimeError::new(
+                                            "realtime.queue_overflow",
+                                            "realtime transition queue overflowed",
+                                        ),
+                                    );
+                                }
+                                stop.store(true, Ordering::Release);
+                                return metrics;
                             }
-                            stop.store(true, Ordering::Release);
-                            break;
                         }
                     }
                 }

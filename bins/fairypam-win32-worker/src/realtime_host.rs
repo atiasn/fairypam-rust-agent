@@ -142,7 +142,7 @@ impl WindowsIoArbiter {
 
 #[cfg(windows)]
 pub struct RealtimeHost {
-    program: Option<fairypam_agent_realtime::music_engine::windows::IndependentMusicProgram>,
+    program: Option<fairypam_agent_realtime::music_engine::windows::GenshinMusicProgram>,
 }
 
 #[cfg(windows)]
@@ -191,7 +191,7 @@ impl RealtimeHost {
             )
             .collect::<Result<Vec<_>, _>>()?;
         self.program = Some(
-            fairypam_agent_realtime::music_engine::windows::IndependentMusicProgram::start(
+            fairypam_agent_realtime::music_engine::windows::GenshinMusicProgram::start(
                 hwnd,
                 spec,
                 keys,

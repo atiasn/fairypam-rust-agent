@@ -103,27 +103,31 @@ impl VerifiedRealtimeSpec {
 
 fn validate(spec: &RealtimeProgramSpec) -> Result<(), RealtimeError> {
     let mut actions = BTreeSet::new();
+    let mut points = BTreeSet::new();
+    let row_y = spec.lanes.first().map(|lane| lane.y_ppm);
     let valid = spec.id == MUSIC_AUTOPLAY_PROGRAM_ID
         && spec.schema_version == 1
         && spec.kind == "pixel-threshold-key-state"
-        && spec.engine == "independent-six-lane"
+        && spec.engine == "single-row-bitblt"
         && spec.required_client_size.width == 1_920
         && spec.required_client_size.height == 1_080
-        && spec.sample_interval_us == 5_000
-        && spec.event_freshness_us == 80_000
+        && (1_000..=20_000).contains(&spec.sample_interval_us)
+        && (spec.sample_interval_us..=200_000).contains(&spec.event_freshness_us)
         && spec.lanes.len() == 6
         && spec.lanes.iter().all(|lane| {
             !lane.action_id.is_empty()
                 && actions.insert(&lane.action_id)
+                && points.insert((lane.x_ppm, lane.y_ppm))
                 && lane.x_ppm <= 1_000_000
                 && lane.y_ppm <= 1_000_000
+                && Some(lane.y_ppm) == row_y
                 && lane.channel == "blue"
-                && lane.press_below == lane.release_at_or_above
+                && lane.press_below <= lane.release_at_or_above
         })
         && spec.safety.require_foreground
         && spec.safety.reject_local_input
-        && spec.safety.target_revalidate_ms == 250
-        && spec.safety.maximum_queue_depth == 32;
+        && (100..=2_000).contains(&spec.safety.target_revalidate_ms)
+        && (6..=256).contains(&spec.safety.maximum_queue_depth);
     if !valid {
         return Err(RealtimeError::new(
             "realtime.spec_invalid",

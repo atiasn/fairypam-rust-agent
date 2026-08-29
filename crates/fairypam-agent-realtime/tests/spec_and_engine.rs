@@ -16,34 +16,56 @@ impl SignatureVerifier for AcceptDigest {
     }
 }
 
-#[test]
-fn signed_spec_binds_only_the_installed_independent_engine() {
-    let content = spec();
+fn verify(content: RealtimeProgramSpec) -> Result<VerifiedRealtimeSpec, String> {
     let canonical = serde_json::to_vec(&content).unwrap();
     let digest_bytes: [u8; 32] = Sha256::digest(canonical).into();
     let digest = digest_bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let installed = VerifiedRealtimeSpec::verify(
+    VerifiedRealtimeSpec::verify(
         &serde_json::to_vec(&RealtimeProgramEnvelope {
             content,
-            content_sha256: digest.clone(),
+            content_sha256: digest,
             signature: "test-signature".into(),
         })
         .unwrap(),
         &AcceptDigest(digest_bytes),
     )
-    .unwrap();
+    .map_err(|error| error.code().to_string())
+}
+
+#[test]
+fn signed_spec_binds_the_installed_single_row_engine() {
+    let installed = verify(spec()).unwrap();
     assert!(StartProgram {
         program_id: MUSIC_AUTOPLAY_PROGRAM_ID.into(),
         schema_version: 1,
-        digest,
+        digest: installed.digest().into(),
         maximum_duration: Duration::from_secs(90),
         supervision_lease: Some(Duration::from_secs(2)),
     }
     .bind(&installed)
     .is_ok());
+}
+
+#[test]
+fn signed_spec_accepts_bounded_hub_tuning_without_recompiling_the_agent() {
+    let mut content = spec();
+    content.sample_interval_us = 8_000;
+    content.event_freshness_us = 120_000;
+    content.lanes[0].press_below = 210;
+    content.lanes[0].release_at_or_above = 225;
+    content.safety.target_revalidate_ms = 500;
+    content.safety.maximum_queue_depth = 64;
+    assert!(verify(content).is_ok());
+}
+
+#[test]
+fn signed_spec_rejects_points_from_multiple_rows() {
+    let mut content = spec();
+    content.lanes[5].y_ppm += 1;
+    assert_eq!(verify(content).unwrap_err(), "realtime.spec_invalid");
 }
 
 #[test]
@@ -69,7 +91,7 @@ fn spec() -> RealtimeProgramSpec {
         id: MUSIC_AUTOPLAY_PROGRAM_ID.into(),
         schema_version: 1,
         kind: "pixel-threshold-key-state".into(),
-        engine: "independent-six-lane".into(),
+        engine: "single-row-bitblt".into(),
         required_client_size: ClientSize {
             width: 1_920,
             height: 1_080,
