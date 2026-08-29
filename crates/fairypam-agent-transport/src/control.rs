@@ -523,7 +523,7 @@ mod v3_tests {
             heartbeat_interval_ms: 1_000,
             max_input_lease_ms: 500,
             max_frame_bytes: 1_024,
-            accepted_protocol_minor: 1,
+            accepted_protocol_minor: fairypam_agent_protocol::AGENT_PROTOCOL_MINOR + 1,
         };
 
         assert_eq!(

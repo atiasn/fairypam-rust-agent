@@ -29,7 +29,7 @@ mod task_contract;
 mod telemetry;
 
 pub const AGENT_PROTOCOL_MAJOR: u32 = 3;
-pub const AGENT_PROTOCOL_MINOR: u32 = 0;
+pub const AGENT_PROTOCOL_MINOR: u32 = 1;
 
 pub use agent_local::{
     decode_local_control_envelope, encode_local_control_envelope, validate_local_control_request,
