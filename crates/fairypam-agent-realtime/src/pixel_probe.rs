@@ -92,6 +92,7 @@ pub mod windows {
         bitmap: isize,
         previous_bitmap: isize,
         bits: usize,
+        owner_thread: std::thread::ThreadId,
     }
 
     impl<const N: usize> GdiPixelRowProbe<N> {
@@ -108,6 +109,7 @@ pub mod windows {
                 bitmap: 0,
                 previous_bitmap: 0,
                 bits: 0,
+                owner_thread: std::thread::current().id(),
             };
             probe.initialize_resources()?;
             Ok(probe)
@@ -205,29 +207,52 @@ pub mod windows {
             self.plan.blue_channels(bgra)
         }
 
-        fn release_resources(&mut self) {
+        pub fn close(mut self) -> Result<(), RealtimeError> {
+            self.release_resources()
+        }
+
+        fn release_resources(&mut self) -> Result<(), RealtimeError> {
             use windows::Win32::Graphics::Gdi::{
                 DeleteDC, DeleteObject, ReleaseDC, SelectObject, HDC, HGDIOBJ,
             };
 
+            if std::thread::current().id() != self.owner_thread {
+                return Err(sample_error(
+                    "realtime pixel probe must be released on its owner thread",
+                ));
+            }
+            let mut first_error = None;
             unsafe {
                 if self.target_dc != 0 && self.previous_bitmap != 0 {
-                    SelectObject(
+                    let restored = SelectObject(
                         HDC(self.target_dc as *mut std::ffi::c_void),
                         HGDIOBJ(self.previous_bitmap as *mut std::ffi::c_void),
                     );
+                    if restored.is_invalid() {
+                        first_error =
+                            Some(sample_error("SelectObject failed while releasing sampler"));
+                    }
                 }
                 if self.bitmap != 0 {
-                    let _ = DeleteObject(HGDIOBJ(self.bitmap as *mut std::ffi::c_void));
+                    if let Err(error) = DeleteObject(HGDIOBJ(self.bitmap as *mut std::ffi::c_void))
+                    {
+                        first_error.get_or_insert_with(|| sample_error(error.to_string()));
+                    }
                 }
                 if self.target_dc != 0 {
-                    let _ = DeleteDC(HDC(self.target_dc as *mut std::ffi::c_void));
+                    if let Err(error) = DeleteDC(HDC(self.target_dc as *mut std::ffi::c_void)) {
+                        first_error.get_or_insert_with(|| sample_error(error.to_string()));
+                    }
                 }
                 if self.source_dc != 0 {
-                    ReleaseDC(
+                    if ReleaseDC(
                         Some(HWND(self.hwnd as *mut std::ffi::c_void)),
                         HDC(self.source_dc as *mut std::ffi::c_void),
-                    );
+                    ) == 0
+                    {
+                        first_error
+                            .get_or_insert_with(|| sample_error("ReleaseDC failed for sampler"));
+                    }
                 }
             }
             self.source_dc = 0;
@@ -235,12 +260,13 @@ pub mod windows {
             self.bitmap = 0;
             self.previous_bitmap = 0;
             self.bits = 0;
+            first_error.map_or(Ok(()), Err)
         }
     }
 
     impl<const N: usize> Drop for GdiPixelRowProbe<N> {
         fn drop(&mut self) {
-            self.release_resources();
+            let _ = self.release_resources();
         }
     }
 

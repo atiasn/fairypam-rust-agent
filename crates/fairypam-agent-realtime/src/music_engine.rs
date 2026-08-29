@@ -117,14 +117,10 @@ pub mod windows {
                         "music program requires exactly six lanes",
                     )
                 })?;
-            let probe = GdiPixelRowProbe::new(
-                hwnd,
-                &points,
-                (
-                    spec.spec().required_client_size.width,
-                    spec.spec().required_client_size.height,
-                ),
-            )?;
+            let client_size = (
+                spec.spec().required_client_size.width,
+                spec.spec().required_client_size.height,
+            );
             let stop = Arc::new(AtomicBool::new(false));
             let supervision_deadline = Arc::new(Mutex::new(
                 supervision_lease.map(|value| Instant::now() + value),
@@ -134,6 +130,7 @@ pub mod windows {
             let held_action_ids = Arc::new(Mutex::new(BTreeSet::new()));
             let worker_held_action_ids = Arc::clone(&held_action_ids);
             let content = spec.spec().clone();
+            let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
             let thread = std::thread::Builder::new()
                 .name("fairypam-realtime-music".into())
                 .spawn(move || {
@@ -141,14 +138,31 @@ pub mod windows {
                         hwnd_value,
                         content,
                         lane_keys,
-                        probe,
+                        points,
+                        client_size,
                         maximum_duration,
                         worker_supervision,
                         worker_stop,
                         worker_held_action_ids,
+                        ready_sender,
                     )
                 })
                 .map_err(|error| RealtimeError::new("realtime.start_failed", error.to_string()))?;
+            match ready_receiver.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    stop.store(true, Ordering::Release);
+                    let _ = thread.join();
+                    return Err(error);
+                }
+                Err(error) => {
+                    stop.store(true, Ordering::Release);
+                    let joined_error = thread.join().ok().and_then(|result| result.error);
+                    return Err(joined_error.unwrap_or_else(|| {
+                        RealtimeError::new("realtime.start_failed", error.to_string())
+                    }));
+                }
+            }
             Ok(Self {
                 stop,
                 supervision_deadline,
@@ -221,13 +235,16 @@ pub mod windows {
         hwnd: usize,
         spec: crate::spec::RealtimeProgramSpec,
         keys: Vec<PhysicalKey>,
-        probe: GdiPixelRowProbe<6>,
+        points: [(i32, i32); 6],
+        client_size: (u32, u32),
         maximum_duration: Duration,
         supervision_deadline: Arc<Mutex<Option<Instant>>>,
         stop: Arc<AtomicBool>,
         held_action_ids: Arc<Mutex<BTreeSet<String>>>,
+        ready: mpsc::SyncSender<Result<(), RealtimeError>>,
     ) -> MusicProgramResult {
-        let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+        let hwnd_value = hwnd;
+        let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
         let (sender, receiver) = mpsc::sync_channel(spec.safety.maximum_queue_depth as usize);
         let sampler_error = Arc::new(Mutex::new(None));
         let sampler = std::thread::spawn({
@@ -236,6 +253,22 @@ pub mod windows {
             let lanes = spec.lanes.clone();
             let interval = Duration::from_micros(u64::from(spec.sample_interval_us));
             move || {
+                let probe = match GdiPixelRowProbe::new(
+                    HWND(hwnd_value as *mut std::ffi::c_void),
+                    &points,
+                    client_size,
+                ) {
+                    Ok(probe) => probe,
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        sampler_stop.store(true, Ordering::Release);
+                        return SamplerMetrics::default();
+                    }
+                };
+                if ready.send(Ok(())).is_err() {
+                    sampler_stop.store(true, Ordering::Release);
+                    return SamplerMetrics::default();
+                }
                 row_loop(
                     probe,
                     lanes,
@@ -440,6 +473,7 @@ pub mod windows {
                 metrics.missed_deadlines += 1;
                 deadline = now;
             }
+            let mut send_failed = false;
             match probe.sample_blue() {
                 Ok(blue) => {
                     metrics.samples += 1;
@@ -467,7 +501,8 @@ pub mod windows {
                                     );
                                 }
                                 stop.store(true, Ordering::Release);
-                                return metrics;
+                                send_failed = true;
+                                break;
                             }
                         }
                     }
@@ -478,7 +513,13 @@ pub mod windows {
                     break;
                 }
             }
+            if send_failed {
+                break;
+            }
             deadline += interval;
+        }
+        if let Err(error) = probe.close() {
+            record_error(&first_error, error);
         }
         metrics
     }
