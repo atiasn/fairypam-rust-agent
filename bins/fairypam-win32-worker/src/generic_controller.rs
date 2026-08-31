@@ -384,9 +384,6 @@ mod windows_impl {
             let virtual_key = match self.action(action_id)? {
                 ActionDefinition::Hold {
                     maa_virtual_key, ..
-                }
-                | ActionDefinition::Pulse {
-                    maa_virtual_key, ..
                 } => i32::from(*maa_virtual_key),
                 _ => return Err(action_kind_invalid()),
             };
@@ -403,9 +400,6 @@ mod windows_impl {
             let virtual_key = match self.action(action_id)? {
                 ActionDefinition::Hold {
                     maa_virtual_key, ..
-                }
-                | ActionDefinition::Pulse {
-                    maa_virtual_key, ..
                 } => i32::from(*maa_virtual_key),
                 _ => return Err(action_kind_invalid()),
             };
@@ -415,6 +409,17 @@ mod windows_impl {
             self.maa.key_up(virtual_key, OPERATION_TIMEOUT)?;
             self.held_actions.remove(action_id);
             Ok(())
+        }
+
+        pub fn click_key(&mut self, action_id: &str) -> Result<(), MaaRuntimeError> {
+            self.revalidate()?;
+            let virtual_key = match self.action(action_id)? {
+                ActionDefinition::Pulse {
+                    maa_virtual_key, ..
+                } => i32::from(*maa_virtual_key),
+                _ => return Err(action_kind_invalid()),
+            };
+            self.maa.click_key(virtual_key, OPERATION_TIMEOUT)
         }
 
         pub fn scroll(

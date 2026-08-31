@@ -437,6 +437,13 @@ mod windows_impl {
                         .map_err(io_error)?;
                     Ok(CommandResult::applied().action(&value.action_id))
                 }
+                worker_request::Payload::GenericClickKey(value) => {
+                    self.arbiter
+                        .allow_generic_input(identity.input_owner_epoch)
+                        .map_err(io_error)?;
+                    self.lock_controller()?.click_key(&value.action_id)?;
+                    Ok(CommandResult::applied().action(&value.action_id))
+                }
                 worker_request::Payload::GenericScroll(value) => {
                     self.arbiter
                         .allow_generic_input(identity.input_owner_epoch)
@@ -700,8 +707,18 @@ mod windows_impl {
                     self.arbiter.mode(),
                     WindowsIoMode::Generic | WindowsIoMode::Faulted
                 ) {
-                    if let Err(error) = self.lock_controller()?.release_all() {
-                        first_error.get_or_insert(error);
+                    match self.lock_controller() {
+                        Ok(mut controller) => {
+                            if let Err(error) = controller.inactive() {
+                                first_error.get_or_insert(error);
+                            }
+                            if let Err(error) = controller.release_all() {
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
                     }
                 }
                 if self.arbiter.mode() == WindowsIoMode::Generic {
@@ -1239,6 +1256,7 @@ mod windows_impl {
                     | worker_request::Payload::GenericSwipe(_)
                     | worker_request::Payload::GenericKeyDown(_)
                     | worker_request::Payload::GenericKeyUp(_)
+                    | worker_request::Payload::GenericClickKey(_)
                     | worker_request::Payload::GenericScroll(_)
                     | worker_request::Payload::GenericRelativeMove(_)
                     | worker_request::Payload::GenericInactive(_)

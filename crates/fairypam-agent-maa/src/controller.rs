@@ -51,6 +51,7 @@ pub trait GenericWindowsController {
     ) -> Result<(), MaaRuntimeError>;
     fn key_down(&mut self, virtual_key: i32, timeout: Duration) -> Result<(), MaaRuntimeError>;
     fn key_up(&mut self, virtual_key: i32, timeout: Duration) -> Result<(), MaaRuntimeError>;
+    fn click_key(&mut self, virtual_key: i32, timeout: Duration) -> Result<(), MaaRuntimeError>;
     fn move_to(&mut self, x: i32, y: i32, timeout: Duration) -> Result<(), MaaRuntimeError>;
     fn scroll(&mut self, dx: i32, dy: i32, timeout: Duration) -> Result<(), MaaRuntimeError>;
     fn scroll_at(
@@ -95,6 +96,7 @@ pub fn run_compatibility_input_smoke(
     }
     controller.key_down(0x87, timeout)?;
     controller.key_up(0x87, timeout)?;
+    controller.click_key(0x87, timeout)?;
     controller.scroll_at(Some(point), 0, 120, timeout)?;
     controller.relative_move(1, 1, timeout)?;
     controller.inactive(timeout)
@@ -110,6 +112,7 @@ mod tests {
         Swipe((i32, i32), (i32, i32), Duration),
         KeyDown(i32),
         KeyUp(i32),
+        ClickKey(i32),
         MoveTo(i32, i32),
         Scroll(i32, i32),
         RelativeMove(i32, i32),
@@ -180,6 +183,15 @@ mod tests {
             Ok(())
         }
 
+        fn click_key(
+            &mut self,
+            virtual_key: i32,
+            _timeout: Duration,
+        ) -> Result<(), MaaRuntimeError> {
+            self.0.push(Call::ClickKey(virtual_key));
+            Ok(())
+        }
+
         fn move_to(&mut self, x: i32, y: i32, _timeout: Duration) -> Result<(), MaaRuntimeError> {
             self.0.push(Call::MoveTo(x, y));
             Ok(())
@@ -236,6 +248,7 @@ mod tests {
                 Call::Click(MouseButton::X2),
                 Call::KeyDown(0x87),
                 Call::KeyUp(0x87),
+                Call::ClickKey(0x87),
                 Call::MoveTo(320, 240),
                 Call::Scroll(0, 120),
                 Call::RelativeMove(1, 1),
@@ -495,6 +508,15 @@ pub mod windows {
 
         fn key_up(&mut self, virtual_key: i32, timeout: Duration) -> Result<(), MaaRuntimeError> {
             let id = self.controller()?.post_key_up(virtual_key);
+            self.run(id, timeout)
+        }
+
+        fn click_key(
+            &mut self,
+            virtual_key: i32,
+            timeout: Duration,
+        ) -> Result<(), MaaRuntimeError> {
+            let id = self.controller()?.post_click_key(virtual_key);
             self.run(id, timeout)
         }
 

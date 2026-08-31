@@ -1,10 +1,10 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fairypam_agent_core::profile::{CaptureRegion, VerifiedProfile};
+use fairypam_agent_core::profile::{ActionDefinition, CaptureRegion, VerifiedProfile};
 use fairypam_agent_core::target::{TargetBinding, TargetCandidate, TargetSelector, TargetSnapshot};
 use fairypam_agent_core::AgentError;
 use fairypam_agent_maa::worker_client::windows::{WorkerProcess, WorkerProcessConfig};
@@ -17,9 +17,10 @@ use fairypam_agent_protocol::v3::{
 use fairypam_agent_protocol::worker_realtime_metrics_digest;
 use fairypam_agent_protocol::worker_v1::{
     worker_event, worker_request, AttachTarget, CaptureOnce, DetachTarget, GenericClick,
-    GenericKeyDown, GenericKeyUp, GenericScroll, GenericSwipe, GetHealth, RealtimeProgramState,
-    ReleaseAll, StartGenericCapture, StartRealtimeProgram, StopGenericCapture, StopRealtimeProgram,
-    WindowsIoMode, WorkerEvent, WorkerOutcome, WorkerResponse,
+    GenericClickKey, GenericKeyDown, GenericKeyUp, GenericScroll, GenericSwipe, GetHealth,
+    RealtimeProgramState, ReleaseAll, StartGenericCapture, StartRealtimeProgram,
+    StopGenericCapture, StopRealtimeProgram, WindowsIoMode, WorkerEvent, WorkerOutcome,
+    WorkerResponse,
 };
 
 use super::{
@@ -84,6 +85,56 @@ fn retain_input_lease_for_holds(
         *input_expires_at = None;
     }
     holds_active
+}
+
+fn click_key_payload(action_id: &str) -> worker_request::Payload {
+    worker_request::Payload::GenericClickKey(GenericClickKey {
+        action_id: action_id.to_owned(),
+    })
+}
+
+fn input_frame_key_plan(
+    actions: &BTreeMap<String, ActionDefinition>,
+    held_actions: &BTreeSet<String>,
+    action_ids: &[String],
+) -> Result<(Vec<worker_request::Payload>, BTreeSet<String>), AgentError> {
+    let mut requested_holds = BTreeSet::new();
+    let mut pulses = Vec::new();
+    for action_id in action_ids.iter().cloned().collect::<BTreeSet<_>>() {
+        match actions.get(&action_id) {
+            Some(ActionDefinition::Hold { .. }) => {
+                requested_holds.insert(action_id);
+            }
+            Some(ActionDefinition::Pulse { .. }) => pulses.push(click_key_payload(&action_id)),
+            Some(_) => {
+                return Err(AgentError::new(
+                    "input.action_kind_invalid",
+                    "input frame key action must be a Profile Hold or Pulse",
+                ));
+            }
+            None => {
+                return Err(AgentError::new(
+                    "input.action_not_allowed",
+                    "input frame key action is not declared by the signed Profile",
+                ));
+            }
+        }
+    }
+    let mut plan = held_actions
+        .difference(&requested_holds)
+        .map(|action_id| {
+            worker_request::Payload::GenericKeyUp(GenericKeyUp {
+                action_id: action_id.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    plan.extend(requested_holds.difference(held_actions).map(|action_id| {
+        worker_request::Payload::GenericKeyDown(GenericKeyDown {
+            action_id: action_id.clone(),
+        })
+    }));
+    plan.extend(pulses);
+    Ok((plan, requested_holds))
 }
 
 impl WorkerRuntimePlatform {
@@ -869,18 +920,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         }
         self.require_session(session)?;
         let mut applied_any = false;
-        self.request_in_sequence(
-            worker_request::Payload::GenericKeyDown(GenericKeyDown {
-                action_id: action_id.to_owned(),
-            }),
-            &mut applied_any,
-        )?;
-        self.request_in_sequence(
-            worker_request::Payload::GenericKeyUp(GenericKeyUp {
-                action_id: action_id.to_owned(),
-            }),
-            &mut applied_any,
-        )?;
+        self.request_in_sequence(click_key_payload(action_id), &mut applied_any)?;
         Ok(())
     }
 
@@ -921,35 +961,32 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             } else {
                 None
             };
-        let requested = held_action_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let (key_plan, requested) = input_frame_key_plan(
+            &profile.profile().actions,
+            &self.held_actions,
+            held_action_ids,
+        )?;
         let mut applied_any = false;
-        for action_id in self
-            .held_actions
-            .difference(&requested)
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            self.request_in_sequence(
-                worker_request::Payload::GenericKeyUp(GenericKeyUp {
-                    action_id: action_id.clone(),
-                }),
-                &mut applied_any,
-            )?;
-            self.held_actions.remove(&action_id);
+        for payload in key_plan {
+            let hold_change = match &payload {
+                worker_request::Payload::GenericKeyDown(value) => {
+                    Some((value.action_id.clone(), true))
+                }
+                worker_request::Payload::GenericKeyUp(value) => {
+                    Some((value.action_id.clone(), false))
+                }
+                _ => None,
+            };
+            self.request_in_sequence(payload, &mut applied_any)?;
+            if let Some((action_id, held)) = hold_change {
+                if held {
+                    self.held_actions.insert(action_id);
+                } else {
+                    self.held_actions.remove(&action_id);
+                }
+            }
         }
-        for action_id in requested
-            .difference(&self.held_actions)
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            self.request_in_sequence(
-                worker_request::Payload::GenericKeyDown(GenericKeyDown {
-                    action_id: action_id.clone(),
-                }),
-                &mut applied_any,
-            )?;
-            self.held_actions.insert(action_id);
-        }
+        debug_assert_eq!(self.held_actions, requested);
         if wheel_delta != 0 {
             self.request_in_sequence(
                 worker_request::Payload::GenericScroll(GenericScroll {
@@ -1260,6 +1297,7 @@ fn request_applied_response(
 ) -> Result<WorkerResponse, AgentError> {
     let expected_action = match &payload {
         worker_request::Payload::GenericClick(value) => Some(value.action_id.clone()),
+        worker_request::Payload::GenericClickKey(value) => Some(value.action_id.clone()),
         worker_request::Payload::GenericSwipe(value) => Some(value.action_id.clone()),
         worker_request::Payload::GenericKeyDown(value) => Some(value.action_id.clone()),
         worker_request::Payload::GenericKeyUp(value) => Some(value.action_id.clone()),
@@ -1345,14 +1383,15 @@ fn map_worker_error(error: fairypam_agent_maa::MaaRuntimeError) -> AgentError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::{Duration, Instant};
 
-    use fairypam_agent_protocol::worker_v1::{WindowsIoMode, WorkerHealth};
+    use fairypam_agent_core::profile::ActionDefinition;
+    use fairypam_agent_protocol::worker_v1::{worker_request, WindowsIoMode, WorkerHealth};
 
     use super::{
-        attachment_decision, retain_input_lease_for_holds, verify_release_health,
-        AttachmentDecision, RuntimePlatform, WorkerRuntimePlatform,
+        attachment_decision, input_frame_key_plan, retain_input_lease_for_holds,
+        verify_release_health, AttachmentDecision, RuntimePlatform, WorkerRuntimePlatform,
     };
     use crate::profile_store::ProfileStore;
 
@@ -1422,6 +1461,51 @@ mod tests {
             &mut expires_at,
         ));
         assert_eq!(expires_at, Some(deadline));
+    }
+
+    #[test]
+    fn input_frame_pulse_uses_one_atomic_worker_click_key_request() {
+        let actions = BTreeMap::from([
+            (
+                "gadget.quick_use".into(),
+                ActionDefinition::Pulse {
+                    maa_virtual_key: 0x5a,
+                    physical_scan_code: 44,
+                    extended: false,
+                },
+            ),
+            (
+                "move.forward".into(),
+                ActionDefinition::Hold {
+                    maa_virtual_key: 0x57,
+                    physical_scan_code: 17,
+                    extended: false,
+                },
+            ),
+        ]);
+        let (first_plan, holds) = input_frame_key_plan(
+            &actions,
+            &BTreeSet::new(),
+            &[
+                "gadget.quick_use".into(),
+                "gadget.quick_use".into(),
+                "move.forward".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(holds, BTreeSet::from(["move.forward".into()]));
+        let [worker_request::Payload::GenericKeyDown(down), worker_request::Payload::GenericClickKey(click)] =
+            first_plan.as_slice()
+        else {
+            panic!("InputFrame Pulse must stay atomic across the Worker boundary");
+        };
+        assert_eq!(down.action_id, "move.forward");
+        assert_eq!(click.action_id, "gadget.quick_use");
+
+        let (settled_plan, settled_holds) =
+            input_frame_key_plan(&actions, &holds, &["move.forward".into()]).unwrap();
+        assert_eq!(settled_holds, holds);
+        assert!(settled_plan.is_empty());
     }
 
     #[test]

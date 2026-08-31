@@ -75,6 +75,7 @@ message WorkerRequest {
     ReleaseAll release_all = 18;
     Shutdown shutdown = 19;
     GenericSwipe generic_swipe = 20;
+    GenericClickKey generic_click_key = 21;
   }
 }
 
@@ -163,6 +164,7 @@ message GenericSwipe {
 
 message GenericKeyDown { string action_id = 1; }
 message GenericKeyUp { string action_id = 1; }
+message GenericClickKey { string action_id = 1; }
 
 message GenericScroll {
   string action_id = 1;

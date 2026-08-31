@@ -5,7 +5,8 @@ use fairypam_agent_protocol::worker_v1::{
     local_envelope, LocalEnvelope, WorkerEvent, WorkerRequest, WorkerResponse,
 };
 use fairypam_agent_protocol::{
-    decode_local_envelope, encode_local_envelope, MAX_LOCAL_MESSAGE_BYTES,
+    decode_local_envelope, encode_local_envelope, LOCAL_PROTOCOL_MAJOR, LOCAL_PROTOCOL_MINOR,
+    MAX_LOCAL_MESSAGE_BYTES,
 };
 
 use crate::MaaRuntimeError;
@@ -40,8 +41,8 @@ impl<S: Read + Write> WorkerClient<S> {
         }
         let command_id = identity.local_command_id.clone();
         let envelope = encode_local_envelope(&LocalEnvelope {
-            protocol_major: 1,
-            protocol_minor: 0,
+            protocol_major: LOCAL_PROTOCOL_MAJOR,
+            protocol_minor: LOCAL_PROTOCOL_MINOR,
             payload: Some(local_envelope::Payload::Request(request)),
         })
         .map_err(|error| MaaRuntimeError::new("worker.write_failed", error.to_string()))?;
@@ -92,10 +93,12 @@ pub fn read_envelope(stream: &mut impl Read) -> Result<LocalEnvelope, MaaRuntime
 mod tests {
     use std::io::{Cursor, Read, Write};
 
-    use fairypam_agent_protocol::encode_local_envelope;
     use fairypam_agent_protocol::worker_v1::{
         local_envelope, LocalEnvelope, WorkerCommandIdentity, WorkerEvent, WorkerRequest,
         WorkerResponse,
+    };
+    use fairypam_agent_protocol::{
+        encode_local_envelope, LOCAL_PROTOCOL_MAJOR, LOCAL_PROTOCOL_MINOR,
     };
 
     use super::WorkerClient;
@@ -134,15 +137,15 @@ mod tests {
             ..WorkerResponse::default()
         };
         let mut reads = encode_local_envelope(&LocalEnvelope {
-            protocol_major: 1,
-            protocol_minor: 0,
+            protocol_major: LOCAL_PROTOCOL_MAJOR,
+            protocol_minor: LOCAL_PROTOCOL_MINOR,
             payload: Some(local_envelope::Payload::Event(event.clone())),
         })
         .unwrap();
         reads.extend(
             encode_local_envelope(&LocalEnvelope {
-                protocol_major: 1,
-                protocol_minor: 0,
+                protocol_major: LOCAL_PROTOCOL_MAJOR,
+                protocol_minor: LOCAL_PROTOCOL_MINOR,
                 payload: Some(local_envelope::Payload::Response(response.clone())),
             })
             .unwrap(),
@@ -183,10 +186,12 @@ pub mod windows {
     use std::sync::atomic::{fence, AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use fairypam_agent_protocol::worker_request_digest;
     use fairypam_agent_protocol::worker_v1::{
         local_envelope, worker_request, WorkerCapabilities, WorkerCommandIdentity, WorkerEvent,
         WorkerHealth, WorkerRequest, WorkerResponse,
+    };
+    use fairypam_agent_protocol::{
+        worker_request_digest, LOCAL_PROTOCOL_MAJOR, LOCAL_PROTOCOL_MINOR,
     };
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -307,12 +312,22 @@ pub mod windows {
             };
             let mut stream = NamedPipeStream::new(stream, Duration::from_secs(10));
             let hello = read_envelope(&mut stream)?;
+            if hello.protocol_major != LOCAL_PROTOCOL_MAJOR
+                || hello.protocol_minor != LOCAL_PROTOCOL_MINOR
+            {
+                return Err(invalid("worker protocol version is incompatible"));
+            }
             match hello.payload {
                 Some(local_envelope::Payload::Hello(value))
                     if value.worker_generation == generation && value.process_id == child.id() => {}
                 _ => return Err(invalid("worker hello is invalid")),
             }
             let ready = read_envelope(&mut stream)?;
+            if ready.protocol_major != LOCAL_PROTOCOL_MAJOR
+                || ready.protocol_minor != LOCAL_PROTOCOL_MINOR
+            {
+                return Err(invalid("worker protocol version is incompatible"));
+            }
             let (capabilities, health) = match ready.payload {
                 Some(local_envelope::Payload::Ready(value))
                     if value.worker_generation == generation =>

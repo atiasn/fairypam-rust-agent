@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use crate::worker_v1::{LocalEnvelope, RealtimeProgramMetrics, WorkerRequest};
 
 pub const LOCAL_PROTOCOL_MAJOR: u32 = 1;
-pub const LOCAL_PROTOCOL_MINOR: u32 = 0;
+pub const LOCAL_PROTOCOL_MINOR: u32 = 1;
 pub const MAX_LOCAL_MESSAGE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,8 +120,8 @@ pub fn verify_worker_request(
 #[cfg(test)]
 mod tests {
     use crate::worker_v1::{
-        local_envelope, worker_request, GetHealth, LocalEnvelope, WorkerCommandIdentity,
-        WorkerRequest,
+        local_envelope, worker_request, GenericClickKey, GetHealth, LocalEnvelope,
+        WorkerCommandIdentity, WorkerRequest,
     };
 
     use super::*;
@@ -148,6 +148,24 @@ mod tests {
             protocol_major: LOCAL_PROTOCOL_MAJOR,
             protocol_minor: LOCAL_PROTOCOL_MINOR,
             payload: Some(local_envelope::Payload::Request(request())),
+        };
+        assert_eq!(
+            decode_local_envelope(&encode_local_envelope(&envelope).unwrap()).unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
+    fn atomic_click_key_round_trips_as_one_payload() {
+        let mut request = request();
+        request.payload = Some(worker_request::Payload::GenericClickKey(GenericClickKey {
+            action_id: "gadget.quick_use".into(),
+        }));
+        request.identity.as_mut().unwrap().request_digest = worker_request_digest(&request);
+        let envelope = LocalEnvelope {
+            protocol_major: LOCAL_PROTOCOL_MAJOR,
+            protocol_minor: LOCAL_PROTOCOL_MINOR,
+            payload: Some(local_envelope::Payload::Request(request)),
         };
         assert_eq!(
             decode_local_envelope(&encode_local_envelope(&envelope).unwrap()).unwrap(),
