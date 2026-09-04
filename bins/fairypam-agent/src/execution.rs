@@ -138,18 +138,6 @@ fn outcome_applied(outcome: &CommandOutcome) -> bool {
     }
 }
 
-fn record_frame_sequence(sequence: &AtomicU64, captured: u64) -> Result<u64, AgentError> {
-    let previous = sequence.load(Ordering::Acquire);
-    if captured == 0 || captured <= previous {
-        return Err(AgentError::new(
-            "capture.sequence_invalid",
-            "capture backend returned a non-monotonic frame sequence",
-        ));
-    }
-    sequence.store(captured, Ordering::Release);
-    Ok(captured)
-}
-
 fn next_frame_sequence(sequence: &AtomicU64) -> Result<u64, AgentError> {
     sequence
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -328,6 +316,14 @@ pub trait RuntimePlatform: Send {
     ) -> Result<RuntimeCapturedFrame, AgentError> {
         self.start_capture(binding, source_id, region, fps, encoding)?
             .next_frame(deadline)
+    }
+
+    fn bind_capture_frame_sequence(
+        &mut self,
+        _runtime_sequence: u64,
+        _public_sequence: u64,
+    ) -> Result<(), AgentError> {
+        Ok(())
     }
 
     fn focus(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError>;
@@ -1927,7 +1923,9 @@ impl CommandExecutor {
                             .entry(frame_sequence_key(&value.source_id, Some(&attempt)))
                             .or_insert_with(|| Arc::new(AtomicU64::new(0))),
                     );
-                    let sequence = record_frame_sequence(&frame_sequence, frame.sequence)?;
+                    let sequence = next_frame_sequence(&frame_sequence)?;
+                    self.platform
+                        .bind_capture_frame_sequence(frame.sequence, sequence)?;
                     let enqueue_started = Instant::now();
                     let payload_bytes = frame.bytes.len();
                     let publish_result = frames.publish_required(FramePacket {
@@ -3854,6 +3852,7 @@ mod tests {
         fail_begin_monitor: bool,
         fail_close: bool,
         next_capture_sequence: u64,
+        bound_capture_sequences: Vec<(u64, u64)>,
         single_capture_calls: usize,
         single_capture_deadline_remaining: Option<Duration>,
         input_command_deadline_remaining: Option<Duration>,
@@ -3994,6 +3993,19 @@ mod tests {
                 captured_at_unix_us: now_unix_us(),
                 backend: "test".into(),
             })
+        }
+
+        fn bind_capture_frame_sequence(
+            &mut self,
+            runtime_sequence: u64,
+            public_sequence: u64,
+        ) -> Result<(), AgentError> {
+            self.state
+                .lock()
+                .unwrap()
+                .bound_capture_sequences
+                .push((runtime_sequence, public_sequence));
+            Ok(())
         }
 
         fn focus(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError> {
@@ -5522,7 +5534,7 @@ mod tests {
         assert!(matches!(
             executor.execute(&capture, &ExecutionSession::test(), sink.clone()),
             CommandOutcome::TaskAck { ref outcome, ref receipt, .. }
-                if outcome.as_ref().unwrap().source_frame_sequence == Some(41)
+                if outcome.as_ref().unwrap().source_frame_sequence == Some(1)
                     && receipt.capture_state
                         == fairypam_agent_protocol::internal_v1::TaskCaptureState::Stopped as i32
         ));
@@ -5541,7 +5553,7 @@ mod tests {
         assert!(executor.capture.is_none());
         let frames = sink.0.lock().unwrap();
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].frame_sequence, 41);
+        assert_eq!(frames[0].frame_sequence, 1);
         assert_eq!(frames[0].payload, vec![1, 2, 3]);
         assert_eq!(
             frames[0].attempt.as_ref().unwrap().attempt_id,
@@ -5581,7 +5593,34 @@ mod tests {
             .take_command_telemetry_attributes()
             .iter()
             .any(|attribute| attribute.key == "capture.complete_us"));
-        state.lock().unwrap().capture_error = None;
+        {
+            let mut state = state.lock().unwrap();
+            state.capture_error = None;
+            state.next_capture_sequence = 0;
+        }
+        let recovered_capture = HubControlCommand {
+            payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {
+                source_id: "client".into(),
+                encoding: "jpeg".into(),
+                quality: 85,
+                task: Some(task_ref(&contract, "capture-frame-after-worker-restart")),
+                target_generation: 1,
+                ..CaptureFrame::default()
+            })),
+        };
+        assert!(matches!(
+            executor.execute(
+                &recovered_capture,
+                &ExecutionSession::test(),
+                sink.clone(),
+            ),
+            CommandOutcome::TaskAck { ref outcome, .. }
+                if outcome.as_ref().unwrap().source_frame_sequence == Some(2)
+        ));
+        assert_eq!(
+            state.lock().unwrap().bound_capture_sequences,
+            vec![(41, 1), (1, 2)]
+        );
 
         let paused_capture = HubControlCommand {
             payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {

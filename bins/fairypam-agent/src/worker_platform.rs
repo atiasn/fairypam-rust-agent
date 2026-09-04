@@ -199,6 +199,19 @@ impl WorkerRuntimePlatform {
             })
     }
 
+    fn invalidate_timed_out_worker(&mut self) -> Result<(), AgentError> {
+        self.faulted.store(true, Ordering::Release);
+        {
+            let mut state = self.lock_worker()?;
+            if let Some(process) = state.process.as_mut() {
+                process.terminate();
+            }
+            state.process = None;
+            state.attached_generation = None;
+        }
+        self.release_emergency("worker-capture-timeout")
+    }
+
     fn attach(
         &mut self,
         profile: &VerifiedProfile,
@@ -846,10 +859,6 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                     "Worker CaptureOnce frame does not match its response",
                 ));
             }
-            self.source_frames
-                .lock()
-                .map_err(|error| AgentError::new("worker.state_poisoned", error.to_string()))?
-                .record(frame.sequence, frame.sequence);
             stage = "complete";
             Ok(frame)
         })();
@@ -867,17 +876,33 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             self.capture_telemetry
                 .push(telemetry_int("capture.worker_after_image_us", value));
         }
-        if result.as_ref().is_err_and(|error| {
+        let timed_out = result.as_ref().is_err_and(|error| {
             matches!(
                 error.code(),
                 "worker.deadline_expired" | "maa.operation_timeout"
             )
-        }) || (result.is_err() && Instant::now() >= deadline)
-        {
+        }) || (result.is_err() && Instant::now() >= deadline);
+        if timed_out {
             self.capture_telemetry
                 .push(telemetry_string("timeout.stage", stage));
+            if stage == "worker_round_trip" {
+                self.invalidate_timed_out_worker()?;
+            }
         }
         result
+    }
+
+    fn bind_capture_frame_sequence(
+        &mut self,
+        runtime_sequence: u64,
+        public_sequence: u64,
+    ) -> Result<(), AgentError> {
+        self.source_frames
+            .lock()
+            .map_err(|error| AgentError::new("worker.state_poisoned", error.to_string()))?
+            .record(public_sequence, runtime_sequence);
+        self.faulted.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn start_capture(
@@ -1515,6 +1540,7 @@ fn map_worker_error(error: fairypam_agent_maa::MaaRuntimeError) -> AgentError {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     use fairypam_agent_core::profile::ActionDefinition;
@@ -1583,6 +1609,28 @@ mod tests {
         );
 
         assert_eq!(error.code(), "worker.deadline_expired");
+    }
+
+    #[test]
+    fn timed_out_worker_discards_stale_frame_mappings() {
+        let mut platform = WorkerRuntimePlatform::new(&ProfileStore::default(), None);
+        RuntimePlatform::bind_capture_frame_sequence(&mut platform, 1, 25).unwrap();
+        platform.worker.lock().unwrap().attached_generation = Some("stale-worker".into());
+
+        platform.invalidate_timed_out_worker().unwrap();
+
+        assert!(platform.faulted.load(Ordering::Acquire));
+        assert!(platform.worker.lock().unwrap().process.is_none());
+        assert!(platform
+            .worker
+            .lock()
+            .unwrap()
+            .attached_generation
+            .is_none());
+        assert_eq!(
+            platform.runtime_source_frame(25).unwrap_err().code(),
+            "input.frame_invalid"
+        );
     }
 
     #[test]
