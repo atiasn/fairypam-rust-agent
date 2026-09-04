@@ -648,9 +648,11 @@ mod tests {
         let sequence = original_status.status_sequence;
         let expected_close = original_status.expected_close_at_unix_ms;
         lifecycle
-            .configure(&original, start + Duration::from_secs(10), 2_000)
+            .configure(&original, start + Duration::from_secs(10), 11_000)
             .unwrap();
-        let replayed_status = lifecycle.status(start, 2_000).unwrap();
+        let replayed_status = lifecycle
+            .status(start + Duration::from_secs(10), 11_000)
+            .unwrap();
         assert_eq!(replayed_status.status_sequence, sequence);
         assert_eq!(replayed_status.expected_close_at_unix_ms, expected_close);
 
