@@ -619,21 +619,6 @@ mod windows_impl {
         Ok(remaining)
     }
 
-    #[cfg(test)]
-    mod deadline_tests {
-        use std::time::{Duration, Instant};
-
-        use super::maa_remaining;
-
-        #[test]
-        fn maa_budget_excludes_worker_preparation_time() {
-            let deadline = Instant::now() + Duration::from_millis(100);
-            std::thread::sleep(Duration::from_millis(25));
-
-            assert!(maa_remaining(deadline, "test").unwrap() < Duration::from_millis(90));
-        }
-    }
-
     fn read_geometry(
         hwnd: HWND,
         expected_process_id: u32,
@@ -686,6 +671,20 @@ mod windows_impl {
             "input.action_kind_invalid",
             "action kind is not valid for this Generic command",
         )
+    }
+    #[cfg(test)]
+    mod deadline_tests {
+        use std::time::{Duration, Instant};
+
+        use super::maa_remaining;
+
+        #[test]
+        fn maa_budget_excludes_worker_preparation_time() {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            std::thread::sleep(Duration::from_millis(25));
+
+            assert!(maa_remaining(deadline, "test").unwrap() < Duration::from_millis(90));
+        }
     }
 }
 
