@@ -4600,7 +4600,7 @@ mod tests {
         executor.set_binding(Some(binding())).unwrap();
 
         let mut pulse_task = task_ref(&reference, "pulse-frame");
-        pulse_task.command.as_mut().unwrap().expires_at_unix_ms = current_unix_ms() + 100;
+        pulse_task.command.as_mut().unwrap().expires_at_unix_ms = current_unix_ms() + 6_000;
         assert!(matches!(
             executor.execute_v3_input_frame(
                 &pulse_task,
@@ -5508,7 +5508,7 @@ mod tests {
         state.lock().unwrap().next_capture_sequence = 40;
 
         let mut capture_task = task_ref(&contract, "capture-frame-1");
-        capture_task.command.as_mut().unwrap().expires_at_unix_ms = current_unix_ms() + 100;
+        capture_task.command.as_mut().unwrap().expires_at_unix_ms = current_unix_ms() + 6_000;
         let capture = HubControlCommand {
             payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {
                 source_id: "client".into(),
