@@ -286,6 +286,10 @@ pub trait RuntimePlatform: Send {
         Ok(false)
     }
 
+    fn take_capture_telemetry(&mut self) -> Vec<v3::TelemetryAttribute> {
+        Vec::new()
+    }
+
     fn start_task_target(&mut self, profile: &VerifiedProfile)
         -> Result<TargetBinding, AgentError>;
 
@@ -378,6 +382,7 @@ pub trait RuntimePlatform: Send {
         session: &SessionRef,
         input_sequence: u64,
         expires_at: Instant,
+        command_deadline: Instant,
         held_action_ids: &[String],
         wheel_action_id: &str,
         wheel_delta: i32,
@@ -575,6 +580,7 @@ pub struct CommandExecutor {
     managed_game: ManagedGameLifecycle,
     last_local_input_token: Option<u32>,
     profile_update_blocked: bool,
+    command_telemetry_attributes: Vec<v3::TelemetryAttribute>,
 }
 
 impl CommandExecutor {
@@ -666,7 +672,12 @@ impl CommandExecutor {
             managed_game: ManagedGameLifecycle::memory(),
             last_local_input_token: None,
             profile_update_blocked: false,
+            command_telemetry_attributes: Vec::new(),
         }
+    }
+
+    pub fn take_command_telemetry_attributes(&mut self) -> Vec<v3::TelemetryAttribute> {
+        std::mem::take(&mut self.command_telemetry_attributes)
     }
 
     pub fn set_profile_update_blocked(&mut self, blocked: bool) {
@@ -983,6 +994,7 @@ impl CommandExecutor {
         session: &ExecutionSession,
         frames: Arc<dyn FrameSink>,
     ) -> CommandOutcome {
+        self.command_telemetry_attributes.clear();
         let outcome = self
             .execute_inner(command, session, frames)
             .unwrap_or_else(CommandOutcome::from_error);
@@ -1095,6 +1107,7 @@ impl CommandExecutor {
                 .and_then(|command| command.session.as_ref())
                 .ok_or_else(task_reference_invalid)?;
             let expires_at = Instant::now() + Duration::from_millis(u64::from(frame.lease_ms));
+            let command_deadline = task_command_deadline(task)?;
             let frame_result = self
                 .require_target_generation(frame.target_generation)
                 .and_then(|_| {
@@ -1104,6 +1117,7 @@ impl CommandExecutor {
                         session,
                         frame.input_sequence,
                         expires_at,
+                        command_deadline,
                         &frame.held_action_ids,
                         &frame.wheel_action_id,
                         frame.wheel_delta,
@@ -1884,22 +1898,39 @@ impl CommandExecutor {
                 }
                 let attempt = self.task_attempt.attempt_ref(task)?;
                 let result: Result<u64, AgentError> = (|| {
+                    let capture_started = Instant::now();
                     self.require_target_generation(value.target_generation)?;
-                    let frame = self.platform.capture_once(
+                    let command_deadline = task_command_deadline(task)
+                        .map_err(|error| capture_command_error(error, Instant::now()))?;
+                    let capture_result = self.platform.capture_once(
                         &binding,
                         &value.source_id,
                         region,
                         source.maximum_fps.min(60),
                         encoding,
-                        Instant::now() + CAPTURE_NO_FRAME_TIMEOUT,
-                    )?;
+                        command_deadline,
+                    );
+                    self.command_telemetry_attributes = self.platform.take_capture_telemetry();
+                    let frame = match capture_result {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            let error = capture_command_error(error, command_deadline);
+                            self.command_telemetry_attributes.push(telemetry_int(
+                                "capture.complete_us",
+                                elapsed_us(capture_started),
+                            ));
+                            return Err(error);
+                        }
+                    };
                     let frame_sequence = Arc::clone(
                         self.frame_sequences
                             .entry(frame_sequence_key(&value.source_id, Some(&attempt)))
                             .or_insert_with(|| Arc::new(AtomicU64::new(0))),
                     );
                     let sequence = record_frame_sequence(&frame_sequence, frame.sequence)?;
-                    frames.publish_required(FramePacket {
+                    let enqueue_started = Instant::now();
+                    let payload_bytes = frame.bytes.len();
+                    let publish_result = frames.publish_required(FramePacket {
                         session: Some(v3::SessionRef {
                             agent_id: session.reference.agent_id.clone(),
                             session_id: session.reference.session_id.clone(),
@@ -1923,7 +1954,18 @@ impl CommandExecutor {
                         }),
                         target_generation: self.target_generation,
                         backend: frame.backend,
-                    })?;
+                    });
+                    self.command_telemetry_attributes.push(telemetry_int(
+                        "capture.frame_enqueue_us",
+                        elapsed_us(enqueue_started),
+                    ));
+                    self.command_telemetry_attributes
+                        .push(telemetry_int("capture.payload_bytes", payload_bytes as i64));
+                    self.command_telemetry_attributes.push(telemetry_int(
+                        "capture.complete_us",
+                        elapsed_us(capture_started),
+                    ));
+                    publish_result?;
                     Ok(sequence)
                 })();
                 match result {
@@ -2392,6 +2434,7 @@ impl CommandExecutor {
                     &session,
                     1,
                     expires_at,
+                    expires_at,
                     &[action_id.to_owned()],
                     "",
                     0,
@@ -2406,6 +2449,7 @@ impl CommandExecutor {
                         &binding,
                         &session,
                         2,
+                        expires_at,
                         expires_at,
                         &[],
                         "",
@@ -2563,6 +2607,7 @@ fn input_frame_outcome(error: Option<&AgentError>) -> TaskCommandOutcomeState {
             | "environment.local_input_detected"
             | "input.frame_invalid"
             | "target.generation_stale"
+            | "worker.deadline_expired"
             | "worker.not_applied",
         ) => TaskCommandOutcomeState::NotApplied,
         Some(_) => TaskCommandOutcomeState::Uncertain,
@@ -2769,6 +2814,61 @@ fn current_unix_ms() -> i64 {
     now_unix_us() / 1_000
 }
 
+pub(super) fn elapsed_us(started: Instant) -> i64 {
+    started.elapsed().as_micros().min(i64::MAX as u128) as i64
+}
+
+pub(super) fn telemetry_int(key: &str, value: i64) -> v3::TelemetryAttribute {
+    v3::TelemetryAttribute {
+        key: key.to_owned(),
+        value: Some(v3::telemetry_attribute::Value::IntValue(value)),
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn telemetry_string(key: &str, value: &str) -> v3::TelemetryAttribute {
+    v3::TelemetryAttribute {
+        key: key.to_owned(),
+        value: Some(v3::telemetry_attribute::Value::StringValue(
+            value.to_owned(),
+        )),
+    }
+}
+
+fn task_command_deadline(
+    task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
+) -> Result<Instant, AgentError> {
+    let expires_at = task
+        .command
+        .as_ref()
+        .ok_or_else(task_reference_invalid)?
+        .expires_at_unix_ms;
+    let remaining_ms = expires_at.saturating_sub(current_unix_ms());
+    if remaining_ms <= 0 {
+        return Err(AgentError::new(
+            "worker.deadline_expired",
+            "command deadline expired before Worker dispatch",
+        ));
+    }
+    Instant::now()
+        .checked_add(Duration::from_millis(remaining_ms as u64))
+        .ok_or_else(|| {
+            AgentError::new("task.reference_invalid", "command deadline is out of range")
+        })
+}
+
+fn capture_command_error(error: AgentError, deadline: Instant) -> AgentError {
+    if matches!(
+        error.code(),
+        "worker.deadline_expired" | "maa.operation_timeout"
+    ) || Instant::now() >= deadline
+    {
+        AgentError::new("protocol.command_timeout", error.to_string())
+    } else {
+        error
+    }
+}
+
 #[cfg(any(windows, test))]
 fn retry_startup_identity<T>(
     deadline: Instant,
@@ -2841,6 +2941,7 @@ impl RuntimePlatform for UnsupportedPlatform {
         _session: &SessionRef,
         _input_sequence: u64,
         _expires_at: Instant,
+        _command_deadline: Instant,
         _held_action_ids: &[String],
         _wheel_action_id: &str,
         _wheel_delta: i32,
@@ -3403,6 +3504,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         _session: &SessionRef,
         _input_sequence: u64,
         _expires_at: Instant,
+        _command_deadline: Instant,
         _held_action_ids: &[String],
         _wheel_action_id: &str,
         _wheel_delta: i32,
@@ -3454,6 +3556,21 @@ mod tests {
         assert_ne!(frames.runtime_sequence(2), Some(2));
         frames.clear();
         assert_eq!(frames.runtime_sequence(2), None);
+    }
+
+    #[test]
+    fn input_deadline_before_worker_dispatch_is_not_applied() {
+        let expired = AgentError::new("worker.deadline_expired", "deadline expired");
+        let submitted = AgentError::new("worker.side_effect_uncertain", "response missing");
+
+        assert_eq!(
+            input_frame_outcome(Some(&expired)),
+            TaskCommandOutcomeState::NotApplied
+        );
+        assert_eq!(
+            input_frame_outcome(Some(&submitted)),
+            TaskCommandOutcomeState::Uncertain
+        );
     }
 
     #[test]
@@ -3748,6 +3865,8 @@ mod tests {
         fail_close: bool,
         next_capture_sequence: u64,
         single_capture_calls: usize,
+        single_capture_deadline_remaining: Option<Duration>,
+        input_command_deadline_remaining: Option<Duration>,
         capture_error: Option<AgentError>,
         input_frame_error: Option<AgentError>,
         release_error: Option<AgentError>,
@@ -3867,13 +3986,15 @@ mod tests {
             _region: CaptureRegion,
             _fps: u32,
             _encoding: RuntimeCaptureEncoding,
-            _deadline: Instant,
+            deadline: Instant,
         ) -> Result<RuntimeCapturedFrame, AgentError> {
             let mut state = self.state.lock().unwrap();
             if let Some(error) = state.capture_error.clone() {
                 return Err(error);
             }
             state.single_capture_calls += 1;
+            state.single_capture_deadline_remaining =
+                Some(deadline.saturating_duration_since(Instant::now()));
             state.next_capture_sequence += 1;
             Ok(RuntimeCapturedFrame {
                 bytes: vec![1, 2, 3],
@@ -3947,6 +4068,7 @@ mod tests {
             _session: &SessionRef,
             _sequence: u64,
             _expires_at: Instant,
+            command_deadline: Instant,
             held_action_ids: &[String],
             _wheel_action_id: &str,
             _wheel_delta: i32,
@@ -3956,6 +4078,8 @@ mod tests {
             client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
         ) -> Result<bool, AgentError> {
             let mut state = self.state.lock().unwrap();
+            state.input_command_deadline_remaining =
+                Some(command_deadline.saturating_duration_since(Instant::now()));
             if let Some(error) = state.input_frame_error.take() {
                 return Err(error);
             }
@@ -4485,9 +4609,11 @@ mod tests {
         ));
         executor.set_binding(Some(binding())).unwrap();
 
+        let mut pulse_task = task_ref(&reference, "pulse-frame");
+        pulse_task.command.as_mut().unwrap().expires_at_unix_ms = current_unix_ms() + 100;
         assert!(matches!(
             executor.execute_v3_input_frame(
-                &task_ref(&reference, "pulse-frame"),
+                &pulse_task,
                 &v3::InputFrame {
                     input_sequence: 1,
                     lease_ms: 500,
@@ -4502,6 +4628,13 @@ mod tests {
                 if outcome.outcome == TaskCommandOutcomeState::Applied as i32
                     && receipt.input_state == TaskInputState::Released as i32
         ));
+        assert!(state
+            .lock()
+            .unwrap()
+            .input_command_deadline_remaining
+            .is_some_and(|remaining| {
+                !remaining.is_zero() && remaining < Duration::from_millis(250)
+            }));
         assert!(!state.lock().unwrap().input_active);
     }
 
@@ -4787,7 +4920,7 @@ mod tests {
                 }),
                 command_id: command_id.into(),
                 sequence: NEXT_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-                expires_at_unix_ms: i64::MAX,
+                expires_at_unix_ms: current_unix_ms() + 60_000,
             }),
             attempt: Some(AttemptRef {
                 task_run_id: contract.task_run_id.clone(),
@@ -5384,12 +5517,14 @@ mod tests {
 
         state.lock().unwrap().next_capture_sequence = 40;
 
+        let mut capture_task = task_ref(&contract, "capture-frame-1");
+        capture_task.command.as_mut().unwrap().expires_at_unix_ms = current_unix_ms() + 100;
         let capture = HubControlCommand {
             payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {
                 source_id: "client".into(),
                 encoding: "jpeg".into(),
                 quality: 85,
-                task: Some(task_ref(&contract, "capture-frame-1")),
+                task: Some(capture_task),
                 target_generation: 1,
                 ..CaptureFrame::default()
             })),
@@ -5401,6 +5536,16 @@ mod tests {
                     && receipt.capture_state
                         == fairypam_agent_protocol::internal_v1::TaskCaptureState::Stopped as i32
         ));
+        assert!(state
+            .lock()
+            .unwrap()
+            .single_capture_deadline_remaining
+            .is_some_and(|remaining| remaining < Duration::from_secs(1)));
+        let telemetry = executor.take_command_telemetry_attributes();
+        assert!(telemetry.iter().any(|attribute| {
+            attribute.key == "capture.payload_bytes"
+                && attribute.value == Some(v3::telemetry_attribute::Value::IntValue(3))
+        }));
         assert!(executor.capture.is_none());
         let frames = sink.0.lock().unwrap();
         assert_eq!(frames.len(), 1);
@@ -5412,6 +5557,39 @@ mod tests {
         );
         drop(frames);
         assert_eq!(state.lock().unwrap().single_capture_calls, 1);
+
+        state.lock().unwrap().capture_error = Some(AgentError::new(
+            "worker.deadline_expired",
+            "worker ran out of command budget",
+        ));
+        let mut timed_out_task = task_ref(&contract, "capture-frame-timeout");
+        timed_out_task.command.as_mut().unwrap().expires_at_unix_ms = current_unix_ms() + 100;
+        let timed_out_capture = HubControlCommand {
+            payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {
+                source_id: "client".into(),
+                encoding: "jpeg".into(),
+                quality: 85,
+                task: Some(timed_out_task),
+                target_generation: 1,
+                ..CaptureFrame::default()
+            })),
+        };
+        assert!(matches!(
+            executor.execute(
+                &timed_out_capture,
+                &ExecutionSession::test(),
+                Arc::new(CollectFrames::default()),
+            ),
+            CommandOutcome::TaskAck { ref outcome, ref receipt, .. }
+                if outcome.as_ref().unwrap().outcome
+                    == TaskCommandOutcomeState::NotApplied as i32
+                    && receipt.error_code.as_deref() == Some("protocol.command_timeout")
+        ));
+        assert!(executor
+            .take_command_telemetry_attributes()
+            .iter()
+            .any(|attribute| attribute.key == "capture.complete_us"));
+        state.lock().unwrap().capture_error = None;
 
         let paused_capture = HubControlCommand {
             payload: Some(hub_control_command::Payload::CaptureFrame(CaptureFrame {

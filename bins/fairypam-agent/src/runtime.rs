@@ -1326,6 +1326,7 @@ impl SessionDriver for GrpcSessionDriver {
                                     command_started_at,
                                     telemetry_unix_nano(),
                                     Some(error.code()),
+                                    &[],
                                 );
                             }
                             let event = match v3_adapter::internal_task_identity(&identity) {
@@ -1442,6 +1443,8 @@ impl SessionDriver for GrpcSessionDriver {
                         }
                     };
                     execution.stamp_target_generation(&mut outcome);
+                    let command_telemetry_attributes =
+                        execution.take_command_telemetry_attributes();
                     drop(execution);
                     if let Ok(mut state) = self.state.lock() {
                         state.record_command_diagnostic(&outcome);
@@ -1453,6 +1456,7 @@ impl SessionDriver for GrpcSessionDriver {
                             command_started_at,
                             telemetry_unix_nano(),
                             outcome.telemetry_error_code(),
+                            &command_telemetry_attributes,
                         );
                     }
                     let event = v3_adapter::result(identity, outcome);

@@ -12,7 +12,7 @@ use fairypam_agent_protocol::internal_v1::{AttemptRef, SessionRef};
 use fairypam_agent_protocol::v3::{
     agent_control_event, AgentControlEvent, AttemptRef as AgentAttemptRef, RealtimeProgramEvent,
     RealtimeProgramMetrics, RealtimeProgramState as AgentRealtimeProgramState,
-    SessionRef as AgentSessionRef,
+    SessionRef as AgentSessionRef, TelemetryAttribute,
 };
 use fairypam_agent_protocol::worker_realtime_metrics_digest;
 use fairypam_agent_protocol::worker_v1::{
@@ -24,12 +24,17 @@ use fairypam_agent_protocol::worker_v1::{
 };
 
 use super::{
-    ensure_current_source_frame, RuntimeCapture, RuntimeCaptureEncoding, RuntimeCapturedFrame,
-    RuntimePlatform, SourceFrameMap, WindowsRuntimePlatform,
+    elapsed_us, ensure_current_source_frame, now_unix_us, telemetry_int, telemetry_string,
+    RuntimeCapture, RuntimeCaptureEncoding, RuntimeCapturedFrame, RuntimePlatform, SourceFrameMap,
+    WindowsRuntimePlatform,
 };
 use crate::profile_store::ProfileStore;
 
-const WORKER_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn worker_maintenance_deadline() -> Instant {
+    Instant::now() + WORKER_MAINTENANCE_TIMEOUT
+}
 const FRAME_SLOT_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) struct WorkerRuntimePlatform {
@@ -47,6 +52,7 @@ pub(super) struct WorkerRuntimePlatform {
     realtime_events: VecDeque<AgentControlEvent>,
     root_public_key: Option<String>,
     source_frames: Arc<Mutex<SourceFrameMap>>,
+    capture_telemetry: Vec<TelemetryAttribute>,
 }
 
 struct WorkerState {
@@ -73,6 +79,14 @@ fn attachment_decision(
         AttachmentDecision::Reuse
     } else {
         AttachmentDecision::Attach
+    }
+}
+
+fn attach_error(error: AgentError, deadline: Instant) -> AgentError {
+    if Instant::now() >= deadline {
+        AgentError::new("worker.deadline_expired", error.to_string())
+    } else {
+        error
     }
 }
 
@@ -160,6 +174,7 @@ impl WorkerRuntimePlatform {
             realtime_events: VecDeque::new(),
             root_public_key,
             source_frames: Arc::new(Mutex::new(SourceFrameMap::default())),
+            capture_telemetry: Vec::new(),
         }
     }
 
@@ -188,6 +203,7 @@ impl WorkerRuntimePlatform {
         &mut self,
         profile: &VerifiedProfile,
         binding: &TargetBinding,
+        deadline: Instant,
     ) -> Result<(), AgentError> {
         let mut state = self.lock_worker()?;
         let same_target = matches!(
@@ -211,13 +227,13 @@ impl WorkerRuntimePlatform {
                 let _ = request_applied(
                     process,
                     worker_request::Payload::DetachTarget(DetachTarget {}),
-                    WORKER_TIMEOUT,
+                    deadline,
                 );
             }
             state.process = None;
             state.attached_generation = None;
         }
-        let process = ensure_process(&mut state)?;
+        let process = ensure_process(&mut state, deadline)?;
         let attach = request_applied(
             process,
             worker_request::Payload::AttachTarget(AttachTarget {
@@ -226,8 +242,9 @@ impl WorkerRuntimePlatform {
                 profile_id: profile.profile().id.clone(),
                 profile_digest: profile.content_sha256().to_owned(),
             }),
-            WORKER_TIMEOUT,
-        );
+            deadline,
+        )
+        .map_err(|error| attach_error(error, deadline));
         let generation = process.generation().to_owned();
         if attach.is_err() {
             process.terminate();
@@ -255,7 +272,7 @@ impl WorkerRuntimePlatform {
                         worker_request::Payload::ReleaseAll(ReleaseAll {
                             reason_code: reason.to_owned(),
                         }),
-                        Duration::from_secs(2),
+                        Instant::now() + Duration::from_secs(2),
                     )
                     .and_then(|response| {
                         verify_release_health(
@@ -319,7 +336,14 @@ impl WorkerRuntimePlatform {
     fn handle_side_effect<T>(&mut self, result: Result<T, AgentError>) -> Result<T, AgentError> {
         match result {
             Ok(value) => Ok(value),
-            Err(error) if error.code() == "worker.not_applied" => Err(error),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    "worker.not_applied" | "worker.deadline_expired"
+                ) =>
+            {
+                Err(error)
+            }
             Err(error) => Err(self.mark_uncertain(error)),
         }
     }
@@ -343,25 +367,36 @@ impl WorkerRuntimePlatform {
     fn request_in_sequence(
         &mut self,
         payload: worker_request::Payload,
+        deadline: Instant,
         applied_any: &mut bool,
     ) -> Result<(), AgentError> {
-        match self.request(payload) {
+        match self.request(payload, deadline) {
             Ok(()) => {
                 *applied_any = true;
                 Ok(())
             }
-            Err(error) if *applied_any && error.code() == "worker.not_applied" => {
+            Err(error)
+                if *applied_any
+                    && matches!(
+                        error.code(),
+                        "worker.not_applied" | "worker.deadline_expired"
+                    ) =>
+            {
                 Err(self.mark_uncertain(error))
             }
             Err(error) => Err(error),
         }
     }
 
-    fn request(&mut self, payload: worker_request::Payload) -> Result<(), AgentError> {
+    fn request(
+        &mut self,
+        payload: worker_request::Payload,
+        deadline: Instant,
+    ) -> Result<(), AgentError> {
         let (result, generation, events, held_action_ids) = {
             let mut state = self.lock_worker()?;
-            let process = ensure_process(&mut state)?;
-            let result = request_applied(process, payload, WORKER_TIMEOUT);
+            let process = ensure_process(&mut state, deadline)?;
+            let result = request_applied(process, payload, deadline);
             (
                 result,
                 process.generation().to_owned(),
@@ -548,7 +583,7 @@ impl WorkerRuntimePlatform {
                 let _ = request_applied(
                     process,
                     worker_request::Payload::DetachTarget(DetachTarget {}),
-                    WORKER_TIMEOUT,
+                    worker_maintenance_deadline(),
                 );
                 process.terminate();
             }
@@ -592,13 +627,18 @@ fn verify_release_health(
 }
 
 impl RuntimePlatform for WorkerRuntimePlatform {
+    fn take_capture_telemetry(&mut self) -> Vec<TelemetryAttribute> {
+        std::mem::take(&mut self.capture_telemetry)
+    }
+
     fn ensure_worker_ready(&mut self) -> Result<Option<super::WindowsIoRuntimeInfo>, AgentError> {
         let mut state = self.lock_worker()?;
-        let result = ensure_process(&mut state).and_then(|process| {
+        let deadline = worker_maintenance_deadline();
+        let result = ensure_process(&mut state, deadline).and_then(|process| {
             request_applied(
                 process,
                 worker_request::Payload::GetHealth(GetHealth {}),
-                WORKER_TIMEOUT,
+                deadline,
             )?;
             let info = process.runtime_info();
             Ok(super::WindowsIoRuntimeInfo {
@@ -682,7 +722,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             &mut self.target,
             profile,
         )?;
-        self.attach(profile, &binding)?;
+        self.attach(profile, &binding, worker_maintenance_deadline())?;
         Ok(binding)
     }
 
@@ -697,7 +737,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
     ) -> Result<TargetBinding, AgentError> {
         let binding =
             <WindowsRuntimePlatform as RuntimePlatform>::lock(&mut self.target, profile, selector)?;
-        self.attach(profile, &binding)?;
+        self.attach(profile, &binding, worker_maintenance_deadline())?;
         Ok(binding)
     }
 
@@ -711,7 +751,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             profile,
             binding,
         )?;
-        self.attach(profile, &binding)?;
+        self.attach(profile, &binding, worker_maintenance_deadline())?;
         Ok(binding)
     }
 
@@ -724,60 +764,120 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         encoding: RuntimeCaptureEncoding,
         deadline: Instant,
     ) -> Result<RuntimeCapturedFrame, AgentError> {
-        if region != CaptureRegion::FullClient {
-            return Err(AgentError::new(
-                "capture.region_unsupported",
-                "MAA Generic capture only exposes the full client frame",
-            ));
+        self.capture_telemetry.clear();
+        let started = Instant::now();
+        let mut stage = "prepare";
+        let mut prepare_us = 0;
+        let mut attach_us = 0;
+        let mut worker_round_trip_us = 0;
+        let mut ring_read_us = 0;
+        let mut worker_to_image_us = None;
+        let mut worker_after_image_us = None;
+        let result = (|| {
+            if region != CaptureRegion::FullClient {
+                return Err(AgentError::new(
+                    "capture.region_unsupported",
+                    "MAA Generic capture only exposes the full client frame",
+                ));
+            }
+            self.tick_input_safety(Instant::now())?;
+            let profile = self.profile.clone().ok_or_else(|| {
+                AgentError::new("profile.not_active", "worker has no active Profile")
+            })?;
+            let (encoding, quality) = match encoding {
+                RuntimeCaptureEncoding::Jpeg { quality } => ("jpeg", u32::from(quality)),
+                RuntimeCaptureEncoding::Png => ("png", 0),
+            };
+            prepare_us = elapsed_us(started);
+            stage = "attach";
+            let attach_started = Instant::now();
+            let attached = self.attach(&profile, binding, deadline);
+            attach_us = elapsed_us(attach_started);
+            attached?;
+            stage = "worker_round_trip";
+            let worker_started = Instant::now();
+            let worker_started_unix_us = now_unix_us();
+            let sequence = {
+                let mut state = self.lock_worker()?;
+                let response = request_applied_response(
+                    ensure_process(&mut state, deadline)?,
+                    worker_request::Payload::CaptureOnce(CaptureOnce {
+                        capture_source_id: source_id.to_owned(),
+                        encoding: encoding.to_owned(),
+                        quality,
+                    }),
+                    deadline,
+                );
+                worker_round_trip_us = elapsed_us(worker_started);
+                response?.frame_sequence.ok_or_else(|| {
+                    AgentError::new(
+                        "worker.response_invalid",
+                        "Worker CaptureOnce response has no frame sequence",
+                    )
+                })?
+            };
+            stage = "ring_read";
+            let ring_started = Instant::now();
+            let mut capture = WorkerCapture {
+                worker: Arc::clone(&self.worker),
+                faulted: Arc::clone(&self.faulted),
+                profile,
+                source_id: None,
+                last_sequence: sequence.saturating_sub(1),
+                source_frames: Arc::clone(&self.source_frames),
+            };
+            let frame_result = capture.next_frame(deadline);
+            ring_read_us = elapsed_us(ring_started);
+            let frame = frame_result?;
+            worker_to_image_us = Some(
+                frame
+                    .captured_at_unix_us
+                    .saturating_sub(worker_started_unix_us)
+                    .max(0),
+            );
+            worker_after_image_us = Some(
+                now_unix_us()
+                    .saturating_sub(frame.captured_at_unix_us)
+                    .max(0),
+            );
+            if frame.sequence != sequence {
+                return Err(AgentError::new(
+                    "worker.frame_sequence_invalid",
+                    "Worker CaptureOnce frame does not match its response",
+                ));
+            }
+            self.source_frames
+                .lock()
+                .map_err(|error| AgentError::new("worker.state_poisoned", error.to_string()))?
+                .record(frame.sequence, frame.sequence);
+            stage = "complete";
+            Ok(frame)
+        })();
+        self.capture_telemetry = vec![
+            telemetry_int("capture.prepare_us", prepare_us),
+            telemetry_int("capture.attach_us", attach_us),
+            telemetry_int("capture.worker_round_trip_us", worker_round_trip_us),
+            telemetry_int("capture.ring_read_us", ring_read_us),
+        ];
+        if let Some(value) = worker_to_image_us {
+            self.capture_telemetry
+                .push(telemetry_int("capture.worker_to_image_us", value));
         }
-        self.tick_input_safety(Instant::now())?;
-        let profile = self
-            .profile
-            .clone()
-            .ok_or_else(|| AgentError::new("profile.not_active", "worker has no active Profile"))?;
-        self.attach(&profile, binding)?;
-        let (encoding, quality) = match encoding {
-            RuntimeCaptureEncoding::Jpeg { quality } => ("jpeg", u32::from(quality)),
-            RuntimeCaptureEncoding::Png => ("png", 0),
-        };
-        let sequence = {
-            let mut state = self.lock_worker()?;
-            let response = request_applied_response(
-                ensure_process(&mut state)?,
-                worker_request::Payload::CaptureOnce(CaptureOnce {
-                    capture_source_id: source_id.to_owned(),
-                    encoding: encoding.to_owned(),
-                    quality,
-                }),
-                WORKER_TIMEOUT,
-            )?;
-            response.frame_sequence.ok_or_else(|| {
-                AgentError::new(
-                    "worker.response_invalid",
-                    "Worker CaptureOnce response has no frame sequence",
-                )
-            })?
-        };
-        let mut capture = WorkerCapture {
-            worker: Arc::clone(&self.worker),
-            faulted: Arc::clone(&self.faulted),
-            profile,
-            source_id: None,
-            last_sequence: sequence.saturating_sub(1),
-            source_frames: Arc::clone(&self.source_frames),
-        };
-        let frame = capture.next_frame(deadline)?;
-        if frame.sequence != sequence {
-            return Err(AgentError::new(
-                "worker.frame_sequence_invalid",
-                "Worker CaptureOnce frame does not match its response",
-            ));
+        if let Some(value) = worker_after_image_us {
+            self.capture_telemetry
+                .push(telemetry_int("capture.worker_after_image_us", value));
         }
-        self.source_frames
-            .lock()
-            .map_err(|error| AgentError::new("worker.state_poisoned", error.to_string()))?
-            .record(frame.sequence, frame.sequence);
-        Ok(frame)
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error.code(),
+                "worker.deadline_expired" | "maa.operation_timeout"
+            )
+        }) || (result.is_err() && Instant::now() >= deadline)
+        {
+            self.capture_telemetry
+                .push(telemetry_string("timeout.stage", stage));
+        }
+        result
     }
 
     fn start_capture(
@@ -798,7 +898,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             .profile
             .clone()
             .ok_or_else(|| AgentError::new("profile.not_active", "worker has no active Profile"))?;
-        self.attach(&profile, binding)?;
+        self.attach(&profile, binding, worker_maintenance_deadline())?;
         let (encoding_name, quality) = match encoding {
             RuntimeCaptureEncoding::Jpeg { quality } => ("jpeg", u32::from(quality)),
             RuntimeCaptureEncoding::Png => ("png", 0),
@@ -806,15 +906,16 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         {
             self.clear_source_frames()?;
             let mut state = self.lock_worker()?;
+            let deadline = worker_maintenance_deadline();
             request_applied(
-                ensure_process(&mut state)?,
+                ensure_process(&mut state, deadline)?,
                 worker_request::Payload::StartGenericCapture(StartGenericCapture {
                     capture_source_id: source_id.to_owned(),
                     fps,
                     encoding: encoding_name.to_owned(),
                     quality,
                 }),
-                WORKER_TIMEOUT,
+                deadline,
             )?;
         }
         Ok(Box::new(WorkerCapture {
@@ -886,7 +987,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                 "Hub must observe a new frame after Worker recovery",
             ));
         }
-        self.attach(profile, binding)?;
+        self.attach(profile, binding, expires_at)?;
         self.session = Some(session.clone());
         self.input_expires_at = Some(expires_at);
         Ok(())
@@ -910,7 +1011,9 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         action_id: &str,
         now: Instant,
     ) -> Result<(), AgentError> {
-        let deadline = self.input_expires_at.unwrap_or(now + WORKER_TIMEOUT);
+        let deadline = self
+            .input_expires_at
+            .unwrap_or(now + WORKER_MAINTENANCE_TIMEOUT);
         self.guard_local_input()?;
         if self.session.is_none() {
             let profile = self.profile.clone().ok_or_else(|| {
@@ -920,7 +1023,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         }
         self.require_session(session)?;
         let mut applied_any = false;
-        self.request_in_sequence(click_key_payload(action_id), &mut applied_any)?;
+        self.request_in_sequence(click_key_payload(action_id), deadline, &mut applied_any)?;
         Ok(())
     }
 
@@ -932,6 +1035,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         session: &SessionRef,
         _input_sequence: u64,
         expires_at: Instant,
+        command_deadline: Instant,
         held_action_ids: &[String],
         wheel_action_id: &str,
         wheel_delta: i32,
@@ -948,7 +1052,15 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         }
         self.guard_local_input()?;
         if self.session.is_none() {
-            self.start_task_input(profile, binding, session, expires_at)?;
+            if self.faulted.load(Ordering::Acquire) {
+                return Err(AgentError::new(
+                    "worker.reobservation_required",
+                    "Hub must observe a new frame after Worker recovery",
+                ));
+            }
+            self.attach(profile, binding, command_deadline)?;
+            self.session = Some(session.clone());
+            self.input_expires_at = Some(expires_at);
         }
         self.require_session(session)?;
         self.input_expires_at = Some(expires_at);
@@ -977,7 +1089,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                 }
                 _ => None,
             };
-            self.request_in_sequence(payload, &mut applied_any)?;
+            self.request_in_sequence(payload, command_deadline, &mut applied_any)?;
             if let Some((action_id, held)) = hold_change {
                 if held {
                     self.held_actions.insert(action_id);
@@ -996,6 +1108,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                     y_ppm: wheel_point.map(|value| value.1),
                     source_frame_sequence: runtime_source_frame,
                 }),
+                command_deadline,
                 &mut applied_any,
             )?;
         }
@@ -1010,6 +1123,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                     y_ppm,
                     source_frame_sequence,
                 }),
+                command_deadline,
                 &mut applied_any,
             )?;
         }
@@ -1029,6 +1143,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                     duration_ms,
                     source_frame_sequence,
                 }),
+                command_deadline,
                 &mut applied_any,
             )?;
         }
@@ -1077,15 +1192,16 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         self.realtime_program = Some(program_id.to_owned());
         self.realtime_attempt = Some(attempt.clone());
         self.realtime_terminal = None;
-        let result = self.request(worker_request::Payload::StartRealtimeProgram(
-            StartRealtimeProgram {
+        let result = self.request(
+            worker_request::Payload::StartRealtimeProgram(StartRealtimeProgram {
                 program_id: program_id.to_owned(),
                 program_schema_version,
                 program_digest: program_digest.to_owned(),
                 maximum_duration_ms,
                 supervision_lease_ms,
-            },
-        ));
+            }),
+            worker_maintenance_deadline(),
+        );
         if result.is_err() {
             self.realtime_program = None;
             self.realtime_attempt = None;
@@ -1119,12 +1235,15 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                 "supervision lease is too large",
             )
         })?;
-        self.request(worker_request::Payload::RenewRealtimeProgram(
-            fairypam_agent_protocol::worker_v1::RenewRealtimeProgram {
-                program_id: program_id.to_owned(),
-                supervision_lease_ms,
-            },
-        ))
+        self.request(
+            worker_request::Payload::RenewRealtimeProgram(
+                fairypam_agent_protocol::worker_v1::RenewRealtimeProgram {
+                    program_id: program_id.to_owned(),
+                    supervision_lease_ms,
+                },
+            ),
+            worker_maintenance_deadline(),
+        )
     }
 
     fn stop_realtime_program(
@@ -1149,11 +1268,12 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                 Ok(None)
             };
         }
-        self.request(worker_request::Payload::StopRealtimeProgram(
-            StopRealtimeProgram {
+        self.request(
+            worker_request::Payload::StopRealtimeProgram(StopRealtimeProgram {
                 program_id: program_id.to_owned(),
-            },
-        ))?;
+            }),
+            worker_maintenance_deadline(),
+        )?;
         self.realtime_program = None;
         self.realtime_attempt = None;
         self.realtime_terminal = None;
@@ -1162,7 +1282,10 @@ impl RuntimePlatform for WorkerRuntimePlatform {
 
     fn poll_realtime_program_events(&mut self) -> Result<Vec<AgentControlEvent>, AgentError> {
         if self.realtime_program.is_some() && self.realtime_terminal.is_none() {
-            self.request(worker_request::Payload::GetHealth(GetHealth {}))?;
+            self.request(
+                worker_request::Payload::GetHealth(GetHealth {}),
+                worker_maintenance_deadline(),
+            )?;
         }
         Ok(self.realtime_events.drain(..).collect())
     }
@@ -1261,14 +1384,17 @@ impl Drop for WorkerCapture {
                     worker_request::Payload::StopGenericCapture(StopGenericCapture {
                         capture_source_id: source_id.clone(),
                     }),
-                    Duration::from_secs(2),
+                    Instant::now() + Duration::from_secs(2),
                 );
             }
         }
     }
 }
 
-fn ensure_process(state: &mut WorkerState) -> Result<&mut WorkerProcess, AgentError> {
+fn ensure_process(
+    state: &mut WorkerState,
+    deadline: Instant,
+) -> Result<&mut WorkerProcess, AgentError> {
     if state.process.is_none() {
         state.attached_generation = None;
         let config = state.config.as_ref().ok_or_else(|| {
@@ -1277,7 +1403,7 @@ fn ensure_process(state: &mut WorkerState) -> Result<&mut WorkerProcess, AgentEr
                 "Worker runtime or signed Profile directory is not configured",
             )
         })?;
-        state.process = Some(WorkerProcess::spawn(config).map_err(map_worker_error)?);
+        state.process = Some(WorkerProcess::spawn(config, deadline).map_err(map_worker_error)?);
     }
     Ok(state.process.as_mut().unwrap())
 }
@@ -1285,15 +1411,15 @@ fn ensure_process(state: &mut WorkerState) -> Result<&mut WorkerProcess, AgentEr
 fn request_applied(
     process: &mut WorkerProcess,
     payload: worker_request::Payload,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<(), AgentError> {
-    request_applied_response(process, payload, timeout).map(drop)
+    request_applied_response(process, payload, deadline).map(drop)
 }
 
 fn request_applied_response(
     process: &mut WorkerProcess,
     payload: worker_request::Payload,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<WorkerResponse, AgentError> {
     let expected_action = match &payload {
         worker_request::Payload::GenericClick(value) => Some(value.action_id.clone()),
@@ -1306,7 +1432,7 @@ fn request_applied_response(
         _ => None,
     };
     let response = process
-        .request(payload, timeout)
+        .request(payload, deadline)
         .map_err(map_worker_error)?;
     match WorkerOutcome::try_from(response.outcome).unwrap_or(WorkerOutcome::Unspecified) {
         WorkerOutcome::Applied
@@ -1320,12 +1446,17 @@ fn request_applied_response(
             "worker.side_effect_uncertain",
             "Worker Applied result does not identify the requested action",
         )),
-        WorkerOutcome::NotApplied => Err(AgentError::new(
-            "worker.not_applied",
-            response
+        WorkerOutcome::NotApplied => {
+            let code = response
                 .error_code
-                .unwrap_or_else(|| "worker.not_applied".to_owned()),
-        )),
+                .unwrap_or_else(|| "worker.not_applied".to_owned());
+            let error_code = match code.as_str() {
+                "worker.deadline_expired" => "worker.deadline_expired",
+                "maa.operation_timeout" => "maa.operation_timeout",
+                _ => "worker.not_applied",
+            };
+            Err(AgentError::new(error_code, code))
+        }
         WorkerOutcome::Uncertain | WorkerOutcome::Unspecified => Err(AgentError::new(
             "worker.side_effect_uncertain",
             response
@@ -1390,7 +1521,7 @@ mod tests {
     use fairypam_agent_protocol::worker_v1::{worker_request, WindowsIoMode, WorkerHealth};
 
     use super::{
-        attachment_decision, input_frame_key_plan, retain_input_lease_for_holds,
+        attach_error, attachment_decision, input_frame_key_plan, retain_input_lease_for_holds,
         verify_release_health, AttachmentDecision, RuntimePlatform, WorkerRuntimePlatform,
     };
     use crate::profile_store::ProfileStore;
@@ -1442,6 +1573,16 @@ mod tests {
             attachment_decision(false, Some("worker-2"), Some("worker-2")),
             AttachmentDecision::Replace
         );
+    }
+
+    #[test]
+    fn expired_attach_is_definitely_not_applied() {
+        let error = attach_error(
+            fairypam_agent_core::AgentError::new("maa.runtime_io_failed", "pipe timed out"),
+            Instant::now(),
+        );
+
+        assert_eq!(error.code(), "worker.deadline_expired");
     }
 
     #[test]

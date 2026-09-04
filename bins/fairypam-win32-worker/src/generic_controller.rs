@@ -161,7 +161,7 @@ mod windows_impl {
 
     use super::{bind_optional_client_point, ppm_coordinate, wheel_notches, SourceFrameWindow};
 
-    const OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
+    const MAA_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(3);
 
     pub struct GenericController {
         maa: MaaWindowsController,
@@ -251,9 +251,12 @@ mod windows_impl {
             Ok(())
         }
 
-        pub fn capture_once(&mut self) -> Result<(u64, CapturedFrame), MaaRuntimeError> {
+        pub fn capture_once(
+            &mut self,
+            deadline: Instant,
+        ) -> Result<(u64, CapturedFrame), MaaRuntimeError> {
             self.revalidate()?;
-            let frame = self.maa.capture_once(OPERATION_TIMEOUT)?;
+            let frame = self.maa.capture_once(maa_remaining(deadline, "capture")?)?;
             let geometry = self
                 .geometry
                 .ok_or_else(|| invalid_target("target is detached"))?;
@@ -323,6 +326,7 @@ mod windows_impl {
             x_ppm: u32,
             y_ppm: u32,
             source_frame_sequence: u64,
+            deadline: Instant,
         ) -> Result<(), MaaRuntimeError> {
             self.require_source_frame(source_frame_sequence)?;
             let geometry = self.revalidate()?;
@@ -332,7 +336,8 @@ mod windows_impl {
             };
             let x = ppm_coordinate(x_ppm, geometry.width)?;
             let y = ppm_coordinate(y_ppm, geometry.height)?;
-            self.maa.click(button, x, y, OPERATION_TIMEOUT)
+            self.maa
+                .click(button, x, y, maa_remaining(deadline, "click")?)
         }
 
         pub fn swipe(
@@ -342,6 +347,7 @@ mod windows_impl {
             end_ppm: (u32, u32),
             duration_ms: u32,
             source_frame_sequence: u64,
+            deadline: Instant,
         ) -> Result<(), MaaRuntimeError> {
             self.require_source_frame(source_frame_sequence)?;
             let geometry = self.revalidate()?;
@@ -375,11 +381,15 @@ mod windows_impl {
                 start,
                 end,
                 Duration::from_millis(u64::from(duration_ms)),
-                OPERATION_TIMEOUT,
+                maa_remaining(deadline, "swipe")?,
             )
         }
 
-        pub fn key_down(&mut self, action_id: &str) -> Result<(), MaaRuntimeError> {
+        pub fn key_down(
+            &mut self,
+            action_id: &str,
+            deadline: Instant,
+        ) -> Result<(), MaaRuntimeError> {
             self.revalidate()?;
             let virtual_key = match self.action(action_id)? {
                 ActionDefinition::Hold {
@@ -390,12 +400,17 @@ mod windows_impl {
             if self.held_actions.contains(action_id) {
                 return Ok(());
             }
-            self.maa.key_down(virtual_key, OPERATION_TIMEOUT)?;
+            self.maa
+                .key_down(virtual_key, maa_remaining(deadline, "key_down")?)?;
             self.held_actions.insert(action_id.to_owned());
             Ok(())
         }
 
-        pub fn key_up(&mut self, action_id: &str) -> Result<(), MaaRuntimeError> {
+        pub fn key_up(
+            &mut self,
+            action_id: &str,
+            deadline: Instant,
+        ) -> Result<(), MaaRuntimeError> {
             self.revalidate()?;
             let virtual_key = match self.action(action_id)? {
                 ActionDefinition::Hold {
@@ -406,12 +421,17 @@ mod windows_impl {
             if !self.held_actions.contains(action_id) {
                 return Ok(());
             }
-            self.maa.key_up(virtual_key, OPERATION_TIMEOUT)?;
+            self.maa
+                .key_up(virtual_key, maa_remaining(deadline, "key_up")?)?;
             self.held_actions.remove(action_id);
             Ok(())
         }
 
-        pub fn click_key(&mut self, action_id: &str) -> Result<(), MaaRuntimeError> {
+        pub fn click_key(
+            &mut self,
+            action_id: &str,
+            deadline: Instant,
+        ) -> Result<(), MaaRuntimeError> {
             self.revalidate()?;
             let virtual_key = match self.action(action_id)? {
                 ActionDefinition::Pulse {
@@ -419,7 +439,8 @@ mod windows_impl {
                 } => i32::from(*maa_virtual_key),
                 _ => return Err(action_kind_invalid()),
             };
-            self.maa.click_key(virtual_key, OPERATION_TIMEOUT)
+            self.maa
+                .click_key(virtual_key, maa_remaining(deadline, "click_key")?)
         }
 
         pub fn scroll(
@@ -429,6 +450,7 @@ mod windows_impl {
             x_ppm: Option<u32>,
             y_ppm: Option<u32>,
             source_frame_sequence: Option<u64>,
+            deadline: Instant,
         ) -> Result<(), MaaRuntimeError> {
             let geometry = self.revalidate()?;
             if let Some(source) = source_frame_sequence {
@@ -448,17 +470,10 @@ mod windows_impl {
                         && delta.unsigned_abs() <= *maximum_delta as u32 => {}
                 _ => return Err(action_kind_invalid()),
             }
-            let deadline = Instant::now() + OPERATION_TIMEOUT;
             let mut point = bound_point;
             for notch in wheel_notches(delta) {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(MaaRuntimeError::new(
-                        "maa.operation_timeout",
-                        "MAA scroll deadline expired",
-                    ));
-                }
-                self.maa.scroll_at(point.take(), 0, notch, remaining)?;
+                self.maa
+                    .scroll_at(point.take(), 0, notch, maa_remaining(deadline, "scroll")?)?;
             }
             Ok(())
         }
@@ -468,6 +483,7 @@ mod windows_impl {
             action_id: &str,
             dx: i32,
             dy: i32,
+            deadline: Instant,
         ) -> Result<(), MaaRuntimeError> {
             self.revalidate()?;
             match self.action(action_id)? {
@@ -476,11 +492,12 @@ mod windows_impl {
                         && dy.unsigned_abs() <= *maximum_delta as u32 => {}
                 _ => return Err(action_kind_invalid()),
             }
-            self.maa.relative_move(dx, dy, OPERATION_TIMEOUT)
+            self.maa
+                .relative_move(dx, dy, maa_remaining(deadline, "relative_move")?)
         }
 
         pub fn inactive(&mut self) -> Result<(), MaaRuntimeError> {
-            self.maa.inactive(OPERATION_TIMEOUT)
+            self.maa.inactive(MAA_MAINTENANCE_TIMEOUT)
         }
 
         pub fn release_all(&mut self) -> Result<(), MaaRuntimeError> {
@@ -499,7 +516,7 @@ mod windows_impl {
                     ) => i32::from(*maa_virtual_key),
                     _ => continue,
                 };
-                if let Err(error) = self.maa.key_up(virtual_key, OPERATION_TIMEOUT) {
+                if let Err(error) = self.maa.key_up(virtual_key, MAA_MAINTENANCE_TIMEOUT) {
                     first_error.get_or_insert(error);
                 }
             }
@@ -588,6 +605,32 @@ mod windows_impl {
                 ));
             }
             Ok(current)
+        }
+    }
+
+    fn maa_remaining(deadline: Instant, operation: &str) -> Result<Duration, MaaRuntimeError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(MaaRuntimeError::new(
+                "maa.operation_timeout",
+                format!("MAA {operation} deadline expired"),
+            ));
+        }
+        Ok(remaining)
+    }
+
+    #[cfg(test)]
+    mod deadline_tests {
+        use std::time::{Duration, Instant};
+
+        use super::maa_remaining;
+
+        #[test]
+        fn maa_budget_excludes_worker_preparation_time() {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            std::thread::sleep(Duration::from_millis(25));
+
+            assert!(maa_remaining(deadline, "test").unwrap() < Duration::from_millis(90));
         }
     }
 

@@ -251,7 +251,10 @@ pub mod windows {
     };
 
     impl WorkerProcess {
-        pub fn spawn(config: &WorkerProcessConfig) -> Result<Self, MaaRuntimeError> {
+        pub fn spawn(
+            config: &WorkerProcessConfig,
+            deadline: Instant,
+        ) -> Result<Self, MaaRuntimeError> {
             let runtime_root_public_key =
                 required_runtime_root_public_key(config.runtime_root_public_key.as_deref())?;
             let generation = generation_id();
@@ -302,7 +305,7 @@ pub mod windows {
                 .spawn()
                 .map_err(|error| MaaRuntimeError::new("worker.start_failed", error.to_string()))?;
             let job = assign_kill_on_close_job(&mut child)?;
-            let stream = match connect_pipe(&pipe_name, &mut child, Duration::from_secs(10)) {
+            let stream = match connect_pipe(&pipe_name, &mut child, deadline) {
                 Ok(stream) => stream,
                 Err(error) => {
                     let _ = child.kill();
@@ -310,8 +313,8 @@ pub mod windows {
                     return Err(error);
                 }
             };
-            let mut stream = NamedPipeStream::new(stream, Duration::from_secs(10));
-            let hello = read_envelope(&mut stream)?;
+            let mut stream = NamedPipeStream::new(stream, deadline);
+            let hello = read_startup_envelope(&mut stream, deadline)?;
             if hello.protocol_major != LOCAL_PROTOCOL_MAJOR
                 || hello.protocol_minor != LOCAL_PROTOCOL_MINOR
             {
@@ -322,7 +325,7 @@ pub mod windows {
                     if value.worker_generation == generation && value.process_id == child.id() => {}
                 _ => return Err(invalid("worker hello is invalid")),
             }
-            let ready = read_envelope(&mut stream)?;
+            let ready = read_startup_envelope(&mut stream, deadline)?;
             if ready.protocol_major != LOCAL_PROTOCOL_MAJOR
                 || ready.protocol_minor != LOCAL_PROTOCOL_MINOR
             {
@@ -370,7 +373,7 @@ pub mod windows {
         pub fn request(
             &mut self,
             payload: worker_request::Payload,
-            timeout: Duration,
+            deadline: Instant,
         ) -> Result<WorkerResponse, MaaRuntimeError> {
             if self.child.try_wait()?.is_some() {
                 return Err(MaaRuntimeError::new(
@@ -386,7 +389,7 @@ pub mod windows {
                 identity: Some(WorkerCommandIdentity {
                     worker_generation: self.generation.clone(),
                     local_command_id: format!("{}-{}", self.generation, self.command_sequence),
-                    deadline_unix_ms: unix_ms().saturating_add(timeout.as_millis() as i64),
+                    deadline_unix_ms: wire_deadline_unix_ms(deadline)?,
                     target_generation: self.target_generation,
                     input_owner_epoch: self.input_owner_epoch,
                     request_digest: String::new(),
@@ -394,7 +397,7 @@ pub mod windows {
                 payload: Some(payload),
             };
             request.identity.as_mut().unwrap().request_digest = worker_request_digest(&request);
-            self.client.stream.set_timeout(timeout);
+            self.client.stream.set_deadline(deadline);
             let response = self.client.round_trip(request)?;
             if let Some(health) = response.health.as_ref() {
                 self.update_health(health)?;
@@ -722,15 +725,15 @@ pub mod windows {
     }
 
     impl NamedPipeStream {
-        fn new(file: File, timeout: Duration) -> Self {
+        fn new(file: File, deadline: Instant) -> Self {
             Self {
                 file,
-                read_deadline: Instant::now() + timeout,
+                read_deadline: deadline,
             }
         }
 
-        fn set_timeout(&mut self, timeout: Duration) {
-            self.read_deadline = Instant::now() + timeout;
+        fn set_deadline(&mut self, deadline: Instant) {
+            self.read_deadline = deadline;
         }
     }
 
@@ -768,16 +771,20 @@ pub mod windows {
     fn connect_pipe(
         pipe_name: &str,
         child: &mut Child,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<File, MaaRuntimeError> {
-        let deadline = Instant::now() + timeout;
         loop {
             match OpenOptions::new().read(true).write(true).open(pipe_name) {
                 Ok(stream) => return Ok(stream),
                 Err(error) if Instant::now() < deadline && child.try_wait()?.is_none() => {
-                    std::thread::sleep(Duration::from_millis(25));
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(25)),
+                    );
                     let _ = error;
                 }
+                Err(_) if Instant::now() >= deadline => return Err(deadline_expired()),
                 Err(error) => {
                     return Err(MaaRuntimeError::new(
                         "worker.start_failed",
@@ -786,6 +793,38 @@ pub mod windows {
                 }
             }
         }
+    }
+
+    fn read_startup_envelope(
+        stream: &mut impl Read,
+        deadline: Instant,
+    ) -> Result<LocalEnvelope, MaaRuntimeError> {
+        read_envelope(stream).map_err(|error| {
+            if Instant::now() >= deadline {
+                deadline_expired()
+            } else {
+                error
+            }
+        })
+    }
+
+    fn remaining_timeout(deadline: Instant) -> Result<Duration, MaaRuntimeError> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(deadline_expired)
+    }
+
+    fn wire_deadline_unix_ms(deadline: Instant) -> Result<i64, MaaRuntimeError> {
+        let now_unix_ms = unix_ms();
+        let remaining = remaining_timeout(deadline)?;
+        Ok(now_unix_ms.saturating_add(remaining.as_millis() as i64))
+    }
+
+    fn deadline_expired() -> MaaRuntimeError {
+        MaaRuntimeError::new(
+            "worker.deadline_expired",
+            "Worker deadline expired before dispatch",
+        )
     }
 
     fn generation_id() -> String {
@@ -838,19 +877,33 @@ pub mod windows {
     #[cfg(test)]
     mod tests {
         use std::path::PathBuf;
+        use std::time::{Duration, Instant};
 
-        use super::{WorkerProcess, WorkerProcessConfig};
+        use super::{wire_deadline_unix_ms, WorkerProcess, WorkerProcessConfig};
+
+        #[test]
+        fn wire_deadline_does_not_move_when_request_preparation_takes_time() {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let first = wire_deadline_unix_ms(deadline).unwrap();
+            std::thread::sleep(Duration::from_millis(25));
+            let second = wire_deadline_unix_ms(deadline).unwrap();
+
+            assert!(second <= first + 1);
+        }
 
         #[test]
         fn worker_spawn_requires_runtime_root_public_key() {
-            let error = WorkerProcess::spawn(&WorkerProcessConfig {
-                executable: PathBuf::from(r"Z:\__fairypam_missing_worker__.exe"),
-                runtime_root: PathBuf::from(r"Z:\__fairypam_missing_runtime__"),
-                profile_dir: None,
-                profile_root_public_key: None,
-                runtime_root_public_key: None,
-                frame_slot_bytes: 1024 * 1024,
-            })
+            let error = WorkerProcess::spawn(
+                &WorkerProcessConfig {
+                    executable: PathBuf::from(r"Z:\__fairypam_missing_worker__.exe"),
+                    runtime_root: PathBuf::from(r"Z:\__fairypam_missing_runtime__"),
+                    profile_dir: None,
+                    profile_root_public_key: None,
+                    runtime_root_public_key: None,
+                    frame_slot_bytes: 1024 * 1024,
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
             .err()
             .unwrap();
 

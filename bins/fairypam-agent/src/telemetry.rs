@@ -367,6 +367,7 @@ impl TelemetryState {
         started_at_unix_nano: i64,
         ended_at_unix_nano: i64,
         error_code: Option<&str>,
+        attributes: &[TelemetryAttribute],
     ) -> Result<(), AgentError> {
         let (command, task_run_id, attempt_id) = match identity.value.as_ref() {
             Some(command_identity::Value::Command(command)) => (command, None, None),
@@ -429,6 +430,7 @@ impl TelemetryState {
                     TelemetrySpanStatus::Ok as i32
                 },
                 error_code: error_code.map(str::to_owned),
+                attributes: attributes.to_vec(),
                 trace_flags,
                 tracestate: context.tracestate.clone(),
                 ..Default::default()
@@ -1567,6 +1569,7 @@ mod tests {
                 now_unix_nano(),
                 now_unix_nano(),
                 None,
+                &[],
             )
             .unwrap();
 

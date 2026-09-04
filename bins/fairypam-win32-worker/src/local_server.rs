@@ -9,7 +9,7 @@ mod windows_impl {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use fairypam_agent_core::profile::Ed25519SignatureVerifier;
     use fairypam_agent_maa::MaaRuntimeError;
@@ -52,6 +52,7 @@ mod windows_impl {
 
     const MAX_SEEN_COMMANDS: usize = 4096;
     const MAA_RUNTIME_VERSION: &str = "5.12.3";
+    const CONTINUOUS_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub fn run() -> Result<(), MaaRuntimeError> {
         let config = Config::parse(std::env::args_os().skip(1))?;
@@ -254,7 +255,9 @@ mod windows_impl {
                 let mut event = None;
                 let mut shutdown = false;
                 let response = match self.validate(&request) {
-                    Ok(()) => match self.dispatch(&request) {
+                    Ok(()) => match operation_deadline(&request)
+                        .and_then(|deadline| self.dispatch(&request, deadline))
+                    {
                         Ok(result) => {
                             event = result.event;
                             shutdown = result.shutdown;
@@ -318,7 +321,11 @@ mod windows_impl {
             Ok(())
         }
 
-        fn dispatch(&mut self, request: &WorkerRequest) -> Result<CommandResult, MaaRuntimeError> {
+        fn dispatch(
+            &mut self,
+            request: &WorkerRequest,
+            deadline: Instant,
+        ) -> Result<CommandResult, MaaRuntimeError> {
             let identity = request.identity.as_ref().unwrap();
             match request.payload.as_ref().unwrap() {
                 worker_request::Payload::AttachTarget(value) => {
@@ -367,6 +374,7 @@ mod windows_impl {
                         &value.capture_source_id,
                         &value.encoding,
                         value.quality,
+                        deadline,
                     )?;
                     Ok(CommandResult::applied().frame(sequence))
                 }
@@ -393,6 +401,7 @@ mod windows_impl {
                         value.x_ppm,
                         value.y_ppm,
                         value.source_frame_sequence,
+                        deadline,
                     )?;
                     Ok(CommandResult::applied().action(&value.action_id))
                 }
@@ -406,6 +415,7 @@ mod windows_impl {
                         (value.end_x_ppm, value.end_y_ppm),
                         value.duration_ms,
                         value.source_frame_sequence,
+                        deadline,
                     )?;
                     Ok(CommandResult::applied().action(&value.action_id))
                 }
@@ -415,7 +425,7 @@ mod windows_impl {
                         .map_err(io_error)?;
                     let held = {
                         let mut controller = self.lock_controller()?;
-                        controller.key_down(&value.action_id)?;
+                        controller.key_down(&value.action_id, deadline)?;
                         controller.held_action_ids()
                     };
                     self.arbiter
@@ -429,7 +439,7 @@ mod windows_impl {
                         .map_err(io_error)?;
                     let held = {
                         let mut controller = self.lock_controller()?;
-                        controller.key_up(&value.action_id)?;
+                        controller.key_up(&value.action_id, deadline)?;
                         controller.held_action_ids()
                     };
                     self.arbiter
@@ -441,7 +451,8 @@ mod windows_impl {
                     self.arbiter
                         .allow_generic_input(identity.input_owner_epoch)
                         .map_err(io_error)?;
-                    self.lock_controller()?.click_key(&value.action_id)?;
+                    self.lock_controller()?
+                        .click_key(&value.action_id, deadline)?;
                     Ok(CommandResult::applied().action(&value.action_id))
                 }
                 worker_request::Payload::GenericScroll(value) => {
@@ -454,6 +465,7 @@ mod windows_impl {
                         value.x_ppm,
                         value.y_ppm,
                         value.source_frame_sequence,
+                        deadline,
                     )?;
                     Ok(CommandResult::applied().action(&value.action_id))
                 }
@@ -461,8 +473,12 @@ mod windows_impl {
                     self.arbiter
                         .allow_generic_input(identity.input_owner_epoch)
                         .map_err(io_error)?;
-                    self.lock_controller()?
-                        .relative_move(&value.action_id, value.dx, value.dy)?;
+                    self.lock_controller()?.relative_move(
+                        &value.action_id,
+                        value.dx,
+                        value.dy,
+                        deadline,
+                    )?;
                     Ok(CommandResult::applied().action(&value.action_id))
                 }
                 worker_request::Payload::GenericInactive(_) => {
@@ -615,7 +631,12 @@ mod windows_impl {
                 .spawn(move || {
                     while !worker_stop.load(Ordering::Acquire) {
                         let started = std::time::Instant::now();
-                        if let Err(error) = capture_and_publish(&controller, &ring, wire_encoding) {
+                        if let Err(error) = capture_and_publish(
+                            &controller,
+                            &ring,
+                            wire_encoding,
+                            Instant::now() + CONTINUOUS_CAPTURE_TIMEOUT,
+                        ) {
                             if let Ok(mut slot) = worker_error.lock() {
                                 *slot = Some(error.code().to_owned());
                             }
@@ -665,11 +686,12 @@ mod windows_impl {
             source_id: &str,
             encoding: &str,
             quality: u32,
+            deadline: Instant,
         ) -> Result<u64, MaaRuntimeError> {
             let wire_encoding = CaptureEncoding::parse(encoding, quality)?;
             self.lock_controller()?
                 .validate_capture_source(source_id, None, encoding)?;
-            capture_and_publish(&self.controller, &self.ring, wire_encoding)
+            capture_and_publish(&self.controller, &self.ring, wire_encoding, deadline)
         }
 
         fn release_current_mode(&mut self) -> Result<(), MaaRuntimeError> {
@@ -1108,6 +1130,7 @@ mod windows_impl {
         controller: &Arc<Mutex<GenericController>>,
         ring: &Arc<Mutex<FrameRing>>,
         encoding: CaptureEncoding,
+        deadline: Instant,
     ) -> Result<u64, MaaRuntimeError> {
         let (sequence, frame) = controller
             .lock()
@@ -1117,7 +1140,7 @@ mod windows_impl {
                     "MAA controller lock is poisoned",
                 )
             })?
-            .capture_once()?;
+            .capture_once(deadline)?;
         let captured_at = unix_us();
         let (payload, wire_encoding) = encode_frame(&frame, encoding)?;
         ring.lock()
@@ -1286,6 +1309,26 @@ mod windows_impl {
 
     fn config_error(message: &str) -> MaaRuntimeError {
         MaaRuntimeError::new("worker.config_invalid", message)
+    }
+
+    fn operation_deadline(request: &WorkerRequest) -> Result<Instant, MaaRuntimeError> {
+        let remaining_ms = request
+            .identity
+            .as_ref()
+            .ok_or_else(|| MaaRuntimeError::new("worker.identity_missing", "identity is missing"))?
+            .deadline_unix_ms
+            .saturating_sub(unix_ms());
+        if remaining_ms <= 0 {
+            return Err(MaaRuntimeError::new(
+                "worker.deadline_expired",
+                "Worker request deadline expired before dispatch",
+            ));
+        }
+        Instant::now()
+            .checked_add(Duration::from_millis(remaining_ms as u64))
+            .ok_or_else(|| {
+                MaaRuntimeError::new("worker.deadline_expired", "Worker deadline is out of range")
+            })
     }
 
     fn unix_ms() -> i64 {
