@@ -1352,8 +1352,9 @@ impl SessionDriver for GrpcSessionDriver {
                             continue;
                         }
                     };
-                    let mut execution = self.execution_for_session(&session)?;
-                    let mut outcome = match translated {
+                    let (outcome, command_telemetry_attributes) = {
+                        let mut execution = self.execution_for_session(&session)?;
+                        let mut outcome = match translated {
                         v3_adapter::TranslatedCommand::Internal(internal) => {
                             let frames = {
                                 let state = self.state.lock().map_err(lock_error)?;
@@ -1447,11 +1448,12 @@ impl SessionDriver for GrpcSessionDriver {
                         v3_adapter::TranslatedCommand::StopRealtimeProgram { task, value } => {
                             execution.execute_v3_stop_realtime_program(&task, &value)
                         }
+                        };
+                        execution.stamp_target_generation(&mut outcome);
+                        let command_telemetry_attributes =
+                            execution.take_command_telemetry_attributes();
+                        (outcome, command_telemetry_attributes)
                     };
-                    execution.stamp_target_generation(&mut outcome);
-                    let command_telemetry_attributes =
-                        execution.take_command_telemetry_attributes();
-                    drop(execution);
                     if let Ok(mut state) = self.state.lock() {
                         state.record_command_diagnostic(&outcome);
                     }
