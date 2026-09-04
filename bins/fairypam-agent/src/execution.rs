@@ -29,6 +29,7 @@ mod worker_platform;
 
 const MAX_CLOSE_TIMEOUT_MS: u32 = 5_000;
 const MAX_INPUT_LEASE_MS: u32 = 5_000;
+const DEVICE_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const CAPTURE_NO_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(windows, test))]
@@ -1107,7 +1108,7 @@ impl CommandExecutor {
                 .and_then(|command| command.session.as_ref())
                 .ok_or_else(task_reference_invalid)?;
             let expires_at = Instant::now() + Duration::from_millis(u64::from(frame.lease_ms));
-            let command_deadline = task_command_deadline(task)?;
+            let command_deadline = device_operation_deadline();
             let frame_result = self
                 .require_target_generation(frame.target_generation)
                 .and_then(|_| {
@@ -1900,8 +1901,7 @@ impl CommandExecutor {
                 let result: Result<u64, AgentError> = (|| {
                     let capture_started = Instant::now();
                     self.require_target_generation(value.target_generation)?;
-                    let command_deadline = task_command_deadline(task)
-                        .map_err(|error| capture_command_error(error, Instant::now()))?;
+                    let command_deadline = device_operation_deadline();
                     let capture_result = self.platform.capture_once(
                         &binding,
                         &value.source_id,
@@ -2835,26 +2835,8 @@ pub(super) fn telemetry_string(key: &str, value: &str) -> v3::TelemetryAttribute
     }
 }
 
-fn task_command_deadline(
-    task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
-) -> Result<Instant, AgentError> {
-    let expires_at = task
-        .command
-        .as_ref()
-        .ok_or_else(task_reference_invalid)?
-        .expires_at_unix_ms;
-    let remaining_ms = expires_at.saturating_sub(current_unix_ms());
-    if remaining_ms <= 0 {
-        return Err(AgentError::new(
-            "worker.deadline_expired",
-            "command deadline expired before Worker dispatch",
-        ));
-    }
-    Instant::now()
-        .checked_add(Duration::from_millis(remaining_ms as u64))
-        .ok_or_else(|| {
-            AgentError::new("task.reference_invalid", "command deadline is out of range")
-        })
+fn device_operation_deadline() -> Instant {
+    Instant::now() + DEVICE_OPERATION_TIMEOUT
 }
 
 fn capture_command_error(error: AgentError, deadline: Instant) -> AgentError {
@@ -3571,6 +3553,14 @@ mod tests {
             input_frame_outcome(Some(&submitted)),
             TaskCommandOutcomeState::Uncertain
         );
+    }
+
+    #[test]
+    fn device_operation_budget_is_local_monotonic_time() {
+        let remaining = device_operation_deadline().saturating_duration_since(Instant::now());
+
+        assert!(remaining > Duration::from_millis(2_900));
+        assert!(remaining <= Duration::from_secs(3));
     }
 
     #[test]
@@ -4633,7 +4623,7 @@ mod tests {
             .unwrap()
             .input_command_deadline_remaining
             .is_some_and(|remaining| {
-                !remaining.is_zero() && remaining < Duration::from_millis(250)
+                remaining > Duration::from_millis(2_900) && remaining <= Duration::from_secs(3)
             }));
         assert!(!state.lock().unwrap().input_active);
     }
@@ -5540,7 +5530,9 @@ mod tests {
             .lock()
             .unwrap()
             .single_capture_deadline_remaining
-            .is_some_and(|remaining| remaining < Duration::from_secs(1)));
+            .is_some_and(|remaining| {
+                remaining > Duration::from_millis(2_900) && remaining <= Duration::from_secs(3)
+            }));
         let telemetry = executor.take_command_telemetry_attributes();
         assert!(telemetry.iter().any(|attribute| {
             attribute.key == "capture.payload_bytes"
