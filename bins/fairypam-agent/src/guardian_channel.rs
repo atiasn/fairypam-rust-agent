@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, TryLockError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -113,7 +113,7 @@ fn run(
 
     loop {
         match health_rx.try_recv() {
-            Ok(worker_ready) => {
+            Ok(Some(worker_ready)) => {
                 health_probe_running = false;
                 if activation_pending {
                     exchange(
@@ -129,6 +129,7 @@ fn run(
                     );
                 }
             }
+            Ok(None) => health_probe_running = false,
             Err(mpsc::TryRecvError::Disconnected) => {
                 return Err(AgentError::new(
                     "worker.health_probe_failed",
@@ -144,13 +145,7 @@ fn run(
             std::thread::Builder::new()
                 .name("fairypam-worker-health".into())
                 .spawn(move || {
-                    let ready = execution
-                        .lock()
-                        .map_err(|error| {
-                            AgentError::new("worker.state_poisoned", error.to_string())
-                        })
-                        .and_then(|mut execution| execution.ensure_worker_ready())
-                        .is_ok();
+                    let ready = probe_worker_health(&execution);
                     let _ = health_tx.send(ready);
                 })
                 .map_err(|error| {
@@ -177,6 +172,14 @@ fn run(
                 }
             }
         }
+    }
+}
+
+fn probe_worker_health(execution: &Arc<Mutex<CommandExecutor>>) -> Option<bool> {
+    match execution.try_lock() {
+        Ok(mut execution) => Some(execution.ensure_worker_ready().is_ok()),
+        Err(TryLockError::WouldBlock) => None,
+        Err(TryLockError::Poisoned(_)) => Some(false),
     }
 }
 
@@ -272,5 +275,17 @@ mod tests {
         assert!(holds
             .iter()
             .all(|hold| matches!(hold, PhysicalHold::MouseButton { .. })));
+    }
+
+    #[test]
+    fn worker_health_probe_skips_a_busy_execution_lane() {
+        let execution = Arc::new(Mutex::new(CommandExecutor::production(
+            ProfileStore::default(),
+            "agent",
+            None,
+        )));
+        let _busy = execution.lock().unwrap();
+
+        assert_eq!(probe_worker_health(&execution), None);
     }
 }
