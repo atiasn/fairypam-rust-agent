@@ -1319,16 +1319,6 @@ impl SessionDriver for GrpcSessionDriver {
                     let translated = match translator.translate(&command) {
                         Ok(command) => command,
                         Err(error) => {
-                            if let Ok(mut telemetry) = self.telemetry.lock() {
-                                let _ = telemetry.record_command_span(
-                                    command_name,
-                                    &identity,
-                                    command_started_at,
-                                    telemetry_unix_nano(),
-                                    Some(error.code()),
-                                    &[],
-                                );
-                            }
                             let event = match v3_adapter::internal_task_identity(&identity) {
                                 Ok(task) => {
                                     let mut execution = self.execution_for_session(&session)?;
@@ -1338,11 +1328,27 @@ impl SessionDriver for GrpcSessionDriver {
                                         execution.reject_v3_task(&task, error.code())
                                     };
                                     execution.stamp_target_generation(&mut outcome);
-                                    v3_adapter::result(identity, outcome)
+                                    v3_adapter::result(identity.clone(), outcome)
                                 }
-                                Err(_) => v3_adapter::error(identity, &error),
+                                Err(_) => v3_adapter::error(identity.clone(), &error),
                             };
-                            sender.try_send(event).map_err(map_transport)?;
+                            let send_result =
+                                send_command_result(&sender, event, &cancellation).await;
+                            let telemetry_error_code = send_result
+                                .as_ref()
+                                .err()
+                                .map_or(error.code(), |send_error| send_error.code());
+                            if let Ok(mut telemetry) = self.telemetry.lock() {
+                                let _ = telemetry.record_command_span(
+                                    command_name,
+                                    &identity,
+                                    command_started_at,
+                                    telemetry_unix_nano(),
+                                    Some(telemetry_error_code),
+                                    &[],
+                                );
+                            }
+                            send_result?;
                             continue;
                         }
                     };
@@ -1449,18 +1455,26 @@ impl SessionDriver for GrpcSessionDriver {
                     if let Ok(mut state) = self.state.lock() {
                         state.record_command_diagnostic(&outcome);
                     }
+                    let outcome_error_code =
+                        outcome.telemetry_error_code().map(str::to_owned);
+                    let event = v3_adapter::result(identity.clone(), outcome);
+                    let send_result = send_command_result(&sender, event, &cancellation).await;
+                    let telemetry_error_code = send_result
+                        .as_ref()
+                        .err()
+                        .map(|error| error.code())
+                        .or(outcome_error_code.as_deref());
                     if let Ok(mut telemetry) = self.telemetry.lock() {
                         let _ = telemetry.record_command_span(
                             command_name,
                             &identity,
                             command_started_at,
                             telemetry_unix_nano(),
-                            outcome.telemetry_error_code(),
+                            telemetry_error_code,
                             &command_telemetry_attributes,
                         );
                     }
-                    let event = v3_adapter::result(identity, outcome);
-                    sender.try_send(event).map_err(map_transport)?;
+                    send_result?;
                     self.activate_profile_catalog_if_ready(&sender, &session)?;
                 }
             }
@@ -2439,6 +2453,18 @@ fn map_transport(error: TransportError) -> AgentError {
     AgentError::new(error.code(), error.to_string())
 }
 
+async fn send_command_result(
+    sender: &ControlSender,
+    event: AgentControlEvent,
+    cancellation: &CancellationToken,
+) -> Result<(), AgentError> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(cancelled()),
+        result = sender.send(event) => result.map_err(map_transport),
+    }
+}
+
 fn lock_error<T>(error: std::sync::PoisonError<T>) -> AgentError {
     AgentError::new("runtime.state_poisoned", error.to_string())
 }
@@ -2557,6 +2583,31 @@ mod tests {
     use crate::runtime_api::{LogLevel, RuntimeCommand as LocalCommand};
 
     use super::*;
+
+    #[tokio::test]
+    async fn command_result_waits_for_control_queue_capacity() {
+        let (sender, mut receiver) = control_queue();
+        for _ in 0..fairypam_agent_transport::CONTROL_QUEUE_CAPACITY {
+            sender.try_send(AgentControlEvent::default()).unwrap();
+        }
+        let cancellation = CancellationToken::new();
+        let waiting = tokio::spawn({
+            let sender = sender.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                send_command_result(&sender, AgentControlEvent::default(), &cancellation).await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        receiver.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn registration_failure_log_code_is_whitelisted() {

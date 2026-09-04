@@ -644,14 +644,15 @@ mod tests {
         lifecycle.bind_target("genshin-impact", start, 1_000);
         let original = config(2, true, false);
         lifecycle.configure(&original, start, 1_000).unwrap();
-        let sequence = lifecycle.status(start, 1_000).unwrap().status_sequence;
+        let original_status = lifecycle.status(start, 1_000).unwrap();
+        let sequence = original_status.status_sequence;
+        let expected_close = original_status.expected_close_at_unix_ms;
         lifecycle
             .configure(&original, start + Duration::from_secs(10), 2_000)
             .unwrap();
-        assert_eq!(
-            lifecycle.status(start, 2_000).unwrap().status_sequence,
-            sequence
-        );
+        let replayed_status = lifecycle.status(start, 2_000).unwrap();
+        assert_eq!(replayed_status.status_sequence, sequence);
+        assert_eq!(replayed_status.expected_close_at_unix_ms, expected_close);
 
         let mut conflict = original;
         conflict.occupied = true;
