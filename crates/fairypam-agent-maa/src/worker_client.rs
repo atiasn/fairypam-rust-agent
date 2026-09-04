@@ -187,8 +187,8 @@ pub mod windows {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use fairypam_agent_protocol::worker_v1::{
-        local_envelope, worker_request, WorkerCapabilities, WorkerCommandIdentity, WorkerEvent,
-        WorkerHealth, WorkerRequest, WorkerResponse,
+        local_envelope, worker_request, LocalEnvelope, WorkerCapabilities, WorkerCommandIdentity,
+        WorkerEvent, WorkerHealth, WorkerRequest, WorkerResponse,
     };
     use fairypam_agent_protocol::{
         worker_request_digest, LOCAL_PROTOCOL_MAJOR, LOCAL_PROTOCOL_MINOR,
