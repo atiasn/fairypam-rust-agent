@@ -433,7 +433,6 @@ impl TelemetryState {
                 attributes: attributes.to_vec(),
                 trace_flags,
                 tracestate: context.tracestate.clone(),
-                ..Default::default()
             })),
             severity: if error_code.is_some() {
                 TelemetrySeverity::Error as i32
