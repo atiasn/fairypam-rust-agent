@@ -135,6 +135,7 @@ pub fn hello(
     agent_process_generation_id: String,
     profiles: &ProfileStore,
     active_catalog: Option<(u64, &str)>,
+    managed_game_released: bool,
 ) -> wire::AgentControlEvent {
     wire::AgentControlEvent {
         payload: Some(wire::agent_control_event::Payload::Hello(
@@ -158,6 +159,7 @@ pub fn hello(
                 active_profile_catalog_version: active_catalog.map(|catalog| catalog.0),
                 active_profile_catalog_digest: active_catalog.map(|catalog| catalog.1.to_owned()),
                 agent_process_generation_id,
+                managed_game_released: Some(managed_game_released),
             },
         )),
     }

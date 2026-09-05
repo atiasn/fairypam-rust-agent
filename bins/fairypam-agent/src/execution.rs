@@ -1309,6 +1309,15 @@ impl CommandExecutor {
         Ok(v3::AgentRuntimeState::ConnectedIdle)
     }
 
+    pub fn managed_game_released(&mut self) -> Result<bool, AgentError> {
+        Ok(matches!(
+            self.runtime_state()?,
+            v3::AgentRuntimeState::ConnectedIdle | v3::AgentRuntimeState::ProfileUpdateBlocked
+        ) && self.binding.is_none()
+            && self.capture.is_none()
+            && self.managed_game.released())
+    }
+
     pub fn execute_local(
         &mut self,
         command: &LocalCommand,
@@ -4521,6 +4530,56 @@ mod tests {
         executor.shutdown().unwrap();
         assert!(executor.binding.is_none());
         assert_eq!(state.lock().unwrap().close_calls.len(), 1);
+    }
+
+    #[test]
+    fn released_hello_requires_no_binding_or_active_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lifecycle.json");
+        let mut lifecycle = ManagedGameLifecycle::persistent(path.clone(), "agent-a");
+        lifecycle
+            .configure(
+                &v3::ConfigureIdleClose {
+                    game_id: "game-1".into(),
+                    game_session_id: "session-1".into(),
+                    profile_id: "genshin-impact".into(),
+                    state_version: 1,
+                    enabled: false,
+                    occupied: false,
+                    ..v3::ConfigureIdleClose::default()
+                },
+                Instant::now(),
+                1_000,
+            )
+            .unwrap();
+        let mut executor = executor();
+        executor.managed_game = ManagedGameLifecycle::persistent(path, "agent-a");
+        assert!(executor.managed_game_released().unwrap());
+        executor.profile_update_blocked = true;
+        assert!(executor.managed_game_released().unwrap());
+        executor.profile_update_blocked = false;
+        executor.set_binding(Some(binding())).unwrap();
+        assert!(!executor.managed_game_released().unwrap());
+        executor.set_binding(None).unwrap();
+        executor.capture = Some(CaptureWorker {
+            source_id: "client".into(),
+            plan: capture_plan(
+                Arc::new(CollectFrames::default()),
+                Duration::from_secs(1),
+                false,
+            ),
+            stop: Arc::new(AtomicBool::new(false)),
+            failure: Arc::new(Mutex::new(None)),
+            thread: None,
+        });
+        assert!(!executor.managed_game_released().unwrap());
+        executor.capture.take().unwrap().stop().unwrap();
+        let (contract, reference) = v3_task_contract(&verified_profile());
+        assert!(matches!(
+            executor.execute_v3_begin(&task_ref(&reference, "begin"), &contract),
+            CommandOutcome::TaskAck { .. }
+        ));
+        assert!(!executor.managed_game_released().unwrap());
     }
 
     #[test]

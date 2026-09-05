@@ -1131,6 +1131,11 @@ impl SessionDriver for GrpcSessionDriver {
             result = connect_control(&config.transport) => result.map_err(map_transport)?,
         };
         let (sender, receiver) = control_queue();
+        let managed_game_released = self
+            .execution
+            .lock()
+            .map_err(lock_error)?
+            .managed_game_released()?;
         sender
             .send(v3_adapter::hello(
                 config.transport.agent_id.clone(),
@@ -1143,6 +1148,7 @@ impl SessionDriver for GrpcSessionDriver {
                         .active()
                         .map(|active| (active.version, active.digest.as_str()))
                 }),
+                managed_game_released,
             ))
             .await
             .map_err(map_transport)?;

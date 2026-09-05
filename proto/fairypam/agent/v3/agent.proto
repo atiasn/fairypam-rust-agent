@@ -169,6 +169,10 @@ message AgentHello {
   optional uint64 active_profile_catalog_version = 8;
   optional string active_profile_catalog_digest = 9;
   string agent_process_generation_id = 10;
+  // True only with trusted lifecycle state and no live target binding, capture,
+  // unresolved attempt or close receipt. Persisted idle policy alone is not a binding.
+  // Absence is unknown; this does not assert that the game process has exited.
+  optional bool managed_game_released = 11;
 }
 
 message HubHello {

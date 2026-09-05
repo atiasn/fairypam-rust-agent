@@ -93,6 +93,7 @@ pub struct ManagedGameLifecycle {
     bound_profile_id: Option<String>,
     active: Option<ActiveState>,
     pending_close_report: bool,
+    recovery_state_known: bool,
 }
 
 impl ManagedGameLifecycle {
@@ -103,18 +104,20 @@ impl ManagedGameLifecycle {
             bound_profile_id: None,
             active: None,
             pending_close_report: false,
+            recovery_state_known: false,
         }
     }
 
     #[cfg(any(windows, test))]
     pub fn persistent(legacy_path: PathBuf, agent_id: &str) -> Self {
         let path = namespaced_path(&legacy_path, agent_id);
-        let persisted = load(&path)
-            .filter(|persisted| persisted.agent_id.as_deref() == Some(agent_id))
-            .unwrap_or_else(|| PersistedState {
-                agent_id: Some(agent_id.to_owned()),
-                ..PersistedState::default()
-            });
+        let loaded =
+            load(&path).filter(|persisted| persisted.agent_id.as_deref() == Some(agent_id));
+        let recovery_state_known = loaded.is_some();
+        let persisted = loaded.unwrap_or_else(|| PersistedState {
+            agent_id: Some(agent_id.to_owned()),
+            ..PersistedState::default()
+        });
         let pending_close_report = persisted.pending_close_receipt.is_some();
         Self {
             path: Some(path),
@@ -122,7 +125,21 @@ impl ManagedGameLifecycle {
             bound_profile_id: None,
             active: None,
             pending_close_report,
+            recovery_state_known,
         }
+    }
+
+    pub fn released(&self) -> bool {
+        self.recovery_state_known
+            && self.bound_profile_id.is_none()
+            && self.active.is_none()
+            && self.persisted.closing.is_none()
+            && self.persisted.pending_close_receipt.is_none()
+            && self
+                .persisted
+                .policies
+                .values()
+                .all(|policy| !policy.occupied)
     }
 
     pub fn bind_target(&mut self, profile_id: &str, now: Instant, now_unix_ms: i64) {
@@ -757,5 +774,55 @@ mod tests {
             .configure(&config(2, false, true), start, 4_000)
             .unwrap();
         assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+    }
+
+    #[test]
+    fn released_requires_readable_matching_state_and_preserves_close_evidence() {
+        let directory = tempdir().unwrap();
+        let legacy_path = directory.path().join("lifecycle.json");
+        let path = namespaced_path(&legacy_path, "agent-a");
+        assert!(!ManagedGameLifecycle::memory().released());
+        assert!(!ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-a").released());
+        fs::write(&path, b"broken json").unwrap();
+        assert!(!ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-a").released());
+        fs::write(&path, br#"{"agent_id":"other-agent"}"#).unwrap();
+        assert!(!ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-a").released());
+
+        let start = Instant::now();
+        let mut lifecycle = ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-a");
+        lifecycle
+            .configure(&config(1, true, true), start, 1_000)
+            .unwrap();
+        assert!(!ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-a").released());
+        lifecycle
+            .configure(&config(2, true, false), start, 1_000)
+            .unwrap();
+        let mut reopened = ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-a");
+        assert!(!reopened.persisted.policies.is_empty());
+        assert!(reopened.released());
+        reopened.bind_target("genshin-impact", start, 1_000);
+        assert!(!reopened.released());
+        reopened.begin_close().unwrap();
+        assert!(!ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-a").released());
+        let receipt = reopened
+            .close_receipt(
+                v3::ManagedGameCloseTrigger::Idle,
+                v3::ManagedGameCloseResult::Graceful,
+                2_000,
+                None,
+            )
+            .unwrap();
+        reopened.mark_close_reported();
+        assert!(!reopened.released());
+        let mut awaiting_ack = ManagedGameLifecycle::persistent(legacy_path, "agent-a");
+        assert!(!awaiting_ack.released());
+        awaiting_ack
+            .acknowledge_close(
+                &close_event_id(&receipt),
+                &receipt.game_session_id,
+                receipt.state_version,
+            )
+            .unwrap();
+        assert!(awaiting_ack.released());
     }
 }
