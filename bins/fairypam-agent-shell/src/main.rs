@@ -56,7 +56,6 @@ mod windows_shell {
     const CMD_STOP: usize = 104;
     const CMD_REGISTER: usize = 105;
     const CMD_REGISTER_SUBMIT: usize = 106;
-    const CMD_EMERGENCY_STOP: usize = 107;
     const HUB_URL: PCWSTR = w!("https://fp.atiasn.com");
 
     static GUARDIAN: OnceLock<Mutex<Option<GuardianProcess>>> = OnceLock::new();
@@ -335,7 +334,6 @@ mod windows_shell {
         let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_HUB, w!("打开 FairyPam"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_ENVIRONMENT, w!("环境检查"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_DIAGNOSTICS, w!("导出诊断包"));
-        let _ = AppendMenuW(menu, MF_STRING, CMD_EMERGENCY_STOP, w!("紧急停止"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, CMD_STOP, w!("停止并退出"));
         let mut point = POINT::default();
@@ -374,9 +372,6 @@ mod windows_shell {
             }
             CMD_DIAGNOSTICS => {
                 export_diagnostics(hwnd);
-            }
-            CMD_EMERGENCY_STOP => {
-                emergency_stop(hwnd);
             }
             CMD_STOP => {
                 let _ = DestroyWindow(hwnd);
@@ -448,16 +443,6 @@ mod windows_shell {
             _ => "无法连接本机服务，请稍后重试。".to_owned(),
         };
         message(hwnd, "环境检查", &text, false);
-    }
-
-    unsafe fn emergency_stop(hwnd: HWND) {
-        let _ = KillTimer(Some(hwnd), TIMER_ID);
-        let (text, error) = match stop_suite() {
-            Ok(()) => ("已停止 FairyPam 并释放输入。", false),
-            Err(_) => ("安全释放结果不确定，请立即重启 Windows。", true),
-        };
-        message(hwnd, "紧急停止", text, error);
-        let _ = DestroyWindow(hwnd);
     }
 
     unsafe fn export_diagnostics(hwnd: HWND) {

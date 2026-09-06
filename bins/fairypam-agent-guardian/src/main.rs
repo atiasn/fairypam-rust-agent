@@ -325,7 +325,7 @@ fn supervise_agent_inner(
         match owner.try_recv() {
             Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
                 let _ = connect_local_agent_pipe(pipe_name, Duration::from_millis(100));
-                stop_agent(child, monitor, ReleaseReason::EmergencyStop)?;
+                stop_agent(child, monitor, ReleaseReason::AgentExited)?;
                 return Ok(SupervisorOutcome::OwnerStopped);
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -404,7 +404,7 @@ fn supervise_agent_inner(
         match owner.try_recv() {
             Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
                 drop(events_rx);
-                stop_agent(child, monitor, ReleaseReason::EmergencyStop)?;
+                stop_agent(child, monitor, ReleaseReason::AgentExited)?;
                 return Ok(SupervisorOutcome::OwnerStopped);
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -626,7 +626,7 @@ fn self_test() -> Result<(), String> {
         ),
         (
             GuardianRequest::ReleaseAll {
-                reason: ReleaseReason::EmergencyStop,
+                reason: ReleaseReason::AgentExited,
             },
             GuardianResponse::Ack {
                 isolation_status: None,
@@ -933,7 +933,7 @@ mod tests {
         assert!(stop_agent_with_grace(
             &mut child,
             &mut monitor,
-            ReleaseReason::EmergencyStop,
+            ReleaseReason::AgentExited,
             Duration::ZERO,
         )
         .is_ok());

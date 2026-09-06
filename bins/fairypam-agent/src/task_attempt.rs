@@ -23,14 +23,12 @@ const MAX_FINISH_COMMAND_RESULTS: usize = 4;
 const MAX_RECOVERY_COMMAND_RESULTS: usize =
     MAX_INSPECT_COMMAND_RESULTS + MAX_RELEASE_COMMAND_RESULTS + MAX_FINISH_COMMAND_RESULTS;
 const MAX_COMMAND_RESULTS: usize = MAX_BUSINESS_COMMAND_RESULTS + MAX_RECOVERY_COMMAND_RESULTS;
-const EMERGENCY_STOP_MARKER: &str = "emergency-stopped";
 
 pub struct TaskAttemptRuntime {
     root: Option<PathBuf>,
     active: Option<AttemptState>,
     loaded: bool,
     recovered_active: bool,
-    emergency_stopped: bool,
 }
 
 pub struct TaskCommandResult {
@@ -45,7 +43,6 @@ impl TaskAttemptRuntime {
             active: None,
             loaded: false,
             recovered_active: false,
-            emergency_stopped: false,
         }
     }
 
@@ -55,7 +52,6 @@ impl TaskAttemptRuntime {
             active: None,
             loaded: true,
             recovered_active: false,
-            emergency_stopped: false,
         }
     }
 
@@ -66,7 +62,6 @@ impl TaskAttemptRuntime {
             active: None,
             loaded: false,
             recovered_active: false,
-            emergency_stopped: false,
         }
     }
 
@@ -79,13 +74,6 @@ impl TaskAttemptRuntime {
         let (reference, command) = validate_task(task)?;
         validate_contract_reference(reference, contract)?;
         self.load_active()?;
-
-        if self.emergency_stopped {
-            return Err(AgentError::new(
-                "emergency_stopped",
-                "local emergency stop must be reset before accepting a task attempt",
-            ));
-        }
 
         self.reject_terminal_reuse(reference)?;
         if self
@@ -141,12 +129,6 @@ impl TaskAttemptRuntime {
             ));
         }
         self.load_active()?;
-        if self.emergency_stopped {
-            return Err(AgentError::new(
-                "emergency_stopped",
-                "local emergency stop must be reset before accepting a task attempt",
-            ));
-        }
         self.reject_terminal_reuse(reference)?;
         if self
             .active
@@ -977,56 +959,6 @@ impl TaskAttemptRuntime {
         }))
     }
 
-    pub fn emergency_stopped(&mut self) -> Result<bool, AgentError> {
-        self.load_active()?;
-        Ok(self.emergency_stopped)
-    }
-
-    pub fn set_emergency_stopped(&mut self, stopped: bool) -> Result<(), AgentError> {
-        self.load_active()?;
-        let previous = self.emergency_stopped;
-        self.emergency_stopped = stopped;
-        if let Some(root) = self.root.as_ref() {
-            if let Err(error) = fs::create_dir_all(root) {
-                if !stopped {
-                    self.emergency_stopped = previous;
-                }
-                return Err(io_error("task.ledger_unavailable", error));
-            }
-            let marker = root.join(EMERGENCY_STOP_MARKER);
-            if stopped {
-                let file = match OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .open(marker)
-                {
-                    Ok(file) => file,
-                    Err(error) => return Err(io_error("task.ledger_unavailable", error)),
-                };
-                if let Err(error) = file.sync_all() {
-                    return Err(io_error("task.ledger_unavailable", error));
-                }
-            } else if let Err(error) = fs::remove_file(marker) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    self.emergency_stopped = previous;
-                    return Err(io_error("task.ledger_unavailable", error));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn reset_emergency(&mut self) -> Result<(), AgentError> {
-        if self.is_active()? {
-            return Err(AgentError::new(
-                "emergency_cleanup_incomplete",
-                "task cleanup must be complete before resetting emergency stop",
-            ));
-        }
-        self.set_emergency_stopped(false)
-    }
-
     fn require_active(&mut self, task: &TaskCommandRef) -> Result<&AttemptState, AgentError> {
         let (reference, _) = validate_task(task)?;
         self.load_active()?;
@@ -1087,7 +1019,6 @@ impl TaskAttemptRuntime {
             self.loaded = true;
             return Ok(());
         };
-        self.emergency_stopped = root.join(EMERGENCY_STOP_MARKER).is_file();
         let entries = match fs::read_dir(root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2319,34 +2250,6 @@ mod tests {
                 .code(),
             "target.stale"
         );
-    }
-
-    #[test]
-    fn emergency_stop_marker_survives_restart_until_local_reset() {
-        let root = temporary_root();
-        let contract = contract();
-        let begin = task(&contract, "begin-1", 'c');
-        let mut runtime = TaskAttemptRuntime::at(root.clone());
-        runtime.begin(&begin, &contract).unwrap();
-        runtime.set_emergency_stopped(true).unwrap();
-        assert!(runtime
-            .emergency_finish(true, true, true, None)
-            .unwrap()
-            .unwrap()
-            .cleanup_complete
-            .unwrap());
-
-        let mut restarted = TaskAttemptRuntime::at(root.clone());
-        assert!(restarted.emergency_stopped().unwrap());
-        assert_eq!(
-            restarted.begin(&begin, &contract).unwrap_err().code(),
-            "emergency_stopped"
-        );
-        restarted.reset_emergency().unwrap();
-        assert!(!TaskAttemptRuntime::at(root.clone())
-            .emergency_stopped()
-            .unwrap());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

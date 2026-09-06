@@ -1294,9 +1294,6 @@ impl CommandExecutor {
     }
 
     pub fn runtime_state(&mut self) -> Result<v3::AgentRuntimeState, AgentError> {
-        if self.task_attempt.emergency_stopped()? {
-            return Ok(v3::AgentRuntimeState::EmergencyStopped);
-        }
         if self.task_attempt.recovery_blocked()? {
             return Ok(v3::AgentRuntimeState::RecoveryBlocked);
         }
@@ -1326,7 +1323,6 @@ impl CommandExecutor {
             command,
             LocalCommand::Status | LocalCommand::Doctor | LocalCommand::ListProfiles
         );
-        let emergency_stopped = self.task_attempt.emergency_stopped()?;
         let task_active = self.task_attempt.is_active()?;
         if self.profile_update_blocked
             && !matches!(
@@ -1335,7 +1331,6 @@ impl CommandExecutor {
                     | LocalCommand::Doctor
                     | LocalCommand::ListProfiles
                     | LocalCommand::StopCapture { .. }
-                    | LocalCommand::ReleaseAll
                     | LocalCommand::UpdateStatus
                     | LocalCommand::StartupStatus
                     | LocalCommand::GetConnectionStatus
@@ -1343,7 +1338,6 @@ impl CommandExecutor {
                     | LocalCommand::GetLogTail { .. }
                     | LocalCommand::ScanInstalledGames
                     | LocalCommand::CloseTarget
-                    | LocalCommand::ShutdownAgent
                     | LocalCommand::RegisterHub { .. }
             )
         {
@@ -1352,19 +1346,7 @@ impl CommandExecutor {
                 "Profile Catalog must be applied before accepting commands",
             ));
         }
-        if emergency_stopped
-            && !read_only
-            && !matches!(
-                command,
-                LocalCommand::ReleaseAll | LocalCommand::ResetEmergencyStop
-            )
-        {
-            return Err(AgentError::new(
-                "emergency_stopped",
-                "only local emergency cleanup or reset is allowed while stopped",
-            ));
-        }
-        if task_active && !read_only && !matches!(command, LocalCommand::ReleaseAll) {
+        if task_active && !read_only {
             return Err(AgentError::new(
                 "task_command_not_allowed",
                 "active M1 task attempt rejects this local command",
@@ -1374,10 +1356,7 @@ impl CommandExecutor {
             && !read_only
             && !matches!(
                 command,
-                LocalCommand::CloseTarget
-                    | LocalCommand::StopCapture { .. }
-                    | LocalCommand::ReleaseAll
-                    | LocalCommand::ResetEmergencyStop
+                LocalCommand::CloseTarget | LocalCommand::StopCapture { .. }
             )
         {
             return Err(AgentError::new(
@@ -1387,9 +1366,7 @@ impl CommandExecutor {
         }
         match command {
             LocalCommand::Status => Ok(json!({
-                "state": if emergency_stopped {
-                    "EmergencyStopped"
-                } else if self.binding.is_some() {
+                "state": if self.binding.is_some() {
                     "TargetLocked"
                 } else if task_active {
                     "TaskActive"
@@ -1400,9 +1377,7 @@ impl CommandExecutor {
                 "capture_active": self.capture.is_some(),
                 "build_id": option_env!("FAIRYPAM_BUILD_ID").unwrap_or("unknown"),
                 "suite_version": env!("CARGO_PKG_VERSION"),
-                "guardian_state": if emergency_stopped {
-                    "emergency_stopped"
-                } else if self.binding.is_none() && self.capture.is_none() {
+                "guardian_state": if self.binding.is_none() && self.capture.is_none() {
                     "idle_no_holds"
                 } else {
                     "active"
@@ -1560,11 +1535,6 @@ impl CommandExecutor {
                 self.stop_capture(Some(source_id))?;
                 Ok(json!({"capture_source_id": source_id, "state": "stopped"}))
             }
-            LocalCommand::ReleaseAll => self.emergency_stop(),
-            LocalCommand::ResetEmergencyStop => {
-                self.task_attempt.reset_emergency()?;
-                Ok(json!({"state": "ConnectedIdle", "holds": 0}))
-            }
             LocalCommand::StartCapture { .. } => Err(AgentError::new(
                 "capture.local_sink_unavailable",
                 "local capture requires a verified Frame session; it will not discard frames",
@@ -1576,7 +1546,6 @@ impl CommandExecutor {
             | LocalCommand::RunEnvironmentCheck
             | LocalCommand::GetLogTail { .. }
             | LocalCommand::ScanInstalledGames
-            | LocalCommand::ShutdownAgent
             | LocalCommand::RegisterHub { .. } => Err(AgentError::new(
                 "local.observability_runtime_required",
                 "local observability requires the Agent runtime state",
@@ -1608,14 +1577,6 @@ impl CommandExecutor {
             return Err(AgentError::new(
                 "profile_update_blocked",
                 "Profile Catalog must be applied before accepting commands",
-            ));
-        }
-        if self.task_attempt.emergency_stopped()?
-            && !matches!(payload, Some(Payload::InspectTaskAttempt(_)))
-        {
-            return Err(AgentError::new(
-                "emergency_stopped",
-                "remote commands cannot reset a local emergency stop",
             ));
         }
         if self.managed_game.is_closing() && command_targets_managed_game(command) {
@@ -2196,7 +2157,7 @@ impl CommandExecutor {
                 Ok(CommandOutcome::TaskAck {
                     result: "{}".into(),
                     outcome: None,
-                    receipt: Box::new(self.inspect_task_attempt(task)?),
+                    receipt: Box::new(self.task_attempt.inspect(task)?),
                     local_diagnostic: None,
                 })
             }
@@ -2517,77 +2478,6 @@ impl CommandExecutor {
             return Err(error);
         }
         self.managed_game.release_task_occupancy()
-    }
-
-    pub fn shutdown(&mut self) -> Result<(), AgentError> {
-        self.reset_session()?;
-        if let Some(binding) = self.binding.clone() {
-            self.platform.close(
-                &binding,
-                Duration::from_millis(u64::from(MAX_CLOSE_TIMEOUT_MS)),
-            )?;
-        }
-        self.active_profile = None;
-        self.set_binding(None)?;
-        self.frame_sequences.clear();
-        Ok(())
-    }
-
-    fn emergency_stop(&mut self) -> Result<serde_json::Value, AgentError> {
-        self.task_attempt.set_emergency_stopped(true)?;
-        let release_error = self.platform.release_task_input().err();
-        let capture_error = self.stop_capture(None).err();
-        self.platform.finish_attempt_monitor();
-        let managed_target_running = self.binding.is_some();
-        self.frame_sequences.clear();
-        let error_code = capture_error
-            .as_ref()
-            .or(release_error.as_ref())
-            .map(AgentError::code);
-        let receipt = self.task_attempt.emergency_finish(
-            release_error.is_none(),
-            capture_error.is_none(),
-            managed_target_running,
-            error_code,
-        )?;
-        let cleanup_complete = receipt
-            .as_ref()
-            .and_then(|value| value.cleanup_complete)
-            .unwrap_or(release_error.is_none() && capture_error.is_none());
-        let response_error_code = receipt
-            .as_ref()
-            .and_then(|value| value.error_code.as_deref())
-            .or(error_code);
-        Ok(json!({
-            "state": "EmergencyStopped",
-            "holds": 0,
-            "cleanup_complete": cleanup_complete,
-            "error_code": response_error_code,
-        }))
-    }
-
-    fn inspect_task_attempt(
-        &mut self,
-        task: &fairypam_agent_protocol::internal_v1::TaskCommandRef,
-    ) -> Result<fairypam_agent_protocol::internal_v1::TaskAttemptReceiptV1, AgentError> {
-        if !self.task_attempt.emergency_stopped()? {
-            return self.task_attempt.inspect(task);
-        }
-
-        let receipt = self.task_attempt.inspect(task)?;
-        if receipt.cleanup_complete != Some(true) {
-            return Ok(receipt);
-        }
-        let release_error = self.platform.release_task_input().err();
-        let capture_error = self.stop_capture(None).err();
-        self.platform.finish_attempt_monitor();
-        self.frame_sequences.clear();
-        if let Some(error) = release_error.or(capture_error) {
-            return Err(error);
-        }
-
-        self.task_attempt.reset_emergency()?;
-        Ok(receipt)
     }
 
     pub fn emergency_release_input(&mut self) -> Result<(), AgentError> {
@@ -4528,7 +4418,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn lost_session_releases_resources_without_persisting_manual_emergency() {
+    fn startup_ignores_retired_stop_marker_after_releasing_input() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("emergency-stopped"), b"").unwrap();
+        let (mut executor, state) = executor_with_state();
+        executor.task_attempt = TaskAttemptRuntime::at(root.path().to_path_buf());
+        state.lock().unwrap().input_active = true;
+
+        executor.reset_session().unwrap();
+
+        assert!(!state.lock().unwrap().input_active);
+        assert_eq!(
+            executor.runtime_state().unwrap(),
+            v3::AgentRuntimeState::ConnectedIdle
+        );
+        let contract = task_contract(&verified_profile());
+        executor
+            .task_attempt
+            .begin(&task_ref(&contract, "begin-after-startup"), &contract)
+            .unwrap();
+    }
+
+    #[test]
+    fn lost_session_releases_resources_and_allows_a_fresh_runtime() {
         let root = tempfile::tempdir().unwrap();
         let (mut executor, state) = executor_with_state();
         let lifecycle_path = root.path().join("lifecycle.json");
@@ -4585,13 +4497,6 @@ pub(crate) mod tests {
         );
         assert_eq!(receipt.cleanup_complete, Some(false));
         assert!(state.lock().unwrap().close_calls.is_empty());
-
-        restarted.execute_local(&LocalCommand::ReleaseAll).unwrap();
-        restarted.reset_session().unwrap();
-        assert_eq!(
-            restarted.runtime_state().unwrap(),
-            v3::AgentRuntimeState::EmergencyStopped
-        );
     }
 
     #[test]
@@ -4618,7 +4523,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn session_reset_keeps_the_managed_target_until_agent_shutdown() {
+    fn session_reset_keeps_the_managed_target() {
         let (mut executor, state) = executor_with_state();
         executor.active_profile = Some(verified_profile());
         executor.set_binding(Some(binding())).unwrap();
@@ -4627,10 +4532,6 @@ pub(crate) mod tests {
         executor.reset_session().unwrap();
         assert!(executor.binding.is_some());
         assert!(state.lock().unwrap().close_calls.is_empty());
-
-        executor.shutdown().unwrap();
-        assert!(executor.binding.is_none());
-        assert_eq!(state.lock().unwrap().close_calls.len(), 1);
     }
 
     #[test]
@@ -5550,7 +5451,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn current_session_inspect_rechecks_cleanup_before_resetting_emergency_stop() {
+    fn session_reset_ends_attempt_input_and_capture_but_keeps_target() {
         let profile = verified_profile();
         let contract = task_contract(&profile);
         let state = Arc::new(Mutex::new(FakePlatformState::default()));
@@ -5564,7 +5465,7 @@ pub(crate) mod tests {
         let begin = HubControlCommand {
             payload: Some(hub_control_command::Payload::BeginTaskAttempt(
                 BeginTaskAttempt {
-                    task: Some(task_ref(&contract, "begin-emergency")),
+                    task: Some(task_ref(&contract, "begin-shutdown")),
                     contract: Some(contract.clone()),
                 },
             )),
@@ -5590,7 +5491,7 @@ pub(crate) mod tests {
             HubControlCommand {
                 payload: Some(hub_control_command::Payload::StartTaskTarget(
                     StartTaskTarget {
-                        task: Some(task_ref(&contract, "target-emergency")),
+                        task: Some(task_ref(&contract, "target-shutdown")),
                     },
                 )),
             },
@@ -5600,7 +5501,7 @@ pub(crate) mod tests {
                     fps: 10,
                     encoding: "jpeg".into(),
                     quality: 80,
-                    task: Some(task_ref(&contract, "capture-emergency")),
+                    task: Some(task_ref(&contract, "capture-shutdown")),
                     target_generation: 1,
                     ..StartCapture::default()
                 })),
@@ -5608,7 +5509,7 @@ pub(crate) mod tests {
             HubControlCommand {
                 payload: Some(hub_control_command::Payload::InputLease(InputLease {
                     ttl_ms: 1_000,
-                    task: Some(task_ref(&contract, "lease-emergency")),
+                    task: Some(task_ref(&contract, "lease-shutdown")),
                     ..InputLease::default()
                 })),
             },
@@ -5632,86 +5533,18 @@ pub(crate) mod tests {
             true
         );
 
-        let stopped = executor.execute_local(&LocalCommand::ReleaseAll).unwrap();
-        assert_eq!(stopped["state"], "EmergencyStopped");
-        assert_eq!(stopped["cleanup_complete"], true);
+        executor.reset_session().unwrap();
         assert!(!state.lock().unwrap().input_active);
         assert!(state.lock().unwrap().close_calls.is_empty());
-        assert_eq!(
-            executor.execute_local(&LocalCommand::Status).unwrap()["state"],
-            "EmergencyStopped"
-        );
-        assert_eq!(
-            executor.execute_local(&LocalCommand::Status).unwrap()["task_active"],
-            false
-        );
-        assert_eq!(
-            executor.runtime_state().unwrap(),
-            v3::AgentRuntimeState::EmergencyStopped
-        );
-        assert_eq!(
-            executor.execute_local(&LocalCommand::Doctor).unwrap()["runtime"],
-            "dry_run"
-        );
-
-        let new_attempt = HubControlCommand {
-            payload: Some(hub_control_command::Payload::BeginTaskAttempt(
-                BeginTaskAttempt {
-                    task: Some(task_ref(&contract, "begin-after-emergency")),
-                    contract: Some(contract.clone()),
-                },
-            )),
-        };
-        assert!(matches!(
-            executor.execute(&new_attempt, &ExecutionSession::test(), sink.clone()),
-            CommandOutcome::Nack { ref code, .. } if code == "emergency_stopped"
-        ));
-
-        state.lock().unwrap().release_error = Some(AgentError::new(
-            "input.release_uncertain",
-            "simulated Worker release failure",
-        ));
-        let failed_inspect = HubControlCommand {
-            payload: Some(hub_control_command::Payload::InspectTaskAttempt(
-                InspectTaskAttempt {
-                    task: Some(task_ref(&contract, "inspect-emergency-failed")),
-                },
-            )),
-        };
-        assert!(matches!(
-            executor.execute(
-                &failed_inspect,
-                &ExecutionSession::test(),
-                sink.clone(),
-            ),
-            CommandOutcome::Nack { ref code, .. } if code == "input.release_uncertain"
-        ));
-        assert_eq!(
-            executor.runtime_state().unwrap(),
-            v3::AgentRuntimeState::EmergencyStopped
-        );
-
-        state.lock().unwrap().release_error = None;
-        let inspect = HubControlCommand {
-            payload: Some(hub_control_command::Payload::InspectTaskAttempt(
-                InspectTaskAttempt {
-                    task: Some(task_ref(&contract, "inspect-emergency-recovered")),
-                },
-            )),
-        };
-        assert!(matches!(
-            executor.execute(&inspect, &ExecutionSession::test(), sink),
-            CommandOutcome::TaskAck { ref receipt, .. }
-                if receipt.cleanup_complete == Some(true)
-        ));
-        assert_eq!(
-            executor.execute_local(&LocalCommand::Status).unwrap()["state"],
-            "TargetLocked"
-        );
-        assert_eq!(
-            executor.execute_local(&LocalCommand::Status).unwrap()["task_active"],
-            false
-        );
+        assert!(executor.capture.is_none());
+        assert!(executor.binding.is_some());
+        assert!(executor.frame_sequences.is_empty());
+        assert!(!executor.task_attempt.is_active().unwrap());
+        let receipt = executor
+            .task_attempt
+            .inspect(&task_ref(&contract, "inspect-shutdown"))
+            .unwrap();
+        assert_eq!(receipt.attempt_state, TaskAttemptState::Terminal as i32);
         assert_eq!(
             executor.runtime_state().unwrap(),
             v3::AgentRuntimeState::ConnectedIdle

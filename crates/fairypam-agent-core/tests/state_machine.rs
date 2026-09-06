@@ -237,39 +237,6 @@ fn lease_expiry_closes_gate_and_releases_all() {
 }
 
 #[test]
-fn emergency_stop_requires_authorized_local_reset() {
-    let now = Instant::now();
-    let mut state = controlling_machine(now);
-    state.apply(Event::EmergencyStop).unwrap();
-
-    let err = state.local_reset(&DenyAllAuthorization, now).unwrap_err();
-
-    assert_eq!(err.code(), "authorization.denied");
-    assert_eq!(state.current(), &AgentState::EmergencyStopped);
-}
-
-#[test]
-fn emergency_stop_survives_disconnect_until_local_reset() {
-    let now = Instant::now();
-    let mut state = controlling_machine(now);
-    state.apply(Event::EmergencyStop).unwrap();
-
-    let effects = state.apply(Event::ControlDisconnected).unwrap();
-
-    assert_eq!(effects, vec![Effect::CloseInputGate, Effect::ReleaseAll]);
-    assert_eq!(state.current(), &AgentState::EmergencyStopped);
-    state
-        .local_reset(
-            &TestAuthorization {
-                expires_at: now + Duration::from_secs(30),
-            },
-            now,
-        )
-        .unwrap();
-    assert_eq!(state.current(), &AgentState::Disconnected);
-}
-
-#[test]
 fn connected_agent_cannot_enter_dry_run_without_verified_preflight() {
     let mut state = Machine::new();
     state.start_completed().unwrap();
@@ -279,30 +246,6 @@ fn connected_agent_cannot_enter_dry_run_without_verified_preflight() {
 
     assert_eq!(err.code(), "state.invalid_transition");
     assert_eq!(state.current(), &AgentState::ConnectedIdle);
-}
-
-#[test]
-fn local_reset_before_profile_returns_only_to_connected_idle() {
-    let now = Instant::now();
-    let mut state = Machine::new();
-    state.start_completed().unwrap();
-    state.control_connected(session(1)).unwrap();
-    state.apply(Event::EmergencyStop).unwrap();
-
-    state
-        .local_reset(
-            &TestAuthorization {
-                expires_at: now + Duration::from_secs(30),
-            },
-            now,
-        )
-        .unwrap();
-
-    assert_eq!(state.current(), &AgentState::ConnectedIdle);
-    assert_eq!(
-        state.enter_dry_run().unwrap_err().code(),
-        "state.invalid_transition"
-    );
 }
 
 #[test]
@@ -334,25 +277,14 @@ fn focus_and_guardian_failures_release_in_order() {
 }
 
 #[test]
-fn failed_safe_cannot_be_downgraded_to_a_resettable_state() {
-    let now = Instant::now();
-    let mut state = controlling_machine(now);
+fn failed_safe_remains_blocked_after_disconnect() {
+    let mut state = controlling_machine(Instant::now());
     state.apply(Event::FailSafe).unwrap();
-
-    let effects = state.apply(Event::EmergencyStop).unwrap();
-
+    let effects = state.apply(Event::ControlDisconnected).unwrap();
     assert_eq!(effects, vec![Effect::CloseInputGate, Effect::ReleaseAll]);
     assert_eq!(state.current(), &AgentState::FailedSafe);
     assert_eq!(
-        state
-            .local_reset(
-                &TestAuthorization {
-                    expires_at: now + Duration::from_secs(30),
-                },
-                now,
-            )
-            .unwrap_err()
-            .code(),
+        state.control_connected(session(2)).unwrap_err().code(),
         "state.invalid_transition"
     );
 }

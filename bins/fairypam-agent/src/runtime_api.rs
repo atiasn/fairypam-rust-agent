@@ -39,8 +39,6 @@ pub enum RuntimeCommand {
     StopCapture {
         source_id: String,
     },
-    ReleaseAll,
-    ResetEmergencyStop,
     UpdateStatus,
     StartupStatus,
     GetConnectionStatus,
@@ -58,7 +56,6 @@ pub enum RuntimeCommand {
     InputProbe {
         action: InputProbeAction,
     },
-    ShutdownAgent,
     RegisterHub {
         registration_code: Zeroizing<String>,
     },

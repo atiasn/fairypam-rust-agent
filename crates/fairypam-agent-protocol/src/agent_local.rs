@@ -4,7 +4,7 @@ use prost::Message;
 
 use crate::local_v1::{LocalControlEnvelope, LocalControlRequest};
 
-pub const LOCAL_CONTROL_PROTOCOL_MAJOR: u32 = 1;
+pub const LOCAL_CONTROL_PROTOCOL_MAJOR: u32 = 2;
 pub const LOCAL_CONTROL_PROTOCOL_MINOR: u32 = 0;
 pub const LOCAL_AGENT_PIPE_NAME: &str = r"\\.\pipe\FairyPam.Agent.Control.v1";
 const MAX_LOCAL_CONTROL_BYTES: usize = 1024 * 1024;
@@ -301,6 +301,36 @@ mod tests {
             decode_local_control_envelope(&encode_local_control_envelope(&envelope).unwrap())
                 .unwrap(),
             envelope
+        );
+    }
+
+    #[test]
+    fn local_control_rejects_retired_shell_protocol() {
+        let envelope = LocalControlEnvelope {
+            protocol_major: 1,
+            protocol_minor: 0,
+            payload: Some(local_control_envelope::Payload::Request(request(2_000))),
+        };
+        assert_eq!(
+            decode_local_control_envelope(&encode_local_control_envelope(&envelope).unwrap())
+                .unwrap_err()
+                .code(),
+            "local.protocol_incompatible"
+        );
+    }
+
+    #[test]
+    fn retired_emergency_release_wire_command_is_rejected() {
+        let mut retired = request(2_000);
+        retired.command = None;
+        let mut encoded = retired.encode_to_vec();
+        encoded.extend_from_slice(&[0x6a, 0]); // Retired field 13, empty message.
+        let decoded = LocalControlRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(
+            validate_local_control_request(&decoded, 1_000)
+                .unwrap_err()
+                .code(),
+            "local.command_missing"
         );
     }
 

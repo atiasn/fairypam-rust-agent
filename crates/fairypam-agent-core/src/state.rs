@@ -17,7 +17,6 @@ pub enum AgentState {
     Armed { expires_at: Instant },
     Controlling,
     RecoveringLocal,
-    EmergencyStopped,
     FailedSafe,
 }
 
@@ -28,7 +27,6 @@ pub enum Event {
     FocusLost,
     LeaseExpired,
     GuardianUnhealthy,
-    EmergencyStop,
     FailSafe,
 }
 
@@ -303,39 +301,14 @@ impl Machine {
         Ok(())
     }
 
-    pub fn local_reset(
-        &mut self,
-        authorization: &dyn LocalAuthorization,
-        now: Instant,
-    ) -> Result<Vec<Effect>, AgentError> {
-        self.require_state(&AgentState::EmergencyStopped, "local_reset")?;
-        authorized_expiry(authorization, now)?;
-        self.clear_session_context();
-        self.current = if self.control_connected {
-            AgentState::ConnectedIdle
-        } else {
-            AgentState::Disconnected
-        };
-        Ok(Vec::new())
-    }
-
     pub fn apply(&mut self, event: Event) -> Result<Vec<Effect>, AgentError> {
         match event {
             Event::ControlDisconnected => {
                 self.control_connected = false;
                 self.clear_session_context();
-                if !matches!(
-                    self.current,
-                    AgentState::EmergencyStopped | AgentState::FailedSafe
-                ) {
+                if self.current != AgentState::FailedSafe {
                     self.current = AgentState::Disconnected;
                 }
-                Ok(safety_effects())
-            }
-            Event::EmergencyStop if self.current == AgentState::FailedSafe => Ok(safety_effects()),
-            Event::EmergencyStop => {
-                self.authorization_expires_at = None;
-                self.current = AgentState::EmergencyStopped;
                 Ok(safety_effects())
             }
             Event::FailSafe => {
@@ -465,7 +438,6 @@ const fn event_name(event: &Event) -> &'static str {
         Event::FocusLost => "focus_lost",
         Event::LeaseExpired => "lease_expired",
         Event::GuardianUnhealthy => "guardian_unhealthy",
-        Event::EmergencyStop => "emergency_stop",
         Event::FailSafe => "fail_safe",
     }
 }

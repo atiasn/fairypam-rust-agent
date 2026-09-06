@@ -16,9 +16,9 @@ use fairypam_agent_core::supervisor::{SessionDriver, SupervisorHooks};
 use fairypam_agent_core::AgentError;
 #[cfg(any(windows, test))]
 use fairypam_agent_protocol::local_v1::{
-    local_control_request, local_control_response, DiagnosticsResult, EmergencyReleaseResult,
-    EnvironmentCheck, EnvironmentResult, LocalCommandOutcome, LocalControlRequest,
-    LocalControlResponse, RegistrationResult, StatusResult,
+    local_control_request, local_control_response, DiagnosticsResult, EnvironmentCheck,
+    EnvironmentResult, LocalCommandOutcome, LocalControlRequest, LocalControlResponse,
+    RegistrationResult, StatusResult,
 };
 use fairypam_agent_protocol::v3::{
     self as v3, agent_control_event, hub_telemetry_command, AgentControlEvent, AgentRuntimeState,
@@ -400,7 +400,6 @@ enum RuntimeLogMessage {
     EnrollmentRefreshFailed,
     SessionCleared,
     LocalShutdownRequested,
-    LocalUiShutdownRequested,
     LocalEnvironmentCheckRequested,
     LocalGameScanRequested,
     LocalRegistrationRequested,
@@ -420,7 +419,6 @@ impl RuntimeLogMessage {
         Self::EnrollmentRefreshFailed,
         Self::SessionCleared,
         Self::LocalShutdownRequested,
-        Self::LocalUiShutdownRequested,
         Self::LocalEnvironmentCheckRequested,
         Self::LocalGameScanRequested,
         Self::LocalRegistrationRequested,
@@ -439,7 +437,6 @@ impl RuntimeLogMessage {
             Self::EnrollmentRefreshFailed => "注册信息刷新失败，连接将保持安全关闭",
             Self::SessionCleared => "连接已重置，正在重新连接",
             Self::LocalShutdownRequested => "本机 Core 收到安全停止请求",
-            Self::LocalUiShutdownRequested => "界面请求安全停止本机 Core",
             Self::LocalEnvironmentCheckRequested => "界面请求环境检查",
             Self::LocalGameScanRequested => "界面请求扫描已安装游戏",
             Self::LocalRegistrationRequested => "界面请求注册服务",
@@ -2014,37 +2011,6 @@ impl LocalControlRuntime {
     ) -> LocalControlResponse {
         let request_id = std::mem::take(&mut request.request_id);
         let command = request.command.take();
-        if matches!(
-            command,
-            Some(local_control_request::Command::EmergencyRelease(_))
-        ) {
-            return match self.execute_local(&LocalCommand::ReleaseAll) {
-                Ok(value) => {
-                    let cleanup_complete = value["cleanup_complete"].as_bool().unwrap_or(false);
-                    LocalControlResponse {
-                        request_id,
-                        outcome: if cleanup_complete {
-                            LocalCommandOutcome::Applied
-                        } else {
-                            LocalCommandOutcome::Uncertain
-                        } as i32,
-                        error_code: value["error_code"].as_str().map(str::to_owned),
-                        result: Some(local_control_response::Result::EmergencyRelease(
-                            EmergencyReleaseResult {
-                                cleanup_complete,
-                                holds: value["holds"].as_u64().unwrap_or_default() as u32,
-                            },
-                        )),
-                    }
-                }
-                Err(error) => LocalControlResponse {
-                    request_id,
-                    outcome: LocalCommandOutcome::Uncertain as i32,
-                    error_code: Some(error.code().to_owned()),
-                    result: None,
-                },
-            };
-        }
         let result = match command {
             Some(local_control_request::Command::GetStatus(_)) => self
                 .local_status()
@@ -2063,7 +2029,6 @@ impl LocalControlRuntime {
                     })
                 })
             }
-            Some(local_control_request::Command::EmergencyRelease(_)) => unreachable!(),
             Some(local_control_request::Command::ExportDiagnostics(_)) => {
                 #[cfg(windows)]
                 let bundle = self.diagnostic_bundle();
@@ -2183,7 +2148,6 @@ impl LocalControlRuntime {
 
     fn record_local_operation(&self, command: &LocalCommand) {
         let message = match command {
-            LocalCommand::ShutdownAgent => Some(RuntimeLogMessage::LocalUiShutdownRequested),
             LocalCommand::RunEnvironmentCheck => {
                 Some(RuntimeLogMessage::LocalEnvironmentCheckRequested)
             }
@@ -2669,7 +2633,7 @@ mod tests {
     }
 
     #[test]
-    fn local_control_exposes_typed_status_and_confirmed_release() {
+    fn local_control_exposes_typed_status_and_rejects_missing_commands() {
         let local = GrpcSessionDriver::for_test().local_control();
         let request = |command| LocalControlRequest {
             request_id: "shell-test".into(),
@@ -2689,20 +2653,16 @@ mod tests {
             }))
         ));
 
-        let released =
-            local.handle_local_request(request(local_control_request::Command::EmergencyRelease(
-                fairypam_agent_protocol::local_v1::EmergencyRelease {},
-            )));
-        assert_eq!(released.outcome, LocalCommandOutcome::Applied as i32);
-        assert!(matches!(
-            released.result,
-            Some(local_control_response::Result::EmergencyRelease(
-                EmergencyReleaseResult {
-                    cleanup_complete: true,
-                    holds: 0,
-                }
-            ))
-        ));
+        let rejected = local.handle_local_request(LocalControlRequest {
+            request_id: "retired-stop-command".into(),
+            deadline_unix_ms: now_unix_ms() + 1_000,
+            command: None,
+        });
+        assert_eq!(rejected.outcome, LocalCommandOutcome::NotApplied as i32);
+        assert_eq!(
+            rejected.error_code.as_deref(),
+            Some("local.command_missing")
+        );
     }
 
     #[test]
