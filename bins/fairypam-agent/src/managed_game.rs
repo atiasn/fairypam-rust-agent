@@ -69,7 +69,7 @@ impl PendingCloseReceipt {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct PersistedState {
     agent_id: Option<String>,
@@ -140,6 +140,30 @@ impl ManagedGameLifecycle {
                 .policies
                 .values()
                 .all(|policy| !policy.occupied)
+    }
+
+    pub fn release_task_occupancy(&mut self) -> Result<(), AgentError> {
+        if !self
+            .persisted
+            .policies
+            .values()
+            .any(|policy| policy.occupied)
+        {
+            return Ok(());
+        }
+        let previous = self.persisted.clone();
+        for policy in self.persisted.policies.values_mut() {
+            policy.occupied = false;
+        }
+        self.bump_sequence();
+        if let Err(error) = self.persist() {
+            self.persisted = previous;
+            return Err(error);
+        }
+        if let Some(active) = self.active.as_mut() {
+            active.policy.occupied = false;
+        }
+        Ok(())
     }
 
     pub fn bind_target(&mut self, profile_id: &str, now: Instant, now_unix_ms: i64) {
@@ -774,6 +798,90 @@ mod tests {
             .configure(&config(2, false, true), start, 4_000)
             .unwrap();
         assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+    }
+
+    #[test]
+    fn lost_session_releases_persisted_occupancy_without_erasing_close_evidence() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("lifecycle.json");
+        let start = Instant::now();
+        let mut lifecycle = ManagedGameLifecycle::persistent(path.clone(), "agent-a");
+        lifecycle
+            .configure(&config(1, true, true), start, 1_000)
+            .unwrap();
+        let mut reopened = ManagedGameLifecycle::persistent(path.clone(), "agent-a");
+        assert!(!reopened.released());
+        reopened.release_task_occupancy().unwrap();
+        assert!(reopened.released());
+        let saved = ManagedGameLifecycle::persistent(path.clone(), "agent-a");
+        assert!(saved.released());
+        assert_eq!(
+            saved.persisted.policies["game-1"],
+            PolicySnapshot::from(&config(1, true, false))
+        );
+        assert!(saved.persisted.status_sequence > lifecycle.persisted.status_sequence);
+        assert_eq!(
+            reopened
+                .configure(&config(1, true, true), start, 1_000)
+                .unwrap_err()
+                .code(),
+            "idle_close.state_version_conflict"
+        );
+        reopened
+            .configure(&config(2, true, false), start, 1_000)
+            .unwrap();
+
+        reopened.bind_target("genshin-impact", start, 1_000);
+        reopened
+            .configure(&config(3, true, true), start, 1_000)
+            .unwrap();
+        reopened.release_task_occupancy().unwrap();
+        assert!(!reopened.active.as_ref().unwrap().policy.occupied);
+        assert!(!reopened.released());
+        reopened.begin_close().unwrap();
+        reopened.release_task_occupancy().unwrap();
+        assert!(!ManagedGameLifecycle::persistent(path.clone(), "agent-a").released());
+        reopened
+            .close_receipt(
+                v3::ManagedGameCloseTrigger::Idle,
+                v3::ManagedGameCloseResult::Graceful,
+                2_000,
+                None,
+            )
+            .unwrap();
+        reopened.release_task_occupancy().unwrap();
+        assert!(!ManagedGameLifecycle::persistent(path, "agent-a").released());
+        assert!(reopened.pending_close_receipt().is_some());
+
+        let unknown_path = directory.path().join("unknown.json");
+        let mut unknown = ManagedGameLifecycle::persistent(unknown_path, "agent-a");
+        unknown.release_task_occupancy().unwrap();
+        assert!(!unknown.released());
+    }
+
+    #[test]
+    fn lost_session_occupancy_persistence_failure_remains_retryable() {
+        let directory = tempdir().unwrap();
+        let legacy_path = directory.path().join("lifecycle.json");
+        let path = namespaced_path(&legacy_path, "agent-a");
+        let start = Instant::now();
+        let mut lifecycle = ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-a");
+        lifecycle
+            .configure(&config(1, true, true), start, 1_000)
+            .unwrap();
+        let mut reopened = ManagedGameLifecycle::persistent(legacy_path.clone(), "agent-a");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                reopened.release_task_occupancy().unwrap_err().code(),
+                "idle_close.persistence_failed"
+            );
+            assert!(!reopened.released());
+        }
+        fs::remove_dir(&path).unwrap();
+        reopened.release_task_occupancy().unwrap();
+        assert!(ManagedGameLifecycle::persistent(legacy_path, "agent-a").released());
     }
 
     #[test]

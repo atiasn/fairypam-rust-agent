@@ -2498,14 +2498,25 @@ impl CommandExecutor {
     }
 
     pub fn reset_session(&mut self) -> Result<(), AgentError> {
-        if self.task_attempt.is_active()? || self.task_attempt.emergency_stopped()? {
-            self.emergency_stop()?;
-        }
-        self.platform.release_task_input()?;
-        self.stop_capture(None)?;
+        let release_error = self.platform.release_task_input().err();
+        let capture_error = self.stop_capture(None).err();
         self.platform.finish_attempt_monitor();
         self.frame_sequences.clear();
-        Ok(())
+        if self.task_attempt.is_active()? {
+            self.task_attempt.emergency_finish(
+                release_error.is_none(),
+                capture_error.is_none(),
+                self.binding.is_some(),
+                release_error
+                    .as_ref()
+                    .or(capture_error.as_ref())
+                    .map(AgentError::code),
+            )?;
+        }
+        if let Some(error) = release_error.or(capture_error) {
+            return Err(error);
+        }
+        self.managed_game.release_task_occupancy()
     }
 
     pub fn shutdown(&mut self) -> Result<(), AgentError> {
@@ -3514,7 +3525,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
 
@@ -3845,7 +3856,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakePlatformState {
+    pub(crate) struct FakePlatformState {
         launch_calls: usize,
         rediscovery_calls: usize,
         target_owned: bool,
@@ -3867,7 +3878,7 @@ mod tests {
         input_command_deadline_remaining: Option<Duration>,
         capture_error: Option<AgentError>,
         input_frame_error: Option<AgentError>,
-        release_error: Option<AgentError>,
+        pub(crate) release_error: Option<AgentError>,
         worker_ready_error: Option<AgentError>,
         music_autoplay_starts: usize,
         music_autoplay_renews: usize,
@@ -4498,7 +4509,7 @@ mod tests {
         executor_with_state().0
     }
 
-    fn executor_with_state() -> (CommandExecutor, Arc<Mutex<FakePlatformState>>) {
+    pub(crate) fn executor_with_state() -> (CommandExecutor, Arc<Mutex<FakePlatformState>>) {
         let state = Arc::new(Mutex::new(FakePlatformState::default()));
         let executor = CommandExecutor::with_platform(
             ProfileStore::from_verified_profiles([verified_profile()]).unwrap(),
@@ -4514,6 +4525,96 @@ mod tests {
         let executor = CommandExecutor::production(ProfileStore::default(), "agent-a", None);
 
         assert_eq!(executor.runtime_mode, "production");
+    }
+
+    #[test]
+    fn lost_session_releases_resources_without_persisting_manual_emergency() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut executor, state) = executor_with_state();
+        let lifecycle_path = root.path().join("lifecycle.json");
+        let mut lifecycle = ManagedGameLifecycle::persistent(lifecycle_path.clone(), "agent-a");
+        lifecycle
+            .configure(
+                &v3::ConfigureIdleClose {
+                    game_id: "game-1".into(),
+                    game_session_id: "session-1".into(),
+                    profile_id: "genshin-impact".into(),
+                    state_version: 1,
+                    occupied: true,
+                    ..v3::ConfigureIdleClose::default()
+                },
+                Instant::now(),
+                1_000,
+            )
+            .unwrap();
+        executor.managed_game = ManagedGameLifecycle::persistent(lifecycle_path.clone(), "agent-a");
+        executor.task_attempt = TaskAttemptRuntime::at(root.path().to_path_buf());
+        let contract = task_contract(&verified_profile());
+        executor
+            .task_attempt
+            .begin(&task_ref(&contract, "begin-lost"), &contract)
+            .unwrap();
+        executor
+            .task_attempt
+            .mark_active_side_effect_uncertain("worker.side_effect_uncertain", false)
+            .unwrap();
+        state.lock().unwrap().input_active = true;
+        executor.reset_session().unwrap();
+        assert!(!state.lock().unwrap().input_active);
+        assert!(executor.managed_game_released().unwrap());
+        assert!(ManagedGameLifecycle::persistent(lifecycle_path, "agent-a").released());
+        assert_eq!(
+            executor.runtime_state().unwrap(),
+            v3::AgentRuntimeState::ConnectedIdle
+        );
+
+        let (mut restarted, _) = executor_with_state();
+        restarted.task_attempt = TaskAttemptRuntime::at(root.path().to_path_buf());
+        restarted.reset_session().unwrap();
+        assert_eq!(
+            restarted.runtime_state().unwrap(),
+            v3::AgentRuntimeState::ConnectedIdle
+        );
+        let receipt = restarted
+            .task_attempt
+            .inspect(&task_ref(&contract, "inspect-lost"))
+            .unwrap();
+        assert_eq!(
+            receipt.side_effect_state,
+            fairypam_agent_protocol::internal_v1::TaskSideEffectState::Uncertain as i32
+        );
+        assert_eq!(receipt.cleanup_complete, Some(false));
+        assert!(state.lock().unwrap().close_calls.is_empty());
+
+        restarted.execute_local(&LocalCommand::ReleaseAll).unwrap();
+        restarted.reset_session().unwrap();
+        assert_eq!(
+            restarted.runtime_state().unwrap(),
+            v3::AgentRuntimeState::EmergencyStopped
+        );
+    }
+
+    #[test]
+    fn lost_session_cleanup_failure_is_retried_before_accepting_new_attempts() {
+        let (mut executor, state) = executor_with_state();
+        let contract = task_contract(&verified_profile());
+        executor
+            .task_attempt
+            .begin(&task_ref(&contract, "begin-lost"), &contract)
+            .unwrap();
+        state.lock().unwrap().release_error =
+            Some(AgentError::new("input.release_failed", "test failure"));
+        assert_eq!(
+            executor.reset_session().unwrap_err().code(),
+            "input.release_failed"
+        );
+        assert!(executor.task_attempt.is_active().unwrap());
+        state.lock().unwrap().release_error = None;
+        executor.reset_session().unwrap();
+        assert_eq!(
+            executor.runtime_state().unwrap(),
+            v3::AgentRuntimeState::ConnectedIdle
+        );
     }
 
     #[test]

@@ -1111,6 +1111,7 @@ fn new_telemetry_state(process_generation_id: String) -> TelemetryState {
 
 impl SessionDriver for GrpcSessionDriver {
     async fn establish_session(&self, cancellation: CancellationToken) -> Result<(), AgentError> {
+        self.execution.lock().map_err(lock_error)?.reset_session()?;
         let config = self.config.lock().map_err(lock_error)?.clone();
         #[cfg(windows)]
         if config.awaiting_enrollment {
@@ -2613,6 +2614,22 @@ mod tests {
     use crate::runtime_api::{LogLevel, RuntimeCommand as LocalCommand};
 
     use super::*;
+
+    #[tokio::test]
+    async fn lost_session_cleanup_failure_prevents_control_connection_and_hello() {
+        let driver = GrpcSessionDriver::new(RuntimeConfig::unregistered());
+        let (executor, platform) = crate::execution::tests::executor_with_state();
+        platform.lock().unwrap().release_error =
+            Some(AgentError::new("input.release_failed", "test failure"));
+        *driver.execution.lock().unwrap() = executor;
+        let before = driver.state.lock().unwrap().control_state.as_str();
+        let failure = driver
+            .establish_session(CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code(), "input.release_failed");
+        assert_eq!(driver.state.lock().unwrap().control_state.as_str(), before);
+    }
 
     #[tokio::test]
     async fn command_result_waits_for_control_queue_capacity() {

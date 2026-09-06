@@ -87,9 +87,12 @@ impl TaskAttemptRuntime {
             ));
         }
 
-        if self.active.as_ref().is_some_and(|active| {
-            active.attempt_state == TaskAttemptState::Terminal as i32 && active.cleanup_complete
-        }) {
+        self.reject_terminal_reuse(reference)?;
+        if self
+            .active
+            .as_ref()
+            .is_some_and(AttemptState::local_resources_released)
+        {
             self.active = None;
             self.recovered_active = false;
         }
@@ -144,9 +147,12 @@ impl TaskAttemptRuntime {
                 "local emergency stop must be reset before accepting a task attempt",
             ));
         }
-        if self.active.as_ref().is_some_and(|active| {
-            active.attempt_state == TaskAttemptState::Terminal as i32 && active.cleanup_complete
-        }) {
+        self.reject_terminal_reuse(reference)?;
+        if self
+            .active
+            .as_ref()
+            .is_some_and(AttemptState::local_resources_released)
+        {
             self.active = None;
             self.recovered_active = false;
         }
@@ -257,9 +263,26 @@ impl TaskAttemptRuntime {
 
     pub fn is_active(&mut self) -> Result<bool, AgentError> {
         self.load_active()?;
-        Ok(self.active.as_ref().is_some_and(|active| {
-            active.attempt_state != TaskAttemptState::Terminal as i32 || !active.cleanup_complete
-        }))
+        Ok(self
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.local_resources_released()))
+    }
+
+    fn reject_terminal_reuse(&self, reference: &AttemptRef) -> Result<(), AgentError> {
+        let terminal = |state: &AttemptState| {
+            state.reference.attempt_id == reference.attempt_id
+                && state.attempt_state == TaskAttemptState::Terminal as i32
+        };
+        if self.active.as_ref().is_some_and(terminal)
+            || self.load_named(reference)?.as_ref().is_some_and(terminal)
+        {
+            return Err(AgentError::new(
+                "attempt_terminal",
+                "a terminal attempt cannot be started again",
+            ));
+        }
+        Ok(())
     }
 
     pub fn recovery_blocked(&mut self) -> Result<bool, AgentError> {
@@ -863,7 +886,7 @@ impl TaskAttemptRuntime {
         error_code: Option<&str>,
     ) -> Result<Option<TaskAttemptReceiptV1>, AgentError> {
         self.load_active()?;
-        let Some(mut active) = self.active.take() else {
+        let Some(mut active) = self.active.clone() else {
             return Ok(None);
         };
         let side_effect_resolved = !matches!(
@@ -1081,7 +1104,7 @@ impl TaskAttemptRuntime {
                 continue;
             }
             let state = load_last(&path)?;
-            if state.attempt_state == TaskAttemptState::Terminal as i32 && state.cleanup_complete {
+            if state.local_resources_released() {
                 continue;
             }
             if self.active.replace(state).is_some() {
@@ -1310,6 +1333,21 @@ impl From<&AttemptRef> for StoredAttemptRef {
 }
 
 impl AttemptState {
+    fn local_resources_released(&self) -> bool {
+        self.attempt_state == TaskAttemptState::Terminal as i32
+            && self.input_state == TaskInputState::Released as i32
+            && matches!(
+                TaskCaptureState::try_from(self.capture_state),
+                Ok(TaskCaptureState::NotStarted | TaskCaptureState::Stopped)
+            )
+            && matches!(
+                TaskOwnedTargetState::try_from(self.owned_target_state),
+                Ok(TaskOwnedTargetState::NotStarted
+                    | TaskOwnedTargetState::Running
+                    | TaskOwnedTargetState::Closed)
+            )
+    }
+
     fn claimed(
         contract: StoredContract,
         reference: AttemptRef,
@@ -2308,6 +2346,69 @@ mod tests {
         assert!(!TaskAttemptRuntime::at(root.clone())
             .emergency_stopped()
             .unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lost_session_persistence_failure_keeps_the_active_attempt() {
+        let root = temporary_root();
+        let contract = contract();
+        let mut runtime = TaskAttemptRuntime::at(root.clone());
+        runtime
+            .begin(&task(&contract, "begin", 'a'), &contract)
+            .unwrap();
+        let ledger = root.join(format!("{}.jsonl", contract.attempt_id));
+        fs::rename(&ledger, root.join("saved-ledger")).unwrap();
+        fs::create_dir(&ledger).unwrap();
+        assert!(runtime.emergency_finish(true, true, false, None).is_err());
+        assert!(runtime.is_active().unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lost_session_releases_uncertain_terminal_after_restart() {
+        let root = temporary_root();
+        let contract = contract();
+        let mut runtime = TaskAttemptRuntime::at(root.clone());
+        runtime
+            .begin(&task(&contract, "begin", 'a'), &contract)
+            .unwrap();
+        runtime
+            .mark_active_side_effect_uncertain("worker.side_effect_uncertain", true)
+            .unwrap();
+        runtime.emergency_finish(true, true, true, None).unwrap();
+
+        let mut restarted = TaskAttemptRuntime::at(root.clone());
+        assert!(!restarted.is_active().unwrap());
+        assert!(!restarted.recovery_blocked().unwrap());
+        let receipt = restarted.inspect(&task(&contract, "inspect", 'b')).unwrap();
+        assert_eq!(
+            receipt.side_effect_state,
+            TaskSideEffectState::Uncertain as i32
+        );
+        assert_eq!(receipt.cleanup_complete, Some(false));
+        assert_eq!(
+            restarted
+                .begin(&task(&contract, "rebegin", 'c'), &contract)
+                .unwrap_err()
+                .code(),
+            "attempt_terminal"
+        );
+
+        let mut next_contract = contract.clone();
+        next_contract.task_run_id = "33333333-3333-4333-8333-333333333333".into();
+        next_contract.attempt_id = "44444444-4444-4444-8444-444444444444".into();
+        next_contract.contract_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                fairypam_agent_protocol::canonical_agent_attempt_contract(&next_contract)
+                    .unwrap()
+                    .as_bytes()
+            )
+        );
+        restarted
+            .begin(&task(&next_contract, "new-begin", 'd'), &next_contract)
+            .unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
