@@ -185,6 +185,11 @@ struct DropOrderHooks {
 }
 
 impl SupervisorHooks for DropOrderHooks {
+    fn record_control_failure(&mut self, error: &fairypam_agent_core::AgentError) {
+        assert_eq!(error.code(), "test.control_failed");
+        self.effects.lock().unwrap().push("record_control_failure");
+    }
+
     fn close_input_gate(&mut self) -> Result<(), String> {
         self.effects.lock().unwrap().push("close_input_gate");
         Ok(())
@@ -288,6 +293,7 @@ async fn control_failure_releases_before_frame_future_is_dropped() {
             "guardian_release_all",
             "cancel_all_tasks",
             "frame_future_dropped",
+            "record_control_failure",
             "join_all_tasks",
             "clear_target_session",
         ]

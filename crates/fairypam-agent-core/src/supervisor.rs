@@ -12,6 +12,7 @@ pub trait SupervisorHooks {
     fn guardian_release_all(&mut self) -> Result<(), String>;
     fn cancel_all_tasks(&mut self);
     fn join_all_tasks(&mut self) -> Result<(), String>;
+    fn record_control_failure(&mut self, _error: &AgentError) {}
     fn clear_target_session(&mut self);
     fn cancel_frame_pipeline(&mut self);
     fn join_frame_pipeline(&mut self) -> Result<(), String>;
@@ -127,7 +128,9 @@ impl<H: SupervisorHooks> SessionSupervisor<H> {
             .establish_session(self.cancellation.child_token())
             .await
         {
-            let reconnect_delay = self.handle_control_failure()?;
+            let errors = self.begin_control_failure();
+            self.hooks.record_control_failure(&error);
+            let reconnect_delay = self.finish_control_failure(errors)?;
             return Ok(SessionEnd {
                 error,
                 reconnect_delay,
@@ -155,6 +158,7 @@ impl<H: SupervisorHooks> SessionSupervisor<H> {
                     // Frame remains alive until after CloseInputGate, Guardian
                     // ReleaseAll and cancellation have all happened.
                     drop(frame.take());
+                    self.hooks.record_control_failure(&error);
                     let reconnect_delay = self.finish_control_failure(errors)?;
                     return Ok(SessionEnd { error, reconnect_delay });
                 },

@@ -1648,6 +1648,19 @@ fn join_registration_worker(
 }
 
 impl SupervisorHooks for RuntimeSafetyHooks {
+    fn record_control_failure(&mut self, error: &AgentError) {
+        if let Ok(mut state) = self.state.lock() {
+            state.record_text(
+                LogLevel::Warn,
+                &format!(
+                    "服务连接已结束（错误码：{}；详情：{}）",
+                    error.code(),
+                    observability::redact_log_line(&error.to_string()),
+                ),
+            );
+        }
+    }
+
     fn close_input_gate(&mut self) -> Result<(), String> {
         tracing::info!(effect = "close_input_gate", "fail-closed cleanup effect");
         Ok(())
@@ -2783,6 +2796,31 @@ mod tests {
             assert!(!output.contains(forbidden), "log tail exposed {forbidden}");
         }
         assert_eq!(state.logs.len(), RuntimeLogMessage::ALL.len());
+    }
+
+    #[test]
+    fn control_failure_diagnostic_survives_cleanup_and_redacts_details() {
+        for details in [
+            "status: InvalidArgument, message: CommandResult is stale or invalid",
+            "token=synthetic-test-value",
+        ] {
+            let driver = GrpcSessionDriver::for_test();
+            let mut hooks = RuntimeSafetyHooks::for_driver(&driver);
+            hooks
+                .record_control_failure(&AgentError::new("transport.control_read_failed", details));
+            hooks.clear_target_session();
+
+            let mut state = driver.state.lock().unwrap();
+            let output =
+                observability::log_tail_json(state.logs.make_contiguous(), 200, &LogLevel::Info)
+                    .to_string();
+            assert!(output.contains("transport.control_read_failed"));
+            assert!(!output.contains("synthetic-test-value"));
+            if !details.starts_with("token=") {
+                assert!(output.contains("CommandResult is stale or invalid"));
+            }
+            assert_eq!(state.last_error_code, "runtime.reconnecting");
+        }
     }
 
     #[test]

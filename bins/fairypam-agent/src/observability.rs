@@ -49,6 +49,10 @@ impl FixedLog {
     pub fn append(&self, level: LogLevel, message: &str) -> Result<(), AgentError> {
         let record = AgentLogRecord::new(level, redact_log_line(message));
         let mut line = serde_json::to_string(&json!({
+            "timestamp_unix_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
             "level": log_level_name(&record.level),
             "message": record.message,
         }))
@@ -142,6 +146,7 @@ impl FixedLog {
                     .ok()
                     .and_then(|value| {
                         Some(json!({
+                            "timestamp_unix_ms": value.get("timestamp_unix_ms").and_then(Value::as_u64),
                             "level": value.get("level")?.as_str()?,
                             "message": redact_log_line(value.get("message")?.as_str()?),
                         }))
@@ -863,6 +868,10 @@ mod tests {
         let log = FixedLog::open(&root).unwrap();
         log.append(LogLevel::Info, "本机 Core 已启动，正在准备远程连接")
             .unwrap();
+        let snapshot = log.snapshot(1024).unwrap();
+        let persisted: Value = serde_json::from_slice(&snapshot).unwrap();
+        assert!(persisted["timestamp_unix_ms"].as_u64().unwrap() > 0);
+        assert_eq!(persisted["message"], "本机 Core 已启动，正在准备远程连接");
         assert_eq!(
             log.tail(10, &LogLevel::Info).unwrap()["entries"][0]["message"],
             "本机 Core 已启动，正在准备远程连接"
