@@ -365,6 +365,17 @@ fn translate(
     use hub_control_command::Payload;
     verify_task_command_digest(command)
         .map_err(|error| AgentError::new(error.code(), error.to_string()))?;
+    let reference = identity(command).and_then(|identity| match identity.value? {
+        command_identity::Value::Command(command) => Some(command),
+        command_identity::Value::Task(task) => task.command,
+    });
+    // Expiry rejects this command through its receipt; it must not close Control.
+    if reference.is_some_and(|command| command.expires_at_unix_ms <= now_unix_ms()) {
+        return Err(AgentError::new(
+            "transport.command_expired",
+            "Control command expired before execution",
+        ));
+    }
     let payload = match command.payload.as_ref() {
         Some(Payload::LaunchTarget(value)) => {
             internal::hub_control_command::Payload::LaunchTarget(internal::LaunchTarget {
@@ -1545,6 +1556,71 @@ mod tests {
         assert_eq!(frame.wheel_action_id, "inventory.scroll");
         assert_eq!(frame.source_frame_sequence, Some(7));
         assert_eq!(frame.target_generation, 1);
+    }
+
+    #[test]
+    fn expired_commands_are_rejected_without_consuming_input_sequence() {
+        let contract = contract(vec![1, 3, 4]);
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract);
+        let mut expired = task_identity(&contract, 2);
+        let Some(command_identity::Value::Task(task)) = expired.value.as_mut() else {
+            unreachable!();
+        };
+        task.command.as_mut().unwrap().expires_at_unix_ms = 1;
+        let session_identity = wire::CommandIdentity {
+            value: Some(command_identity::Value::Command(
+                task.command.clone().unwrap(),
+            )),
+        };
+        let input = wire::InputFrame {
+            reference: Some(expired.clone()),
+            input_sequence: 1,
+            lease_ms: 250,
+            held_action_ids: vec!["movement.forward".into()],
+            target_generation: 1,
+            ..Default::default()
+        };
+        for payload in [
+            hub_control_command::Payload::StopSession(wire::StopSession {
+                reference: Some(session_identity),
+                ..Default::default()
+            }),
+            hub_control_command::Payload::CaptureFrame(wire::CaptureFrame {
+                reference: Some(expired),
+                capture_source_id: "client".into(),
+                encoding: "jpeg".into(),
+                quality: 85,
+                target_generation: 1,
+            }),
+            hub_control_command::Payload::InputFrame(input.clone()),
+        ] {
+            let command = wire::HubControlCommand {
+                payload: Some(payload),
+            };
+            let command = if matches!(
+                command.payload,
+                Some(hub_control_command::Payload::StopSession(_))
+            ) {
+                command
+            } else {
+                with_digest(command)
+            };
+            assert_eq!(
+                translator.translate(&command).unwrap_err().code(),
+                "transport.command_expired"
+            );
+        }
+        let valid = with_digest(wire::HubControlCommand {
+            payload: Some(hub_control_command::Payload::InputFrame(wire::InputFrame {
+                reference: Some(task_identity(&contract, 3)),
+                ..input
+            })),
+        });
+        assert!(matches!(
+            translator.translate(&valid).unwrap(),
+            TranslatedCommand::InputFrame { .. }
+        ));
     }
 
     #[test]

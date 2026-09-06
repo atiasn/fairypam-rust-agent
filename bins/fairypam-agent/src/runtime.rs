@@ -43,7 +43,6 @@ use zeroize::Zeroizing;
 
 use crate::execution::{CommandExecutor, CommandOutcome, ExecutionSession, FrameSink};
 use crate::managed_game::close_event_id;
-#[cfg(any(windows, test))]
 use crate::observability;
 use crate::observability::AgentLogRecord;
 use crate::profile_catalog::ProfileCatalogStore;
@@ -1325,18 +1324,9 @@ impl SessionDriver for GrpcSessionDriver {
                     let translated = match translator.translate(&command) {
                         Ok(command) => command,
                         Err(error) => {
-                            let event = match v3_adapter::internal_task_identity(&identity) {
-                                Ok(task) => {
-                                    let mut execution = self.execution_for_session(&session)?;
-                                    let mut outcome = if error.code() == "command.payload_digest_conflict" {
-                                        execution.v3_payload_digest_conflict(&task)
-                                    } else {
-                                        execution.reject_v3_task(&task, error.code())
-                                    };
-                                    execution.stamp_target_generation(&mut outcome);
-                                    v3_adapter::result(identity.clone(), outcome)
-                                }
-                                Err(_) => v3_adapter::error(identity.clone(), &error),
+                            let event = {
+                                let mut execution = self.execution_for_session(&session)?;
+                                command_rejection_event(&mut execution, identity.clone(), &error)
                             };
                             let send_result =
                                 send_command_result(&sender, event, &cancellation).await;
@@ -2472,6 +2462,25 @@ fn required_path(name: &'static str) -> Result<PathBuf, AgentError> {
 
 fn map_transport(error: TransportError) -> AgentError {
     AgentError::new(error.code(), error.to_string())
+}
+
+pub(crate) fn command_rejection_event(
+    execution: &mut CommandExecutor,
+    identity: v3::CommandIdentity,
+    error: &AgentError,
+) -> AgentControlEvent {
+    match v3_adapter::internal_task_identity(&identity) {
+        Ok(task) => {
+            let mut outcome = if error.code() == "command.payload_digest_conflict" {
+                execution.v3_payload_digest_conflict(&task)
+            } else {
+                execution.reject_v3_task(&task, error.code())
+            };
+            execution.stamp_target_generation(&mut outcome);
+            v3_adapter::result(identity, outcome)
+        }
+        Err(_) => v3_adapter::error(identity, error),
+    }
 }
 
 async fn send_command_result(

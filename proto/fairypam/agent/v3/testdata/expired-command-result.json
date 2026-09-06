@@ -1,0 +1,17 @@
+{
+  "outcome": 2,
+  "error_code": "transport.command_expired",
+  "receipt_version": 1,
+  "attempt_state": 3,
+  "last_command_outcome": 2,
+  "side_effect_state": 3,
+  "input_state": 1,
+  "capture_state": 1,
+  "managed_target_state": 2,
+  "cleanup_complete": false,
+  "source_frame_sequence": null,
+  "last_command_source_frame_sequence": null,
+  "target_generation": 1,
+  "receipt_error_code": "transport.command_expired",
+  "last_side_effect_command_id": "start-before-expiry"
+}

@@ -4971,6 +4971,139 @@ mod tests {
 
     static NEXT_TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn expired_capture_receipt_is_persisted_and_matches_hub_vector() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut executor, state) = executor_with_state();
+        executor.task_attempt = TaskAttemptRuntime::at(root.path().to_owned());
+        let (contract, reference) = v3_task_contract(&verified_profile());
+        assert!(matches!(
+            executor.execute_v3_begin(&task_ref(&reference, "begin-expiry"), &contract),
+            CommandOutcome::TaskAck { .. }
+        ));
+        let start = HubControlCommand {
+            payload: Some(hub_control_command::Payload::StartTaskTarget(
+                StartTaskTarget {
+                    task: Some(task_ref(&reference, "start-before-expiry")),
+                },
+            )),
+        };
+        assert!(matches!(
+            executor.execute(
+                &start,
+                &ExecutionSession::test(),
+                Arc::new(CollectFrames::default())
+            ),
+            CommandOutcome::TaskAck { .. }
+        ));
+        let mut task = task_ref(&reference, "expired-capture");
+        task.command.as_mut().unwrap().expires_at_unix_ms = 1;
+        let command_ref = task.command.as_ref().unwrap();
+        let session = command_ref.session.as_ref().unwrap();
+        let attempt = v3::AttemptRef {
+            task_run_id: contract.task_run_id.clone(),
+            attempt_id: contract.attempt_id.clone(),
+            contract_version: contract.contract_version,
+            contract_digest: contract.contract_digest.clone(),
+        };
+        task.payload_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&serde_json::json!({
+            "attempt": {
+                "task_run_id": attempt.task_run_id,
+                "attempt_id": attempt.attempt_id,
+                "contract_version": attempt.contract_version,
+                "contract_digest": attempt.contract_digest,
+            },
+            "kind": "fairypam.agent.v3.CaptureFrame",
+            "payload": {"capture_source_id": "client", "encoding": "jpeg", "quality": 85, "target_generation": 1},
+        })).unwrap()));
+        let identity = v3::CommandIdentity {
+            value: Some(v3::command_identity::Value::Task(v3::TaskCommandRef {
+                command: Some(v3::CommandRef {
+                    session: Some(v3::SessionRef {
+                        agent_id: session.agent_id.clone(),
+                        session_id: session.session_id.clone(),
+                        generation: session.generation,
+                    }),
+                    command_id: command_ref.command_id.clone(),
+                    sequence: command_ref.sequence,
+                    expires_at_unix_ms: 1,
+                    trace_context: None,
+                }),
+                attempt: Some(attempt),
+                payload_digest: task.payload_digest.clone(),
+            })),
+        };
+        let expired = v3::HubControlCommand {
+            payload: Some(v3::hub_control_command::Payload::CaptureFrame(
+                v3::CaptureFrame {
+                    reference: Some(identity.clone()),
+                    capture_source_id: "client".into(),
+                    encoding: "jpeg".into(),
+                    quality: 85,
+                    target_generation: 1,
+                },
+            )),
+        };
+        let error = crate::v3_adapter::Translator::new(1000)
+            .translate(&expired)
+            .unwrap_err();
+        let event =
+            crate::runtime::command_rejection_event(&mut executor, identity.clone(), &error);
+        let Some(v3::agent_control_event::Payload::CommandResult(result)) = event.payload else {
+            unreachable!()
+        };
+        assert_eq!(result.reference, Some(identity.clone()));
+        let receipt = result.attempt_receipt.unwrap();
+        let Some(v3::command_identity::Value::Task(wire_task)) = identity.value else {
+            unreachable!()
+        };
+        assert_eq!(receipt.last_command, Some(wire_task.clone()));
+        assert_eq!(receipt.attempt, wire_task.attempt);
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../proto/fairypam/agent/v3/testdata/expired-command-result.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::json!({
+                "outcome": result.outcome, "error_code": result.error_code,
+                "receipt_version": receipt.receipt_version, "attempt_state": receipt.attempt_state,
+                "last_command_outcome": receipt.last_command_outcome, "side_effect_state": receipt.side_effect_state,
+                "input_state": receipt.input_state, "capture_state": receipt.capture_state,
+                "managed_target_state": receipt.managed_target_state, "cleanup_complete": receipt.cleanup_complete,
+                "source_frame_sequence": result.source_frame_sequence,
+                "last_command_source_frame_sequence": receipt.last_command_source_frame_sequence,
+                "target_generation": receipt.target_generation,
+                "receipt_error_code": receipt.error_code,
+                "last_side_effect_command_id": receipt.last_side_effect_command_id,
+            }),
+            vector
+        );
+        let replay = TaskAttemptRuntime::at(root.path().to_owned())
+            .reject(&task, "different_error")
+            .unwrap();
+        assert_eq!(
+            replay.receipt.error_code.as_deref(),
+            Some("transport.command_expired")
+        );
+        assert_eq!(
+            executor.runtime_state().unwrap(),
+            v3::AgentRuntimeState::Executing
+        );
+        assert_eq!(state.lock().unwrap().single_capture_calls, 0);
+        assert!(!state.lock().unwrap().input_active);
+        let finish = HubControlCommand {
+            payload: Some(hub_control_command::Payload::FinishTaskAttempt(
+                FinishTaskAttempt {
+                    task: Some(task_ref(&reference, "finish-after-expiry")),
+                },
+            )),
+        };
+        assert!(matches!(
+            executor.execute(&finish, &ExecutionSession::test(), Arc::new(CollectFrames::default())),
+            CommandOutcome::TaskAck { ref receipt, .. } if receipt.cleanup_complete == Some(true)
+        ));
+    }
+
     fn task_ref(contract: &AgentAttemptContractV1, command_id: &str) -> TaskCommandRef {
         TaskCommandRef {
             command: Some(CommandRef {

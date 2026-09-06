@@ -143,17 +143,7 @@ impl ControlSession {
         let Some(reference) = command_ref(&verified.0) else {
             return Ok(Some(verified));
         };
-        let now_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(i64::MAX as u128) as i64;
-        verify_command_freshness(
-            reference,
-            self.last_sequence,
-            now_unix_ms,
-            task_identity(&verified.0),
-        )?;
+        verify_command_sequence(reference, self.last_sequence, task_identity(&verified.0))?;
         self.last_sequence = reference.sequence;
         Ok(Some(verified))
     }
@@ -447,10 +437,9 @@ fn task_identity(command: &HubControlCommand) -> bool {
     )
 }
 
-fn verify_command_freshness(
+fn verify_command_sequence(
     reference: &CommandRef,
     last_sequence: u64,
-    now_unix_ms: i64,
     allow_exact_task_replay: bool,
 ) -> Result<(), TransportError> {
     if reference.sequence < last_sequence
@@ -459,12 +448,6 @@ fn verify_command_freshness(
         return Err(TransportError::new(
             "transport.command_replayed",
             "Control command sequence is not strictly monotonic",
-        ));
-    }
-    if reference.expires_at_unix_ms <= now_unix_ms {
-        return Err(TransportError::new(
-            "transport.command_expired",
-            "Control command expired before execution",
         ));
     }
     Ok(())
@@ -620,22 +603,17 @@ mod v3_tests {
     }
 
     #[test]
-    fn command_freshness_is_monotonic_and_deadline_bound() {
+    fn command_sequence_is_monotonic_with_exact_task_replay() {
         let reference = command(2, 7);
         assert_eq!(
-            verify_command_freshness(&reference, 7, 0, false)
+            verify_command_sequence(&reference, 7, false)
                 .unwrap_err()
                 .code(),
             "transport.command_replayed"
         );
-        assert!(verify_command_freshness(&reference, 7, 0, true).is_ok());
+        assert!(verify_command_sequence(&reference, 7, true).is_ok());
         let mut expired = reference;
         expired.expires_at_unix_ms = 1;
-        assert_eq!(
-            verify_command_freshness(&expired, 6, 1, false)
-                .unwrap_err()
-                .code(),
-            "transport.command_expired"
-        );
+        assert!(verify_command_sequence(&expired, 6, false).is_ok());
     }
 }

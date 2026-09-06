@@ -5,8 +5,8 @@ use fairypam_agent_protocol::v3::agent_control_service_server::{
     AgentControlService, AgentControlServiceServer,
 };
 use fairypam_agent_protocol::v3::{
-    agent_control_event, hub_control_command, AgentControlEvent, AgentHello, HubControlCommand,
-    HubHello, SessionRef,
+    agent_control_event, command_identity, hub_control_command, AgentControlEvent, AgentHello,
+    CommandIdentity, CommandRef, HubControlCommand, HubHello, SessionRef, StopSession,
 };
 use fairypam_agent_transport::{
     connect_control, control_queue, open_control_tunnel, receive_hub_hello, TransportConfig,
@@ -59,6 +59,29 @@ impl AgentControlService for HelloService {
                 }))
                 .await
                 .expect("send HubHello");
+            for (sequence, expires_at_unix_ms) in [(1, 1), (2, i64::MAX)] {
+                sender
+                    .send(Ok(HubControlCommand {
+                        payload: Some(hub_control_command::Payload::StopSession(StopSession {
+                            reference: Some(CommandIdentity {
+                                value: Some(command_identity::Value::Command(CommandRef {
+                                    session: Some(SessionRef {
+                                        agent_id: AGENT_A.into(),
+                                        session_id: "session-1".into(),
+                                        generation: 1,
+                                    }),
+                                    command_id: format!("command-{sequence}"),
+                                    sequence,
+                                    expires_at_unix_ms,
+                                    trace_context: None,
+                                })),
+                            }),
+                            ..Default::default()
+                        })),
+                    }))
+                    .await
+                    .expect("send Control command");
+            }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
@@ -109,8 +132,20 @@ async fn control_mtls_is_agent_bound_and_independent_from_frame_availability() {
         .await
         .unwrap();
     let pending = open_control_tunnel(&connection, receiver).await.unwrap();
-    let session = receive_hub_hello(pending).await.unwrap();
+    let mut session = receive_hub_hello(pending).await.unwrap();
     assert_eq!(session.verified_session().agent_id(), AGENT_A);
+    for expected_sequence in [1, 2] {
+        let command = session.message().await.unwrap().unwrap().into_inner();
+        let Some(hub_control_command::Payload::StopSession(command)) = command.payload else {
+            panic!("expected StopSession");
+        };
+        let Some(command_identity::Value::Command(reference)) = command.reference.unwrap().value
+        else {
+            panic!("expected CommandRef");
+        };
+        assert_eq!(reference.sequence, expected_sequence);
+        assert_eq!(reference.session.unwrap().generation, 1);
+    }
 
     let wrong_identity = certificates.config(address.port(), AGENT_B);
     let error = connect_control(&wrong_identity).await.unwrap_err();
