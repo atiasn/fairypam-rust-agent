@@ -305,6 +305,7 @@ pub trait RuntimePlatform: Send {
         encoding: RuntimeCaptureEncoding,
     ) -> Result<Box<dyn RuntimeCapture>, AgentError>;
 
+    #[allow(clippy::too_many_arguments)]
     fn capture_once(
         &mut self,
         binding: &TargetBinding,
