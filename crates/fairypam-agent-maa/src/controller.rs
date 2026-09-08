@@ -16,6 +16,45 @@ pub struct CapturedFrame {
     pub bgr: Vec<u8>,
 }
 
+impl CapturedFrame {
+    /// Crop current MAA pixels before encoding; coordinates remain client-relative.
+    pub fn crop(
+        &self,
+        roi: (u32, u32, u32, u32),
+        canvas: (u32, u32),
+    ) -> Result<Self, MaaRuntimeError> {
+        let (x, y, width, height) = roi;
+        if canvas != (self.width, self.height)
+            || width == 0
+            || height == 0
+            || self.width > 8192
+            || self.height > 8192
+            || x.checked_add(width).is_none_or(|right| right > self.width)
+            || y.checked_add(height)
+                .is_none_or(|bottom| bottom > self.height)
+            || self.stride < self.width * 3
+            || self.bgr.len() != self.stride as usize * self.height as usize
+        {
+            return Err(MaaRuntimeError::new(
+                "capture.roi_invalid",
+                "ROI does not fit the current client frame",
+            ));
+        }
+        let stride = width * 3;
+        let mut bgr = Vec::with_capacity(stride as usize * height as usize);
+        for row in y..y + height {
+            let start = row as usize * self.stride as usize + x as usize * 3;
+            bgr.extend_from_slice(&self.bgr[start..start + stride as usize]);
+        }
+        Ok(Self {
+            width,
+            height,
+            stride,
+            bgr,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseButton {
     Left = 0,
@@ -104,6 +143,21 @@ pub fn run_compatibility_input_smoke(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn crop_preserves_current_pixels_and_rejects_wrong_canvas() {
+        let frame = super::CapturedFrame {
+            width: 4,
+            height: 3,
+            stride: 12,
+            bgr: (0..36).collect(),
+        };
+        let crop = frame.crop((1, 1, 2, 2), (4, 3)).unwrap();
+        assert_eq!((crop.width, crop.height, crop.stride), (2, 2, 6));
+        assert_eq!(crop.bgr, [15, 16, 17, 18, 19, 20, 27, 28, 29, 30, 31, 32]);
+        assert!(frame.crop((3, 0, 2, 2), (4, 3)).is_err());
+        assert!(frame.crop((1, 1, 2, 2), (8, 6)).is_err());
+        assert!(frame.crop((u32::MAX, 0, 2, 2), (4, 3)).is_err());
+    }
     use super::*;
 
     #[derive(Debug, PartialEq, Eq)]

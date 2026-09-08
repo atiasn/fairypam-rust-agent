@@ -775,6 +775,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         region: CaptureRegion,
         _fps: u32,
         encoding: RuntimeCaptureEncoding,
+        roi: Option<&fairypam_agent_protocol::internal_v1::CaptureRoi>,
         deadline: Instant,
     ) -> Result<RuntimeCapturedFrame, AgentError> {
         self.capture_telemetry.clear();
@@ -818,6 +819,14 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                         capture_source_id: source_id.to_owned(),
                         encoding: encoding.to_owned(),
                         quality,
+                        roi: roi.map(|roi| fairypam_agent_protocol::worker_v1::CaptureRoi {
+                            x: roi.x,
+                            y: roi.y,
+                            width: roi.width,
+                            height: roi.height,
+                            canvas_width: roi.canvas_width,
+                            canvas_height: roi.canvas_height,
+                        }),
                     }),
                     deadline,
                 );

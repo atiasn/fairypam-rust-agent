@@ -169,16 +169,18 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
                 "target_generation": value.target_generation,
             }),
         ),
-        Some(Payload::CaptureFrame(value)) => (
-            task(value.reference.as_ref())?,
-            "CaptureFrame",
-            serde_json::json!({
+        Some(Payload::CaptureFrame(value)) => (task(value.reference.as_ref())?, "CaptureFrame", {
+            let mut payload = serde_json::json!({
                 "capture_source_id": value.capture_source_id,
                 "encoding": value.encoding,
                 "quality": value.quality,
                 "target_generation": value.target_generation,
-            }),
-        ),
+            });
+            if let Some(roi) = &value.roi {
+                payload["roi"] = serde_json::json!({"x":roi.x,"y":roi.y,"width":roi.width,"height":roi.height,"canvas_width":roi.canvas_width,"canvas_height":roi.canvas_height});
+            }
+            payload
+        }),
         Some(Payload::StopCapture(value)) => (
             task(value.reference.as_ref())?,
             "StopCapture",

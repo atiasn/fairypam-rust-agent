@@ -465,6 +465,20 @@ fn translate(
             if value.capture_source_id.is_empty()
                 || value.encoding != "jpeg"
                 || !(1..=100).contains(&value.quality)
+                || value.roi.as_ref().is_some_and(|roi| {
+                    roi.width == 0
+                        || roi.height == 0
+                        || !(1..=8192).contains(&roi.canvas_width)
+                        || !(1..=8192).contains(&roi.canvas_height)
+                        || roi
+                            .x
+                            .checked_add(roi.width)
+                            .is_none_or(|end| end > roi.canvas_width)
+                        || roi
+                            .y
+                            .checked_add(roi.height)
+                            .is_none_or(|end| end > roi.canvas_height)
+                })
             {
                 return Err(AgentError::new(
                     "capture.command_invalid",
@@ -477,6 +491,14 @@ fn translate(
                 quality: value.quality,
                 task: task_command(value.reference.as_ref())?,
                 target_generation: value.target_generation,
+                roi: value.roi.as_ref().map(|roi| internal::CaptureRoi {
+                    x: roi.x,
+                    y: roi.y,
+                    width: roi.width,
+                    height: roi.height,
+                    canvas_width: roi.canvas_width,
+                    canvas_height: roi.canvas_height,
+                }),
                 ..internal::CaptureFrame::default()
             })
         }
@@ -1256,16 +1278,20 @@ mod tests {
                     "target_generation": value.target_generation,
                 }),
             ),
-            hub_control_command::Payload::CaptureFrame(value) => (
-                value.reference.as_ref().unwrap(),
-                "CaptureFrame",
-                serde_json::json!({
-                    "capture_source_id": value.capture_source_id,
-                    "encoding": value.encoding,
-                    "quality": value.quality,
-                    "target_generation": value.target_generation,
-                }),
-            ),
+            hub_control_command::Payload::CaptureFrame(value) => {
+                (value.reference.as_ref().unwrap(), "CaptureFrame", {
+                    let mut payload = serde_json::json!({
+                        "capture_source_id": value.capture_source_id,
+                        "encoding": value.encoding,
+                        "quality": value.quality,
+                        "target_generation": value.target_generation,
+                    });
+                    if let Some(roi) = &value.roi {
+                        payload["roi"] = serde_json::json!({"x":roi.x,"y":roi.y,"width":roi.width,"height":roi.height,"canvas_width":roi.canvas_width,"canvas_height":roi.canvas_height});
+                    }
+                    payload
+                })
+            }
             hub_control_command::Payload::StartRealtimeProgram(value) => (
                 value.reference.as_ref().unwrap(),
                 "StartRealtimeProgram",
@@ -1587,6 +1613,7 @@ mod tests {
                 ..Default::default()
             }),
             hub_control_command::Payload::CaptureFrame(wire::CaptureFrame {
+                roi: None,
                 reference: Some(expired),
                 capture_source_id: "client".into(),
                 encoding: "jpeg".into(),
@@ -1743,6 +1770,7 @@ mod tests {
             .translate(&with_digest(wire::HubControlCommand {
                 payload: Some(hub_control_command::Payload::CaptureFrame(
                     wire::CaptureFrame {
+                        roi: None,
                         reference: Some(task_identity(&contract, 2)),
                         capture_source_id: "client".into(),
                         encoding: "jpeg".into(),
@@ -1770,6 +1798,64 @@ mod tests {
     }
 
     #[test]
+    fn translator_binds_roi_and_rejects_out_of_canvas_capture() {
+        let contract = contract(vec![1, 3]);
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract);
+        let mut command = with_digest(wire::HubControlCommand {
+            payload: Some(hub_control_command::Payload::CaptureFrame(
+                wire::CaptureFrame {
+                    reference: Some(task_identity(&contract, 2)),
+                    capture_source_id: "client".into(),
+                    encoding: "jpeg".into(),
+                    quality: 85,
+                    target_generation: 1,
+                    roi: Some(wire::CaptureRoi {
+                        x: 80,
+                        y: 90,
+                        width: 40,
+                        height: 30,
+                        canvas_width: 1920,
+                        canvas_height: 1080,
+                    }),
+                },
+            )),
+        });
+        let translated = translator.translate(&command).unwrap();
+        assert!(matches!(
+            translated,
+            TranslatedCommand::Internal(internal::HubControlCommand {
+                payload: Some(internal::hub_control_command::Payload::CaptureFrame(
+                    internal::CaptureFrame {
+                        roi: Some(internal::CaptureRoi {
+                            x: 80,
+                            canvas_width: 1920,
+                            ..
+                        }),
+                        ..
+                    }
+                ))
+            })
+        ));
+        if let Some(hub_control_command::Payload::CaptureFrame(value)) = command.payload.as_mut() {
+            value.roi.as_mut().unwrap().x = u32::MAX;
+        }
+        assert_eq!(
+            translator.translate(&command).unwrap_err().code(),
+            "command.payload_digest_conflict"
+        );
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract);
+        assert_eq!(
+            translator
+                .translate(&with_digest(command))
+                .unwrap_err()
+                .code(),
+            "capture.command_invalid"
+        );
+    }
+
+    #[test]
     fn translator_rejects_invalid_single_frame_capture() {
         let contract = contract(vec![1, 3]);
         let mut translator = Translator::new(500);
@@ -1785,6 +1871,7 @@ mod tests {
                 .translate(&with_digest(wire::HubControlCommand {
                     payload: Some(hub_control_command::Payload::CaptureFrame(
                         wire::CaptureFrame {
+                            roi: None,
                             reference: Some(task_identity(&contract, sequence)),
                             capture_source_id: source.into(),
                             encoding: encoding.into(),

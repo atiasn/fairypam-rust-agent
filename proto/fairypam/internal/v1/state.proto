@@ -288,6 +288,15 @@ message StartCapture {
   uint64 target_generation = 7;
 }
 
+message CaptureRoi {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 canvas_width = 5;
+  uint32 canvas_height = 6;
+}
+
 message CaptureFrame {
   CommandRef command = 1;
   string source_id = 2;
@@ -295,6 +304,7 @@ message CaptureFrame {
   uint32 quality = 4;
   TaskCommandRef task = 5;
   uint64 target_generation = 6;
+  CaptureRoi roi = 7;
 }
 
 message StopCapture {

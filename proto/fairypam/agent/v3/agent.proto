@@ -434,12 +434,22 @@ message StartCapture {
   uint64 target_generation = 6;
 }
 
+message CaptureRoi {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 canvas_width = 5;
+  uint32 canvas_height = 6;
+}
+
 message CaptureFrame {
   CommandIdentity reference = 1;
   string capture_source_id = 2;
   string encoding = 3;
   uint32 quality = 4;
   uint64 target_generation = 5;
+  CaptureRoi roi = 6;
 }
 
 message StopCapture {
@@ -579,6 +589,7 @@ message FramePacket {
   AttemptRef attempt = 9;
   uint64 target_generation = 10;
   string backend = 11;
+  CaptureRoi roi = 12;
 }
 
 message FrameDirective {

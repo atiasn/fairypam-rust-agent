@@ -374,6 +374,7 @@ mod windows_impl {
                         &value.capture_source_id,
                         &value.encoding,
                         value.quality,
+                        value.roi.as_ref(),
                         deadline,
                     )?;
                     Ok(CommandResult::applied().frame(sequence))
@@ -635,6 +636,7 @@ mod windows_impl {
                             &controller,
                             &ring,
                             wire_encoding,
+                            None,
                             Instant::now() + CONTINUOUS_CAPTURE_TIMEOUT,
                         ) {
                             if let Ok(mut slot) = worker_error.lock() {
@@ -686,12 +688,13 @@ mod windows_impl {
             source_id: &str,
             encoding: &str,
             quality: u32,
+            roi: Option<&fairypam_agent_protocol::worker_v1::CaptureRoi>,
             deadline: Instant,
         ) -> Result<u64, MaaRuntimeError> {
             let wire_encoding = CaptureEncoding::parse(encoding, quality)?;
             self.lock_controller()?
                 .validate_capture_source(source_id, None, encoding)?;
-            capture_and_publish(&self.controller, &self.ring, wire_encoding, deadline)
+            capture_and_publish(&self.controller, &self.ring, wire_encoding, roi, deadline)
         }
 
         fn release_current_mode(&mut self) -> Result<(), MaaRuntimeError> {
@@ -1130,6 +1133,7 @@ mod windows_impl {
         controller: &Arc<Mutex<GenericController>>,
         ring: &Arc<Mutex<FrameRing>>,
         encoding: CaptureEncoding,
+        roi: Option<&fairypam_agent_protocol::worker_v1::CaptureRoi>,
         deadline: Instant,
     ) -> Result<u64, MaaRuntimeError> {
         let (sequence, frame) = controller
@@ -1142,6 +1146,13 @@ mod windows_impl {
             })?
             .capture_once(deadline)?;
         let captured_at = unix_us();
+        let frame = match roi {
+            Some(roi) => frame.crop(
+                (roi.x, roi.y, roi.width, roi.height),
+                (roi.canvas_width, roi.canvas_height),
+            )?,
+            None => frame,
+        };
         let (payload, wire_encoding) = encode_frame(&frame, encoding)?;
         ring.lock()
             .map_err(|_| {

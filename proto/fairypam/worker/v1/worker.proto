@@ -137,10 +137,20 @@ message StartGenericCapture {
   uint32 quality = 4;
 }
 
+message CaptureRoi {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 canvas_width = 5;
+  uint32 canvas_height = 6;
+}
+
 message CaptureOnce {
   string capture_source_id = 1;
   string encoding = 2;
   uint32 quality = 3;
+  CaptureRoi roi = 4;
 }
 
 message StopGenericCapture { string capture_source_id = 1; }

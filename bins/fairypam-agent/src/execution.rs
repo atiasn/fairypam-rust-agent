@@ -312,8 +312,15 @@ pub trait RuntimePlatform: Send {
         region: CaptureRegion,
         fps: u32,
         encoding: RuntimeCaptureEncoding,
+        roi: Option<&fairypam_agent_protocol::internal_v1::CaptureRoi>,
         deadline: Instant,
     ) -> Result<RuntimeCapturedFrame, AgentError> {
+        if roi.is_some() {
+            return Err(AgentError::new(
+                "capture.region_unsupported",
+                "ROI capture is not supported by this platform",
+            ));
+        }
         self.start_capture(binding, source_id, region, fps, encoding)?
             .next_frame(deadline)
     }
@@ -1874,6 +1881,7 @@ impl CommandExecutor {
                         region,
                         source.maximum_fps.min(60),
                         encoding,
+                        value.roi.as_ref(),
                         command_deadline,
                     );
                     self.command_telemetry_attributes = self.platform.take_capture_telemetry();
@@ -1888,6 +1896,14 @@ impl CommandExecutor {
                             return Err(error);
                         }
                     };
+                    if let Some(roi) = &value.roi {
+                        if frame.width != roi.width || frame.height != roi.height {
+                            return Err(AgentError::new(
+                                "capture.roi_mismatch",
+                                "Worker returned a different capture region",
+                            ));
+                        }
+                    }
                     let frame_sequence = Arc::clone(
                         self.frame_sequences
                             .entry(frame_sequence_key(&value.source_id, Some(&attempt)))
@@ -1922,6 +1938,14 @@ impl CommandExecutor {
                         }),
                         target_generation: self.target_generation,
                         backend: frame.backend,
+                        roi: value.roi.as_ref().map(|roi| v3::CaptureRoi {
+                            x: roi.x,
+                            y: roi.y,
+                            width: roi.width,
+                            height: roi.height,
+                            canvas_width: roi.canvas_width,
+                            canvas_height: roi.canvas_height,
+                        }),
                     });
                     self.command_telemetry_attributes.push(telemetry_int(
                         "capture.frame_enqueue_us",
@@ -2637,6 +2661,7 @@ fn spawn_capture_worker(
                             }),
                             target_generation: plan.target_generation,
                             backend: frame.backend,
+                            roi: None,
                         };
                         if let Err(error) = frames.publish(packet) {
                             tracing::error!(code = error.code(), %error, "frame publish failed");
@@ -3885,6 +3910,7 @@ pub(crate) mod tests {
             _region: CaptureRegion,
             _fps: u32,
             _encoding: RuntimeCaptureEncoding,
+            _roi: Option<&fairypam_agent_protocol::internal_v1::CaptureRoi>,
             deadline: Instant,
         ) -> Result<RuntimeCapturedFrame, AgentError> {
             let mut state = self.state.lock().unwrap();
@@ -5038,6 +5064,7 @@ pub(crate) mod tests {
         let expired = v3::HubControlCommand {
             payload: Some(v3::hub_control_command::Payload::CaptureFrame(
                 v3::CaptureFrame {
+                    roi: None,
                     reference: Some(identity.clone()),
                     capture_source_id: "client".into(),
                     encoding: "jpeg".into(),
