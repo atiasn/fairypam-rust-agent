@@ -747,6 +747,9 @@ impl Translator {
             || value.wheel_y_ppm.is_some_and(|value| value > 1_000_000)
             || (value.wheel_x_ppm.is_some() && value.wheel_delta == 0)
             || (value.wheel_delta == 0) != value.wheel_action_id.is_empty()
+            || value.relative_move.as_ref().is_some_and(|relative| {
+                relative.action_id.is_empty() || value.source_frame_sequence.is_none()
+            })
             || value.target_generation == 0
         {
             return Err(AgentError::new(
@@ -763,6 +766,7 @@ impl Translator {
         let capabilities = [
             (!value.held_action_ids.is_empty(), 4),
             (value.wheel_delta != 0, 6),
+            (value.relative_move.is_some(), 7),
         ];
         if capabilities.iter().all(|(used, _)| !used) {
             if ![4, 5, 6]
@@ -1236,6 +1240,13 @@ mod tests {
                 if let Some(y_ppm) = value.wheel_y_ppm {
                     payload["wheel_y_ppm"] = y_ppm.into();
                 }
+                if let Some(relative) = &value.relative_move {
+                    payload["relative_move"] = serde_json::json!({
+                        "action_id": relative.action_id,
+                        "dx": relative.dx,
+                        "dy": relative.dy,
+                    });
+                }
                 (value.reference.as_ref().unwrap(), "InputFrame", payload)
             }
             hub_control_command::Payload::ClientPointClick(value) => (
@@ -1571,6 +1582,7 @@ mod tests {
                 wheel_x_ppm: Some(500_000),
                 wheel_y_ppm: Some(500_000),
                 target_generation: 1,
+                relative_move: None,
             })),
         });
 
@@ -1582,6 +1594,57 @@ mod tests {
         assert_eq!(frame.wheel_action_id, "inventory.scroll");
         assert_eq!(frame.source_frame_sequence, Some(7));
         assert_eq!(frame.target_generation, 1);
+    }
+
+    #[test]
+    fn relative_move_requires_capability_and_source_before_consuming_sequence() {
+        for allowed in [vec![1, 4], vec![1, 4, 7]] {
+            let contract = contract(allowed.clone());
+            let mut translator = Translator::new(500);
+            accept_begin(&mut translator, &contract);
+            let mut frame = wire::InputFrame {
+                reference: Some(task_identity(&contract, 2)),
+                input_sequence: 1,
+                lease_ms: 250,
+                target_generation: 1,
+                held_action_ids: vec!["movement.forward".into()],
+                source_frame_sequence: Some(7),
+                relative_move: Some(wire::RelativeMove {
+                    action_id: "camera.turn".into(),
+                    dx: -120,
+                    dy: 20,
+                }),
+                ..Default::default()
+            };
+            let command = |frame| {
+                with_digest(wire::HubControlCommand {
+                    payload: Some(hub_control_command::Payload::InputFrame(frame)),
+                })
+            };
+            if !allowed.contains(&7) {
+                assert_eq!(
+                    translator.translate(&command(frame)).unwrap_err().code(),
+                    "task.capability_denied"
+                );
+                assert_eq!(translator.last_input_sequence, 0);
+                continue;
+            }
+            frame.source_frame_sequence = None;
+            assert_eq!(
+                translator
+                    .translate(&command(frame.clone()))
+                    .unwrap_err()
+                    .code(),
+                "input.frame_invalid"
+            );
+            assert_eq!(translator.last_input_sequence, 0);
+            frame.reference = Some(task_identity(&contract, 3));
+            frame.source_frame_sequence = Some(7);
+            assert!(
+                matches!(translator.translate(&command(frame)).unwrap(), TranslatedCommand::InputFrame { frame, .. }
+                if frame.relative_move.as_ref().unwrap().dx == -120)
+            );
+        }
     }
 
     #[test]

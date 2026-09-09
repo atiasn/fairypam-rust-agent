@@ -509,10 +509,16 @@ mod v3_tests {
             accepted_protocol_minor: fairypam_agent_protocol::AGENT_PROTOCOL_MINOR + 1,
         };
 
-        assert_eq!(
-            verify_hub_hello(hello, "agent-a").unwrap_err().code(),
-            "transport.session_invalid"
-        );
+        for accepted_protocol_minor in [0, fairypam_agent_protocol::AGENT_PROTOCOL_MINOR + 1] {
+            let rejected = HubHello {
+                accepted_protocol_minor,
+                ..hello.clone()
+            };
+            assert_eq!(
+                verify_hub_hello(rejected, "agent-a").unwrap_err().code(),
+                "transport.session_invalid"
+            );
+        }
     }
 
     #[test]

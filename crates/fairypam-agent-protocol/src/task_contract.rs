@@ -232,6 +232,13 @@ pub fn verify_task_command_digest(command: &HubControlCommand) -> Result<(), Con
             if let Some(y_ppm) = value.wheel_y_ppm {
                 payload["wheel_y_ppm"] = serde_json::json!(y_ppm);
             }
+            if let Some(relative) = &value.relative_move {
+                payload["relative_move"] = serde_json::json!({
+                    "action_id": relative.action_id,
+                    "dx": relative.dx,
+                    "dy": relative.dy,
+                });
+            }
             (task(value.reference.as_ref())?, "InputFrame", payload)
         }
         Some(Payload::ClientPointClick(value)) => (
@@ -455,6 +462,88 @@ mod tests {
             verify_execution_contract(&contract).unwrap_err().code(),
             "task.contract_value_invalid"
         );
+    }
+
+    #[test]
+    fn shared_input_vectors_verify_old_and_relative_move_payloads() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../proto/fairypam/agent/v3/testdata/task-command-vectors.json"
+        ))
+        .unwrap();
+        for vector in vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["kind"] == "InputFrame")
+        {
+            let canonical: serde_json::Value =
+                serde_json::from_str(vector["canonical_json"].as_str().unwrap()).unwrap();
+            let payload = &canonical["payload"];
+            let attempt = &canonical["attempt"];
+            let relative_move =
+                payload
+                    .get("relative_move")
+                    .map(|relative| crate::v3::RelativeMove {
+                        action_id: relative["action_id"].as_str().unwrap().into(),
+                        dx: relative["dx"].as_i64().unwrap() as i32,
+                        dy: relative["dy"].as_i64().unwrap() as i32,
+                    });
+            let frame = crate::v3::InputFrame {
+                reference: Some(crate::v3::CommandIdentity {
+                    value: Some(crate::v3::command_identity::Value::Task(
+                        crate::v3::TaskCommandRef {
+                            attempt: Some(crate::v3::AttemptRef {
+                                attempt_id: attempt["attempt_id"].as_str().unwrap().into(),
+                                task_run_id: attempt["task_run_id"].as_str().unwrap().into(),
+                                contract_digest: attempt["contract_digest"]
+                                    .as_str()
+                                    .unwrap()
+                                    .into(),
+                                contract_version: attempt["contract_version"].as_u64().unwrap()
+                                    as u32,
+                            }),
+                            payload_digest: vector["sha256"].as_str().unwrap().into(),
+                            ..Default::default()
+                        },
+                    )),
+                }),
+                held_action_ids: payload["held_action_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().into())
+                    .collect(),
+                input_sequence: payload["input_sequence"].as_u64().unwrap(),
+                lease_ms: payload["lease_ms"].as_u64().unwrap() as u32,
+                target_generation: payload["target_generation"].as_u64().unwrap(),
+                wheel_action_id: payload["wheel_action_id"].as_str().unwrap().into(),
+                wheel_delta: payload["wheel_delta"].as_i64().unwrap() as i32,
+                source_frame_sequence: payload
+                    .get("source_frame_sequence")
+                    .map(|v| v.as_u64().unwrap()),
+                wheel_x_ppm: payload
+                    .get("wheel_x_ppm")
+                    .map(|v| v.as_u64().unwrap() as u32),
+                wheel_y_ppm: payload
+                    .get("wheel_y_ppm")
+                    .map(|v| v.as_u64().unwrap() as u32),
+                relative_move,
+            };
+            let mut command = HubControlCommand {
+                payload: Some(hub_control_command::Payload::InputFrame(frame)),
+            };
+            verify_task_command_digest(&command).unwrap();
+            if let Some(hub_control_command::Payload::InputFrame(frame)) = command.payload.as_mut()
+            {
+                if let Some(relative) = frame.relative_move.as_mut() {
+                    relative.dx += 1;
+                    assert_eq!(
+                        verify_task_command_digest(&command).unwrap_err().code(),
+                        "command.payload_digest_conflict"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

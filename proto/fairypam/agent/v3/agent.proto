@@ -521,6 +521,12 @@ message RealtimeProgramMetrics {
   string metrics_digest = 16;
 }
 
+message RelativeMove {
+  string action_id = 1;
+  sint32 dx = 2;
+  sint32 dy = 3;
+}
+
 message InputFrame {
   CommandIdentity reference = 1;
   uint64 input_sequence = 2;
@@ -532,6 +538,7 @@ message InputFrame {
   optional uint32 wheel_x_ppm = 8;
   optional uint32 wheel_y_ppm = 9;
   uint64 target_generation = 10;
+  RelativeMove relative_move = 11;
 }
 
 message ClientPointClick {

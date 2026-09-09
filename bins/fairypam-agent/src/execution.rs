@@ -393,6 +393,7 @@ pub trait RuntimePlatform: Send {
         wheel_delta: i32,
         wheel_point: Option<(u32, u32)>,
         source_frame: Option<(&AtomicU64, u64)>,
+        relative_move: Option<&v3::RelativeMove>,
         client_point: Option<(&str, u32, u32)>,
         client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
     ) -> Result<bool, AgentError>;
@@ -1097,6 +1098,16 @@ impl CommandExecutor {
             } else {
                 None
             };
+            if frame.relative_move.is_some() {
+                let profile_id = self.task_attempt.profile_id(task)?;
+                let profile = self.profiles.get(&profile_id)?;
+                if let Err(error) = self
+                    .require_target_generation(frame.target_generation)
+                    .and_then(|_| validate_relative_move(profile, frame))
+                {
+                    return Ok(self.reject_v3_task(task, error.code()));
+                }
+            }
             if let Some(result) = self.task_attempt.prepare(task, true)? {
                 return Ok(CommandOutcome::task(result));
             }
@@ -1130,6 +1141,7 @@ impl CommandExecutor {
                         source_frame
                             .as_ref()
                             .map(|(current, expected)| (current.as_ref(), *expected)),
+                        frame.relative_move.as_ref(),
                         client_point,
                         client_swipe,
                     )
@@ -2435,6 +2447,7 @@ impl CommandExecutor {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .and_then(|_| {
                     self.platform.apply_task_input_frame(
@@ -2447,6 +2460,7 @@ impl CommandExecutor {
                         &[],
                         "",
                         0,
+                        None,
                         None,
                         None,
                         None,
@@ -2529,6 +2543,33 @@ fn execution_safety_event(
             state: "recovery_blocked".to_owned(),
             attempt,
         })),
+    }
+}
+
+fn validate_relative_move(
+    profile: &VerifiedProfile,
+    frame: &v3::InputFrame,
+) -> Result<(), AgentError> {
+    let Some(relative) = &frame.relative_move else {
+        return Ok(());
+    };
+    // Validate the complete transient action before changing any held key state.
+    if frame
+        .source_frame_sequence
+        .is_some_and(|sequence| sequence > 0)
+        && matches!(
+            profile.profile().actions.get(&relative.action_id),
+            Some(ActionDefinition::RelativeMouse { maximum_delta })
+                if relative.dx.unsigned_abs() <= *maximum_delta as u32
+                    && relative.dy.unsigned_abs() <= *maximum_delta as u32
+        )
+    {
+        Ok(())
+    } else {
+        Err(AgentError::new(
+            "input.frame_invalid",
+            "relative move requires a current frame and a signed RelativeMouse action within its delta limit",
+        ))
     }
 }
 
@@ -2863,6 +2904,7 @@ impl RuntimePlatform for UnsupportedPlatform {
         _wheel_delta: i32,
         _wheel_point: Option<(u32, u32)>,
         _source_frame: Option<(&AtomicU64, u64)>,
+        _relative_move: Option<&v3::RelativeMove>,
         _client_point: Option<(&str, u32, u32)>,
         _client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
     ) -> Result<bool, AgentError> {
@@ -3426,6 +3468,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         _wheel_delta: i32,
         _wheel_point: Option<(u32, u32)>,
         _source_frame: Option<(&AtomicU64, u64)>,
+        _relative_move: Option<&v3::RelativeMove>,
         _client_point: Option<(&str, u32, u32)>,
         _client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
     ) -> Result<bool, AgentError> {
@@ -3575,6 +3618,10 @@ pub(crate) mod tests {
                     encodings: vec!["jpeg".into()],
                 }],
                 actions: BTreeMap::from([
+                    (
+                        "camera.turn".into(),
+                        ActionDefinition::RelativeMouse { maximum_delta: 200 },
+                    ),
                     (
                         "move.forward".into(),
                         ActionDefinition::Hold {
@@ -3781,6 +3828,7 @@ pub(crate) mod tests {
         input_active: bool,
         pulse_calls: Vec<String>,
         point_clicks: usize,
+        relative_moves: Vec<(i32, i32)>,
         advance_source_before_click: bool,
         begin_monitor_calls: usize,
         finish_monitor_calls: usize,
@@ -4013,6 +4061,7 @@ pub(crate) mod tests {
             _wheel_delta: i32,
             _wheel_point: Option<(u32, u32)>,
             source_frame: Option<(&AtomicU64, u64)>,
+            relative_move: Option<&v3::RelativeMove>,
             client_point: Option<(&str, u32, u32)>,
             client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
         ) -> Result<bool, AgentError> {
@@ -4038,6 +4087,9 @@ pub(crate) mod tests {
             ensure_current_source_frame(source_frame)?;
             state.point_clicks += usize::from(client_point.is_some());
             state.point_clicks += usize::from(client_swipe.is_some());
+            if let Some(relative) = relative_move {
+                state.relative_moves.push((relative.dx, relative.dy));
+            }
             Ok(holds_active)
         }
 
@@ -4609,6 +4661,116 @@ pub(crate) mod tests {
             CommandOutcome::TaskAck { .. }
         ));
         assert!(!executor.managed_game_released().unwrap());
+    }
+
+    #[test]
+    fn relative_move_is_one_shot_and_lease_renewal_does_not_repeat_it() {
+        let profile = verified_profile();
+        let (contract, reference) = v3_task_contract(&profile);
+        let (mut executor, state) = executor_with_state();
+        executor.execute_v3_begin(&task_ref(&reference, "begin"), &contract);
+        executor.set_binding(Some(binding())).unwrap();
+        let command = task_ref(&reference, "turn");
+        executor.frame_sequences.insert(
+            frame_sequence_key("client", command.attempt.as_ref()),
+            Arc::new(AtomicU64::new(7)),
+        );
+        let frame = v3::InputFrame {
+            input_sequence: 1,
+            lease_ms: 500,
+            held_action_ids: vec!["move.forward".into()],
+            target_generation: 1,
+            source_frame_sequence: Some(7),
+            relative_move: Some(v3::RelativeMove {
+                action_id: "camera.turn".into(),
+                dx: -120,
+                dy: 20,
+            }),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                executor.execute_v3_input_frame(&command, &frame, None, None),
+                CommandOutcome::TaskAck { outcome: Some(outcome), .. }
+                    if outcome.outcome == TaskCommandOutcomeState::Applied as i32
+            ));
+        }
+        let renewal = v3::InputFrame {
+            input_sequence: 2,
+            relative_move: None,
+            ..frame.clone()
+        };
+        executor.execute_v3_input_frame(&task_ref(&reference, "renew"), &renewal, None, None);
+        assert_eq!(state.lock().unwrap().relative_moves, [(-120, 20)]);
+        assert!(state.lock().unwrap().input_active);
+
+        let mut invalid = frame.clone();
+        invalid.relative_move.as_mut().unwrap().dx = 201;
+        for command_id in ["invalid-turn", "stale-target-turn"] {
+            assert!(matches!(
+                executor.execute_v3_input_frame(&task_ref(&reference, command_id), &invalid, None, None),
+                CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
+                    if outcome.outcome == TaskCommandOutcomeState::NotApplied as i32
+                        && receipt.input_state == TaskInputState::Active as i32
+            ));
+            invalid.relative_move.as_mut().unwrap().dx = 120;
+            invalid.target_generation = 2;
+        }
+        assert!(state.lock().unwrap().input_active);
+
+        let uncertain = task_ref(&reference, "uncertain-turn");
+        state.lock().unwrap().input_frame_error = Some(AgentError::new(
+            "worker.side_effect_uncertain",
+            "response missing",
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                executor.execute_v3_input_frame(&uncertain, &frame, None, None),
+                CommandOutcome::TaskAck { outcome: Some(outcome), .. }
+                    if outcome.outcome == TaskCommandOutcomeState::Uncertain as i32
+            ));
+        }
+        assert_eq!(state.lock().unwrap().relative_moves, [(-120, 20)]);
+    }
+
+    #[test]
+    fn invalid_relative_move_never_changes_held_keys() {
+        // Each case isolates an independent signed-action or frame-identity boundary.
+        for (action_id, dx, source) in [
+            ("unsigned", 1, Some(7)),
+            ("move.forward", 1, Some(7)),
+            ("camera.turn", i32::MIN, Some(7)),
+            ("camera.turn", 1, None),
+            ("camera.turn", 1, Some(6)),
+        ] {
+            let (contract, reference) = v3_task_contract(&verified_profile());
+            let (mut executor, state) = executor_with_state();
+            executor.execute_v3_begin(&task_ref(&reference, "begin"), &contract);
+            executor.set_binding(Some(binding())).unwrap();
+            let command = task_ref(&reference, "invalid-turn");
+            executor.frame_sequences.insert(
+                frame_sequence_key("client", command.attempt.as_ref()),
+                Arc::new(AtomicU64::new(7)),
+            );
+            let frame = v3::InputFrame {
+                input_sequence: 1,
+                lease_ms: 500,
+                target_generation: 1,
+                held_action_ids: vec!["move.forward".into()],
+                source_frame_sequence: source,
+                relative_move: Some(v3::RelativeMove {
+                    action_id: action_id.into(),
+                    dx,
+                    dy: 0,
+                }),
+                ..Default::default()
+            };
+            assert!(!outcome_applied(
+                &executor.execute_v3_input_frame(&command, &frame, None, None)
+            ));
+            assert!(!state.lock().unwrap().input_active);
+            assert!(state.lock().unwrap().relative_moves.is_empty());
+        }
     }
 
     #[test]
