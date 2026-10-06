@@ -748,7 +748,10 @@ impl Translator {
             || (value.wheel_x_ppm.is_some() && value.wheel_delta == 0)
             || (value.wheel_delta == 0) != value.wheel_action_id.is_empty()
             || value.relative_move.as_ref().is_some_and(|relative| {
-                relative.action_id.is_empty() || value.source_frame_sequence.is_none()
+                value.source_frame_sequence.is_none()
+                    || !canonical_action_ids(std::slice::from_ref(&relative.action_id))
+                    || relative.dx.unsigned_abs() > 1_000
+                    || relative.dy.unsigned_abs() > 1_000
             })
             || value.target_generation == 0
         {
@@ -769,7 +772,7 @@ impl Translator {
             (value.relative_move.is_some(), 7),
         ];
         if capabilities.iter().all(|(used, _)| !used) {
-            if ![4, 5, 6]
+            if ![4, 5, 6, 7]
                 .iter()
                 .any(|capability| contract.allowed_capabilities.contains(capability))
             {
@@ -1240,7 +1243,7 @@ mod tests {
                 if let Some(y_ppm) = value.wheel_y_ppm {
                     payload["wheel_y_ppm"] = y_ppm.into();
                 }
-                if let Some(relative) = &value.relative_move {
+                if let Some(relative) = value.relative_move.as_ref() {
                     payload["relative_move"] = serde_json::json!({
                         "action_id": relative.action_id,
                         "dx": relative.dx,
@@ -1597,54 +1600,107 @@ mod tests {
     }
 
     #[test]
-    fn relative_move_requires_capability_and_source_before_consuming_sequence() {
-        for allowed in [vec![1, 4], vec![1, 4, 7]] {
-            let contract = contract(allowed.clone());
+    fn translator_preserves_relative_move_and_requires_its_capability() {
+        for capabilities in [vec![1, 7], vec![1, 4]] {
+            let contract = contract(capabilities.clone());
             let mut translator = Translator::new(500);
             accept_begin(&mut translator, &contract);
-            let mut frame = wire::InputFrame {
-                reference: Some(task_identity(&contract, 2)),
-                input_sequence: 1,
-                lease_ms: 250,
-                target_generation: 1,
-                held_action_ids: vec!["movement.forward".into()],
-                source_frame_sequence: Some(7),
-                relative_move: Some(wire::RelativeMove {
-                    action_id: "camera.turn".into(),
-                    dx: -120,
-                    dy: 20,
-                }),
-                ..Default::default()
+            let relative = wire::RelativeMove {
+                action_id: "nav.camera_relative".into(),
+                dx: -120,
+                dy: 40,
             };
-            let command = |frame| {
-                with_digest(wire::HubControlCommand {
-                    payload: Some(hub_control_command::Payload::InputFrame(frame)),
-                })
-            };
-            if !allowed.contains(&7) {
+            let command = with_digest(wire::HubControlCommand {
+                payload: Some(hub_control_command::Payload::InputFrame(wire::InputFrame {
+                    reference: Some(task_identity(&contract, 2)),
+                    input_sequence: 1,
+                    lease_ms: 250,
+                    source_frame_sequence: Some(7),
+                    target_generation: 1,
+                    relative_move: Some(relative.clone()),
+                    ..wire::InputFrame::default()
+                })),
+            });
+            if capabilities.contains(&7) {
+                let TranslatedCommand::InputFrame { frame, .. } =
+                    translator.translate(&command).unwrap()
+                else {
+                    panic!("relative InputFrame was not preserved");
+                };
+                assert_eq!(frame.relative_move, Some(relative));
+            } else {
                 assert_eq!(
-                    translator.translate(&command(frame)).unwrap_err().code(),
+                    translator.translate(&command).unwrap_err().code(),
                     "task.capability_denied"
                 );
                 assert_eq!(translator.last_input_sequence, 0);
-                continue;
             }
-            frame.source_frame_sequence = None;
+        }
+    }
+
+    #[test]
+    fn relative_input_rejects_invalid_frame_binding_and_digest_tampering() {
+        let contract = contract(vec![1, 7]);
+        let frame = wire::InputFrame {
+            reference: Some(task_identity(&contract, 2)),
+            input_sequence: 1,
+            lease_ms: 250,
+            source_frame_sequence: Some(7),
+            target_generation: 1,
+            relative_move: Some(wire::RelativeMove {
+                action_id: "nav.camera_relative".into(),
+                dx: -120,
+                dy: 0,
+            }),
+            ..wire::InputFrame::default()
+        };
+        let mut invalid = Vec::new();
+        let mut missing_frame = frame.clone();
+        missing_frame.source_frame_sequence = None;
+        invalid.push(missing_frame);
+        let mut zero_frame = frame.clone();
+        zero_frame.source_frame_sequence = Some(0);
+        invalid.push(zero_frame);
+        let mut missing_generation = frame.clone();
+        missing_generation.target_generation = 0;
+        invalid.push(missing_generation);
+        let mut out_of_bounds = frame.clone();
+        out_of_bounds.relative_move.as_mut().unwrap().dx = i32::MIN;
+        invalid.push(out_of_bounds);
+        let mut missing_action = frame.clone();
+        missing_action
+            .relative_move
+            .as_mut()
+            .unwrap()
+            .action_id
+            .clear();
+        invalid.push(missing_action);
+        for frame in invalid {
+            let mut translator = Translator::new(500);
+            accept_begin(&mut translator, &contract);
+            let command = with_digest(wire::HubControlCommand {
+                payload: Some(hub_control_command::Payload::InputFrame(frame)),
+            });
             assert_eq!(
-                translator
-                    .translate(&command(frame.clone()))
-                    .unwrap_err()
-                    .code(),
+                translator.translate(&command).unwrap_err().code(),
                 "input.frame_invalid"
             );
             assert_eq!(translator.last_input_sequence, 0);
-            frame.reference = Some(task_identity(&contract, 3));
-            frame.source_frame_sequence = Some(7);
-            assert!(
-                matches!(translator.translate(&command(frame)).unwrap(), TranslatedCommand::InputFrame { frame, .. }
-                if frame.relative_move.as_ref().unwrap().dx == -120)
-            );
         }
+        let mut translator = Translator::new(500);
+        accept_begin(&mut translator, &contract);
+        let mut command = with_digest(wire::HubControlCommand {
+            payload: Some(hub_control_command::Payload::InputFrame(frame)),
+        });
+        let Some(hub_control_command::Payload::InputFrame(frame)) = command.payload.as_mut() else {
+            unreachable!()
+        };
+        frame.relative_move.as_mut().unwrap().dx += 1;
+        assert_eq!(
+            translator.translate(&command).unwrap_err().code(),
+            "command.payload_digest_conflict"
+        );
+        assert_eq!(translator.last_input_sequence, 0);
     }
 
     #[test]

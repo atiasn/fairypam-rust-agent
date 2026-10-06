@@ -25,8 +25,8 @@ use fairypam_agent_protocol::worker_v1::{
 
 use super::{
     elapsed_us, ensure_current_source_frame, now_unix_us, telemetry_int, telemetry_string,
-    RuntimeCapture, RuntimeCaptureEncoding, RuntimeCapturedFrame, RuntimePlatform, SourceFrameMap,
-    WindowsRuntimePlatform,
+    validate_frame_relative_move, RuntimeCapture, RuntimeCaptureEncoding, RuntimeCapturedFrame,
+    RuntimePlatform, SourceFrameMap, WindowsRuntimePlatform,
 };
 use crate::profile_store::ProfileStore;
 
@@ -1075,10 +1075,17 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         wheel_delta: i32,
         wheel_point: Option<(u32, u32)>,
         source_frame: Option<(&AtomicU64, u64)>,
-        relative_move: Option<&fairypam_agent_protocol::v3::RelativeMove>,
         client_point: Option<(&str, u32, u32)>,
         client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
+        relative_move: Option<&fairypam_agent_protocol::v3::RelativeMove>,
     ) -> Result<bool, AgentError> {
+        validate_frame_relative_move(profile, relative_move)?;
+        if relative_move.is_some() && source_frame.is_none() {
+            return Err(AgentError::new(
+                "input.frame_invalid",
+                "relative movement requires a source frame",
+            ));
+        }
         if expires_at <= Instant::now() {
             return Err(AgentError::new(
                 "input_lease_expired",
@@ -1100,17 +1107,14 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         self.require_session(session)?;
         self.input_expires_at = Some(expires_at);
         ensure_current_source_frame(source_frame)?;
-        let runtime_source_frame = if wheel_delta != 0
-            || relative_move.is_some()
-            || client_point.is_some()
-            || client_swipe.is_some()
-        {
-            source_frame
-                .map(|(_, sequence)| self.runtime_source_frame(sequence))
-                .transpose()?
-        } else {
-            None
-        };
+        let runtime_source_frame =
+            if wheel_delta != 0 || client_point.is_some() || client_swipe.is_some() {
+                source_frame
+                    .map(|(_, sequence)| self.runtime_source_frame(sequence))
+                    .transpose()?
+            } else {
+                None
+            };
         let (key_plan, requested) = input_frame_key_plan(
             &profile.profile().actions,
             &self.held_actions,
@@ -1137,24 +1141,6 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             }
         }
         debug_assert_eq!(self.held_actions, requested);
-        if let Some(relative) = relative_move {
-            if let Err(error) = ensure_current_source_frame(source_frame) {
-                return Err(if applied_any {
-                    self.mark_uncertain(error)
-                } else {
-                    error
-                });
-            }
-            self.request_in_sequence(
-                worker_request::Payload::GenericRelativeMove(GenericRelativeMove {
-                    action_id: relative.action_id.clone(),
-                    dx: relative.dx,
-                    dy: relative.dy,
-                }),
-                command_deadline,
-                &mut applied_any,
-            )?;
-        }
         if wheel_delta != 0 {
             self.request_in_sequence(
                 worker_request::Payload::GenericScroll(GenericScroll {
@@ -1200,6 +1186,24 @@ impl RuntimePlatform for WorkerRuntimePlatform {
                     source_frame_sequence,
                 }),
                 command_deadline,
+                &mut applied_any,
+            )?;
+        }
+        if let Some(relative) = relative_move {
+            if let Err(error) = ensure_current_source_frame(source_frame) {
+                return Err(if applied_any {
+                    self.mark_uncertain(error)
+                } else {
+                    error
+                });
+            }
+            self.request_in_sequence(
+                worker_request::Payload::GenericRelativeMove(GenericRelativeMove {
+                    action_id: relative.action_id.clone(),
+                    dx: relative.dx,
+                    dy: relative.dy,
+                }),
+                command_deadline.min(expires_at),
                 &mut applied_any,
             )?;
         }

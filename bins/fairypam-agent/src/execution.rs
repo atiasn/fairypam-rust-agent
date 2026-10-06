@@ -88,6 +88,27 @@ fn ensure_current_source_frame(source_frame: Option<(&AtomicU64, u64)>) -> Resul
     Ok(())
 }
 
+fn validate_frame_relative_move(
+    profile: &VerifiedProfile,
+    relative_move: Option<&v3::RelativeMove>,
+) -> Result<(), AgentError> {
+    let Some(relative) = relative_move else {
+        return Ok(());
+    };
+    match profile.profile().actions.get(&relative.action_id) {
+        Some(ActionDefinition::RelativeMouse { maximum_delta })
+            if relative.dx.unsigned_abs() <= *maximum_delta as u32
+                && relative.dy.unsigned_abs() <= *maximum_delta as u32 =>
+        {
+            Ok(())
+        }
+        _ => Err(AgentError::new(
+            "input.frame_invalid",
+            "relative movement must match the signed Profile action and delta limit",
+        )),
+    }
+}
+
 fn command_refreshes_managed_activity(command: &HubControlCommand) -> bool {
     use hub_control_command::Payload;
     matches!(
@@ -393,9 +414,9 @@ pub trait RuntimePlatform: Send {
         wheel_delta: i32,
         wheel_point: Option<(u32, u32)>,
         source_frame: Option<(&AtomicU64, u64)>,
-        relative_move: Option<&v3::RelativeMove>,
         client_point: Option<(&str, u32, u32)>,
         client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
+        relative_move: Option<&v3::RelativeMove>,
     ) -> Result<bool, AgentError>;
 
     fn release_task_input(&mut self) -> Result<(), AgentError>;
@@ -1080,6 +1101,12 @@ impl CommandExecutor {
             if let Some(result) = self.task_attempt.replay(task)? {
                 return Ok(CommandOutcome::task(result));
             }
+            if frame.relative_move.is_some() && frame.source_frame_sequence.is_none() {
+                return Err(AgentError::new(
+                    "input.frame_invalid",
+                    "relative movement requires the latest task source frame",
+                ));
+            }
             let source_frame = if let Some(source) = frame.source_frame_sequence {
                 let attempt = self.task_attempt.attempt_ref(task)?;
                 let frame_key = frame_sequence_key("client", Some(&attempt));
@@ -1098,16 +1125,6 @@ impl CommandExecutor {
             } else {
                 None
             };
-            if frame.relative_move.is_some() {
-                let profile_id = self.task_attempt.profile_id(task)?;
-                let profile = self.profiles.get(&profile_id)?;
-                if let Err(error) = self
-                    .require_target_generation(frame.target_generation)
-                    .and_then(|_| validate_relative_move(profile, frame))
-                {
-                    return Ok(self.reject_v3_task(task, error.code()));
-                }
-            }
             if let Some(result) = self.task_attempt.prepare(task, true)? {
                 return Ok(CommandOutcome::task(result));
             }
@@ -1123,9 +1140,14 @@ impl CommandExecutor {
                 .and_then(|command| command.session.as_ref())
                 .ok_or_else(task_reference_invalid)?;
             let expires_at = Instant::now() + Duration::from_millis(u64::from(frame.lease_ms));
-            let command_deadline = device_operation_deadline();
+            let command_deadline = if frame.relative_move.is_some() {
+                device_operation_deadline().min(expires_at)
+            } else {
+                device_operation_deadline()
+            };
             let frame_result = self
                 .require_target_generation(frame.target_generation)
+                .and_then(|_| validate_frame_relative_move(&profile, frame.relative_move.as_ref()))
                 .and_then(|_| {
                     self.platform.apply_task_input_frame(
                         &profile,
@@ -1141,9 +1163,9 @@ impl CommandExecutor {
                         source_frame
                             .as_ref()
                             .map(|(current, expected)| (current.as_ref(), *expected)),
-                        frame.relative_move.as_ref(),
                         client_point,
                         client_swipe,
+                        frame.relative_move.as_ref(),
                     )
                 });
             let holds_active = frame_result.as_ref().ok().copied().unwrap_or(false);
@@ -2546,33 +2568,6 @@ fn execution_safety_event(
     }
 }
 
-fn validate_relative_move(
-    profile: &VerifiedProfile,
-    frame: &v3::InputFrame,
-) -> Result<(), AgentError> {
-    let Some(relative) = &frame.relative_move else {
-        return Ok(());
-    };
-    // Validate the complete transient action before changing any held key state.
-    if frame
-        .source_frame_sequence
-        .is_some_and(|sequence| sequence > 0)
-        && matches!(
-            profile.profile().actions.get(&relative.action_id),
-            Some(ActionDefinition::RelativeMouse { maximum_delta })
-                if relative.dx.unsigned_abs() <= *maximum_delta as u32
-                    && relative.dy.unsigned_abs() <= *maximum_delta as u32
-        )
-    {
-        Ok(())
-    } else {
-        Err(AgentError::new(
-            "input.frame_invalid",
-            "relative move requires a current frame and a signed RelativeMouse action within its delta limit",
-        ))
-    }
-}
-
 fn input_frame_outcome(error: Option<&AgentError>) -> TaskCommandOutcomeState {
     match error.map(AgentError::code) {
         None => TaskCommandOutcomeState::Applied,
@@ -2904,9 +2899,9 @@ impl RuntimePlatform for UnsupportedPlatform {
         _wheel_delta: i32,
         _wheel_point: Option<(u32, u32)>,
         _source_frame: Option<(&AtomicU64, u64)>,
-        _relative_move: Option<&v3::RelativeMove>,
         _client_point: Option<(&str, u32, u32)>,
         _client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
+        _relative_move: Option<&v3::RelativeMove>,
     ) -> Result<bool, AgentError> {
         Err(AgentError::new(
             "input.platform_unsupported",
@@ -3468,9 +3463,9 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         _wheel_delta: i32,
         _wheel_point: Option<(u32, u32)>,
         _source_frame: Option<(&AtomicU64, u64)>,
-        _relative_move: Option<&v3::RelativeMove>,
         _client_point: Option<(&str, u32, u32)>,
         _client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
+        _relative_move: Option<&v3::RelativeMove>,
     ) -> Result<bool, AgentError> {
         Err(AgentError::new(
             "worker.required",
@@ -3619,10 +3614,6 @@ pub(crate) mod tests {
                 }],
                 actions: BTreeMap::from([
                     (
-                        "camera.turn".into(),
-                        ActionDefinition::RelativeMouse { maximum_delta: 200 },
-                    ),
-                    (
                         "move.forward".into(),
                         ActionDefinition::Hold {
                             maa_virtual_key: 0x57,
@@ -3651,6 +3642,10 @@ pub(crate) mod tests {
                         ActionDefinition::ClientPointClick {
                             button: ClientPointButton::Left,
                         },
+                    ),
+                    (
+                        "nav.camera_relative".into(),
+                        ActionDefinition::RelativeMouse { maximum_delta: 200 },
                     ),
                     (
                         "music.note.a".into(),
@@ -3828,7 +3823,8 @@ pub(crate) mod tests {
         input_active: bool,
         pulse_calls: Vec<String>,
         point_clicks: usize,
-        relative_moves: Vec<(i32, i32)>,
+        relative_moves: Vec<v3::RelativeMove>,
+        input_frame_calls: usize,
         advance_source_before_click: bool,
         begin_monitor_calls: usize,
         finish_monitor_calls: usize,
@@ -4061,11 +4057,12 @@ pub(crate) mod tests {
             _wheel_delta: i32,
             _wheel_point: Option<(u32, u32)>,
             source_frame: Option<(&AtomicU64, u64)>,
-            relative_move: Option<&v3::RelativeMove>,
             client_point: Option<(&str, u32, u32)>,
             client_swipe: Option<(&str, u32, u32, u32, u32, u32)>,
+            relative_move: Option<&v3::RelativeMove>,
         ) -> Result<bool, AgentError> {
             let mut state = self.state.lock().unwrap();
+            state.input_frame_calls += 1;
             state.input_command_deadline_remaining =
                 Some(command_deadline.saturating_duration_since(Instant::now()));
             if let Some(error) = state.input_frame_error.take() {
@@ -4079,7 +4076,9 @@ pub(crate) mod tests {
                 )
             });
             state.input_active = holds_active;
-            if client_point.is_some() && state.advance_source_before_click {
+            if (client_point.is_some() || relative_move.is_some())
+                && state.advance_source_before_click
+            {
                 if let Some((current, _)) = source_frame {
                     current.fetch_add(1, Ordering::Release);
                 }
@@ -4088,7 +4087,7 @@ pub(crate) mod tests {
             state.point_clicks += usize::from(client_point.is_some());
             state.point_clicks += usize::from(client_swipe.is_some());
             if let Some(relative) = relative_move {
-                state.relative_moves.push((relative.dx, relative.dy));
+                state.relative_moves.push(relative.clone());
             }
             Ok(holds_active)
         }
@@ -4664,116 +4663,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn relative_move_is_one_shot_and_lease_renewal_does_not_repeat_it() {
-        let profile = verified_profile();
-        let (contract, reference) = v3_task_contract(&profile);
-        let (mut executor, state) = executor_with_state();
-        executor.execute_v3_begin(&task_ref(&reference, "begin"), &contract);
-        executor.set_binding(Some(binding())).unwrap();
-        let command = task_ref(&reference, "turn");
-        executor.frame_sequences.insert(
-            frame_sequence_key("client", command.attempt.as_ref()),
-            Arc::new(AtomicU64::new(7)),
-        );
-        let frame = v3::InputFrame {
-            input_sequence: 1,
-            lease_ms: 500,
-            held_action_ids: vec!["move.forward".into()],
-            target_generation: 1,
-            source_frame_sequence: Some(7),
-            relative_move: Some(v3::RelativeMove {
-                action_id: "camera.turn".into(),
-                dx: -120,
-                dy: 20,
-            }),
-            ..Default::default()
-        };
-        for _ in 0..2 {
-            assert!(matches!(
-                executor.execute_v3_input_frame(&command, &frame, None, None),
-                CommandOutcome::TaskAck { outcome: Some(outcome), .. }
-                    if outcome.outcome == TaskCommandOutcomeState::Applied as i32
-            ));
-        }
-        let renewal = v3::InputFrame {
-            input_sequence: 2,
-            relative_move: None,
-            ..frame.clone()
-        };
-        executor.execute_v3_input_frame(&task_ref(&reference, "renew"), &renewal, None, None);
-        assert_eq!(state.lock().unwrap().relative_moves, [(-120, 20)]);
-        assert!(state.lock().unwrap().input_active);
-
-        let mut invalid = frame.clone();
-        invalid.relative_move.as_mut().unwrap().dx = 201;
-        for command_id in ["invalid-turn", "stale-target-turn"] {
-            assert!(matches!(
-                executor.execute_v3_input_frame(&task_ref(&reference, command_id), &invalid, None, None),
-                CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
-                    if outcome.outcome == TaskCommandOutcomeState::NotApplied as i32
-                        && receipt.input_state == TaskInputState::Active as i32
-            ));
-            invalid.relative_move.as_mut().unwrap().dx = 120;
-            invalid.target_generation = 2;
-        }
-        assert!(state.lock().unwrap().input_active);
-
-        let uncertain = task_ref(&reference, "uncertain-turn");
-        state.lock().unwrap().input_frame_error = Some(AgentError::new(
-            "worker.side_effect_uncertain",
-            "response missing",
-        ));
-        for _ in 0..2 {
-            assert!(matches!(
-                executor.execute_v3_input_frame(&uncertain, &frame, None, None),
-                CommandOutcome::TaskAck { outcome: Some(outcome), .. }
-                    if outcome.outcome == TaskCommandOutcomeState::Uncertain as i32
-            ));
-        }
-        assert_eq!(state.lock().unwrap().relative_moves, [(-120, 20)]);
-    }
-
-    #[test]
-    fn invalid_relative_move_never_changes_held_keys() {
-        // Each case isolates an independent signed-action or frame-identity boundary.
-        for (action_id, dx, source) in [
-            ("unsigned", 1, Some(7)),
-            ("move.forward", 1, Some(7)),
-            ("camera.turn", i32::MIN, Some(7)),
-            ("camera.turn", 1, None),
-            ("camera.turn", 1, Some(6)),
-        ] {
-            let (contract, reference) = v3_task_contract(&verified_profile());
-            let (mut executor, state) = executor_with_state();
-            executor.execute_v3_begin(&task_ref(&reference, "begin"), &contract);
-            executor.set_binding(Some(binding())).unwrap();
-            let command = task_ref(&reference, "invalid-turn");
-            executor.frame_sequences.insert(
-                frame_sequence_key("client", command.attempt.as_ref()),
-                Arc::new(AtomicU64::new(7)),
-            );
-            let frame = v3::InputFrame {
-                input_sequence: 1,
-                lease_ms: 500,
-                target_generation: 1,
-                held_action_ids: vec!["move.forward".into()],
-                source_frame_sequence: source,
-                relative_move: Some(v3::RelativeMove {
-                    action_id: action_id.into(),
-                    dx,
-                    dy: 0,
-                }),
-                ..Default::default()
-            };
-            assert!(!outcome_applied(
-                &executor.execute_v3_input_frame(&command, &frame, None, None)
-            ));
-            assert!(!state.lock().unwrap().input_active);
-            assert!(state.lock().unwrap().relative_moves.is_empty());
-        }
-    }
-
-    #[test]
     fn v3_client_point_click_reaches_the_device_path() {
         let profile = verified_profile();
         let (contract, reference) = v3_task_contract(&profile);
@@ -4848,6 +4737,169 @@ pub(crate) mod tests {
             } if receipt.error_code.as_deref() == Some("source_frame_stale")
         ));
         assert_eq!(stale_state.lock().unwrap().point_clicks, 0);
+    }
+
+    #[test]
+    fn v3_relative_move_reaches_device_once_with_a_lease_bound_deadline() {
+        let profile = verified_profile();
+        let (contract, reference) = v3_task_contract(&profile);
+        let (mut executor, state) = executor_with_state();
+        executor.execute_v3_begin(&task_ref(&reference, "relative-begin"), &contract);
+        executor.set_binding(Some(binding())).unwrap();
+        let task = task_ref(&reference, "relative-input");
+        executor.frame_sequences.insert(
+            frame_sequence_key("client", task.attempt.as_ref()),
+            Arc::new(AtomicU64::new(7)),
+        );
+        let relative = v3::RelativeMove {
+            action_id: "nav.camera_relative".into(),
+            dx: -120,
+            dy: 40,
+        };
+        let frame = v3::InputFrame {
+            input_sequence: 1,
+            lease_ms: 500,
+            source_frame_sequence: Some(7),
+            target_generation: 1,
+            relative_move: Some(relative.clone()),
+            ..v3::InputFrame::default()
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                executor.execute_v3_input_frame(&task, &frame, None, None),
+                CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
+                    if outcome.outcome == TaskCommandOutcomeState::Applied as i32
+                        && outcome.source_frame_sequence == Some(7)
+                        && receipt.input_state == TaskInputState::Released as i32
+            ));
+        }
+        let state = state.lock().unwrap();
+        assert_eq!(state.input_frame_calls, 1);
+        assert_eq!(state.relative_moves, vec![relative]);
+        assert!(state
+            .input_command_deadline_remaining
+            .is_some_and(|remaining| {
+                remaining > Duration::ZERO && remaining <= Duration::from_millis(500)
+            }));
+    }
+
+    #[test]
+    fn v3_relative_move_rejects_profile_policy_before_held_key_side_effects() {
+        for (action_id, dx) in [
+            ("unknown.action", 1),
+            ("move.forward", 1),
+            ("nav.camera_relative", 201),
+            ("nav.camera_relative", i32::MIN),
+        ] {
+            let profile = verified_profile();
+            let (contract, reference) = v3_task_contract(&profile);
+            let (mut executor, state) = executor_with_state();
+            executor.execute_v3_begin(&task_ref(&reference, "relative-begin"), &contract);
+            executor.set_binding(Some(binding())).unwrap();
+            let task = task_ref(&reference, "relative-invalid");
+            executor.frame_sequences.insert(
+                frame_sequence_key("client", task.attempt.as_ref()),
+                Arc::new(AtomicU64::new(7)),
+            );
+            assert!(matches!(
+                executor.execute_v3_input_frame(&task, &v3::InputFrame {
+                    input_sequence: 1,
+                    lease_ms: 500,
+                    held_action_ids: vec!["move.forward".into()],
+                    source_frame_sequence: Some(7),
+                    target_generation: 1,
+                    relative_move: Some(v3::RelativeMove { action_id: action_id.into(), dx, dy: 0 }),
+                    ..v3::InputFrame::default()
+                }, None, None),
+                CommandOutcome::TaskAck { outcome: Some(outcome), .. }
+                    if outcome.outcome == TaskCommandOutcomeState::NotApplied as i32
+                        && outcome.error_code.as_deref() == Some("input.frame_invalid")
+            ));
+            let state = state.lock().unwrap();
+            assert_eq!(state.input_frame_calls, 0);
+            assert!(!state.input_active);
+            assert!(state.relative_moves.is_empty());
+        }
+    }
+
+    #[test]
+    fn v3_relative_move_uncertain_result_is_not_replayed() {
+        let profile = verified_profile();
+        let (contract, reference) = v3_task_contract(&profile);
+        let (mut executor, state) = executor_with_state();
+        executor.execute_v3_begin(&task_ref(&reference, "relative-begin"), &contract);
+        executor.set_binding(Some(binding())).unwrap();
+        let task = task_ref(&reference, "relative-uncertain");
+        executor.frame_sequences.insert(
+            frame_sequence_key("client", task.attempt.as_ref()),
+            Arc::new(AtomicU64::new(7)),
+        );
+        state.lock().unwrap().input_frame_error = Some(AgentError::new(
+            "worker.side_effect_uncertain",
+            "posted relative action did not receive a definitive receipt",
+        ));
+        let frame = v3::InputFrame {
+            input_sequence: 1,
+            lease_ms: 500,
+            source_frame_sequence: Some(7),
+            target_generation: 1,
+            relative_move: Some(v3::RelativeMove {
+                action_id: "nav.camera_relative".into(),
+                dx: 1,
+                dy: 0,
+            }),
+            ..v3::InputFrame::default()
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                executor.execute_v3_input_frame(&task, &frame, None, None),
+                CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
+                    if outcome.outcome == TaskCommandOutcomeState::Uncertain as i32
+                        && receipt.input_state == TaskInputState::Unknown as i32
+            ));
+        }
+        assert_eq!(state.lock().unwrap().input_frame_calls, 1);
+    }
+
+    #[test]
+    fn v3_relative_move_rejects_stale_frame_and_generation_without_moving() {
+        for (source, generation, advance_before_input) in [
+            (None, 1, false),
+            (Some(6), 1, false),
+            (Some(7), 2, false),
+            (Some(7), 1, true),
+        ] {
+            let profile = verified_profile();
+            let (contract, reference) = v3_task_contract(&profile);
+            let (mut executor, state) = executor_with_state();
+            executor.execute_v3_begin(&task_ref(&reference, "relative-begin"), &contract);
+            executor.set_binding(Some(binding())).unwrap();
+            let task = task_ref(&reference, "relative-stale");
+            executor.frame_sequences.insert(
+                frame_sequence_key("client", task.attempt.as_ref()),
+                Arc::new(AtomicU64::new(7)),
+            );
+            state.lock().unwrap().advance_source_before_click = advance_before_input;
+            let outcome = executor.execute_v3_input_frame(
+                &task,
+                &v3::InputFrame {
+                    input_sequence: 1,
+                    lease_ms: 500,
+                    source_frame_sequence: source,
+                    target_generation: generation,
+                    relative_move: Some(v3::RelativeMove {
+                        action_id: "nav.camera_relative".into(),
+                        dx: 1,
+                        dy: 0,
+                    }),
+                    ..v3::InputFrame::default()
+                },
+                None,
+                None,
+            );
+            assert!(!outcome_applied(&outcome));
+            assert!(state.lock().unwrap().relative_moves.is_empty());
+        }
     }
 
     #[test]
