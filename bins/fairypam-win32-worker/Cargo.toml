@@ -9,6 +9,7 @@ fairypam-agent-core = { path = "../../crates/fairypam-agent-core", default-featu
 fairypam-agent-maa = { path = "../../crates/fairypam-agent-maa" }
 fairypam-agent-protocol = { path = "../../crates/fairypam-agent-protocol" }
 fairypam-agent-realtime = { path = "../../crates/fairypam-agent-realtime" }
+fairypam-agent-windows = { path = "../../crates/fairypam-agent-windows" }
 image.workspace = true
 prost = "0.14"
 serde.workspace = true

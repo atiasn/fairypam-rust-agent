@@ -5,7 +5,10 @@ use fairypam_agent_core::target::{
 };
 use fairypam_agent_core::AgentError;
 use sha2::{Digest, Sha256};
-use std::time::{Duration, Instant};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -219,7 +222,7 @@ pub fn lock_unique(
     api: &mut dyn WindowsApi,
     profile: &VerifiedProfile,
 ) -> Result<WindowsTargetCandidate, WindowsError> {
-    let mut matching = matching_candidates(api, profile)?;
+    let mut matching = matching_candidates(api, profile, None)?;
     match matching.len() {
         0 => Err(WindowsError::new(
             "target.not_found",
@@ -265,6 +268,7 @@ fn require_same_identity(
 fn matching_candidates(
     api: &mut dyn WindowsApi,
     profile: &VerifiedProfile,
+    expected_process: Option<(u32, [u8; 32])>,
 ) -> Result<Vec<WindowsTargetCandidate>, WindowsError> {
     let rules = &profile.profile().target;
     Ok(api
@@ -275,10 +279,19 @@ fn matching_candidates(
                 .process_names
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&candidate.process_name))
-                && rules.process_path_sha256.iter().any(|hash| {
-                    decode_sha256(hash)
-                        .is_some_and(|value| value == candidate.identity.process_path_sha256)
-                })
+                && expected_process.map_or_else(
+                    || {
+                        rules.process_path_sha256.iter().any(|hash| {
+                            decode_sha256(hash).is_some_and(|value| {
+                                value == candidate.identity.process_path_sha256
+                            })
+                        })
+                    },
+                    |(pid, path)| {
+                        candidate.identity.pid == pid
+                            && candidate.identity.process_path_sha256 == path
+                    },
+                )
                 && rules
                     .window_classes
                     .iter()
@@ -393,6 +406,40 @@ fn candidate_to_binding(
     }
 }
 
+fn executable_scope(executable: &Path, process_id: u32) -> Result<(u32, [u8; 32]), AgentError> {
+    if process_id == 0 || !executable.is_absolute() {
+        return Err(
+            WindowsError::new("target.invalid", "resolved executable scope is invalid").into(),
+        );
+    }
+    let digest = executable
+        .to_str()
+        .and_then(crate::normalized_process_path_sha256)
+        .ok_or_else(|| {
+            WindowsError::new("target.invalid", "resolved executable path is invalid")
+        })?;
+    Ok((process_id, digest))
+}
+
+fn select_binding(
+    candidates: Vec<WindowsTargetCandidate>,
+    profile: &VerifiedProfile,
+    selector: TargetSelector,
+) -> Result<TargetBinding, AgentError> {
+    let mut selected = candidates
+        .into_iter()
+        .filter(|candidate| selector_id(&candidate.identity) == selector.candidate_id);
+    let candidate = selected
+        .next()
+        .ok_or_else(|| WindowsError::new("target.not_found", "candidate is no longer valid"))?;
+    if selected.next().is_some() {
+        return Err(
+            WindowsError::new("target.ambiguous", "candidate identity is not unique").into(),
+        );
+    }
+    Ok(candidate_to_binding(candidate, profile))
+}
+
 pub struct WindowsTargetPlatform<A> {
     api: A,
 }
@@ -483,6 +530,34 @@ fn locked_input_target(current: WindowsTargetCandidate) -> Result<LockedInputTar
 }
 
 impl<A: WindowsApi> WindowsTargetPlatform<A> {
+    pub fn enumerate_for_executable(
+        &mut self,
+        profile: &VerifiedProfile,
+        executable: &Path,
+        process_id: u32,
+    ) -> Result<Vec<TargetCandidate>, AgentError> {
+        let scope = executable_scope(executable, process_id)?;
+        Ok(matching_candidates(&mut self.api, profile, Some(scope))?
+            .iter()
+            .map(candidate_to_core)
+            .collect())
+    }
+
+    pub fn lock_for_executable(
+        &mut self,
+        profile: &VerifiedProfile,
+        executable: &Path,
+        process_id: u32,
+        selector: TargetSelector,
+    ) -> Result<TargetBinding, AgentError> {
+        let scope = executable_scope(executable, process_id)?;
+        select_binding(
+            matching_candidates(&mut self.api, profile, Some(scope))?,
+            profile,
+            selector,
+        )
+    }
+
     pub fn validate_environment(&mut self) -> Result<(), AgentError> {
         self.api.check_environment()?;
         Ok(())
@@ -544,13 +619,17 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
             .into());
         }
         let expected = binding_identity(binding)?;
-        let mut matches = matching_candidates(&mut self.api, profile)?
-            .into_iter()
-            .filter(|candidate| {
-                candidate.identity.pid == expected.pid
-                    && candidate.identity.process_started_at == expected.process_started_at
-                    && candidate.identity.process_path_sha256 == expected.process_path_sha256
-            });
+        let mut matches = matching_candidates(
+            &mut self.api,
+            profile,
+            Some((expected.pid, expected.process_path_sha256)),
+        )?
+        .into_iter()
+        .filter(|candidate| {
+            candidate.identity.pid == expected.pid
+                && candidate.identity.process_started_at == expected.process_started_at
+                && candidate.identity.process_path_sha256 == expected.process_path_sha256
+        });
         let candidate = matches.next().ok_or_else(|| {
             WindowsError::new(
                 "target.not_found",
@@ -599,7 +678,7 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
 
 impl<A: WindowsApi> TargetPlatform for WindowsTargetPlatform<A> {
     fn enumerate(&mut self, profile: &VerifiedProfile) -> Result<Vec<TargetCandidate>, AgentError> {
-        Ok(matching_candidates(&mut self.api, profile)?
+        Ok(matching_candidates(&mut self.api, profile, None)?
             .iter()
             .map(candidate_to_core)
             .collect())
@@ -610,19 +689,11 @@ impl<A: WindowsApi> TargetPlatform for WindowsTargetPlatform<A> {
         profile: &VerifiedProfile,
         selector: TargetSelector,
     ) -> Result<TargetBinding, AgentError> {
-        let candidates = matching_candidates(&mut self.api, profile)?;
-        let mut selected = candidates
-            .into_iter()
-            .filter(|candidate| selector_id(&candidate.identity) == selector.candidate_id);
-        let candidate = selected
-            .next()
-            .ok_or_else(|| WindowsError::new("target.not_found", "candidate is no longer valid"))?;
-        if selected.next().is_some() {
-            return Err(
-                WindowsError::new("target.ambiguous", "candidate identity is not unique").into(),
-            );
-        }
-        Ok(candidate_to_binding(candidate, profile))
+        select_binding(
+            matching_candidates(&mut self.api, profile, None)?,
+            profile,
+            selector,
+        )
     }
 
     fn revalidate(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError> {

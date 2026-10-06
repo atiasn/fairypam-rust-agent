@@ -225,6 +225,8 @@ impl WorkerRuntimePlatform {
                 if active_profile.content_sha256() == profile.content_sha256()
                 && active_binding.window_handle == binding.window_handle
                 && active_binding.process_id == binding.process_id
+                && active_binding.process_started_at_unix_ms == binding.process_started_at_unix_ms
+                && active_binding.process_path_sha256 == binding.process_path_sha256
         );
         let decision = attachment_decision(
             same_target,
@@ -254,6 +256,8 @@ impl WorkerRuntimePlatform {
                 process_id: binding.process_id,
                 profile_id: profile.profile().id.clone(),
                 profile_digest: profile.content_sha256().to_owned(),
+                process_started_at_unix_ms: binding.process_started_at_unix_ms,
+                process_path_sha256: binding.process_path_sha256.clone(),
             }),
             deadline,
         )

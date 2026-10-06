@@ -124,6 +124,8 @@ message AttachTarget {
   uint32 process_id = 2;
   string profile_id = 3;
   string profile_digest = 4;
+  uint64 process_started_at_unix_ms = 5;
+  string process_path_sha256 = 6;
 }
 
 message DetachTarget {}

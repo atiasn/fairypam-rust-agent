@@ -1,7 +1,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -292,8 +292,15 @@ pub fn scan_installed_games(profiles: &ProfileStore) -> Result<Value, AgentError
 }
 
 pub fn resolve_profile_executable(profile: &VerifiedProfile) -> Result<PathBuf, AgentError> {
-    let mut paths = HashSet::new();
-    for entry in registry_entries()? {
+    resolve_executable_from_entries(profile, &registry_entries()?)
+}
+
+fn resolve_executable_from_entries(
+    profile: &VerifiedProfile,
+    entries: &[RegistryEntry],
+) -> Result<PathBuf, AgentError> {
+    let mut paths = HashMap::new();
+    for entry in entries {
         if entry.source != RegistrySource::Machine {
             continue;
         }
@@ -312,19 +319,13 @@ pub fn resolve_profile_executable(profile: &VerifiedProfile) -> Result<PathBuf, 
         {
             continue;
         }
-        let executable = Path::new(entry.install_location.as_deref().unwrap_or_default())
-            .join("games")
-            .join(game.game_dir)
-            .join(game.process_name);
-        if trusted_executable(&executable) && profile_allows_path(profile, &executable) {
-            paths.insert(executable);
-        }
+        paths.extend(trusted_candidates(entry, game));
     }
-    let mut paths = paths.into_iter();
+    let mut paths = paths.into_values();
     let executable = paths.next().ok_or_else(|| {
         AgentError::new(
             "target_invalid",
-            "no installed executable matches the signed Profile",
+            "no installed executable matches the signed Profile process",
         )
     })?;
     if paths.next().is_some() {
@@ -336,23 +337,31 @@ pub fn resolve_profile_executable(profile: &VerifiedProfile) -> Result<PathBuf, 
     Ok(executable)
 }
 
-fn profile_allows_path(profile: &VerifiedProfile, executable: &Path) -> bool {
-    let Some(path) = executable.to_str() else {
-        return false;
-    };
-    let Some(digest) = fairypam_agent_windows::normalized_process_path_sha256(path) else {
-        return false;
-    };
-    let digest = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    profile
-        .profile()
-        .target
-        .process_path_sha256
-        .iter()
-        .any(|allowed| allowed == &digest)
+fn executable_candidates(entry: &RegistryEntry, game: &KnownGame) -> Vec<PathBuf> {
+    let default = Path::new(entry.install_location.as_deref().unwrap_or_default())
+        .join("games")
+        .join(game.game_dir)
+        .join(game.process_name);
+    std::iter::once(default)
+        .chain(
+            entry
+                .game_install_path
+                .as_deref()
+                .map(|directory| Path::new(directory).join(game.process_name)),
+        )
+        .collect()
+}
+
+fn trusted_candidates(entry: &RegistryEntry, game: &KnownGame) -> HashMap<[u8; 32], PathBuf> {
+    executable_candidates(entry, game)
+        .into_iter()
+        .filter(|path| trusted_executable(path))
+        .filter_map(|path| {
+            path.to_str()
+                .and_then(fairypam_agent_windows::normalized_process_path_sha256)
+                .map(|digest| (digest, path))
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -361,6 +370,7 @@ struct RegistryEntry {
     display_name: Option<String>,
     display_version: Option<String>,
     install_location: Option<String>,
+    game_install_path: Option<String>,
     uninstall_string: Option<String>,
 }
 
@@ -418,18 +428,21 @@ fn scan_entries(entries: &[RegistryEntry], profiles: &ProfileStore) -> Vec<Value
             if !seen.insert(dedupe_key.clone()) {
                 return None;
             }
-            let executable = Path::new(root)
-                .join("games")
-                .join(known.game_dir)
-                .join(known.process_name);
-            let installed = trusted_executable(&executable);
-            let version = installed
-                .then(|| game_version(Path::new(root), &executable))
-                .flatten()
-                .or_else(|| entry.display_version.clone());
-            let profile_id = installed
-                .then(|| profile_for_process(profiles, known.process_name))
+            let candidates = trusted_candidates(entry, known);
+            let installed = !candidates.is_empty();
+            let executable = (candidates.len() == 1)
+                .then(|| candidates.values().next())
                 .flatten();
+            let version = executable
+                .and_then(|path| game_version(Path::new(root), path))
+                .or_else(|| entry.display_version.clone());
+            let profile_id = executable
+                .and_then(|_| profile_for_process(profiles, known.process_name))
+                .filter(|id| {
+                    profiles.get(id).is_ok_and(|profile| {
+                        resolve_executable_from_entries(profile, entries).is_ok()
+                    })
+                });
             Some(json!({
                 "discovery_id": stable_discovery_id(&dedupe_key),
                 "name": entry.display_name.as_deref().unwrap_or(known.display_name),
@@ -470,6 +483,14 @@ fn trusted_executable(executable: &Path) -> bool {
         };
         if metadata.file_type().is_symlink() {
             return false;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                return false;
+            }
         }
     }
     executable.is_file()
@@ -578,8 +599,8 @@ fn registry_entries() -> Result<Vec<RegistryEntry>, AgentError> {
             Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS},
             System::Registry::{
                 RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY,
-                HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_EXPAND_SZ,
-                REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
+                HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
+                REG_EXPAND_SZ, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
             },
         },
     };
@@ -692,12 +713,23 @@ fn registry_entries() -> Result<Vec<RegistryEntry>, AgentError> {
             let Ok(key) = open_key(uninstall.0, &name, KEY_READ | access) else {
                 continue;
             };
+            let uninstall_string = string_value(key.0, "UninstallString");
+            let game_install_path = uninstall_string
+                .as_deref()
+                .and_then(extract_game_id)
+                .filter(|id| KNOWN_GAMES.iter().any(|game| game.game_id == *id))
+                .and_then(|id| {
+                    let location = format!(r"Software\miHoYo\HYP\1_1\{id}");
+                    let key = open_key(HKEY_CURRENT_USER, &location, KEY_READ).ok()?;
+                    string_value(key.0, "GameInstallPath")
+                });
             entries.push(RegistryEntry {
                 source: RegistrySource::Machine,
                 display_name: string_value(key.0, "DisplayName"),
                 display_version: string_value(key.0, "DisplayVersion"),
                 install_location: string_value(key.0, "InstallLocation"),
-                uninstall_string: string_value(key.0, "UninstallString"),
+                game_install_path,
+                uninstall_string,
             });
         }
         Ok(Some(entries))
@@ -744,6 +776,10 @@ mod tests {
     }
 
     fn signed_profile_for(process_name: &str) -> ProfileStore {
+        signed_profile_for_paths(process_name, vec!["aa".repeat(32)])
+    }
+
+    fn signed_profile_for_paths(process_name: &str, paths: Vec<String>) -> ProfileStore {
         let content = ProfileContent {
             schema_version: 1,
             profile: Profile {
@@ -752,7 +788,7 @@ mod tests {
                 display_name: "Profile A".into(),
                 target: TargetRules {
                     process_names: vec![process_name.into()],
-                    process_path_sha256: vec!["aa".repeat(32)],
+                    process_path_sha256: paths,
                     window_classes: vec!["GameWindow".into()],
                     title_patterns: vec!["Game".into()],
                     require_elevated: false,
@@ -811,6 +847,7 @@ mod tests {
             display_version: Some("launcher-version".into()),
             install_location: Some(root.display().to_string()),
             uninstall_string: Some("uninstall.exe --uninstall_game=hk4e_cn".into()),
+            ..Default::default()
         }];
         let games = scan_entries(&entries, &ProfileStore::default());
         let first = games.first().expect("known game is discovered");
@@ -837,6 +874,132 @@ mod tests {
             Some("profile-a")
         );
         assert!(profile_for_process(&profiles, "StarRail.exe").is_none());
+    }
+
+    fn discovery_test_root(label: &str) -> PathBuf {
+        let temporary = std::env::temp_dir();
+        #[cfg(unix)]
+        let temporary = temporary.canonicalize().unwrap();
+        temporary.join(format!("fairypam-discovery-{}-{label}", std::process::id()))
+    }
+
+    fn path_digest(path: &Path) -> String {
+        fairypam_agent_windows::normalized_process_path_sha256(path.to_str().unwrap())
+            .unwrap()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn custom_hoyoplay_location_is_shared_by_discovery_and_launch() {
+        let root = discovery_test_root("custom");
+        let executable = root.join("custom game").join("YuanShen.exe");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, []).unwrap();
+        fs::write(
+            executable.parent().unwrap().join("config.ini"),
+            "game_version=7.1.0\n",
+        )
+        .unwrap();
+        let profiles = signed_profile_for("YuanShen.exe");
+        let entries = [RegistryEntry {
+            install_location: Some(root.join("launcher").display().to_string()),
+            game_install_path: Some(executable.parent().unwrap().display().to_string()),
+            uninstall_string: Some("uninstall.exe --uninstall_game=hk4e_cn".into()),
+            ..Default::default()
+        }];
+        let resolved =
+            resolve_executable_from_entries(profiles.get("profile-a").unwrap(), &entries);
+        let games = scan_entries(&entries, &profiles);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(resolved.unwrap(), executable);
+        assert_eq!(games[0]["installed"], true);
+        assert_eq!(games[0]["supported"], true);
+        assert_eq!(games[0]["version"], "7.1.0");
+        assert!(!games[0].to_string().contains(root.to_str().unwrap()));
+    }
+
+    #[test]
+    fn custom_location_requires_machine_game_marker_and_signed_process() {
+        let root = discovery_test_root("unsigned");
+        let executable = root.join("custom").join("YuanShen.exe");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, []).unwrap();
+        let profiles = signed_profile_for("StarRail.exe");
+        let mut entries = [RegistryEntry {
+            install_location: Some(root.join("launcher").display().to_string()),
+            game_install_path: Some(executable.parent().unwrap().display().to_string()),
+            uninstall_string: Some("uninstall.exe --uninstall_game=hk4e_cn".into()),
+            ..Default::default()
+        }];
+        assert!(
+            resolve_executable_from_entries(profiles.get("profile-a").unwrap(), &entries).is_err()
+        );
+        let profiles = signed_profile_for_paths("YuanShen.exe", vec![path_digest(&executable)]);
+        entries[0].source = RegistrySource::CurrentUser;
+        assert!(scan_entries(&entries, &profiles).is_empty());
+        assert!(
+            resolve_executable_from_entries(profiles.get("profile-a").unwrap(), &entries).is_err()
+        );
+        entries[0].source = RegistrySource::Machine;
+        entries[0].uninstall_string = Some("uninstall.exe".into());
+        assert!(
+            resolve_executable_from_entries(profiles.get("profile-a").unwrap(), &entries).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_discovered_locations_and_reparse_hints_are_rejected() {
+        let root = discovery_test_root("ambiguous");
+        let default = root
+            .join("games")
+            .join("Genshin Impact Game")
+            .join("YuanShen.exe");
+        let custom = root.join("custom").join("YuanShen.exe");
+        for path in [&default, &custom] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, []).unwrap();
+        }
+        let profiles = signed_profile_for_paths(
+            "YuanShen.exe",
+            vec![path_digest(&default), path_digest(&custom)],
+        );
+        let mut entries = [RegistryEntry {
+            install_location: Some(root.display().to_string()),
+            game_install_path: Some(custom.parent().unwrap().display().to_string()),
+            uninstall_string: Some("uninstall.exe --uninstall_game=hk4e_cn".into()),
+            ..Default::default()
+        }];
+        let ambiguous =
+            resolve_executable_from_entries(profiles.get("profile-a").unwrap(), &entries);
+        let ambiguous_scan = scan_entries(&entries, &profiles);
+        entries[0].game_install_path = Some(default.parent().unwrap().display().to_string());
+        let duplicate =
+            resolve_executable_from_entries(profiles.get("profile-a").unwrap(), &entries);
+        let duplicate_scan = scan_entries(&entries, &profiles);
+        let link = root.join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(custom.parent().unwrap(), &link).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(custom.parent().unwrap())
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let linked = link.join("YuanShen.exe");
+        let reparse_rejected = !trusted_executable(&linked);
+        fs::remove_dir_all(root).unwrap();
+        assert!(ambiguous.is_err());
+        assert_eq!(ambiguous_scan[0]["installed"], true);
+        assert_eq!(ambiguous_scan[0]["supported"], false);
+        assert_eq!(duplicate.unwrap(), default);
+        assert_eq!(duplicate_scan[0]["supported"], true);
+        assert!(reparse_rejected);
     }
 
     #[test]
@@ -1032,6 +1195,7 @@ mod tests {
             display_version: None,
             install_location: Some(r"C:\\attacker".into()),
             uninstall_string: Some("uninstall.exe --uninstall_game=hk4e_cn".into()),
+            ..Default::default()
         }];
         assert!(scan_entries(&user_entries, &ProfileStore::default()).is_empty());
 

@@ -139,3 +139,121 @@ fn invalid_rectangle_is_rejected_at_the_boundary() {
     assert_eq!(error.code(), "target.client_rect_invalid");
     let _: WindowsError = error;
 }
+
+#[test]
+fn installed_executable_scope_binds_and_rediscovers_without_changing_signed_profile() {
+    use fairypam_agent_core::platform::TargetPlatform;
+    let executable = std::env::temp_dir()
+        .join("installed game")
+        .join("testbed.exe");
+    let digest =
+        fairypam_agent_windows::normalized_process_path_sha256(executable.to_str().unwrap())
+            .unwrap();
+    let profile = profile();
+    let original_profile_digest = profile.content_sha256().to_owned();
+    let mut actual = candidate(1, 100);
+    actual.identity.process_path_sha256 = digest;
+    let mut targets =
+        WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![actual.clone()]));
+    assert!(targets.enumerate(&profile).unwrap().is_empty());
+    let candidates = targets
+        .enumerate_for_executable(&profile, &executable, 42)
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    let binding = targets
+        .lock_for_executable(&profile, &executable, 42, candidates[0].selector.clone())
+        .unwrap();
+    assert_eq!(binding.process_id, 42);
+    assert_eq!(binding.process_started_at_unix_ms, 100);
+    assert_eq!(
+        binding.process_path_sha256,
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    assert_eq!(profile.content_sha256(), original_profile_digest);
+    actual.identity.hwnd = 2;
+    let mut targets = WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![actual]));
+    let replacement = targets.rediscover(&profile, &binding).unwrap();
+    assert_eq!(replacement.window_handle, 2);
+    assert_eq!(replacement.process_path_sha256, binding.process_path_sha256);
+}
+
+#[test]
+fn scoped_lock_rejects_other_process_path_profile_and_recycled_selector() {
+    let executable = std::env::temp_dir()
+        .join("installed game")
+        .join("testbed.exe");
+    let digest =
+        fairypam_agent_windows::normalized_process_path_sha256(executable.to_str().unwrap())
+            .unwrap();
+    let profile = profile();
+    let mut actual = candidate(1, 100);
+    actual.identity.process_path_sha256 = digest;
+    let mut targets =
+        WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![actual.clone()]));
+    let selected = targets
+        .enumerate_for_executable(&profile, &executable, 42)
+        .unwrap()
+        .remove(0)
+        .selector;
+    for changed in 0..4 {
+        let mut other = actual.clone();
+        match changed {
+            0 => other.identity.pid = 43,
+            1 => other.identity.process_path_sha256 = [0x22; 32],
+            2 => other.window_title = "unrelated game".into(),
+            _ => other.identity.process_started_at = 101,
+        }
+        let mut targets = WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![other]));
+        assert!(targets
+            .lock_for_executable(&profile, &executable, 42, selected.clone())
+            .is_err());
+    }
+    assert!(targets
+        .enumerate_for_executable(&profile, &executable, 0)
+        .is_err());
+    assert!(targets
+        .enumerate_for_executable(&profile, std::path::Path::new("relative.exe"), 42)
+        .is_err());
+}
+
+#[test]
+fn scoped_rediscovery_rejects_restarted_or_ambiguous_process_windows() {
+    let executable = std::env::temp_dir()
+        .join("installed game")
+        .join("testbed.exe");
+    let digest =
+        fairypam_agent_windows::normalized_process_path_sha256(executable.to_str().unwrap())
+            .unwrap();
+    let profile = profile();
+    let mut actual = candidate(1, 100);
+    actual.identity.process_path_sha256 = digest;
+    let mut targets =
+        WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![actual.clone()]));
+    let selected = targets
+        .enumerate_for_executable(&profile, &executable, 42)
+        .unwrap()
+        .remove(0)
+        .selector;
+    let binding = targets
+        .lock_for_executable(&profile, &executable, 42, selected)
+        .unwrap();
+    let mut restarted = actual.clone();
+    restarted.identity.process_started_at = 101;
+    let mut targets = WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![restarted]));
+    assert_eq!(
+        targets.rediscover(&profile, &binding).unwrap_err().code(),
+        "target.not_found"
+    );
+    actual.identity.hwnd = 2;
+    let mut second = actual.clone();
+    second.identity.hwnd = 3;
+    let mut targets =
+        WindowsTargetPlatform::new(FakeWindows::with_candidates(vec![actual, second]));
+    assert_eq!(
+        targets.rediscover(&profile, &binding).unwrap_err().code(),
+        "target.ambiguous"
+    );
+}

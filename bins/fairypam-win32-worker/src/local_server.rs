@@ -333,14 +333,8 @@ mod windows_impl {
                         return Err(io_error("worker.io_mode_invalid"));
                     }
                     let (profile_dir, verifier) = self.profile_config()?;
-                    self.lock_controller()?.attach(
-                        value.hwnd,
-                        value.process_id,
-                        &value.profile_id,
-                        &value.profile_digest,
-                        profile_dir,
-                        verifier,
-                    )?;
+                    self.lock_controller()?
+                        .attach(value, profile_dir, verifier)?;
                     if let Err(code) = self.arbiter.attach() {
                         let _ = self.lock_controller()?.detach();
                         return Err(io_error(code));

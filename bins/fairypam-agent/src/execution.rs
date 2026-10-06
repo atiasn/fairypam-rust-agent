@@ -2842,6 +2842,34 @@ fn retry_startup_identity<T>(
 }
 
 #[cfg(any(windows, test))]
+fn startup_executable(
+    managed: Option<&std::path::Path>,
+    resolve: impl FnOnce() -> Result<std::path::PathBuf, AgentError>,
+) -> Result<std::path::PathBuf, AgentError> {
+    managed
+        .map(std::path::Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(resolve)
+}
+
+#[cfg(any(windows, test))]
+fn require_same_managed_process(
+    expected: &TargetBinding,
+    actual: &TargetBinding,
+) -> Result<(), AgentError> {
+    if expected.process_id != actual.process_id
+        || expected.process_started_at_unix_ms != actual.process_started_at_unix_ms
+        || expected.process_path_sha256 != actual.process_path_sha256
+    {
+        return Err(AgentError::new(
+            "target.stale",
+            "managed process identity changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
 fn managed_child_exited(child: Option<&mut std::process::Child>) -> Result<bool, AgentError> {
     let Some(child) = child else {
         return Ok(false);
@@ -3091,17 +3119,15 @@ impl WindowsRuntimePlatform {
     fn wait_for_process_window(
         &mut self,
         profile: &VerifiedProfile,
+        executable: &std::path::Path,
         process_id: u32,
         deadline: Instant,
     ) -> Result<TargetBinding, AgentError> {
-        use fairypam_agent_core::platform::TargetPlatform;
-
         loop {
             let mut candidates = self
                 .targets
-                .enumerate(profile)?
-                .into_iter()
-                .filter(|candidate| candidate.process_id == process_id);
+                .enumerate_for_executable(profile, executable, process_id)?
+                .into_iter();
             if let Some(candidate) = candidates.next() {
                 if candidates.next().is_some() {
                     return Err(AgentError::new(
@@ -3109,7 +3135,12 @@ impl WindowsRuntimePlatform {
                         "the signed Profile process exposes multiple trusted windows",
                     ));
                 }
-                return self.targets.lock(profile, candidate.selector);
+                return self.targets.lock_for_executable(
+                    profile,
+                    executable,
+                    process_id,
+                    candidate.selector,
+                );
             }
             if Instant::now() >= deadline {
                 return Err(AgentError::new(
@@ -3188,7 +3219,6 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 
-        let executable = crate::observability::resolve_profile_executable(profile)?;
         if managed_child_exited(
             self.managed
                 .as_mut()
@@ -3196,6 +3226,12 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         )? {
             self.managed = None;
         }
+        let executable = startup_executable(
+            self.managed
+                .as_ref()
+                .map(|managed| managed.executable.as_path()),
+            || crate::observability::resolve_profile_executable(profile),
+        )?;
         if let Some(managed) = self.managed.as_ref() {
             if managed.binding.profile_id != profile.profile().id {
                 return Err(AgentError::new(
@@ -3204,23 +3240,33 @@ impl RuntimePlatform for WindowsRuntimePlatform {
                 ));
             }
             let process_id = managed.binding.process_id;
+            let expected = managed.binding.clone();
+            let owns_process = managed.child.is_some();
             let matches = retry_startup_identity(
                 Instant::now() + Duration::from_secs(30),
                 Duration::from_millis(500),
                 || fairypam_agent_windows::process_matches_executable(process_id, &executable),
             )?;
             if !matches {
+                if owns_process {
+                    return Err(AgentError::new(
+                        "target.stale",
+                        "owned process identity changed",
+                    ));
+                }
                 self.managed = None;
-            } else {
-                let binding = self.wait_for_process_window(
-                    profile,
-                    process_id,
-                    Instant::now() + Duration::from_secs(120),
-                )?;
-                self.managed.as_mut().expect("checked above").binding = binding.clone();
-                self.rediscovery_used = false;
-                return Ok(binding);
+                return self.start_task_target(profile);
             }
+            let binding = self.wait_for_process_window(
+                profile,
+                &executable,
+                process_id,
+                Instant::now() + Duration::from_secs(120),
+            )?;
+            require_same_managed_process(&expected, &binding)?;
+            self.managed.as_mut().expect("checked above").binding = binding.clone();
+            self.rediscovery_used = false;
+            return Ok(binding);
         }
         let existing = retry_startup_identity(
             Instant::now() + Duration::from_secs(30),
@@ -3236,6 +3282,7 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         if let Some(process_id) = existing.first().copied() {
             let binding = self.wait_for_process_window(
                 profile,
+                &executable,
                 process_id,
                 Instant::now() + Duration::from_secs(120),
             )?;
@@ -3270,7 +3317,8 @@ impl RuntimePlatform for WindowsRuntimePlatform {
             ));
         }
         let deadline = Instant::now() + Duration::from_secs(120);
-        let binding = match self.wait_for_process_window(profile, child.id(), deadline) {
+        let binding = match self.wait_for_process_window(profile, &executable, child.id(), deadline)
+        {
             Ok(binding) => binding,
             Err(error) => {
                 let _ = child.kill();
@@ -3289,6 +3337,17 @@ impl RuntimePlatform for WindowsRuntimePlatform {
 
     fn enumerate(&mut self, profile: &VerifiedProfile) -> Result<Vec<TargetCandidate>, AgentError> {
         use fairypam_agent_core::platform::TargetPlatform;
+        if let Some(managed) = self
+            .managed
+            .as_ref()
+            .filter(|managed| managed.binding.profile_id == profile.profile().id)
+        {
+            return self.targets.enumerate_for_executable(
+                profile,
+                &managed.executable,
+                managed.binding.process_id,
+            );
+        }
         self.targets.enumerate(profile)
     }
 
@@ -3298,7 +3357,20 @@ impl RuntimePlatform for WindowsRuntimePlatform {
         selector: TargetSelector,
     ) -> Result<TargetBinding, AgentError> {
         use fairypam_agent_core::platform::TargetPlatform;
-        let binding = self.targets.lock(profile, selector)?;
+        let binding = if let Some(managed) = self
+            .managed
+            .as_ref()
+            .filter(|managed| managed.binding.profile_id == profile.profile().id)
+        {
+            self.targets.lock_for_executable(
+                profile,
+                &managed.executable,
+                managed.binding.process_id,
+                selector,
+            )?
+        } else {
+            self.targets.lock(profile, selector)?
+        };
         self.rediscovery_used = false;
         Ok(binding)
     }
@@ -3572,6 +3644,58 @@ pub(crate) mod tests {
         })
         .unwrap_err();
         assert_eq!(error.code(), "target.identity_unknown");
+    }
+
+    #[test]
+    fn managed_startup_ignores_changed_or_missing_registry_location() {
+        let original = std::env::temp_dir()
+            .join("managed-original")
+            .join("YuanShen.exe");
+        let moved = std::env::temp_dir()
+            .join("registry-changed")
+            .join("YuanShen.exe");
+        let mut scans = 0;
+        let selected = startup_executable(Some(&original), || {
+            scans += 1;
+            Ok(moved.clone())
+        })
+        .unwrap();
+        assert_eq!(selected, original);
+        assert_eq!(scans, 0);
+        assert_eq!(
+            startup_executable(Some(&original), || {
+                Err(AgentError::new(
+                    "game.discovery_unavailable",
+                    "registry unavailable",
+                ))
+            })
+            .unwrap(),
+            original
+        );
+        assert_eq!(
+            startup_executable(None, || Ok(moved.clone())).unwrap(),
+            moved
+        );
+    }
+
+    #[test]
+    fn managed_reuse_rejects_recycled_process_creation_or_path() {
+        let expected = binding();
+        require_same_managed_process(&expected, &expected).unwrap();
+        let mut restarted = expected.clone();
+        restarted.process_started_at_unix_ms += 1;
+        let mut other_path = expected.clone();
+        other_path.process_path_sha256 = "22".repeat(32);
+        let mut other_pid = expected.clone();
+        other_pid.process_id += 1;
+        for changed in [restarted, other_path, other_pid] {
+            assert_eq!(
+                require_same_managed_process(&expected, &changed)
+                    .unwrap_err()
+                    .code(),
+                "target.stale"
+            );
+        }
     }
 
     #[test]

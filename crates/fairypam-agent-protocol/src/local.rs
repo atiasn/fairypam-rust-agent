@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use crate::worker_v1::{LocalEnvelope, RealtimeProgramMetrics, WorkerRequest};
 
 pub const LOCAL_PROTOCOL_MAJOR: u32 = 1;
-pub const LOCAL_PROTOCOL_MINOR: u32 = 1;
+pub const LOCAL_PROTOCOL_MINOR: u32 = 2;
 pub const MAX_LOCAL_MESSAGE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub fn decode_local_envelope(framed: &[u8]) -> Result<LocalEnvelope, LocalProtoc
     let envelope = LocalEnvelope::decode(&framed[4..])
         .map_err(|_| LocalProtocolError("worker.protobuf_invalid"))?;
     if envelope.protocol_major != LOCAL_PROTOCOL_MAJOR
-        || envelope.protocol_minor > LOCAL_PROTOCOL_MINOR
+        || envelope.protocol_minor != LOCAL_PROTOCOL_MINOR
         || envelope.payload.is_none()
     {
         return Err(LocalProtocolError("worker.protocol_incompatible"));
@@ -153,6 +153,70 @@ mod tests {
             decode_local_envelope(&encode_local_envelope(&envelope).unwrap()).unwrap(),
             envelope
         );
+    }
+
+    #[test]
+    fn rejects_worker_handshakes_without_complete_target_identity_support() {
+        for payload in [
+            local_envelope::Payload::Hello(crate::worker_v1::WorkerHello::default()),
+            local_envelope::Payload::Ready(crate::worker_v1::WorkerReady::default()),
+        ] {
+            let legacy = LocalEnvelope {
+                protocol_major: 1,
+                protocol_minor: 1,
+                payload: Some(payload),
+            };
+            assert_eq!(
+                decode_local_envelope(&encode_local_envelope(&legacy).unwrap())
+                    .unwrap_err()
+                    .code(),
+                "worker.protocol_incompatible"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_attachment_identity_round_trips_and_is_bound_to_the_request_digest() {
+        let mut request = request();
+        request.payload = Some(worker_request::Payload::AttachTarget(
+            crate::worker_v1::AttachTarget {
+                hwnd: 41,
+                process_id: 42,
+                profile_id: "genshin".into(),
+                profile_digest: "cd".repeat(32),
+                process_started_at_unix_ms: 1_700_000_000_000,
+                process_path_sha256: "ab".repeat(32),
+            },
+        ));
+        request.identity.as_mut().unwrap().request_digest = worker_request_digest(&request);
+        let envelope = LocalEnvelope {
+            protocol_major: LOCAL_PROTOCOL_MAJOR,
+            protocol_minor: LOCAL_PROTOCOL_MINOR,
+            payload: Some(local_envelope::Payload::Request(request.clone())),
+        };
+        assert_eq!(
+            decode_local_envelope(&encode_local_envelope(&envelope).unwrap()).unwrap(),
+            envelope
+        );
+        verify_worker_request(&request, "worker-7", 9, 4, 1_000).unwrap();
+        for change_creation_time in [true, false] {
+            let mut tampered = request.clone();
+            let Some(worker_request::Payload::AttachTarget(target)) = tampered.payload.as_mut()
+            else {
+                panic!("attachment payload missing");
+            };
+            if change_creation_time {
+                target.process_started_at_unix_ms += 1;
+            } else {
+                target.process_path_sha256 = "ef".repeat(32);
+            }
+            assert_eq!(
+                verify_worker_request(&tampered, "worker-7", 9, 4, 1_000)
+                    .unwrap_err()
+                    .code(),
+                "worker.request_digest_invalid"
+            );
+        }
     }
 
     #[test]

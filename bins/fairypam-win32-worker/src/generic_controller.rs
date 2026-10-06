@@ -1,8 +1,48 @@
 use fairypam_agent_maa::MaaRuntimeError;
+use fairypam_agent_protocol::worker_v1::AttachTarget;
+use fairypam_agent_windows::{TargetIdentity, WindowsApi};
 use std::collections::VecDeque;
 
 const SOURCE_FRAME_WINDOW_CAPACITY: usize = 256;
 const WHEEL_DELTA: i32 = 120;
+
+fn attachment_identity(
+    api: &mut dyn WindowsApi,
+    target: &AttachTarget,
+) -> Result<TargetIdentity, MaaRuntimeError> {
+    if target.process_started_at_unix_ms == 0
+        || target.process_path_sha256.len() != 64
+        || !target
+            .process_path_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(MaaRuntimeError::new(
+            "worker.target_invalid",
+            "attachment requires process creation time and a canonical path SHA-256",
+        ));
+    }
+    let current = api
+        .snapshot(target.hwnd as isize)
+        .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))?;
+    let current_path_sha256 = current
+        .identity
+        .process_path_sha256
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if current.identity.hwnd as u64 != target.hwnd
+        || current.identity.pid != target.process_id
+        || current.identity.process_started_at != target.process_started_at_unix_ms
+        || current_path_sha256 != target.process_path_sha256
+    {
+        return Err(MaaRuntimeError::new(
+            "worker.target_invalid",
+            "attachment process identity does not match the current window",
+        ));
+    }
+    Ok(current.identity)
+}
 
 #[derive(Default)]
 struct SourceFrameWindow {
@@ -78,7 +118,109 @@ fn wheel_notches(delta: i32) -> impl Iterator<Item = i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_optional_client_point, wheel_notches, SourceFrameWindow};
+    use fairypam_agent_protocol::worker_v1::AttachTarget;
+    use fairypam_agent_windows::{
+        revalidate_identity, FakeWindows, Rect, TargetIdentity, WindowsTargetCandidate,
+    };
+
+    use super::{
+        attachment_identity, bind_optional_client_point, wheel_notches, SourceFrameWindow,
+    };
+
+    fn target_candidate() -> WindowsTargetCandidate {
+        WindowsTargetCandidate {
+            identity: TargetIdentity {
+                hwnd: 41,
+                pid: 42,
+                process_started_at: 1_700_000_000_000,
+                process_path_sha256: [0xab; 32],
+                window_class: "UnityWndClass".to_owned(),
+                client_rect: Rect::new(0, 0, 1920, 1080).unwrap(),
+                dpi: 96,
+            },
+            process_name: "YuanShen.exe".to_owned(),
+            window_title: "原神".to_owned(),
+            elevated: true,
+            foreground: true,
+            minimized: false,
+            capturable: true,
+        }
+    }
+
+    fn target_attachment() -> AttachTarget {
+        AttachTarget {
+            hwnd: 41,
+            process_id: 42,
+            profile_id: "genshin".to_owned(),
+            profile_digest: "cd".repeat(32),
+            process_started_at_unix_ms: 1_700_000_000_000,
+            process_path_sha256: "ab".repeat(32),
+        }
+    }
+
+    #[test]
+    fn attachment_preserves_the_actual_complete_process_identity() {
+        let candidate = target_candidate();
+        let mut api = FakeWindows::with_candidates(vec![candidate.clone()]);
+
+        let identity = attachment_identity(&mut api, &target_attachment()).unwrap();
+
+        assert_eq!(identity, candidate.identity);
+        assert_eq!(revalidate_identity(&mut api, &identity).unwrap(), candidate);
+    }
+
+    #[test]
+    fn attachment_rejects_missing_or_noncanonical_process_identity() {
+        let target = target_attachment();
+        for invalid in [
+            AttachTarget {
+                process_started_at_unix_ms: 0,
+                ..target.clone()
+            },
+            AttachTarget {
+                process_path_sha256: String::new(),
+                ..target.clone()
+            },
+            AttachTarget {
+                process_path_sha256: "AB".repeat(32),
+                ..target.clone()
+            },
+        ] {
+            assert_eq!(
+                attachment_identity(&mut FakeWindows::default(), &invalid)
+                    .unwrap_err()
+                    .code(),
+                "worker.target_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_hwnd_and_pid_cannot_attach_or_revalidate_a_different_process() {
+        let target = target_attachment();
+        let original = target_candidate();
+        let identity = attachment_identity(
+            &mut FakeWindows::with_candidates(vec![original.clone()]),
+            &target,
+        )
+        .unwrap();
+        let mut restarted = original.clone();
+        restarted.identity.process_started_at += 1;
+        let mut different_path = original;
+        different_path.identity.process_path_sha256 = [0xcd; 32];
+
+        for changed in [restarted, different_path] {
+            let mut api = FakeWindows::with_candidates(vec![changed]);
+            assert_eq!(
+                attachment_identity(&mut api, &target).unwrap_err().code(),
+                "worker.target_invalid"
+            );
+            assert_eq!(
+                revalidate_identity(&mut api, &identity).unwrap_err().code(),
+                "target.stale"
+            );
+        }
+    }
 
     #[test]
     fn wheel_delta_is_emitted_as_standard_notches() {
@@ -153,21 +295,25 @@ mod windows_impl {
     };
     use fairypam_agent_maa::health::RuntimeHealth;
     use fairypam_agent_maa::MaaRuntimeError;
+    use fairypam_agent_protocol::worker_v1::AttachTarget;
+    use fairypam_agent_windows::{revalidate_identity, NativeWindows, TargetIdentity};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClientRect, GetWindowThreadProcessId, IsWindow,
     };
 
-    use super::{bind_optional_client_point, ppm_coordinate, wheel_notches, SourceFrameWindow};
+    use super::{
+        attachment_identity, bind_optional_client_point, ppm_coordinate, wheel_notches,
+        SourceFrameWindow,
+    };
 
     const MAA_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(3);
 
     pub struct GenericController {
         maa: MaaWindowsController,
         profile: Option<VerifiedProfile>,
-        hwnd: Option<usize>,
-        process_id: u32,
+        identity: Option<TargetIdentity>,
         geometry: Option<VerifiedGeometry>,
         frame_sequence: u64,
         source_frames: SourceFrameWindow,
@@ -186,8 +332,7 @@ mod windows_impl {
             Ok(Self {
                 maa: MaaWindowsController::new(MaaBackendSelection::default())?,
                 profile: None,
-                hwnd: None,
-                process_id: 0,
+                identity: None,
                 geometry: None,
                 frame_sequence: 0,
                 source_frames: SourceFrameWindow::default(),
@@ -197,13 +342,11 @@ mod windows_impl {
 
         pub fn attach(
             &mut self,
-            hwnd_value: u64,
-            process_id: u32,
-            profile_id: &str,
-            profile_digest: &str,
+            target: &AttachTarget,
             profile_dir: &Path,
             verifier: &Ed25519SignatureVerifier,
         ) -> Result<(), MaaRuntimeError> {
+            let profile_id = &target.profile_id;
             if !safe_profile_id(profile_id) {
                 return Err(invalid_target("profile id is invalid"));
             }
@@ -214,24 +357,26 @@ mod windows_impl {
                 verifier,
             )
             .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))?;
-            if profile.profile().id != profile_id || profile.content_sha256() != profile_digest {
+            if profile.profile().id != *profile_id
+                || profile.content_sha256() != target.profile_digest
+            {
                 return Err(MaaRuntimeError::new(
                     "profile_mismatch",
                     "worker Profile does not match the Agent attachment",
                 ));
             }
-            let hwnd = HWND(hwnd_value as usize as *mut std::ffi::c_void);
-            let geometry = read_geometry(hwnd, process_id)?;
+            let identity = attachment_identity(&mut NativeWindows, target)?;
+            let hwnd = HWND(identity.hwnd as *mut std::ffi::c_void);
+            let geometry = read_geometry(hwnd, identity.pid)?;
             self.maa.attach_target(
-                hwnd_value as usize,
+                identity.hwnd as usize,
                 TargetGeometry {
                     width: geometry.width,
                     height: geometry.height,
                 },
             )?;
             self.profile = Some(profile);
-            self.hwnd = Some(hwnd_value as usize);
-            self.process_id = process_id;
+            self.identity = Some(identity);
             self.geometry = Some(geometry);
             self.frame_sequence = 0;
             self.source_frames.clear();
@@ -243,8 +388,7 @@ mod windows_impl {
             self.release_all()?;
             self.maa.detach_target()?;
             self.profile = None;
-            self.hwnd = None;
-            self.process_id = 0;
+            self.identity = None;
             self.geometry = None;
             self.frame_sequence = 0;
             self.source_frames.clear();
@@ -563,7 +707,10 @@ mod windows_impl {
         }
 
         pub fn hwnd(&self) -> Result<usize, MaaRuntimeError> {
-            self.hwnd
+            self.revalidate()?;
+            self.identity
+                .as_ref()
+                .map(|identity| identity.hwnd as usize)
                 .ok_or_else(|| invalid_target("target is detached"))
         }
 
@@ -593,11 +740,14 @@ mod windows_impl {
         }
 
         fn revalidate(&self) -> Result<VerifiedGeometry, MaaRuntimeError> {
-            let hwnd = self
-                .hwnd
+            let identity = self
+                .identity
+                .as_ref()
                 .ok_or_else(|| invalid_target("target is detached"))?;
-            let hwnd = HWND(hwnd as *mut std::ffi::c_void);
-            let current = read_geometry(hwnd, self.process_id)?;
+            revalidate_identity(&mut NativeWindows, identity)
+                .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))?;
+            let hwnd = HWND(identity.hwnd as *mut std::ffi::c_void);
+            let current = read_geometry(hwnd, identity.pid)?;
             if Some(current) != self.geometry {
                 return Err(MaaRuntimeError::new(
                     "worker.target_geometry_changed",
