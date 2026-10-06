@@ -474,10 +474,9 @@ fn binding_identity(binding: &TargetBinding) -> Result<TargetIdentity, AgentErro
 
 fn revalidate_or_focus_target(
     api: &mut dyn WindowsApi,
-    binding: &TargetBinding,
+    expected: &TargetIdentity,
 ) -> Result<WindowsTargetCandidate, AgentError> {
-    let expected = binding_identity(binding)?;
-    let mut current = revalidate_identity(api, &expected)?;
+    let mut current = revalidate_identity(api, expected)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         api.check_environment()?;
@@ -489,7 +488,7 @@ fn revalidate_or_focus_target(
                 return Err(error.into());
             }
         }
-        current = revalidate_identity(api, &expected)?;
+        current = revalidate_identity(api, expected)?;
         api.check_environment()?;
         if current.foreground && !current.minimized {
             return Ok(current);
@@ -511,7 +510,7 @@ fn revalidate_input_target(
     api: &mut dyn WindowsApi,
     binding: &TargetBinding,
 ) -> Result<LockedInputTarget, AgentError> {
-    let current = revalidate_or_focus_target(api, binding)?;
+    let current = revalidate_or_focus_target(api, &binding_identity(binding)?)?;
     locked_input_target(current)
 }
 
@@ -593,7 +592,14 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
         &mut self,
         binding: &TargetBinding,
     ) -> Result<TargetIdentity, AgentError> {
-        let current = revalidate_or_focus_target(&mut self.api, binding)?;
+        self.capture_target_identity(&binding_identity(binding)?)
+    }
+
+    pub fn capture_target_identity(
+        &mut self,
+        expected: &TargetIdentity,
+    ) -> Result<TargetIdentity, AgentError> {
+        let current = revalidate_or_focus_target(&mut self.api, expected)?;
         if current.minimized || !current.capturable {
             return Err(WindowsError::new(
                 "target.capture_not_permitted",
@@ -647,7 +653,7 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
     }
 
     pub fn focus(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError> {
-        revalidate_or_focus_target(&mut self.api, binding)?;
+        revalidate_or_focus_target(&mut self.api, &binding_identity(binding)?)?;
         let snapshot = self.revalidate(binding)?;
         if !snapshot.foreground {
             return Err(WindowsError::new(

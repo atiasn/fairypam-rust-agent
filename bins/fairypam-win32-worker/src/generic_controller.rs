@@ -44,6 +44,21 @@ fn attachment_identity(
     Ok(current.identity)
 }
 
+fn validate_capture_identity(
+    api: &mut dyn WindowsApi,
+    identity: &TargetIdentity,
+) -> Result<(), MaaRuntimeError> {
+    let current = fairypam_agent_windows::revalidate_identity(api, identity)
+        .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))?;
+    if !current.foreground || current.minimized || !current.capturable {
+        return Err(MaaRuntimeError::new(
+            "target.capture_not_permitted",
+            "captured pixels require the same visible foreground target",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct SourceFrameWindow {
     frames: VecDeque<u64>,
@@ -124,7 +139,8 @@ mod tests {
     };
 
     use super::{
-        attachment_identity, bind_optional_client_point, wheel_notches, SourceFrameWindow,
+        attachment_identity, bind_optional_client_point, validate_capture_identity, wheel_notches,
+        SourceFrameWindow,
     };
 
     fn target_candidate() -> WindowsTargetCandidate {
@@ -167,6 +183,33 @@ mod tests {
 
         assert_eq!(identity, candidate.identity);
         assert_eq!(revalidate_identity(&mut api, &identity).unwrap(), candidate);
+    }
+
+    #[test]
+    fn captured_pixels_require_the_same_visible_foreground_target() {
+        let candidate = target_candidate();
+        validate_capture_identity(
+            &mut FakeWindows::with_candidates(vec![candidate.clone()]),
+            &candidate.identity,
+        )
+        .unwrap();
+        let mut background = candidate.clone();
+        background.foreground = false;
+        let mut minimized = candidate.clone();
+        minimized.minimized = true;
+        let mut hidden = candidate.clone();
+        hidden.capturable = false;
+        for changed in [background, minimized, hidden] {
+            assert_eq!(
+                validate_capture_identity(
+                    &mut FakeWindows::with_candidates(vec![changed]),
+                    &candidate.identity,
+                )
+                .unwrap_err()
+                .code(),
+                "target.capture_not_permitted",
+            );
+        }
     }
 
     #[test]
@@ -296,7 +339,9 @@ mod windows_impl {
     use fairypam_agent_maa::health::RuntimeHealth;
     use fairypam_agent_maa::MaaRuntimeError;
     use fairypam_agent_protocol::worker_v1::AttachTarget;
-    use fairypam_agent_windows::{revalidate_identity, NativeWindows, TargetIdentity};
+    use fairypam_agent_windows::{
+        revalidate_identity, NativeWindows, TargetIdentity, WindowsTargetPlatform,
+    };
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -304,8 +349,8 @@ mod windows_impl {
     };
 
     use super::{
-        attachment_identity, bind_optional_client_point, ppm_coordinate, wheel_notches,
-        SourceFrameWindow,
+        attachment_identity, bind_optional_client_point, ppm_coordinate, validate_capture_identity,
+        wheel_notches, SourceFrameWindow,
     };
 
     const MAA_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -399,8 +444,15 @@ mod windows_impl {
             &mut self,
             deadline: Instant,
         ) -> Result<(u64, CapturedFrame), MaaRuntimeError> {
-            self.revalidate()?;
+            self.prepare_capture()?;
             let frame = self.maa.capture_once(maa_remaining(deadline, "capture")?)?;
+            self.revalidate()?;
+            validate_capture_identity(
+                &mut NativeWindows,
+                self.identity
+                    .as_ref()
+                    .ok_or_else(|| invalid_target("target is detached"))?,
+            )?;
             let geometry = self
                 .geometry
                 .ok_or_else(|| invalid_target("target is detached"))?;
@@ -421,7 +473,7 @@ mod windows_impl {
         }
 
         pub fn start_capture(&mut self) -> Result<(), MaaRuntimeError> {
-            self.revalidate()?;
+            self.prepare_capture()?;
             self.maa.start_capture()
         }
 
@@ -737,6 +789,17 @@ mod windows_impl {
                         "action is not declared by the signed Profile",
                     )
                 })
+        }
+
+        fn prepare_capture(&self) -> Result<VerifiedGeometry, MaaRuntimeError> {
+            let identity = self
+                .identity
+                .as_ref()
+                .ok_or_else(|| invalid_target("target is detached"))?;
+            WindowsTargetPlatform::new(NativeWindows)
+                .capture_target_identity(identity)
+                .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))?;
+            self.revalidate()
         }
 
         fn revalidate(&self) -> Result<VerifiedGeometry, MaaRuntimeError> {
