@@ -1171,15 +1171,17 @@ impl CommandExecutor {
             let holds_active = frame_result.as_ref().ok().copied().unwrap_or(false);
             let error = frame_result.err();
             let outcome = input_frame_outcome(error.as_ref());
-            Ok(CommandOutcome::task(
-                self.task_attempt.complete_input_frame(
-                    task,
-                    frame.source_frame_sequence,
-                    outcome,
-                    holds_active,
-                    error.as_ref().map(AgentError::code),
-                )?,
-            ))
+            let completed = self.task_attempt.complete_input_frame(
+                task,
+                frame.source_frame_sequence,
+                outcome,
+                holds_active,
+                error.as_ref().map(AgentError::code),
+            )?;
+            Ok(match error {
+                Some(error) => CommandOutcome::task_with_diagnostic(completed, &error),
+                None => CommandOutcome::task(completed),
+            })
         })();
         let outcome = result.unwrap_or_else(CommandOutcome::from_error);
         if outcome_applied(&outcome) {
@@ -4889,8 +4891,10 @@ pub(crate) mod tests {
             ..v3::InputFrame::default()
         };
         for _ in 0..2 {
+            let result = executor.execute_v3_input_frame(&task, &frame, None, None);
+            assert!(result.local_diagnostic().is_none());
             assert!(matches!(
-                executor.execute_v3_input_frame(&task, &frame, None, None),
+                result,
                 CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
                     if outcome.outcome == TaskCommandOutcomeState::Applied as i32
                         && outcome.source_frame_sequence == Some(7)
@@ -4974,11 +4978,21 @@ pub(crate) mod tests {
             }),
             ..v3::InputFrame::default()
         };
-        for _ in 0..2 {
+        for attempt in 0..2 {
+            let result = executor.execute_v3_input_frame(&task, &frame, None, None);
+            if attempt == 0 {
+                assert!(result
+                    .local_diagnostic()
+                    .is_some_and(|diagnostic| diagnostic
+                        .contains("posted relative action did not receive a definitive receipt")));
+            } else {
+                assert!(result.local_diagnostic().is_none());
+            }
             assert!(matches!(
-                executor.execute_v3_input_frame(&task, &frame, None, None),
+                result,
                 CommandOutcome::TaskAck { outcome: Some(outcome), receipt, .. }
                     if outcome.outcome == TaskCommandOutcomeState::Uncertain as i32
+                        && outcome.error_code.as_deref() == Some("worker.side_effect_uncertain")
                         && receipt.input_state == TaskInputState::Unknown as i32
             ));
         }
