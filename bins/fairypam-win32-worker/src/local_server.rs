@@ -1,8 +1,74 @@
+use std::io::Read;
+
+use fairypam_agent_maa::MaaRuntimeError;
+use fairypam_agent_protocol::worker_v1::LocalEnvelope;
+use fairypam_agent_protocol::{decode_local_envelope, MAX_LOCAL_MESSAGE_BYTES};
+
+fn read_request<R: Read>(
+    pipe: &mut R,
+    realtime_active: bool,
+    has_data: impl FnOnce(&R) -> Result<bool, MaaRuntimeError>,
+) -> Result<Option<LocalEnvelope>, MaaRuntimeError> {
+    if realtime_active && !has_data(pipe)? {
+        return Ok(None);
+    }
+    let mut length = [0; 4];
+    pipe.read_exact(&mut length)?;
+    let length = u32::from_le_bytes(length) as usize;
+    if length > MAX_LOCAL_MESSAGE_BYTES {
+        return Err(MaaRuntimeError::new(
+            "worker.message_too_large",
+            "local message exceeds the limit",
+        ));
+    }
+    let mut framed = Vec::with_capacity(length + 4);
+    framed.extend_from_slice(&(length as u32).to_le_bytes());
+    framed.resize(length + 4, 0);
+    pipe.read_exact(&mut framed[4..])?;
+    decode_local_envelope(&framed)
+        .map(Some)
+        .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use fairypam_agent_protocol::worker_v1::{local_envelope, WorkerRequest};
+    use fairypam_agent_protocol::{
+        encode_local_envelope, LOCAL_PROTOCOL_MAJOR, LOCAL_PROTOCOL_MINOR,
+    };
+
+    use super::{read_request, LocalEnvelope, MaaRuntimeError};
+
+    #[test]
+    fn generic_reads_directly_while_realtime_keeps_nonblocking_completion_checks() {
+        let envelope = LocalEnvelope {
+            protocol_major: LOCAL_PROTOCOL_MAJOR,
+            protocol_minor: LOCAL_PROTOCOL_MINOR,
+            payload: Some(local_envelope::Payload::Request(WorkerRequest::default())),
+        };
+        let mut pipe = Cursor::new(encode_local_envelope(&envelope).unwrap());
+        let actual = read_request(&mut pipe, false, |_| {
+            Err(MaaRuntimeError::new(
+                "test.unexpected_poll",
+                "Generic must block on its read",
+            ))
+        })
+        .unwrap();
+        assert_eq!(actual, Some(envelope));
+        assert!(read_request(&mut pipe, false, |_| Ok(false)).is_err());
+        let mut pipe = Cursor::new(Vec::<u8>::new());
+        assert_eq!(read_request(&mut pipe, true, |_| Ok(false)).unwrap(), None);
+        assert_eq!(pipe.position(), 0);
+    }
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use std::collections::{HashSet, VecDeque};
     use std::fs;
-    use std::io::{Cursor, Read, Write};
+    use std::io::{Cursor, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
     use std::path::{Path, PathBuf};
@@ -20,9 +86,8 @@ mod windows_impl {
         WorkerOutcome, WorkerReady, WorkerRequest, WorkerResponse,
     };
     use fairypam_agent_protocol::{
-        decode_local_envelope, encode_local_envelope, verify_worker_request,
-        worker_realtime_metrics_digest, LOCAL_PROTOCOL_MAJOR, LOCAL_PROTOCOL_MINOR,
-        MAX_LOCAL_MESSAGE_BYTES,
+        encode_local_envelope, verify_worker_request, worker_realtime_metrics_digest,
+        LOCAL_PROTOCOL_MAJOR, LOCAL_PROTOCOL_MINOR,
     };
     use fairypam_agent_realtime::input_batch::windows::WindowsPhysicalInputBatch;
     use fairypam_agent_realtime::input_batch::PhysicalInputBatch;
@@ -45,6 +110,7 @@ mod windows_impl {
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
 
+    use super::read_request;
     use crate::frame_ring::FrameRing;
     use crate::generic_controller::GenericController;
     use crate::maa_loader::LoadedMaaRuntime;
@@ -236,11 +302,12 @@ mod windows_impl {
                 if let Some(event) = self.finish_realtime_if_ready()? {
                     self.write(&mut pipe, local_envelope::Payload::Event(event))?;
                 }
-                if !pipe_has_data(&pipe)? {
+                let Some(envelope) =
+                    read_request(&mut pipe, self.realtime_program_id.is_some(), pipe_has_data)?
+                else {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
-                }
-                let envelope = read_envelope(&mut pipe)?;
+                };
                 let Some(local_envelope::Payload::Request(request)) = envelope.payload else {
                     return Err(MaaRuntimeError::new(
                         "worker.request_invalid",
@@ -1256,24 +1323,6 @@ mod windows_impl {
         unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut available), None) }
             .map_err(|error| MaaRuntimeError::new("worker.pipe_read_failed", error.to_string()))?;
         Ok(available >= 4)
-    }
-
-    fn read_envelope(pipe: &mut fs::File) -> Result<LocalEnvelope, MaaRuntimeError> {
-        let mut length = [0; 4];
-        pipe.read_exact(&mut length)?;
-        let length = u32::from_le_bytes(length) as usize;
-        if length > MAX_LOCAL_MESSAGE_BYTES {
-            return Err(MaaRuntimeError::new(
-                "worker.message_too_large",
-                "local message exceeds the limit",
-            ));
-        }
-        let mut framed = Vec::with_capacity(length + 4);
-        framed.extend_from_slice(&(length as u32).to_le_bytes());
-        framed.resize(length + 4, 0);
-        pipe.read_exact(&mut framed[4..])?;
-        decode_local_envelope(&framed)
-            .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))
     }
 
     fn outcome_for_error(request: &WorkerRequest, code: &str) -> WorkerOutcome {

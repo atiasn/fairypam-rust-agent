@@ -410,10 +410,18 @@ impl WorkerRuntimePlatform {
         payload: worker_request::Payload,
         deadline: Instant,
     ) -> Result<(), AgentError> {
+        self.request_response(payload, deadline).map(drop)
+    }
+
+    fn request_response(
+        &mut self,
+        payload: worker_request::Payload,
+        deadline: Instant,
+    ) -> Result<WorkerResponse, AgentError> {
         let (result, generation, events, held_action_ids) = {
             let mut state = self.lock_worker()?;
             let process = ensure_process(&mut state, deadline)?;
-            let result = request_applied(process, payload, deadline);
+            let result = request_applied_response(process, payload, deadline);
             (
                 result,
                 process.generation().to_owned(),
@@ -816,9 +824,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             let worker_started = Instant::now();
             let worker_started_unix_us = now_unix_us();
             let sequence = {
-                let mut state = self.lock_worker()?;
-                let response = request_applied_response(
-                    ensure_process(&mut state, deadline)?,
+                let response = self.request_response(
                     worker_request::Payload::CaptureOnce(CaptureOnce {
                         capture_source_id: source_id.to_owned(),
                         encoding: encoding.to_owned(),
@@ -898,7 +904,7 @@ impl RuntimePlatform for WorkerRuntimePlatform {
         if timed_out {
             self.capture_telemetry
                 .push(telemetry_string("timeout.stage", stage));
-            if stage == "worker_round_trip" {
+            if stage == "worker_round_trip" && !self.faulted.load(Ordering::Acquire) {
                 self.invalidate_timed_out_worker()?;
             }
         }
@@ -941,21 +947,16 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             RuntimeCaptureEncoding::Jpeg { quality } => ("jpeg", u32::from(quality)),
             RuntimeCaptureEncoding::Png => ("png", 0),
         };
-        {
-            self.clear_source_frames()?;
-            let mut state = self.lock_worker()?;
-            let deadline = worker_maintenance_deadline();
-            request_applied(
-                ensure_process(&mut state, deadline)?,
-                worker_request::Payload::StartGenericCapture(StartGenericCapture {
-                    capture_source_id: source_id.to_owned(),
-                    fps,
-                    encoding: encoding_name.to_owned(),
-                    quality,
-                }),
-                deadline,
-            )?;
-        }
+        self.clear_source_frames()?;
+        self.request(
+            worker_request::Payload::StartGenericCapture(StartGenericCapture {
+                capture_source_id: source_id.to_owned(),
+                fps,
+                encoding: encoding_name.to_owned(),
+                quality,
+            }),
+            worker_maintenance_deadline(),
+        )?;
         Ok(Box::new(WorkerCapture {
             worker: Arc::clone(&self.worker),
             faulted: Arc::clone(&self.faulted),
@@ -1377,6 +1378,32 @@ struct WorkerCapture {
     source_frames: Arc<Mutex<SourceFrameMap>>,
 }
 
+impl WorkerCapture {
+    fn invalidate(&self, error: AgentError) -> AgentError {
+        self.faulted.store(true, Ordering::Release);
+        if let Ok(mut state) = self.worker.lock() {
+            if let Some(process) = state.process.as_mut() {
+                process.terminate();
+            }
+            state.process = None;
+            state.attached_generation = None;
+        }
+        let release = fairypam_agent_windows::emergency_release_profile(&self.profile)
+            .map_err(|release| AgentError::new(release.code(), release.to_string()))
+            .err();
+        if let Ok(mut frames) = self.source_frames.lock() {
+            frames.clear();
+        }
+        AgentError::new(
+            "worker.capture_failed",
+            release.map_or_else(
+                || error.to_string(),
+                |release| format!("{error}; {release}"),
+            ),
+        )
+    }
+}
+
 impl RuntimeCapture for WorkerCapture {
     fn next_frame(&mut self, deadline: Instant) -> Result<RuntimeCapturedFrame, AgentError> {
         let result = self
@@ -1401,25 +1428,7 @@ impl RuntimeCapture for WorkerCapture {
                     backend: frame.backend,
                 })
             }
-            Err(error) => {
-                self.faulted.store(true, Ordering::Release);
-                if let Ok(mut state) = self.worker.lock() {
-                    if let Some(process) = state.process.as_mut() {
-                        process.terminate();
-                    }
-                    state.process = None;
-                }
-                let release = fairypam_agent_windows::emergency_release_profile(&self.profile)
-                    .map_err(|release| AgentError::new(release.code(), release.to_string()))
-                    .err();
-                Err(AgentError::new(
-                    "worker.capture_failed",
-                    release.map_or_else(
-                        || error.to_string(),
-                        |release| format!("{error}; {release}"),
-                    ),
-                ))
-            }
+            Err(error) => Err(self.invalidate(error)),
         }
     }
 
@@ -1441,16 +1450,26 @@ impl Drop for WorkerCapture {
         let Some(source_id) = self.source_id.as_ref() else {
             return;
         };
-        if let Ok(mut state) = self.worker.lock() {
+        let result = if let Ok(mut state) = self.worker.lock() {
             if let Some(process) = state.process.as_mut() {
-                let _ = request_applied(
+                request_applied(
                     process,
                     worker_request::Payload::StopGenericCapture(StopGenericCapture {
                         capture_source_id: source_id.clone(),
                     }),
                     Instant::now() + Duration::from_secs(2),
-                );
+                )
+            } else {
+                Ok(())
             }
+        } else {
+            Err(AgentError::new(
+                "worker.state_poisoned",
+                "Worker state lock is poisoned",
+            ))
+        };
+        if let Err(error) = result {
+            let _ = self.invalidate(error);
         }
     }
 }
@@ -1583,7 +1602,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use fairypam_agent_core::profile::ActionDefinition;
-    use fairypam_agent_protocol::worker_v1::{worker_request, WindowsIoMode, WorkerHealth};
+    use fairypam_agent_protocol::worker_v1::{
+        worker_request, WindowsIoMode, WorkerHealth, WorkerResponse,
+    };
 
     use super::{
         attach_error, attachment_decision, input_frame_key_plan, retain_input_lease_for_holds,
@@ -1666,6 +1687,25 @@ mod tests {
             .unwrap()
             .attached_generation
             .is_none());
+        assert_eq!(
+            platform.runtime_source_frame(25).unwrap_err().code(),
+            "input.frame_invalid"
+        );
+    }
+
+    #[test]
+    fn non_deadline_worker_failure_uses_shared_release_and_invalidates_frames() {
+        let mut platform = WorkerRuntimePlatform::new(&ProfileStore::default(), None);
+        RuntimePlatform::bind_capture_frame_sequence(&mut platform, 1, 25).unwrap();
+        let result: Result<WorkerResponse, _> = Err(fairypam_agent_core::AgentError::new(
+            "worker.response_invalid",
+            "Worker CaptureOnce returned a foreign command id",
+        ));
+        let error = platform.handle_side_effect(result).unwrap_err();
+        assert_eq!(error.code(), "worker.side_effect_uncertain");
+        assert!(error.to_string().contains("worker.response_invalid"));
+        assert!(platform.faulted.load(Ordering::Acquire));
+        assert!(platform.worker.lock().unwrap().process.is_none());
         assert_eq!(
             platform.runtime_source_frame(25).unwrap_err().code(),
             "input.frame_invalid"

@@ -15,6 +15,7 @@ pub struct WorkerClient<S> {
     stream: S,
     worker_generation: String,
     events: VecDeque<WorkerEvent>,
+    connection_uncertain: bool,
 }
 
 impl<S: Read + Write> WorkerClient<S> {
@@ -23,6 +24,7 @@ impl<S: Read + Write> WorkerClient<S> {
             stream,
             worker_generation,
             events: VecDeque::new(),
+            connection_uncertain: false,
         }
     }
 
@@ -30,6 +32,12 @@ impl<S: Read + Write> WorkerClient<S> {
         &mut self,
         request: WorkerRequest,
     ) -> Result<WorkerResponse, MaaRuntimeError> {
+        if self.connection_uncertain {
+            return Err(MaaRuntimeError::new(
+                "worker.response_invalid",
+                "worker connection is unusable after an incomplete round trip",
+            ));
+        }
         let identity = request.identity.as_ref().ok_or_else(|| {
             MaaRuntimeError::new("worker.identity_invalid", "worker request has no identity")
         })?;
@@ -46,24 +54,29 @@ impl<S: Read + Write> WorkerClient<S> {
             payload: Some(local_envelope::Payload::Request(request)),
         })
         .map_err(|error| MaaRuntimeError::new("worker.write_failed", error.to_string()))?;
-        self.stream.write_all(&envelope)?;
-        self.stream.flush()?;
-        loop {
-            match read_envelope(&mut self.stream)?.payload {
-                Some(local_envelope::Payload::Response(value))
-                    if value.local_command_id == command_id =>
-                {
-                    return Ok(value);
-                }
-                Some(local_envelope::Payload::Event(value)) => self.events.push_back(value),
-                _ => {
-                    return Err(MaaRuntimeError::new(
-                        "worker.response_invalid",
-                        "worker response does not match the command",
-                    ))
+        let result = (|| {
+            self.stream.write_all(&envelope)?;
+            self.stream.flush()?;
+            loop {
+                match read_envelope(&mut self.stream)?.payload {
+                    Some(local_envelope::Payload::Response(value))
+                        if value.local_command_id == command_id =>
+                    {
+                        return Ok(value);
+                    }
+                    Some(local_envelope::Payload::Event(value)) => self.events.push_back(value),
+                    _ => {
+                        return Err(MaaRuntimeError::new(
+                            "worker.response_invalid",
+                            "worker response does not match the command",
+                        ))
+                    }
                 }
             }
-        }
+        })();
+        // A timed-out read can leave a partial frame or a late reply on this pipe.
+        self.connection_uncertain = result.is_err();
+        result
     }
 
     pub fn take_events(&mut self) -> Vec<WorkerEvent> {
@@ -101,16 +114,30 @@ mod tests {
         encode_local_envelope, LOCAL_PROTOCOL_MAJOR, LOCAL_PROTOCOL_MINOR,
     };
 
-    use super::WorkerClient;
+    use super::{read_envelope, WorkerClient};
 
     struct ScriptedStream {
         reads: Cursor<Vec<u8>>,
         writes: Vec<u8>,
+        fail_after: Option<u64>,
     }
 
     impl Read for ScriptedStream {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            self.reads.read(buffer)
+            let length = match self.fail_after {
+                Some(position) if position == self.reads.position() => {
+                    self.fail_after = None;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "worker response deadline expired",
+                    ));
+                }
+                Some(position) => buffer
+                    .len()
+                    .min((position - self.reads.position()) as usize),
+                None => buffer.len(),
+            };
+            self.reads.read(&mut buffer[..length])
         }
     }
 
@@ -154,6 +181,7 @@ mod tests {
             ScriptedStream {
                 reads: Cursor::new(reads),
                 writes: Vec::new(),
+                fail_after: None,
             },
             generation.into(),
         );
@@ -170,6 +198,95 @@ mod tests {
 
         assert_eq!(actual, response);
         assert_eq!(client.take_events(), vec![event]);
+    }
+
+    #[test]
+    fn failed_round_trip_quarantines_late_responses_without_sending_cleanup() {
+        let generation = "worker-1";
+        let envelope = |command_id: &str| {
+            encode_local_envelope(&LocalEnvelope {
+                protocol_major: LOCAL_PROTOCOL_MAJOR,
+                protocol_minor: LOCAL_PROTOCOL_MINOR,
+                payload: Some(local_envelope::Payload::Response(WorkerResponse {
+                    local_command_id: command_id.into(),
+                    ..WorkerResponse::default()
+                })),
+            })
+            .unwrap()
+        };
+        let request = |command_id: &str| WorkerRequest {
+            identity: Some(WorkerCommandIdentity {
+                worker_generation: generation.into(),
+                local_command_id: command_id.into(),
+                ..WorkerCommandIdentity::default()
+            }),
+            payload: None,
+        };
+        let first = envelope("held-key");
+        let delayed = envelope("relative-move");
+        // Cover no response, a partial header, and a partial body before timeout.
+        for partial_bytes in [0, 2, 6] {
+            let fail_after = first.len() as u64 + partial_bytes;
+            let reads = [first.clone(), delayed.clone(), envelope("release-all")].concat();
+            let mut client = WorkerClient::new(
+                ScriptedStream {
+                    reads: Cursor::new(reads),
+                    writes: Vec::new(),
+                    fail_after: Some(fail_after),
+                },
+                generation.into(),
+            );
+            assert_eq!(
+                client
+                    .round_trip(WorkerRequest::default())
+                    .unwrap_err()
+                    .code(),
+                "worker.identity_invalid"
+            );
+            assert!(client.stream.writes.is_empty());
+            client.round_trip(request("held-key")).unwrap();
+            let error = client.round_trip(request("relative-move")).unwrap_err();
+            assert_eq!(error.code(), "maa.runtime_io_failed");
+            let writes_before_cleanup = client.stream.writes.clone();
+            let error = client.round_trip(request("release-all")).unwrap_err();
+            assert_eq!(error.code(), "worker.response_invalid");
+            assert_eq!(client.stream.writes, writes_before_cleanup);
+            assert_eq!(client.stream.reads.position(), fail_after);
+            let mut sent = Cursor::new(client.stream.writes);
+            for command_id in ["held-key", "relative-move"] {
+                let message = read_envelope(&mut sent).unwrap();
+                assert!(matches!(message.payload,
+                    Some(local_envelope::Payload::Request(value))
+                        if value.identity.as_ref().unwrap().local_command_id == command_id));
+            }
+            assert_eq!(sent.position(), sent.get_ref().len() as u64);
+        }
+        let mut client = WorkerClient::new(
+            ScriptedStream {
+                reads: Cursor::new([envelope("old-command"), envelope("stop-capture")].concat()),
+                writes: Vec::new(),
+                fail_after: None,
+            },
+            generation.into(),
+        );
+        assert_eq!(
+            client
+                .round_trip(request("capture-once"))
+                .unwrap_err()
+                .code(),
+            "worker.response_invalid"
+        );
+        let writes = client.stream.writes.clone();
+        let read_position = client.stream.reads.position();
+        assert_eq!(
+            client
+                .round_trip(request("stop-capture"))
+                .unwrap_err()
+                .code(),
+            "worker.response_invalid"
+        );
+        assert_eq!(client.stream.writes, writes);
+        assert_eq!(client.stream.reads.position(), read_position);
     }
 }
 

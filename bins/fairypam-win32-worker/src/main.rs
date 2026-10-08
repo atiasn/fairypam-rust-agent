@@ -2,7 +2,7 @@
 mod frame_ring;
 #[cfg(any(windows, test))]
 mod generic_controller;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod local_server;
 #[cfg(windows)]
 mod maa_loader;
