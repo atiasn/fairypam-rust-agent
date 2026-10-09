@@ -440,13 +440,6 @@ mod windows_impl {
             Ok(())
         }
 
-        pub fn capture_once(
-            &mut self,
-            deadline: Instant,
-        ) -> Result<(u64, CapturedFrame), MaaRuntimeError> {
-            self.capture_once_with_progress(deadline, &mut |_| Ok(()))
-        }
-
         pub fn capture_once_with_progress(
             &mut self,
             deadline: Instant,

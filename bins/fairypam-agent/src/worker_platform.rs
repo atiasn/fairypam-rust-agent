@@ -1742,7 +1742,10 @@ mod tests {
 
     #[test]
     fn capture_progress_keeps_only_the_last_stage_when_the_worker_is_invalidated() {
-        use fairypam_agent_protocol::worker_v1::{CaptureProgress, CaptureStage};
+        use crate::execution::telemetry_string;
+        use fairypam_agent_protocol::worker_v1::{
+            worker_event, CaptureProgress, CaptureStage, WorkerEvent,
+        };
         let mut platform = WorkerRuntimePlatform::new(&ProfileStore::default(), None);
         let events =
             [CaptureStage::TargetPrepare, CaptureStage::MaaCapture].map(|stage| WorkerEvent {
