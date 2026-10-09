@@ -444,8 +444,22 @@ mod windows_impl {
             &mut self,
             deadline: Instant,
         ) -> Result<(u64, CapturedFrame), MaaRuntimeError> {
+            self.capture_once_with_progress(deadline, &mut |_| Ok(()))
+        }
+
+        pub fn capture_once_with_progress(
+            &mut self,
+            deadline: Instant,
+            progress: &mut dyn FnMut(
+                fairypam_agent_protocol::worker_v1::CaptureStage,
+            ) -> Result<(), MaaRuntimeError>,
+        ) -> Result<(u64, CapturedFrame), MaaRuntimeError> {
+            use fairypam_agent_protocol::worker_v1::CaptureStage;
+            progress(CaptureStage::TargetPrepare)?;
             self.prepare_capture()?;
+            progress(CaptureStage::MaaCapture)?;
             let frame = self.maa.capture_once(maa_remaining(deadline, "capture")?)?;
+            progress(CaptureStage::TargetValidate)?;
             self.revalidate()?;
             validate_capture_identity(
                 &mut NativeWindows,

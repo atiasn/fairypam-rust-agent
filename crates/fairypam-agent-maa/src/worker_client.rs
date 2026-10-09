@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 
 use fairypam_agent_protocol::worker_v1::{
-    local_envelope, LocalEnvelope, WorkerEvent, WorkerRequest, WorkerResponse,
+    local_envelope, worker_event, worker_request, CaptureStage, LocalEnvelope, WorkerEvent,
+    WorkerRequest, WorkerResponse,
 };
 use fairypam_agent_protocol::{
     decode_local_envelope, encode_local_envelope, LOCAL_PROTOCOL_MAJOR, LOCAL_PROTOCOL_MINOR,
@@ -48,6 +49,10 @@ impl<S: Read + Write> WorkerClient<S> {
             ));
         }
         let command_id = identity.local_command_id.clone();
+        let capture = matches!(
+            request.payload,
+            Some(worker_request::Payload::CaptureOnce(_))
+        );
         let envelope = encode_local_envelope(&LocalEnvelope {
             protocol_major: LOCAL_PROTOCOL_MAJOR,
             protocol_minor: LOCAL_PROTOCOL_MINOR,
@@ -64,7 +69,20 @@ impl<S: Read + Write> WorkerClient<S> {
                     {
                         return Ok(value);
                     }
-                    Some(local_envelope::Payload::Event(value)) => self.events.push_back(value),
+                    Some(local_envelope::Payload::Event(value)) => {
+                        if matches!(&value.payload,
+                            Some(worker_event::Payload::CaptureProgress(progress)) if !capture
+                                || value.worker_generation != self.worker_generation
+                                || progress.local_command_id != command_id
+                                || !matches!(CaptureStage::try_from(progress.stage), Ok(stage) if stage != CaptureStage::Unspecified)
+                        ) {
+                            return Err(MaaRuntimeError::new(
+                                "worker.response_invalid",
+                                "capture progress does not match the command",
+                            ));
+                        }
+                        self.events.push_back(value);
+                    }
                     _ => {
                         return Err(MaaRuntimeError::new(
                             "worker.response_invalid",
@@ -107,8 +125,8 @@ mod tests {
     use std::io::{Cursor, Read, Write};
 
     use fairypam_agent_protocol::worker_v1::{
-        local_envelope, LocalEnvelope, WorkerCommandIdentity, WorkerEvent, WorkerRequest,
-        WorkerResponse,
+        local_envelope, worker_event, worker_request, CaptureOnce, CaptureProgress, CaptureStage,
+        LocalEnvelope, WorkerCommandIdentity, WorkerEvent, WorkerRequest, WorkerResponse,
     };
     use fairypam_agent_protocol::{
         encode_local_envelope, LOCAL_PROTOCOL_MAJOR, LOCAL_PROTOCOL_MINOR,
@@ -287,6 +305,123 @@ mod tests {
         );
         assert_eq!(client.stream.writes, writes);
         assert_eq!(client.stream.reads.position(), read_position);
+    }
+
+    #[test]
+    fn capture_progress_survives_timeout_without_reopening_the_pipe() {
+        let events =
+            [CaptureStage::TargetPrepare, CaptureStage::MaaCapture].map(|stage| WorkerEvent {
+                worker_generation: "worker-1".into(),
+                payload: Some(worker_event::Payload::CaptureProgress(CaptureProgress {
+                    local_command_id: "capture-1".into(),
+                    stage: stage as i32,
+                })),
+            });
+        let reads = events
+            .iter()
+            .flat_map(|event| {
+                encode_local_envelope(&LocalEnvelope {
+                    protocol_major: LOCAL_PROTOCOL_MAJOR,
+                    protocol_minor: LOCAL_PROTOCOL_MINOR,
+                    payload: Some(local_envelope::Payload::Event(event.clone())),
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let fail_after = reads.len() as u64;
+        let mut client = WorkerClient::new(
+            ScriptedStream {
+                reads: Cursor::new(reads),
+                writes: Vec::new(),
+                fail_after: Some(fail_after),
+            },
+            "worker-1".into(),
+        );
+        let request = WorkerRequest {
+            identity: Some(WorkerCommandIdentity {
+                worker_generation: "worker-1".into(),
+                local_command_id: "capture-1".into(),
+                ..WorkerCommandIdentity::default()
+            }),
+            payload: Some(worker_request::Payload::CaptureOnce(CaptureOnce::default())),
+        };
+        assert_eq!(
+            client.round_trip(request.clone()).unwrap_err().code(),
+            "maa.runtime_io_failed"
+        );
+        assert_eq!(client.take_events(), events);
+        let writes = client.stream.writes.clone();
+        assert_eq!(
+            client.round_trip(request).unwrap_err().code(),
+            "worker.response_invalid"
+        );
+        assert_eq!(client.stream.writes, writes);
+    }
+
+    #[test]
+    fn capture_progress_rejects_foreign_identity_and_unknown_stage() {
+        for (generation, command, stage, capture) in [
+            (
+                "old-worker",
+                "capture-1",
+                CaptureStage::TargetPrepare as i32,
+                true,
+            ),
+            (
+                "worker-1",
+                "other-command",
+                CaptureStage::TargetPrepare as i32,
+                true,
+            ),
+            ("worker-1", "capture-1", 99, true),
+            (
+                "worker-1",
+                "capture-1",
+                CaptureStage::Unspecified as i32,
+                true,
+            ),
+            (
+                "worker-1",
+                "capture-1",
+                CaptureStage::TargetPrepare as i32,
+                false,
+            ),
+        ] {
+            let reads = encode_local_envelope(&LocalEnvelope {
+                protocol_major: LOCAL_PROTOCOL_MAJOR,
+                protocol_minor: LOCAL_PROTOCOL_MINOR,
+                payload: Some(local_envelope::Payload::Event(WorkerEvent {
+                    worker_generation: generation.into(),
+                    payload: Some(worker_event::Payload::CaptureProgress(CaptureProgress {
+                        local_command_id: command.into(),
+                        stage,
+                    })),
+                })),
+            })
+            .unwrap();
+            let mut client = WorkerClient::new(
+                ScriptedStream {
+                    reads: Cursor::new(reads),
+                    writes: Vec::new(),
+                    fail_after: None,
+                },
+                "worker-1".into(),
+            );
+            let request = WorkerRequest {
+                identity: Some(WorkerCommandIdentity {
+                    worker_generation: "worker-1".into(),
+                    local_command_id: "capture-1".into(),
+                    ..WorkerCommandIdentity::default()
+                }),
+                payload: capture
+                    .then(|| worker_request::Payload::CaptureOnce(CaptureOnce::default())),
+            };
+            assert_eq!(
+                client.round_trip(request).unwrap_err().code(),
+                "worker.response_invalid"
+            );
+            assert!(client.take_events().is_empty());
+        }
     }
 }
 

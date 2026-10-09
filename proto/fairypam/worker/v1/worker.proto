@@ -94,7 +94,22 @@ message WorkerEvent {
   oneof payload {
     WorkerHealth health = 2;
     RealtimeProgramEvent realtime_program = 3;
+    CaptureProgress capture_progress = 4;
   }
+}
+
+enum CaptureStage {
+  CAPTURE_STAGE_UNSPECIFIED = 0;
+  CAPTURE_STAGE_TARGET_PREPARE = 1;
+  CAPTURE_STAGE_MAA_CAPTURE = 2;
+  CAPTURE_STAGE_TARGET_VALIDATE = 3;
+  CAPTURE_STAGE_ENCODE = 4;
+  CAPTURE_STAGE_PUBLISH = 5;
+}
+
+message CaptureProgress {
+  string local_command_id = 1;
+  CaptureStage stage = 2;
 }
 
 message WorkerCapabilities {

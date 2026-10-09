@@ -452,6 +452,34 @@ impl WorkerRuntimePlatform {
                     "Worker event generation is stale",
                 ));
             }
+            if let Some(worker_event::Payload::CaptureProgress(progress)) = &event.payload {
+                let stage = match fairypam_agent_protocol::worker_v1::CaptureStage::try_from(
+                    progress.stage,
+                ) {
+                    Ok(fairypam_agent_protocol::worker_v1::CaptureStage::TargetPrepare) => {
+                        "target_prepare"
+                    }
+                    Ok(fairypam_agent_protocol::worker_v1::CaptureStage::MaaCapture) => {
+                        "maa_capture"
+                    }
+                    Ok(fairypam_agent_protocol::worker_v1::CaptureStage::TargetValidate) => {
+                        "target_validate"
+                    }
+                    Ok(fairypam_agent_protocol::worker_v1::CaptureStage::Encode) => "encode",
+                    Ok(fairypam_agent_protocol::worker_v1::CaptureStage::Publish) => "publish",
+                    _ => {
+                        return Err(AgentError::new(
+                            "worker.event_invalid",
+                            "capture stage is invalid",
+                        ))
+                    }
+                };
+                self.capture_telemetry
+                    .retain(|attribute| attribute.key != "capture.worker_stage");
+                self.capture_telemetry
+                    .push(telemetry_string("capture.worker_stage", stage));
+                continue;
+            }
             let Some(worker_event::Payload::RealtimeProgram(program)) = event.payload else {
                 continue;
             };
@@ -881,12 +909,12 @@ impl RuntimePlatform for WorkerRuntimePlatform {
             stage = "complete";
             Ok(frame)
         })();
-        self.capture_telemetry = vec![
+        self.capture_telemetry.extend([
             telemetry_int("capture.prepare_us", prepare_us),
             telemetry_int("capture.attach_us", attach_us),
             telemetry_int("capture.worker_round_trip_us", worker_round_trip_us),
             telemetry_int("capture.ring_read_us", ring_read_us),
-        ];
+        ]);
         if let Some(value) = worker_to_image_us {
             self.capture_telemetry
                 .push(telemetry_int("capture.worker_to_image_us", value));
@@ -1710,6 +1738,29 @@ mod tests {
             platform.runtime_source_frame(25).unwrap_err().code(),
             "input.frame_invalid"
         );
+    }
+
+    #[test]
+    fn capture_progress_keeps_only_the_last_stage_when_the_worker_is_invalidated() {
+        use fairypam_agent_protocol::worker_v1::{CaptureProgress, CaptureStage};
+        let mut platform = WorkerRuntimePlatform::new(&ProfileStore::default(), None);
+        let events =
+            [CaptureStage::TargetPrepare, CaptureStage::MaaCapture].map(|stage| WorkerEvent {
+                worker_generation: "worker-1".into(),
+                payload: Some(worker_event::Payload::CaptureProgress(CaptureProgress {
+                    local_command_id: "capture-1".into(),
+                    stage: stage as i32,
+                })),
+            });
+        platform
+            .queue_worker_events("worker-1", events.into())
+            .unwrap();
+        platform.invalidate_timed_out_worker().unwrap();
+        assert_eq!(
+            platform.take_capture_telemetry(),
+            vec![telemetry_string("capture.worker_stage", "maa_capture")]
+        );
+        assert!(platform.take_capture_telemetry().is_empty());
     }
 
     #[test]

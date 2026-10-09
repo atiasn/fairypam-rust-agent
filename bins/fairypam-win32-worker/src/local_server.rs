@@ -80,10 +80,11 @@ mod windows_impl {
     use fairypam_agent_core::profile::Ed25519SignatureVerifier;
     use fairypam_agent_maa::MaaRuntimeError;
     use fairypam_agent_protocol::worker_v1::{
-        local_envelope, worker_event, worker_request, FrameEncoding, LocalEnvelope, PixelFormat,
-        RealtimeProgramEvent, RealtimeProgramMetrics as WorkerRealtimeProgramMetrics,
-        RealtimeProgramState, WindowsIoMode, WorkerCapabilities, WorkerEvent, WorkerHealth,
-        WorkerOutcome, WorkerReady, WorkerRequest, WorkerResponse,
+        local_envelope, worker_event, worker_request, CaptureProgress, CaptureStage, FrameEncoding,
+        LocalEnvelope, PixelFormat, RealtimeProgramEvent,
+        RealtimeProgramMetrics as WorkerRealtimeProgramMetrics, RealtimeProgramState,
+        WindowsIoMode, WorkerCapabilities, WorkerEvent, WorkerHealth, WorkerOutcome, WorkerReady,
+        WorkerRequest, WorkerResponse,
     };
     use fairypam_agent_protocol::{
         encode_local_envelope, verify_worker_request, worker_realtime_metrics_digest,
@@ -323,7 +324,7 @@ mod windows_impl {
                 let mut shutdown = false;
                 let response = match self.validate(&request) {
                     Ok(()) => match operation_deadline(&request)
-                        .and_then(|deadline| self.dispatch(&request, deadline))
+                        .and_then(|deadline| self.dispatch(&request, deadline, &mut pipe))
                     {
                         Ok(result) => {
                             event = result.event;
@@ -392,6 +393,7 @@ mod windows_impl {
             &mut self,
             request: &WorkerRequest,
             deadline: Instant,
+            pipe: &mut fs::File,
         ) -> Result<CommandResult, MaaRuntimeError> {
             let identity = request.identity.as_ref().unwrap();
             match request.payload.as_ref().unwrap() {
@@ -431,12 +433,27 @@ mod windows_impl {
                 }
                 worker_request::Payload::CaptureOnce(value) => {
                     self.require_generic()?;
+                    let mut progress = |stage| {
+                        self.write(
+                            pipe,
+                            local_envelope::Payload::Event(WorkerEvent {
+                                worker_generation: self.config.worker_generation.clone(),
+                                payload: Some(worker_event::Payload::CaptureProgress(
+                                    CaptureProgress {
+                                        local_command_id: identity.local_command_id.clone(),
+                                        stage: stage as i32,
+                                    },
+                                )),
+                            }),
+                        )
+                    };
                     let sequence = self.capture_once(
                         &value.capture_source_id,
                         &value.encoding,
                         value.quality,
                         value.roi.as_ref(),
                         deadline,
+                        &mut progress,
                     )?;
                     Ok(CommandResult::applied().frame(sequence))
                 }
@@ -699,6 +716,7 @@ mod windows_impl {
                             wire_encoding,
                             None,
                             Instant::now() + CONTINUOUS_CAPTURE_TIMEOUT,
+                            &mut |_| Ok(()),
                         ) {
                             if let Ok(mut slot) = worker_error.lock() {
                                 *slot = Some(error.code().to_owned());
@@ -751,11 +769,19 @@ mod windows_impl {
             quality: u32,
             roi: Option<&fairypam_agent_protocol::worker_v1::CaptureRoi>,
             deadline: Instant,
+            progress: &mut dyn FnMut(CaptureStage) -> Result<(), MaaRuntimeError>,
         ) -> Result<u64, MaaRuntimeError> {
             let wire_encoding = CaptureEncoding::parse(encoding, quality)?;
             self.lock_controller()?
                 .validate_capture_source(source_id, None, encoding)?;
-            capture_and_publish(&self.controller, &self.ring, wire_encoding, roi, deadline)
+            capture_and_publish(
+                &self.controller,
+                &self.ring,
+                wire_encoding,
+                roi,
+                deadline,
+                progress,
+            )
         }
 
         fn release_current_mode(&mut self) -> Result<(), MaaRuntimeError> {
@@ -1196,6 +1222,7 @@ mod windows_impl {
         encoding: CaptureEncoding,
         roi: Option<&fairypam_agent_protocol::worker_v1::CaptureRoi>,
         deadline: Instant,
+        progress: &mut dyn FnMut(CaptureStage) -> Result<(), MaaRuntimeError>,
     ) -> Result<u64, MaaRuntimeError> {
         let (sequence, frame) = controller
             .lock()
@@ -1205,7 +1232,7 @@ mod windows_impl {
                     "MAA controller lock is poisoned",
                 )
             })?
-            .capture_once(deadline)?;
+            .capture_once_with_progress(deadline, progress)?;
         let captured_at = unix_us();
         let frame = match roi {
             Some(roi) => frame.crop(
@@ -1214,7 +1241,9 @@ mod windows_impl {
             )?,
             None => frame,
         };
+        progress(CaptureStage::Encode)?;
         let (payload, wire_encoding) = encode_frame(&frame, encoding)?;
+        progress(CaptureStage::Publish)?;
         ring.lock()
             .map_err(|_| {
                 MaaRuntimeError::new("worker.frame_unavailable", "frame ring lock is poisoned")
