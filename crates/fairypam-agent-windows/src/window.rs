@@ -475,6 +475,7 @@ fn binding_identity(binding: &TargetBinding) -> Result<TargetIdentity, AgentErro
 fn revalidate_or_focus_target(
     api: &mut dyn WindowsApi,
     expected: &TargetIdentity,
+    before_focus: &mut dyn FnMut() -> Result<(), AgentError>,
 ) -> Result<WindowsTargetCandidate, AgentError> {
     let mut current = revalidate_identity(api, expected)?;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -483,6 +484,7 @@ fn revalidate_or_focus_target(
         if current.foreground && !current.minimized {
             return Ok(current);
         }
+        before_focus()?;
         if let Err(error) = api.focus_target(&current.identity) {
             if error.code() != "target.focus_failed" {
                 return Err(error.into());
@@ -510,7 +512,7 @@ fn revalidate_input_target(
     api: &mut dyn WindowsApi,
     binding: &TargetBinding,
 ) -> Result<LockedInputTarget, AgentError> {
-    let current = revalidate_or_focus_target(api, &binding_identity(binding)?)?;
+    let current = revalidate_or_focus_target(api, &binding_identity(binding)?, &mut || Ok(()))?;
     locked_input_target(current)
 }
 
@@ -599,7 +601,15 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
         &mut self,
         expected: &TargetIdentity,
     ) -> Result<TargetIdentity, AgentError> {
-        let current = revalidate_or_focus_target(&mut self.api, expected)?;
+        self.capture_target_identity_with_progress(expected, &mut || Ok(()))
+    }
+
+    pub fn capture_target_identity_with_progress(
+        &mut self,
+        expected: &TargetIdentity,
+        before_focus: &mut dyn FnMut() -> Result<(), AgentError>,
+    ) -> Result<TargetIdentity, AgentError> {
+        let current = revalidate_or_focus_target(&mut self.api, expected, before_focus)?;
         if current.minimized || !current.capturable {
             return Err(WindowsError::new(
                 "target.capture_not_permitted",
@@ -653,7 +663,7 @@ impl<A: WindowsApi> WindowsTargetPlatform<A> {
     }
 
     pub fn focus(&mut self, binding: &TargetBinding) -> Result<TargetSnapshot, AgentError> {
-        revalidate_or_focus_target(&mut self.api, &binding_identity(binding)?)?;
+        revalidate_or_focus_target(&mut self.api, &binding_identity(binding)?, &mut || Ok(()))?;
         let snapshot = self.revalidate(binding)?;
         if !snapshot.foreground {
             return Err(WindowsError::new(
@@ -826,6 +836,66 @@ mod tests {
 
         assert_eq!(targets.api().focus_requests, 3);
         assert!(targets.api().candidates[0].foreground);
+    }
+
+    #[test]
+    fn capture_progress_observes_only_required_focus_attempts() {
+        for foreground in [true, false] {
+            let candidate = input_candidate(foreground);
+            let identity = candidate.identity.clone();
+            let mut targets = WindowsTargetPlatform::new(
+                FakeWindows::with_candidates(vec![candidate]).with_focus_failures(2),
+            );
+            let mut observed = 0;
+
+            assert_eq!(
+                targets
+                    .capture_target_identity_with_progress(&identity, &mut || {
+                        observed += 1;
+                        Ok(())
+                    })
+                    .unwrap(),
+                identity
+            );
+
+            assert_eq!(observed, if foreground { 0 } else { 3 });
+            assert_eq!(targets.api().focus_requests, observed);
+            assert!(targets.api().candidates[0].foreground);
+        }
+    }
+
+    #[test]
+    fn capture_progress_preserves_guards_and_stops_before_focus_if_reporting_fails() {
+        for failure in ["identity", "environment", "progress"] {
+            let mut candidate = input_candidate(false);
+            let identity = candidate.identity.clone();
+            if failure == "identity" {
+                candidate.identity.pid += 1;
+            }
+            let mut api = FakeWindows::with_candidates(vec![candidate]);
+            if failure == "environment" {
+                api = api.with_environment_failure(1);
+            }
+            let mut targets = WindowsTargetPlatform::new(api);
+            let mut observed = 0;
+            let error = targets
+                .capture_target_identity_with_progress(&identity, &mut || {
+                    observed += 1;
+                    Err(AgentError::new("observer.closed", "diagnostic pipe closed"))
+                })
+                .unwrap_err();
+
+            assert_eq!(observed, usize::from(failure == "progress"));
+            assert_eq!(targets.api().focus_requests, 0);
+            assert_eq!(
+                error.code(),
+                match failure {
+                    "identity" => "target.stale",
+                    "environment" => "environment.local_input_detected",
+                    _ => "observer.closed",
+                }
+            );
+        }
     }
 
     #[test]

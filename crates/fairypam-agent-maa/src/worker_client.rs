@@ -309,14 +309,19 @@ mod tests {
 
     #[test]
     fn capture_progress_survives_timeout_without_reopening_the_pipe() {
-        let events =
-            [CaptureStage::TargetPrepare, CaptureStage::MaaCapture].map(|stage| WorkerEvent {
-                worker_generation: "worker-1".into(),
-                payload: Some(worker_event::Payload::CaptureProgress(CaptureProgress {
-                    local_command_id: "capture-1".into(),
-                    stage: stage as i32,
-                })),
-            });
+        let events = [
+            CaptureStage::TargetPrepare,
+            CaptureStage::TargetSnapshot,
+            CaptureStage::TargetFocus,
+            CaptureStage::MaaCapture,
+        ]
+        .map(|stage| WorkerEvent {
+            worker_generation: "worker-1".into(),
+            payload: Some(worker_event::Payload::CaptureProgress(CaptureProgress {
+                local_command_id: "capture-1".into(),
+                stage: stage as i32,
+            })),
+        });
         let reads = events
             .iter()
             .flat_map(|event| {

@@ -459,6 +459,12 @@ impl WorkerRuntimePlatform {
                     Ok(fairypam_agent_protocol::worker_v1::CaptureStage::TargetPrepare) => {
                         "target_prepare"
                     }
+                    Ok(fairypam_agent_protocol::worker_v1::CaptureStage::TargetSnapshot) => {
+                        "target_snapshot"
+                    }
+                    Ok(fairypam_agent_protocol::worker_v1::CaptureStage::TargetFocus) => {
+                        "target_focus"
+                    }
                     Ok(fairypam_agent_protocol::worker_v1::CaptureStage::MaaCapture) => {
                         "maa_capture"
                     }
@@ -1746,24 +1752,29 @@ mod tests {
         use fairypam_agent_protocol::worker_v1::{
             worker_event, CaptureProgress, CaptureStage, WorkerEvent,
         };
-        let mut platform = WorkerRuntimePlatform::new(&ProfileStore::default(), None);
-        let events =
-            [CaptureStage::TargetPrepare, CaptureStage::MaaCapture].map(|stage| WorkerEvent {
+        for (last_stage, name) in [
+            (CaptureStage::MaaCapture, "maa_capture"),
+            (CaptureStage::TargetSnapshot, "target_snapshot"),
+            (CaptureStage::TargetFocus, "target_focus"),
+        ] {
+            let mut platform = WorkerRuntimePlatform::new(&ProfileStore::default(), None);
+            let events = [CaptureStage::TargetPrepare, last_stage].map(|stage| WorkerEvent {
                 worker_generation: "worker-1".into(),
                 payload: Some(worker_event::Payload::CaptureProgress(CaptureProgress {
                     local_command_id: "capture-1".into(),
                     stage: stage as i32,
                 })),
             });
-        platform
-            .queue_worker_events("worker-1", events.into())
-            .unwrap();
-        platform.invalidate_timed_out_worker().unwrap();
-        assert_eq!(
-            platform.take_capture_telemetry(),
-            vec![telemetry_string("capture.worker_stage", "maa_capture")]
-        );
-        assert!(platform.take_capture_telemetry().is_empty());
+            platform
+                .queue_worker_events("worker-1", events.into())
+                .unwrap();
+            platform.invalidate_timed_out_worker().unwrap();
+            assert_eq!(
+                platform.take_capture_telemetry(),
+                vec![telemetry_string("capture.worker_stage", name)]
+            );
+            assert!(platform.take_capture_telemetry().is_empty());
+        }
     }
 
     #[test]

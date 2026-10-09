@@ -449,7 +449,7 @@ mod windows_impl {
         ) -> Result<(u64, CapturedFrame), MaaRuntimeError> {
             use fairypam_agent_protocol::worker_v1::CaptureStage;
             progress(CaptureStage::TargetPrepare)?;
-            self.prepare_capture()?;
+            self.prepare_capture_with_progress(progress)?;
             progress(CaptureStage::MaaCapture)?;
             let frame = self.maa.capture_once(maa_remaining(deadline, "capture")?)?;
             progress(CaptureStage::TargetValidate)?;
@@ -799,12 +799,27 @@ mod windows_impl {
         }
 
         fn prepare_capture(&self) -> Result<VerifiedGeometry, MaaRuntimeError> {
+            self.prepare_capture_with_progress(&mut |_| Ok(()))
+        }
+
+        fn prepare_capture_with_progress(
+            &self,
+            progress: &mut dyn FnMut(
+                fairypam_agent_protocol::worker_v1::CaptureStage,
+            ) -> Result<(), MaaRuntimeError>,
+        ) -> Result<VerifiedGeometry, MaaRuntimeError> {
+            use fairypam_agent_protocol::worker_v1::CaptureStage;
             let identity = self
                 .identity
                 .as_ref()
                 .ok_or_else(|| invalid_target("target is detached"))?;
+            progress(CaptureStage::TargetSnapshot)?;
             WindowsTargetPlatform::new(NativeWindows)
-                .capture_target_identity(identity)
+                .capture_target_identity_with_progress(identity, &mut || {
+                    progress(CaptureStage::TargetFocus).map_err(|error| {
+                        fairypam_agent_core::AgentError::new(error.code(), error.to_string())
+                    })
+                })
                 .map_err(|error| MaaRuntimeError::new(error.code(), error.to_string()))?;
             self.revalidate()
         }
