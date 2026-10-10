@@ -445,6 +445,7 @@ impl WorkerRuntimePlatform {
         events: Vec<WorkerEvent>,
     ) -> Result<(), AgentError> {
         let mut release_uncertain = false;
+        let mut target_focus_count = 0;
         for event in events {
             if event.worker_generation != generation {
                 return Err(AgentError::new(
@@ -463,6 +464,7 @@ impl WorkerRuntimePlatform {
                         "target_snapshot"
                     }
                     Ok(fairypam_agent_protocol::worker_v1::CaptureStage::TargetFocus) => {
+                        target_focus_count += 1;
                         "target_focus"
                     }
                     Ok(fairypam_agent_protocol::worker_v1::CaptureStage::MaaCapture) => {
@@ -596,6 +598,12 @@ impl WorkerRuntimePlatform {
                 self.realtime_terminal = Some(state);
             }
             release_uncertain |= state == RealtimeProgramState::ReleaseUncertain;
+        }
+        if target_focus_count > 0 {
+            self.capture_telemetry.push(telemetry_int(
+                "capture.target_focus_count",
+                target_focus_count,
+            ));
         }
         if release_uncertain {
             Err(AgentError::new(
@@ -1748,7 +1756,7 @@ mod tests {
 
     #[test]
     fn capture_progress_keeps_only_the_last_stage_when_the_worker_is_invalidated() {
-        use crate::execution::telemetry_string;
+        use crate::execution::{telemetry_int, telemetry_string};
         use fairypam_agent_protocol::worker_v1::{
             worker_event, CaptureProgress, CaptureStage, WorkerEvent,
         };
@@ -1758,7 +1766,11 @@ mod tests {
             (CaptureStage::TargetFocus, "target_focus"),
         ] {
             let mut platform = WorkerRuntimePlatform::new(&ProfileStore::default(), None);
-            let events = [CaptureStage::TargetPrepare, last_stage].map(|stage| WorkerEvent {
+            let mut stages = vec![CaptureStage::TargetPrepare, last_stage];
+            if last_stage == CaptureStage::TargetFocus {
+                stages.extend([CaptureStage::TargetFocus; 2]);
+            }
+            let events = stages.into_iter().map(|stage| WorkerEvent {
                 worker_generation: "worker-1".into(),
                 payload: Some(worker_event::Payload::CaptureProgress(CaptureProgress {
                     local_command_id: "capture-1".into(),
@@ -1766,13 +1778,14 @@ mod tests {
                 })),
             });
             platform
-                .queue_worker_events("worker-1", events.into())
+                .queue_worker_events("worker-1", events.collect())
                 .unwrap();
             platform.invalidate_timed_out_worker().unwrap();
-            assert_eq!(
-                platform.take_capture_telemetry(),
-                vec![telemetry_string("capture.worker_stage", name)]
-            );
+            let mut expected = vec![telemetry_string("capture.worker_stage", name)];
+            if last_stage == CaptureStage::TargetFocus {
+                expected.push(telemetry_int("capture.target_focus_count", 3));
+            }
+            assert_eq!(platform.take_capture_telemetry(), expected);
             assert!(platform.take_capture_telemetry().is_empty());
         }
     }
