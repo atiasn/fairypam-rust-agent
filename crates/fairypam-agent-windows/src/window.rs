@@ -1049,7 +1049,7 @@ mod native {
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
         GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
-        SetForegroundWindow, ShowWindowAsync, SW_RESTORE, WM_CLOSE,
+        SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOW, WM_CLOSE,
     };
 
     use crate::{normalized_process_path_sha256, validate_dpi};
@@ -1193,6 +1193,8 @@ mod native {
                 }
                 thread::sleep(Duration::from_millis(10));
             }
+        } else {
+            let _ = unsafe { ShowWindowAsync(hwnd, SW_SHOW) };
         }
         let (direct_accepted, direct_succeeded) =
             request_foreground(hwnd, Duration::from_millis(200));
