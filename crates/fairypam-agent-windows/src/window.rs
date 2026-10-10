@@ -1046,6 +1046,10 @@ mod native {
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
+        VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
         GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
@@ -1084,6 +1088,58 @@ mod native {
     fn request_foreground(hwnd: HWND, timeout: Duration) -> (bool, bool) {
         let accepted = unsafe { SetForegroundWindow(hwnd) }.as_bool();
         (accepted, wait_for_foreground(hwnd, timeout))
+    }
+
+    fn focus_mouse_activity_inputs(button_down: bool) -> Option<[INPUT; 2]> {
+        if button_down {
+            return None;
+        }
+        // ponytail: opposite moves avoid clicks; clipping can leave a small cursor offset.
+        Some([1, -1].map(|dy| INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dy,
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    dwExtraInfo: crate::send_input::SEND_INPUT_MARKER,
+                    ..Default::default()
+                },
+            },
+        }))
+    }
+
+    fn request_focus_mouse_activity() -> Result<(), WindowsError> {
+        let button_down = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+            .iter()
+            .any(|button| unsafe { GetAsyncKeyState(i32::from(button.0)) } < 0);
+        let Some(inputs) = focus_mouse_activity_inputs(button_down) else {
+            return Ok(());
+        };
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent != inputs.len() as u32 {
+            return Err(WindowsError::new(
+                "target.activation_input_failed",
+                format!(
+                    "SendInput accepted {sent}/{} activation moves",
+                    inputs.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn focus_mouse_activity_avoids_drag_and_only_sends_marked_opposite_moves() {
+        assert!(focus_mouse_activity_inputs(true).is_none());
+        let inputs = focus_mouse_activity_inputs(false).unwrap();
+        for (input, dy) in inputs.iter().zip([1, -1]) {
+            assert_eq!(input.r#type, INPUT_MOUSE);
+            let mouse = unsafe { input.Anonymous.mi };
+            assert_eq!((mouse.dx, mouse.dy, mouse.mouseData), (0, dy, 0));
+            assert_eq!(mouse.dwFlags, MOUSEEVENTF_MOVE);
+            assert_eq!(mouse.dwExtraInfo, crate::send_input::SEND_INPUT_MARKER);
+        }
     }
 
     pub(super) fn enumerate_candidates() -> Result<Vec<WindowsTargetCandidate>, WindowsError> {
@@ -1204,6 +1260,15 @@ mod native {
 
         let refreshed = candidate_from_raw_hwnd(identity.hwnd)?;
         require_same_identity(identity, &refreshed.identity)?;
+        if desktop_receives_input() != Some(true) {
+            return Err(WindowsError::new(
+                "target.noninteractive_desktop",
+                "agent desktop stopped receiving user input before activation",
+            ));
+        }
+        crate::local_input::check_active()
+            .map_err(|error| WindowsError::new(error.code(), error.to_string()))?;
+        request_focus_mouse_activity()?;
         let brought_to_top = unsafe { BringWindowToTop(hwnd) }.is_ok();
         let (input_retry_accepted, succeeded) =
             request_foreground(hwnd, Duration::from_millis(800));
